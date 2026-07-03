@@ -101,6 +101,10 @@ export type SeedRow = {
 };
 export type SeedInput = Record<string, SeedRow[]>;
 export type SeedValidators = Record<string, Record<string, Validator<unknown>>>;
+export interface SeedOptions {
+    batchSize?: number;
+    transactionMode?: "manual" | "batch" | "none";
+}
 
 export interface SeedResult {
     kind: "success" | "error";
@@ -115,8 +119,16 @@ type SeedContext = {
     db: Client;
     schema: SchemaMetadata;
     validators?: SeedValidators;
+    batchSize: number;
+    transactionMode: "manual" | "batch" | "none";
     statementIndex: number;
     physicalColumns: Map<string, Set<string>>;
+};
+
+type SeedPreparedRow = {
+    path: string;
+    scalarValues: Record<string, SeedValue>;
+    nestedValues: Array<{ key: string; link: LinkInfo; value: SeedRow | SeedRow[] }>;
 };
 
 function extractAffectedRowGroups(sql: SqlInfo[], resultSets: any[]): any[] {
@@ -323,29 +335,45 @@ export async function seed(
     schema: SchemaMetadata,
     input: SeedInput,
     validators?: SeedValidators,
+    options: SeedOptions = {},
 ): Promise<SeedResult> {
-    const context: SeedContext = { db, schema, validators, statementIndex: 0, physicalColumns: new Map() };
+    const context: SeedContext = {
+        db,
+        schema,
+        validators,
+        batchSize: options.batchSize ?? 100,
+        transactionMode: resolveSeedTransactionMode(db, options.transactionMode),
+        statementIndex: 0,
+        physicalColumns: new Map(),
+    };
     const response: Record<string, unknown[]> = {};
 
     try {
         validateSeedInput(schema, input);
-        await db.execute("begin");
+        if (context.transactionMode === "manual") {
+            await db.execute("begin");
+        }
 
         for (const [tableName, rows] of Object.entries(input)) {
             const table = schema.tables[tableName];
-            response[tableName] = [];
-            for (let index = 0; index < rows.length; index += 1) {
-                response[tableName].push(await insertSeedRow(context, table, rows[index], `${tableName}[${index}]`));
-            }
+            response[tableName] = await insertSeedRows(
+                context,
+                table,
+                rows.map((row, index) => ({ row, path: `${tableName}[${index}]` })),
+            );
         }
 
-        await db.execute("commit");
+        if (context.transactionMode === "manual") {
+            await db.execute("commit");
+        }
         return { kind: "success", response };
     } catch (error) {
-        try {
-            await db.execute("rollback");
-        } catch (_) {
-            // Ignore rollback failures; the original error is more useful.
+        if (context.transactionMode === "manual") {
+            try {
+                await db.execute("rollback");
+            } catch (_) {
+                // Ignore rollback failures; the original error is more useful.
+            }
         }
 
         return {
@@ -356,6 +384,25 @@ export async function seed(
             },
         };
     }
+}
+
+function resolveSeedTransactionMode(
+    db: Client,
+    requestedMode: SeedOptions["transactionMode"],
+): "manual" | "batch" | "none" {
+    if (requestedMode === "manual" || requestedMode === "none") {
+        return requestedMode;
+    }
+
+    if (requestedMode === "batch") {
+        if (typeof db.batch !== "function") {
+            throw new Error("seed batch mode requires a database client with batch support");
+        }
+
+        return "batch";
+    }
+
+    return typeof db.batch === "function" ? "batch" : "manual";
 }
 
 class SeedInputError extends Error { }
@@ -387,6 +434,61 @@ async function insertSeedRow(
     path: string,
     inheritedValues: Record<string, SeedValue> = {},
 ): Promise<Record<string, unknown>> {
+    const [inserted] = await insertSeedRows(context, table, [{ row, path, inheritedValues }]);
+    return inserted;
+}
+
+async function insertSeedRows(
+    context: SeedContext,
+    table: TableMetadata,
+    rows: Array<{ row: SeedRow; path: string; inheritedValues?: Record<string, SeedValue> }>,
+): Promise<Record<string, unknown>[]> {
+    const preparedRows: SeedPreparedRow[] = [];
+
+    for (const item of rows) {
+        preparedRows.push(await prepareSeedRow(context, table, item.row, item.path, item.inheritedValues ?? {}));
+    }
+
+    const insertedRows = await insertScalarRows(context, table, preparedRows);
+
+    for (let rowIndex = 0; rowIndex < preparedRows.length; rowIndex += 1) {
+        const prepared = preparedRows[rowIndex];
+        const inserted = insertedRows[rowIndex];
+
+        for (const nested of prepared.nestedValues.filter(({ link }) => isParentToChildLink(table, link))) {
+            const linkedTable = context.schema.tables[nested.link.to.table];
+            if (!linkedTable) {
+                throw new SeedInputError(`seed link '${prepared.path}.${nested.key}' points to unknown table '${nested.link.to.table}'`);
+            }
+            const parentValue = inserted[nested.link.from];
+            if (!isSeedValue(parentValue)) {
+                throw new SeedInputError(`seed link '${prepared.path}.${nested.key}' cannot derive '${nested.link.from}' from inserted parent row`);
+            }
+
+            const childRows = Array.isArray(nested.value) ? nested.value : [nested.value];
+            const nestedResult = await insertSeedRows(
+                context,
+                linkedTable,
+                childRows.map((childRow, index) => ({
+                    row: childRow,
+                    path: `${prepared.path}.${nested.key}[${index}]`,
+                    inheritedValues: { [nested.link.to.column]: parentValue },
+                })),
+            );
+            inserted[nested.key] = Array.isArray(nested.value) ? nestedResult : nestedResult[0];
+        }
+    }
+
+    return insertedRows;
+}
+
+async function prepareSeedRow(
+    context: SeedContext,
+    table: TableMetadata,
+    row: SeedRow,
+    path: string,
+    inheritedValues: Record<string, SeedValue> = {},
+): Promise<SeedPreparedRow> {
     const scalarValues: Record<string, SeedValue> = { ...inheritedValues };
     const nestedValues: Array<{ key: string; link: LinkInfo; value: SeedRow | SeedRow[] }> = [];
     const columns = new Set((table.columns ?? []).map((column) => column.name));
@@ -435,33 +537,7 @@ async function insertSeedRow(
         scalarValues[nested.link.from] = linkedValue;
     }
 
-    const inserted = await insertScalarRow(context, table, scalarValues, path);
-
-    for (const nested of nestedValues.filter(({ link }) => isParentToChildLink(table, link))) {
-        const linkedTable = context.schema.tables[nested.link.to.table];
-        if (!linkedTable) {
-            throw new SeedInputError(`seed link '${path}.${nested.key}' points to unknown table '${nested.link.to.table}'`);
-        }
-        const parentValue = inserted[nested.link.from];
-        if (!isSeedValue(parentValue)) {
-            throw new SeedInputError(`seed link '${path}.${nested.key}' cannot derive '${nested.link.from}' from inserted parent row`);
-        }
-
-        const childRows = Array.isArray(nested.value) ? nested.value : [nested.value];
-        const nestedResult: Record<string, unknown>[] = [];
-        for (let index = 0; index < childRows.length; index += 1) {
-            nestedResult.push(await insertSeedRow(
-                context,
-                linkedTable,
-                childRows[index],
-                `${path}.${nested.key}[${index}]`,
-                { [nested.link.to.column]: parentValue },
-            ));
-        }
-        inserted[nested.key] = Array.isArray(nested.value) ? nestedResult : nestedResult[0];
-    }
-
-    return inserted;
+    return { path, scalarValues, nestedValues };
 }
 
 function validateSeedColumnValue(
@@ -488,38 +564,84 @@ async function insertScalarRow(
     values: Record<string, SeedValue>,
     path: string,
 ): Promise<Record<string, unknown>> {
-    const inputColumnNames = Object.keys(values);
-    const knownColumns = new Set((table.columns ?? []).map((column) => column.name));
+    const [inserted] = await insertScalarRows(context, table, [{ path, scalarValues: values, nestedValues: [] }]);
+    return inserted;
+}
 
-    for (const columnName of inputColumnNames) {
-        if (!knownColumns.has(columnName)) {
-            throw new SeedInputError(`unknown seed column '${path}.${columnName}' on table '${table.name}'`);
+async function insertScalarRows(
+    context: SeedContext,
+    table: TableMetadata,
+    rows: SeedPreparedRow[],
+): Promise<Record<string, unknown>[]> {
+    const insertedRows: Record<string, unknown>[] = [];
+
+    for (let offset = 0; offset < rows.length; offset += context.batchSize) {
+        const chunk = rows.slice(offset, offset + context.batchSize);
+        const statements = await Promise.all(chunk.map(async ({ scalarValues, path }) => {
+            const inputColumnNames = Object.keys(scalarValues);
+            const knownColumns = new Set((table.columns ?? []).map((column) => column.name));
+
+            for (const columnName of inputColumnNames) {
+                if (!knownColumns.has(columnName)) {
+                    throw new SeedInputError(`unknown seed column '${path}.${columnName}' on table '${table.name}'`);
+                }
+            }
+
+            const normalizedValues = await normalizeSeedValues(context, table, scalarValues);
+            const columnNames = Object.keys(normalizedValues);
+            const args: Record<string, SeedPrimitive> = {};
+            const placeholders = columnNames.map((columnName) => {
+                const argName = `seed_${context.statementIndex++}`;
+                args[argName] = normalizedValues[columnName];
+                return `$${argName}`;
+            });
+            const sql = columnNames.length === 0
+                ? `insert into ${quoteIdentifier(table.name)} default values returning *`
+                : `insert into ${quoteIdentifier(table.name)} (${columnNames.map(quoteIdentifier).join(", ")}) values (${placeholders.join(", ")}) returning *`;
+
+            return { sql, args };
+        }));
+
+        try {
+            const results = await executeSeedInsertStatements(context, statements);
+            for (const result of results) {
+                const row = result.rows?.[0];
+                if (!row) {
+                    throw new Error("insert returned no rows");
+                }
+                insertedRows.push(formatReturnedSeedRow(table, row as Record<string, unknown>));
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : "database insert failed";
+            throw new Error(`failed to insert seed rows starting at '${chunk[0]?.path ?? table.name}' into '${table.name}': ${message}`);
         }
     }
 
-    const normalizedValues = await normalizeSeedValues(context, table, values);
-    const columnNames = Object.keys(normalizedValues);
-    const args: Record<string, SeedPrimitive> = {};
-    const placeholders = columnNames.map((columnName) => {
-        const argName = `seed_${context.statementIndex++}`;
-        args[argName] = normalizedValues[columnName];
-        return `$${argName}`;
-    });
-    const sql = columnNames.length === 0
-        ? `insert into ${quoteIdentifier(table.name)} default values returning *`
-        : `insert into ${quoteIdentifier(table.name)} (${columnNames.map(quoteIdentifier).join(", ")}) values (${placeholders.join(", ")}) returning *`;
+    return insertedRows;
+}
 
-    try {
-        const result = await context.db.execute({ sql, args });
-        const row = result.rows?.[0];
-        if (!row) {
-            throw new Error("insert returned no rows");
-        }
-        return formatReturnedSeedRow(table, row as Record<string, unknown>);
-    } catch (error) {
-        const message = error instanceof Error ? error.message : "database insert failed";
-        throw new Error(`failed to insert seed row '${path}' into '${table.name}': ${message}`);
+async function executeSeedInsertStatements(
+    context: SeedContext,
+    statements: InStatement[],
+): Promise<Array<{ rows?: unknown[] }>> {
+    if (statements.length === 0) {
+        return [];
     }
+
+    if (context.transactionMode === "batch") {
+        if (typeof context.db.batch !== "function") {
+            throw new Error("seed batch mode requires a database client with batch support");
+        }
+
+        return await context.db.batch(statements) as Array<{ rows?: unknown[] }>;
+    }
+
+    const results: Array<{ rows?: unknown[] }> = [];
+    for (const statement of statements) {
+        results.push(await context.db.execute(statement) as { rows?: unknown[] });
+    }
+
+    return results;
 }
 
 async function normalizeSeedValues(

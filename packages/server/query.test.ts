@@ -154,6 +154,67 @@ test("seed inserts nested rows through schema links", async () => {
   expect(Object.values(postInserts[1].args)).toContain(10);
 });
 
+test("seed batches sibling inserts when batch is supported", async () => {
+  const executed: any[] = [];
+  const batched: any[][] = [];
+  const db = {
+    execute: mock(async (statement: any) => {
+      executed.push(statement);
+      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
+        return { rows: [{ name: "id" }, { name: "name" }, { name: "authorId" }, { name: "title" }] };
+      }
+      throw new Error("unexpected execute");
+    }),
+    batch: mock(async (statements: any[]) => {
+      batched.push(statements);
+      return statements.map((statement) => {
+        if (statement.sql.includes('"users"')) {
+          return { rows: [{ id: 10, name: statement.args.seed_0 }] };
+        }
+
+        const values = Object.values(statement.args);
+        const authorId = values.find((value) => value === 10);
+        const title = values.find((value) => value === "First" || value === "Second");
+        return { rows: [{ id: title === "First" ? 20 : 21, authorId, title }] };
+      });
+    }),
+  };
+
+  const result = await seed(db as any, userPostSchema(), {
+    users: [
+      {
+        name: "Fred",
+        posts: [
+          { title: "First" },
+          { title: "Second" },
+        ],
+      },
+    ],
+  });
+
+  expect(result).toEqual({
+    kind: "success",
+    response: {
+      users: [
+        {
+          id: 10,
+          name: "Fred",
+          posts: [
+            { id: 20, authorId: 10, title: "First" },
+            { id: 21, authorId: 10, title: "Second" },
+          ],
+        },
+      ],
+    },
+  });
+  expect(executed.every((statement) => typeof statement === "string" && statement.startsWith("pragma table_info"))).toBe(true);
+  expect(executed).not.toContain("begin");
+  expect(executed).not.toContain("commit");
+  expect(batched).toHaveLength(2);
+  expect(batched[0]).toHaveLength(1);
+  expect(batched[1]).toHaveLength(2);
+});
+
 test("seed rejects nested foreign key conflicts", async () => {
   const db = {
     execute: mock(async (statement: any) => {

@@ -16,6 +16,7 @@ export type {
     QueryMap,
     QueryMetadata,
     SeedInput,
+    SeedOptions,
     SeedResult,
     Session,
     SessionValue,
