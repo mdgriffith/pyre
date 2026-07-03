@@ -429,6 +429,8 @@ export class IndexedDbService {
     }
 
     try {
+      const startedAt = Date.now();
+      this.debugLog('[PyreClient] IndexedDB initial data request started');
       await this.storage.init();
       const tables = await this.storage.getAllTables();
       const cursor = await this.storage.getSyncCursor();
@@ -437,12 +439,18 @@ export class IndexedDbService {
       const tableCounts = Object.fromEntries(
         Object.entries(tables).map(([tableName, rows]) => [tableName, rows.length])
       );
+      const totalRowCount = Object.values(tableCounts).reduce((sum, count) => sum + count, 0);
 
       this.elmApp.ports.receiveIndexedDbMessage.send({
         type: 'initialData',
         data: { tables, cursor, lastAppliedServerRevision },
       });
-      this.debugLog('[PyreClient] IndexedDB initial data loaded', { tableCounts, cursorTables: Object.keys(cursor.tables).length });
+      this.debugLog('[PyreClient] IndexedDB initial data loaded', {
+        tableCounts,
+        totalRowCount,
+        cursorTables: Object.keys(cursor.tables).length,
+        elapsedMs: Date.now() - startedAt,
+      });
     } catch (error) {
       console.error('[PyreClient] Failed to load initial data:', error);
       const fallbackMessage = { type: 'initialData', data: { tables: {}, cursor: { tables: {} }, lastAppliedServerRevision: null } };

@@ -568,13 +568,42 @@ class SingleDatabasePyreClient {
     const initialSequence = this.entityStream.reserveSequence();
     const pendingBatches: EntityChangeBatch[] = [];
     let initialLoaded = false;
+    const startedAt = Date.now();
+    const subscribedTables = subscription.tables.map((table) => ({
+      tableName: table.tableName,
+      whereKeys: table.where ? Object.keys(table.where).sort() : [],
+    }));
+
+    this.logDebug('[PyreClient] Entity stream initial load started', {
+      databaseId: this.databaseId,
+      initialSequence,
+      tableCount: subscription.tables.length,
+      tables: subscribedTables,
+    });
 
     const unsubscribe = this.entityStream.subscribe(subscription, (batch) => {
       if (initialLoaded) {
+        this.logDebug('[PyreClient] Entity stream forwarding batch', {
+          databaseId: this.databaseId,
+          initialSequence,
+          source: batch.source,
+          sequence: batch.sequence,
+          changeCount: batch.changes.length,
+          elapsedMs: Date.now() - startedAt,
+        });
         callback(batch);
         return;
       }
 
+      this.logDebug('[PyreClient] Entity stream buffering batch during initial load', {
+        databaseId: this.databaseId,
+        initialSequence,
+        source: batch.source,
+        sequence: batch.sequence,
+        changeCount: batch.changes.length,
+        bufferedBatchCount: pendingBatches.length + 1,
+        elapsedMs: Date.now() - startedAt,
+      });
       pendingBatches.push(batch);
     });
 
@@ -586,16 +615,50 @@ class SingleDatabasePyreClient {
       this.databaseId,
       initialSequence
     );
-    callback(initialBatch ?? {
+    const initialTableCounts = Object.fromEntries(Array.from(initialRows.entries()).map(([tableName, rows]) => [tableName, rows.length]));
+    const initialChangeCount = initialBatch?.changes.length ?? 0;
+
+    this.logDebug('[PyreClient] Entity stream initial load finished', {
+      databaseId: this.databaseId,
+      initialSequence,
+      elapsedMs: Date.now() - startedAt,
+      tableCounts: initialTableCounts,
+      initialChangeCount,
+      bufferedBatchCount: pendingBatches.length,
+    });
+
+    const batchToEmit = initialBatch ?? {
       type: 'entity-change-batch',
       databaseId: this.databaseId,
       sequence: initialSequence,
       source: 'indexeddb-initial',
       changes: [],
+    };
+
+    this.logDebug('[PyreClient] Entity stream emitting initial batch', {
+      databaseId: this.databaseId,
+      initialSequence,
+      source: batchToEmit.source,
+      sequence: batchToEmit.sequence,
+      changeCount: batchToEmit.changes.length,
+      elapsedMs: Date.now() - startedAt,
     });
+    callback(batchToEmit);
 
     initialLoaded = true;
-    pendingBatches.forEach(callback);
+    pendingBatches.forEach((batch, index) => {
+      this.logDebug('[PyreClient] Entity stream draining buffered batch', {
+        databaseId: this.databaseId,
+        initialSequence,
+        bufferedBatchIndex: index,
+        bufferedBatchCount: pendingBatches.length,
+        source: batch.source,
+        sequence: batch.sequence,
+        changeCount: batch.changes.length,
+        elapsedMs: Date.now() - startedAt,
+      });
+      callback(batch);
+    });
     return unsubscribe;
   }
 
@@ -658,14 +721,24 @@ class SingleDatabasePyreClient {
   private async loadInitialEntityRows(subscription: EntitySubscription): Promise<Map<string, Array<Record<string, unknown>>>> {
     const rowsByTable = new Map<string, Array<Record<string, unknown>>>();
     const tableNames = Array.from(new Set(subscription.tables.map((table) => table.tableName)));
+    const loadStartedAt = Date.now();
+
+    this.logDebug('[PyreClient] Entity stream IndexedDB snapshot scan started', {
+      databaseId: this.databaseId,
+      tableNames,
+      tableCount: tableNames.length,
+    });
 
     await Promise.all(tableNames.map(async (tableName) => {
+      const tableStartedAt = Date.now();
       const rows: Array<Record<string, unknown>> = [];
       let offset = 0;
       const limit = 500;
+      let pageCount = 0;
 
       while (true) {
         const page = await this.storage.getRowsPage(tableName, offset, limit);
+        pageCount += 1;
         page.rows.forEach((row) => {
           if (isRecord(row)) {
             rows.push(row);
@@ -682,7 +755,22 @@ class SingleDatabasePyreClient {
       if (rows.length > 0) {
         rowsByTable.set(tableName, rows);
       }
+
+      this.logDebug('[PyreClient] Entity stream IndexedDB snapshot table loaded', {
+        databaseId: this.databaseId,
+        tableName,
+        rowCount: rows.length,
+        pageCount,
+        elapsedMs: Date.now() - tableStartedAt,
+      });
     }));
+
+    this.logDebug('[PyreClient] Entity stream IndexedDB snapshot scan finished', {
+      databaseId: this.databaseId,
+      tableCount: tableNames.length,
+      totalRowCount: Array.from(rowsByTable.values()).reduce((sum, rows) => sum + rows.length, 0),
+      elapsedMs: Date.now() - loadStartedAt,
+    });
 
     return rowsByTable;
   }
@@ -745,9 +833,17 @@ class SingleDatabasePyreClient {
     this.emitDevtoolsEvent(`sync:${message.type}`, message);
 
     if (message.type === 'delta' && this.shouldAcceptLiveDelta(message)) {
+      const tableGroups = message.data as ServerTableGroup[];
+      this.logDebug('[PyreClient] Live sync delta accepted', {
+        databaseId: this.databaseId,
+        source: this.lastSyncState.status === 'live' ? 'live' : 'catchup',
+        serverRevision: message.serverRevision,
+        tableGroupCount: tableGroups.length,
+        rowCount: tableGroups.reduce((sum, group) => sum + group.rows.length, 0),
+      });
       this.noteAppliedServerRevision(message.serverRevision);
       this.entityStream.handleTableDelta(
-        message.data as ServerTableGroup[],
+        tableGroups,
         this.lastSyncState.status === 'live' ? 'live' : 'catchup',
         this.databaseId
       );
@@ -1081,6 +1177,15 @@ class SingleDatabasePyreClient {
           }
 
           if (message.type === 'register-entity-stream') {
+            this.logDebug('[PyreClient] Elm bridge register entity stream', {
+              databaseId: message.databaseId,
+              streamId: message.streamId,
+              tableCount: message.tables.length,
+              tables: message.tables.map((table) => ({
+                tableName: table.tableName,
+                whereKeys: table.where ? Object.keys(table.where).sort() : [],
+              })),
+            });
             const existingRegistration = entityRegistrations.get(message.streamId);
             if (existingRegistration && entityBridgeRegistrationMatches(existingRegistration, message)) {
               return;
@@ -1103,6 +1208,13 @@ class SingleDatabasePyreClient {
                   return;
                 }
 
+                this.logDebug('[PyreClient] Elm bridge forward entity stream batch', {
+                  databaseId: message.databaseId,
+                  streamId: message.streamId,
+                  source: batch.source,
+                  sequence: batch.sequence,
+                  changeCount: batch.changes.length,
+                });
                 entityChangesPort?.send?.({
                   ...batch,
                   streamId: message.streamId,
@@ -1698,6 +1810,15 @@ export class PyreClient {
           }
 
           if (message.type === 'register-entity-stream') {
+            this.logDebug('[PyreClient] Elm bridge register entity stream', {
+              databaseId: message.databaseId,
+              streamId: message.streamId,
+              tableCount: message.tables.length,
+              tables: message.tables.map((table) => ({
+                tableName: table.tableName,
+                whereKeys: table.where ? Object.keys(table.where).sort() : [],
+              })),
+            });
             const existingRegistration = entityRegistrations.get(message.streamId);
             if (existingRegistration && entityBridgeRegistrationMatches(existingRegistration, message)) {
               return;
@@ -1721,6 +1842,13 @@ export class PyreClient {
                   return;
                 }
 
+                this.logDebug('[PyreClient] Elm bridge forward entity stream batch', {
+                  databaseId: message.databaseId,
+                  streamId: message.streamId,
+                  source: batch.source,
+                  sequence: batch.sequence,
+                  changeCount: batch.changes.length,
+                });
                 entityChangesPort?.send?.({
                   ...batch,
                   streamId: message.streamId,
@@ -1988,6 +2116,13 @@ export class PyreClient {
     this.syncStateCallbacks.forEach((callback) => {
       callback(state);
     });
+  }
+
+  private logDebug(...args: unknown[]): void {
+    this.emitDevtoolsEvent('debug', { args });
+    if (this.config.debug) {
+      console.log(...args);
+    }
   }
 
   private emitDevtoolsEvent(type: string, payload?: unknown): void {
