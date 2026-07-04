@@ -524,12 +524,9 @@ fn init_creates_namespaced_schema() {
 fn normalize_json_paths(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::String(path) => serde_json::Value::String(path.replace('\\', "/")),
-        serde_json::Value::Array(values) => serde_json::Value::Array(
-            values
-                .iter()
-                .map(normalize_json_paths)
-                .collect(),
-        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(normalize_json_paths).collect())
+        }
         _ => value.clone(),
     }
 }

@@ -96,6 +96,47 @@ test("sync mode omits normal mutation result", async () => {
   expect(db.batch).toHaveBeenCalledWith([{ sql: "select _affectedRows", args: {} }]);
 });
 
+test("sync does not fan out when no affected rows are returned", async () => {
+  const db = {
+    batch: mock(async () => ([
+      {
+        columns: ["_affectedRows"],
+        rows: [{ _affectedRows: JSON.stringify([]) }],
+      },
+    ])),
+  };
+  const syncDeltas = mock(async () => ({ serverRevision: 42 }));
+
+  const result = await run(
+    db as any,
+    {
+      createNote: {
+        id: "createNote",
+        sql: [
+          { include: true, params: [], sql: "select _affectedRows" },
+        ],
+        session_args: [],
+        optional_input_args: [],
+        json_input_args: [],
+        InputValidator: z.object({}),
+        SessionValidator: z.object({}),
+      },
+    },
+    "createNote",
+    {},
+    {},
+    new Map([["s1", { session: {} }]]),
+    syncDeltas,
+  );
+
+  const sendToSession = mock(() => {});
+  const syncResult = await result.sync(sendToSession);
+
+  expect(syncResult).toEqual({});
+  expect(syncDeltas).not.toHaveBeenCalled();
+  expect(sendToSession).not.toHaveBeenCalled();
+});
+
 test("seed inserts nested rows through schema links", async () => {
   const executed: any[] = [];
   const db = {

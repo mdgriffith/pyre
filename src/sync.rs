@@ -207,6 +207,7 @@ pub struct TableSyncStatus {
 
 /// Result of sync status check
 pub struct SyncStatusResult {
+    pub server_revision: Option<i64>,
     pub tables: Vec<TableSyncStatus>,
 }
 
@@ -607,7 +608,7 @@ fn get_sync_status_sql_with_params(
         };
 
         let subquery = format!(
-            "SELECT {} AS table_name, {} AS sync_layer, {} AS permission_hash, {} AS last_seen_updated_at, MAX({}.updatedAt) AS max_updated_at FROM {}{}",
+            "SELECT {} AS table_name, {} AS sync_layer, {} AS permission_hash, {} AS last_seen_updated_at, MAX({}.updatedAt) AS max_updated_at, (SELECT value FROM _pyre_sync WHERE key = 'server_revision') AS server_revision FROM {}{}",
             table_name_literal,
             sync_layer_value,
             permission_hash_literal,
@@ -622,7 +623,7 @@ fn get_sync_status_sql_with_params(
 
     if union_parts.is_empty() {
         return Ok(
-            "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at WHERE 0"
+            "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, (SELECT value FROM _pyre_sync WHERE key = 'server_revision') AS server_revision"
                 .to_string(),
         );
     }
@@ -640,16 +641,29 @@ pub fn parse_sync_status(
     _session: &HashMap<String, SessionValue>,
     rows: &[std::collections::HashMap<String, serde_json::Value>],
 ) -> Result<SyncStatusResult, SyncError> {
-    let mut result = SyncStatusResult { tables: Vec::new() };
+    let mut result = SyncStatusResult {
+        server_revision: None,
+        tables: Vec::new(),
+    };
 
     for row in rows {
-        let table_name = row
+        if result.server_revision.is_none() {
+            result.server_revision = row.get("server_revision").and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    v.as_i64().or_else(|| v.as_u64().map(|u| u as i64))
+                }
+            });
+        }
+
+        let Some(table_name) = row
             .get("table_name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                SyncError::SqlGenerationError("Missing table_name in sync status row".to_string())
-            })?
-            .to_string();
+            .map(|v| v.to_string())
+        else {
+            continue;
+        };
 
         let sync_layer = row
             .get("sync_layer")

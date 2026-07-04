@@ -185,12 +185,13 @@ pub async fn catchup(
     let status_rows = query_objects(conn, &status_statement.sql, &status_statement.params).await?;
     let sync_status = sync::parse_sync_status(sync_cursor, context, session, &status_rows)
         .map_err(Error::Sync)?;
+
     let sync_sql = sync::get_sync_sql(&sync_status, sync_cursor, context, session, page_size)
         .map_err(Error::Sync)?;
 
     let mut result = SyncPageResult {
         database_id: None,
-        server_revision: None,
+        server_revision: sync_status.server_revision,
         tables: HashMap::new(),
         has_more: false,
     };
@@ -281,25 +282,7 @@ pub async fn catchup(
         );
     }
 
-    result.server_revision = current_server_revision(conn).await?;
-
     Ok(result)
-}
-
-async fn current_server_revision(conn: &libsql::Connection) -> Result<Option<i64>, Error> {
-    let mut rows = conn
-        .query(
-            "SELECT value FROM _pyre_sync WHERE key = 'server_revision'",
-            (),
-        )
-        .await
-        .map_err(Error::Database)?;
-
-    if let Some(row) = rows.next().await.map_err(Error::Database)? {
-        return row.get::<i64>(0).map(Some).map_err(Error::Database);
-    }
-
-    Ok(None)
 }
 
 async fn next_server_revision(conn: &libsql::Connection) -> Result<i64, Error> {

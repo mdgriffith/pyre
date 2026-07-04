@@ -173,6 +173,20 @@ test("catchup stamps response with databaseId when provided", async () => {
   expect(result.databaseId).toBe("campaign:123");
 });
 
+test("catchup reuses server revision from status query without a second execute", async () => {
+  getSyncSqlMock = () => ({ tables: [] });
+  const db = {
+    execute: mock(async () => ({ rows: [{ server_revision: 7 }] })),
+    batch: mock(async () => ([])),
+  };
+
+  const result = await catchup(db as any, { tables: {} }, {}, 1000);
+
+  expect(result.serverRevision).toBe(7);
+  expect(db.execute).toHaveBeenCalledTimes(1);
+  expect(db.batch).toHaveBeenCalledTimes(0);
+});
+
 test("catchup normalizes bigint row values before reshaping", async () => {
   const db = {
     execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1 }] })),

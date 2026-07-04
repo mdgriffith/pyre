@@ -26,6 +26,7 @@ record GameEntity {
     let context = typecheck::check_schema(&database).expect("schema should typecheck");
 
     let sync_status = SyncStatusResult {
+        server_revision: None,
         tables: vec![TableSyncStatus {
             table_name: "gameEntities".to_string(),
             sync_layer: 0,
@@ -114,6 +115,7 @@ record Note {
     };
     let context = typecheck::check_schema(&database).expect("schema should typecheck");
     let sync_status = SyncStatusResult {
+        server_revision: None,
         tables: vec![TableSyncStatus {
             table_name: "notes".to_string(),
             sync_layer: 0,
@@ -255,6 +257,7 @@ record Quest {
     assert!(!status_sql.contains("accounts"));
 
     let sync_status = SyncStatusResult {
+        server_revision: None,
         tables: vec![
             TableSyncStatus {
                 table_name: "accounts".to_string(),
@@ -310,7 +313,7 @@ record Account {
 
     assert_eq!(
         status_sql,
-        "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at WHERE 0"
+        "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, (SELECT value FROM _pyre_sync WHERE key = 'server_revision') AS server_revision"
     );
 }
 
@@ -345,6 +348,7 @@ record Map {
     let context = typecheck::check_schema(&database).expect("schema should typecheck");
 
     let sync_status = SyncStatusResult {
+        server_revision: None,
         tables: vec![TableSyncStatus {
             table_name: "maps".to_string(),
             sync_layer: 0,
