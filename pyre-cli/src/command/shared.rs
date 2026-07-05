@@ -5,7 +5,7 @@ use pyre::filesystem;
 use pyre::generate;
 use pyre::parser;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 
 pub struct Options<'a> {
@@ -213,7 +213,7 @@ pub fn write_db_schema(options: &Options, database: &ast::Database) -> io::Resul
 }
 
 pub fn get_stdin() -> io::Result<Option<String>> {
-    if atty::is(atty::Stream::Stdin) {
+    if io::stdin().is_terminal() {
         Ok(None)
     } else {
         let mut input = String::new();

@@ -30,7 +30,6 @@ path = "src/lib.rs"
 
 
 [dependencies]
-atty = "0.2.14"
 async-stream = { version = "0.3.5", optional = true }
 axum = { version = "0.6.20", optional = true, features = ["headers", "json"] }
 base64 = { version = "0.21.7", optional = true }

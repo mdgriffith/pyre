@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::io::{self};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 mod command;
@@ -181,7 +181,7 @@ async fn main() -> io::Result<()> {
     // Check if stderr is a TTY to determine if we should enable color output.
     // Disable color when output is redirected (e.g., `pyre check 2> errors.txt`)
     // or piped (e.g., `pyre check 2>&1 | grep error`) to avoid ANSI codes in files/pipes.
-    let enable_color = atty::is(atty::Stream::Stderr);
+    let enable_color = io::stderr().is_terminal();
     let options = command::Options {
         in_dir: Path::new(&cli.r#in),
         enable_color,

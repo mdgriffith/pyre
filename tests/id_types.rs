@@ -691,6 +691,15 @@ record GameDocument {
     .await
     .expect("Failed creating test table");
 
+    // The sync status SQL reads the server revision from _pyre_sync,
+    // which migrations always create before sync runs.
+    conn.execute(pyre::db::migrate::CREATE_SYNC_TABLE, ())
+        .await
+        .expect("Failed creating _pyre_sync table");
+    conn.execute(pyre::db::migrate::INSERT_SYNC_REVISION_ROW, ())
+        .await
+        .expect("Failed seeding _pyre_sync revision row");
+
     assert!(
         !sync_status_sql.contains("gameDocuments.isAdmin"),
         "Sync status SQL should not reference session values as table columns: {}",
