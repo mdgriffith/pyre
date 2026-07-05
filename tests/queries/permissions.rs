@@ -728,3 +728,93 @@ query GetDocuments {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_nested_link_permission_uses_cte_table_alias() -> Result<(), TestError> {
+    let schema = r#"
+session {
+    userId Int
+    isAdmin Bool
+}
+
+record User {
+    @allow(*) { id == Session.userId || Session.isAdmin == True }
+
+    id Int @id
+    name String?
+    email String @unique
+    memberships @link(id, Membership.userId)
+}
+
+record AuthSession {
+    @public
+
+    id Int @id
+    userId Int
+    tokenHash String
+    expiresAt Int
+    user @link(userId, User.id)
+}
+
+record Membership {
+    @public
+
+    id Int @id
+    userId Int
+    gameId Int
+    role String
+}
+"#;
+
+    let db = TestDatabase::new(schema).await?;
+
+    let query = r#"
+query GetAuthSessionByHash($tokenHash: String) {
+    authSession {
+        @where { tokenHash == $tokenHash }
+
+        id
+        userId
+        tokenHash
+        expiresAt
+        user {
+            id
+            email
+            name
+            memberships {
+                gameId
+                role
+            }
+        }
+    }
+}
+"#;
+
+    let sql = db
+        .generate_query_sql(query)?
+        .into_iter()
+        .map(|(_, stmt)| match stmt {
+            pyre::generate::sql::to_sql::SqlAndParams::Sql(sql) => sql,
+            pyre::generate::sql::to_sql::SqlAndParams::SqlWithParams { sql, .. } => sql,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        sql.contains("from users t"),
+        "expected nested user CTE to alias users as t:\n{}",
+        sql
+    );
+    assert!(
+        sql.contains("t.\"id\" = $session_userId"),
+        "expected @allow predicate to use the active t alias:\n{}",
+        sql
+    );
+    assert!(
+        !sql.contains("\"users\".\"id\" = $session_userId"),
+        "@allow predicate must not reference base table name inside aliased CTE:\n{}",
+        sql
+    );
+
+    Ok(())
+}

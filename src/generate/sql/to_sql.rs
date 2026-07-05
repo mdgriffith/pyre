@@ -222,6 +222,17 @@ pub fn render_where(
     operation: &ast::QueryOperation,
     result: &mut String,
 ) {
+    render_where_with_table_ref(table, query_info, query_field, operation, None, result);
+}
+
+pub fn render_where_with_table_ref(
+    table: &typecheck::Table,
+    query_info: &typecheck::QueryInfo,
+    query_field: &ast::QueryField,
+    operation: &ast::QueryOperation,
+    table_ref: Option<&str>,
+    result: &mut String,
+) {
     // Normal @where
     let mut wheres = ast::collect_wheres(&query_field.fields);
     // Add any permissions from the table
@@ -239,12 +250,14 @@ pub fn render_where(
 
     // Combine multiple WHERE clauses with AND
     if wheres.len() == 1 {
-        let where_str = render_where_arg(&wheres[0], table, query_info, query_field);
+        let where_str =
+            render_where_arg_with_table_ref(&wheres[0], table, query_info, query_field, table_ref);
         result.push_str(&format!(" {}\n", where_str));
     } else {
         // Multiple WHERE clauses need to be combined with AND
         let combined = ast::WhereArg::And(wheres.clone());
-        let where_str = render_where_arg(&combined, table, query_info, query_field);
+        let where_str =
+            render_where_arg_with_table_ref(&combined, table, query_info, query_field, table_ref);
         result.push_str(&format!(" {}\n", where_str));
     }
 }
@@ -255,10 +268,25 @@ pub fn render_where_arg(
     query_info: &typecheck::QueryInfo,
     query_field: &ast::QueryField,
 ) -> String {
+    render_where_arg_with_table_ref(arg, table, query_info, query_field, None)
+}
+
+pub fn render_where_arg_with_table_ref(
+    arg: &ast::WhereArg,
+    table: &typecheck::Table,
+    query_info: &typecheck::QueryInfo,
+    query_field: &ast::QueryField,
+    table_ref: Option<&str>,
+) -> String {
     match arg {
         ast::WhereArg::Column(is_session_var, fieldname, op, value, _field_name_range) => {
-            let qualified_column_name =
-                render_real_where_field(table, query_info, *is_session_var, fieldname);
+            let qualified_column_name = if *is_session_var {
+                render_real_where_field(table, query_info, true, fieldname)
+            } else if let Some(table_ref) = table_ref {
+                format!("{}.{}", table_ref, string::quote(fieldname))
+            } else {
+                render_real_where_field(table, query_info, false, fieldname)
+            };
 
             let operator = operator(op);
 
@@ -280,14 +308,26 @@ pub fn render_where_arg(
         ast::WhereArg::And(args) => {
             let mut inner_list = vec![];
             for arg in args {
-                inner_list.push(render_where_arg(arg, table, query_info, query_field));
+                inner_list.push(render_where_arg_with_table_ref(
+                    arg,
+                    table,
+                    query_info,
+                    query_field,
+                    table_ref,
+                ));
             }
             format!("({})", inner_list.join(" and "))
         }
         ast::WhereArg::Or(args) => {
             let mut inner_list = vec![];
             for arg in args {
-                inner_list.push(render_where_arg(arg, table, query_info, query_field));
+                inner_list.push(render_where_arg_with_table_ref(
+                    arg,
+                    table,
+                    query_info,
+                    query_field,
+                    table_ref,
+                ));
             }
             format!("({})", inner_list.join(" or "))
         }

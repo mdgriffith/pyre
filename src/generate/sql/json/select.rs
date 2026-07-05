@@ -368,20 +368,22 @@ fn select_linked(
 
     // Check if render_where will add a WHERE clause
     let mut where_check = String::new();
-    to_sql::render_where(
+    to_sql::render_where_with_table_ref(
         table,
         query_info,
         query_field,
         &ast::QueryOperation::Query,
+        Some(table_alias),
         &mut where_check,
     );
     let has_where = where_check.contains("where");
 
-    to_sql::render_where(
+    to_sql::render_where_with_table_ref(
         table,
         query_info,
         query_field,
         &ast::QueryOperation::Query,
+        Some(table_alias),
         sql,
     );
 
