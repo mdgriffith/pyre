@@ -8,6 +8,9 @@ name: Prepare release
 jobs:
   release:
     name: Release - ${{ matrix.platform.release_for }}
+    # libSQL's local database backend can crash under concurrent test teardown on Windows.
+    env:
+      RUST_TEST_THREADS: 1
     strategy:
       matrix:
         platform:
