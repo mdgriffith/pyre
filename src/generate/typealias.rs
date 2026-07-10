@@ -210,7 +210,7 @@ fn to_query_type_alias(
                     }
                     rendered_fields.push((
                         column.name.clone(),
-                        column.type_.to_string(),
+                        column.type_.query_type_string(),
                         FieldMetadata {
                             is_link: false,
                             is_optional: column.nullable,
@@ -232,7 +232,7 @@ fn to_query_type_alias(
                 ast::Field::Column(col) => {
                     rendered_fields.push((
                         aliased_name,
-                        col.type_.to_string(),
+                        col.type_.query_type_string(),
                         FieldMetadata {
                             is_link: false,
                             is_optional: col.nullable,

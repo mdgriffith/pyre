@@ -1161,11 +1161,18 @@ fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) ->
                 elm_type_from_column_type(inner, qualify_db_types)
             )
         }
-        ast::ColumnType::IdInt { table } | ast::ColumnType::IdUuid { table } => {
+        ast::ColumnType::IdInt { table } => {
             if !table.is_empty() {
                 format!("Db.Id.{}", table)
             } else {
                 "Int".to_string()
+            }
+        }
+        ast::ColumnType::IdUuid { table } => {
+            if !table.is_empty() {
+                format!("Db.Id.{}", table)
+            } else {
+                "String".to_string()
             }
         }
         ast::ColumnType::ForeignKey { table, field, .. } => {
@@ -2115,11 +2122,18 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
         ast::ColumnType::Nullable(inner) => {
             format!("Maybe {}", to_elm_type_from_column_type(lookup, inner))
         }
-        ast::ColumnType::IdInt { table } | ast::ColumnType::IdUuid { table } => {
+        ast::ColumnType::IdInt { table } => {
             if !table.is_empty() {
                 format!("Db.Id.{}", table)
             } else {
                 "Int".to_string()
+            }
+        }
+        ast::ColumnType::IdUuid { table } => {
+            if !table.is_empty() {
+                format!("Db.Id.{}", table)
+            } else {
+                "String".to_string()
             }
         }
         ast::ColumnType::ForeignKey { table, field, .. } => {

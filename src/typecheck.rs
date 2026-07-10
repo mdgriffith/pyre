@@ -823,7 +823,7 @@ pub fn query_param_type_for_column(table: &ast::RecordDetails, column: &ast::Col
         let table_name = column.type_.table_name().unwrap_or(table.name.as_str());
         format!("{}.{}", table_name, column.name)
     } else {
-        column.type_.to_string()
+        column.type_.query_type_string()
     }
 }
 

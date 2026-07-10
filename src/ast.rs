@@ -700,6 +700,34 @@ impl ColumnType {
         }
     }
 
+    /// Returns the concrete query type for a resolved foreign key.
+    pub fn query_type_string(&self) -> String {
+        match self {
+            ColumnType::ForeignKey {
+                table,
+                serialization_type: Some(ConcreteSerializationType::IdUuid),
+                ..
+            } => format!("Id.Uuid<{}>", table),
+            ColumnType::ForeignKey {
+                serialization_type: Some(ConcreteSerializationType::Text),
+                ..
+            } => "String".to_string(),
+            ColumnType::ForeignKey {
+                serialization_type: Some(ConcreteSerializationType::Real),
+                ..
+            } => "Float".to_string(),
+            ColumnType::ForeignKey {
+                serialization_type: Some(ConcreteSerializationType::Date),
+                ..
+            } => "Date".to_string(),
+            ColumnType::ForeignKey {
+                serialization_type: Some(ConcreteSerializationType::DateTime),
+                ..
+            } => "DateTime".to_string(),
+            _ => self.to_string(),
+        }
+    }
+
     /// Check if this type contains a dot (for foreign key detection during parsing)
     pub fn contains_dot(&self) -> bool {
         match self {

@@ -233,8 +233,8 @@ fn rust_type(type_: Option<&str>) -> String {
         Some(ast::ColumnType::String) | Some(ast::ColumnType::DateTime) => "String".to_string(),
         Some(ast::ColumnType::Int)
         | Some(ast::ColumnType::IdInt { .. })
-        | Some(ast::ColumnType::IdUuid { .. })
         | Some(ast::ColumnType::ForeignKey { .. }) => "i64".to_string(),
+        Some(ast::ColumnType::IdUuid { .. }) => "String".to_string(),
         Some(ast::ColumnType::Float) => "f64".to_string(),
         Some(ast::ColumnType::Bool) => "bool".to_string(),
         Some(type_) if type_.is_json_like() => "serde_json::Value".to_string(),

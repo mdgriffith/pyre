@@ -188,9 +188,9 @@ fn to_metadata_formatter() -> typealias::TypeFormatter {
                         }
                         ast::ColumnType::Bool => ("z.boolean()".to_string(), true, true),
                         ast::ColumnType::DateTime => ("z.date()".to_string(), true, true),
-                        ast::ColumnType::IdInt { .. }
-                        | ast::ColumnType::IdUuid { .. }
-                        | ast::ColumnType::ForeignKey { .. } => {
+                        ast::ColumnType::IdInt { .. } => ("z.number()".to_string(), true, false),
+                        ast::ColumnType::IdUuid { .. } => ("z.string()".to_string(), true, false),
+                        ast::ColumnType::ForeignKey { .. } => {
                             ("z.number()".to_string(), true, false)
                         }
                         _ => (output_zod_type_for_column_type(&parsed_type), false, false),
@@ -1227,9 +1227,10 @@ fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", input_zod_type_for_column_type(inner))
         }
-        ast::ColumnType::IdInt { .. }
-        | ast::ColumnType::IdUuid { .. }
-        | ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
+        ast::ColumnType::IdInt { .. } | ast::ColumnType::ForeignKey { .. } => {
+            "z.number()".to_string()
+        }
+        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}", name),
     }
 }
@@ -1252,9 +1253,10 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", output_zod_type_for_column_type(inner))
         }
-        ast::ColumnType::IdInt { .. }
-        | ast::ColumnType::IdUuid { .. }
-        | ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
+        ast::ColumnType::IdInt { .. } | ast::ColumnType::ForeignKey { .. } => {
+            "z.number()".to_string()
+        }
+        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}", name),
     }
 }

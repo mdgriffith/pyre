@@ -112,6 +112,10 @@ pub fn column_type_to_ts_type(type_: &ast::ColumnType, qualify_custom: bool) -> 
         }
         ast::ColumnType::IdInt { .. } => "number".to_string(),
         ast::ColumnType::IdUuid { .. } => "string".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+            ..
+        } => "string".to_string(),
         ast::ColumnType::ForeignKey { .. } => "number".to_string(),
         ast::ColumnType::Custom(name) => {
             if qualify_custom {
@@ -143,6 +147,10 @@ pub fn column_type_to_zod_validator(type_: &ast::ColumnType) -> String {
         }
         ast::ColumnType::IdInt { .. } => "z.number()".to_string(),
         ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+            ..
+        } => "z.string()".to_string(),
         ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
         ast::ColumnType::Custom(name) => format!("z.lazy(() => {})", name),
     }

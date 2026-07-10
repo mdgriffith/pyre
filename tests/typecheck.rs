@@ -36,6 +36,38 @@ fn checked_context(schema_source: &str) -> typecheck::Context {
 }
 
 #[test]
+fn integer_foreign_key_parameters_remain_compatible_with_record_id_aliases() {
+    let context = checked_context(
+        r#"
+record Game {
+    @public
+    id Id.Int @id
+}
+
+record MapScene {
+    @public
+    id Id.Int @id
+    gameId Game.id
+}
+"#,
+    );
+    let query_list = parser::parse_query(
+        "query.pyre",
+        r#"
+insert CreateMapScene($gameId: Game.id) {
+    mapScene {
+        gameId = $gameId
+    }
+}
+"#,
+    )
+    .expect("query parses");
+
+    typecheck::check_queries(&query_list, &context)
+        .expect("integer foreign key should accept its record id alias");
+}
+
+#[test]
 fn timestamps_add_managed_timestamp_fields() {
     let context = checked_context(
         r#"

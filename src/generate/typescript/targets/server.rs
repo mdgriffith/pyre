@@ -108,10 +108,14 @@ fn to_seed_validators(context: &typecheck::Context) -> String {
 fn seed_column_validator(type_: &ast::ColumnType, context: &typecheck::Context) -> String {
     match type_ {
         ast::ColumnType::String | ast::ColumnType::Date => "z.string()".to_string(),
-        ast::ColumnType::Int
-        | ast::ColumnType::Float
-        | ast::ColumnType::IdInt { .. }
-        | ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
+            "z.number()".to_string()
+        }
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+            ..
+        } => "z.string()".to_string(),
+        ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
         ast::ColumnType::Bool => "Db.CoercedBool".to_string(),
         ast::ColumnType::DateTime => "Db.CoercedDate".to_string(),
         ast::ColumnType::Json => "Db.Json".to_string(),
