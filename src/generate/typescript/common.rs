@@ -352,6 +352,7 @@ mod tests {
                 ast::ColumnType::ForeignKey {
                     table: "User".to_string(),
                     field: "id".to_string(),
+                    serialization_type: None,
                 },
             )]),
             start: None,

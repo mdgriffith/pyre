@@ -560,7 +560,8 @@ record Post {
         author_id_column.type_,
         ast::ColumnType::ForeignKey {
             table: "User".to_string(),
-            field: "id".to_string()
+            field: "id".to_string(),
+            serialization_type: Some(ast::ConcreteSerializationType::IdInt),
         },
         "Post.authorId should be a ForeignKey to User.id"
     );

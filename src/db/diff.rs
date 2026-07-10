@@ -349,6 +349,90 @@ record CampaignRecord {
             .iter()
             .any(|column| column.name == "campaignOnly"));
     }
+
+    fn uuid_foreign_key_schema() -> (crate::ast::Schema, crate::typecheck::Context) {
+        let schema = parse_schema(
+            "Main",
+            r#"
+record ClocktowerGame {
+    @public
+    id Id.Uuid @id
+}
+
+record ClocktowerParticipant {
+    @public
+    id Id.Int @id
+    gameId ClocktowerGame.id
+}
+"#,
+        );
+        let database = crate::ast::Database {
+            schemas: vec![schema.clone()],
+        };
+        let context = crate::typecheck::check_schema(&database).expect("database typechecks");
+        (schema, context)
+    }
+
+    #[test]
+    fn uuid_foreign_key_ddl_uses_text() {
+        let (schema, context) = uuid_foreign_key_schema();
+        let introspection = crate::db::introspect::Introspection {
+            tables: vec![],
+            migration_state: crate::db::introspect::MigrationState::NoMigrationTable,
+            schema: crate::db::introspect::SchemaResult::Success {
+                schema: crate::ast::Schema::default(),
+                context: crate::typecheck::empty_context(),
+            },
+        };
+
+        let diff = super::diff(&context, &schema, &introspection);
+        let sql = crate::db::diff::to_sql::to_sql(&diff);
+        assert!(sql.iter().any(|statement| matches!(
+            statement,
+            crate::generate::sql::to_sql::SqlAndParams::Sql(sql)
+                if sql.contains("`gameId` TEXT")
+        )));
+    }
+
+    #[test]
+    fn uuid_foreign_key_text_column_does_not_diff_as_integer() {
+        let (schema, context) = uuid_foreign_key_schema();
+        let introspection = crate::db::introspect::Introspection {
+            tables: vec![crate::db::introspect::Table {
+                name: "clocktower_participant".to_string(),
+                columns: vec![
+                    crate::db::introspect::ColumnInfo {
+                        cid: 0,
+                        name: "id".to_string(),
+                        column_type: "INTEGER".to_string(),
+                        notnull: true,
+                        default_value: None,
+                        pk: true,
+                        indexed: false,
+                    },
+                    crate::db::introspect::ColumnInfo {
+                        cid: 1,
+                        name: "gameId".to_string(),
+                        column_type: "TEXT".to_string(),
+                        notnull: true,
+                        default_value: None,
+                        pk: false,
+                        indexed: false,
+                    },
+                ],
+                foreign_keys: vec![],
+                indexes: vec![],
+            }],
+            migration_state: crate::db::introspect::MigrationState::NoMigrationTable,
+            schema: crate::db::introspect::SchemaResult::Success {
+                schema: crate::ast::Schema::default(),
+                context: crate::typecheck::empty_context(),
+            },
+        };
+
+        let diff = super::diff(&context, &schema, &introspection);
+        assert!(diff.modified_records.is_empty());
+    }
 }
 
 fn create_table_from_fields(

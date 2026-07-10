@@ -1078,6 +1078,7 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                     if let ast::ColumnType::ForeignKey {
                                         table: ref_table,
                                         field: ref_field,
+                                        ..
                                     } = &column.type_
                                     {
                                         // Check if the referenced table exists
@@ -1481,7 +1482,63 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
     if errors.len() > 0 {
         return Err(errors);
     } else {
+        resolve_foreign_key_serialization_types(&mut context);
         return Ok(context);
+    }
+}
+
+fn resolve_foreign_key_serialization_types(context: &mut Context) {
+    let foreign_key_types: HashMap<String, HashMap<String, ast::ConcreteSerializationType>> =
+        context
+            .tables
+            .iter()
+            .map(|(table_name, table)| {
+                let columns = table
+                    .record
+                    .fields
+                    .iter()
+                    .filter_map(|field| match field {
+                        ast::Field::Column(column) => column
+                            .type_
+                            .to_serialization_type()
+                            .into_concrete()
+                            .map(|type_| (column.name.clone(), type_)),
+                        _ => None,
+                    })
+                    .collect();
+                (table_name.clone(), columns)
+            })
+            .collect();
+
+    fn resolve_type(
+        type_: &mut ast::ColumnType,
+        foreign_key_types: &HashMap<String, HashMap<String, ast::ConcreteSerializationType>>,
+    ) {
+        match type_ {
+            ast::ColumnType::ForeignKey {
+                table,
+                field,
+                serialization_type,
+            } => {
+                *serialization_type = foreign_key_types
+                    .get(&crate::ext::string::decapitalize(table))
+                    .and_then(|columns| columns.get(field))
+                    .cloned();
+            }
+            ast::ColumnType::JsonTyped(inner)
+            | ast::ColumnType::List(inner)
+            | ast::ColumnType::Dict(inner)
+            | ast::ColumnType::Nullable(inner) => resolve_type(inner, foreign_key_types),
+            _ => {}
+        }
+    }
+
+    for table in context.tables.values_mut() {
+        for field in &mut table.record.fields {
+            if let ast::Field::Column(column) = field {
+                resolve_type(&mut column.type_, &foreign_key_types);
+            }
+        }
     }
 }
 
@@ -3007,12 +3064,14 @@ fn are_query_types_compatible(left: &str, right: &str) -> bool {
             ast::ColumnType::ForeignKey {
                 table: right_table,
                 field,
+                ..
             },
         ) if field == "id" => left_table == right_table,
         (
             ast::ColumnType::ForeignKey {
                 table: left_table,
                 field,
+                ..
             },
             ast::ColumnType::IdInt { table: right_table },
         ) if field == "id" => left_table == right_table,
@@ -3021,12 +3080,14 @@ fn are_query_types_compatible(left: &str, right: &str) -> bool {
             ast::ColumnType::ForeignKey {
                 table: right_table,
                 field,
+                ..
             },
         ) if field == "id" => left_table == right_table,
         (
             ast::ColumnType::ForeignKey {
                 table: left_table,
                 field,
+                ..
             },
             ast::ColumnType::IdUuid { table: right_table },
         ) if field == "id" => left_table == right_table,

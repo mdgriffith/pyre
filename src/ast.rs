@@ -611,11 +611,19 @@ pub enum ColumnType {
     Nullable(Box<ColumnType>),
 
     // ID types with branding
-    IdInt { table: String },
-    IdUuid { table: String },
+    IdInt {
+        table: String,
+    },
+    IdUuid {
+        table: String,
+    },
 
     // Foreign key reference (e.g., User.id)
-    ForeignKey { table: String, field: String },
+    ForeignKey {
+        table: String,
+        field: String,
+        serialization_type: Option<ConcreteSerializationType>,
+    },
 
     // Custom/user-defined types
     Custom(String),
@@ -650,7 +658,7 @@ impl ColumnType {
                     format!("Id.Uuid<{}>", table)
                 }
             }
-            ColumnType::ForeignKey { table, field } => format!("{}.{}", table, field),
+            ColumnType::ForeignKey { table, field, .. } => format!("{}.{}", table, field),
             ColumnType::Custom(name) => name.clone(),
         }
     }
@@ -680,10 +688,14 @@ impl ColumnType {
             ColumnType::IdUuid { .. } => {
                 SerializationType::Concrete(ConcreteSerializationType::IdUuid)
             }
-            ColumnType::ForeignKey { .. } => {
-                // Foreign keys are stored as integers by default
-                SerializationType::Concrete(ConcreteSerializationType::Integer)
-            }
+            ColumnType::ForeignKey {
+                serialization_type, ..
+            } => SerializationType::Concrete(
+                serialization_type
+                    .clone()
+                    // Parsed, untypechecked foreign keys retain the historical integer fallback.
+                    .unwrap_or(ConcreteSerializationType::Integer),
+            ),
             ColumnType::Custom(name) => SerializationType::FromType(name.clone()),
         }
     }
@@ -858,6 +870,7 @@ impl ColumnType {
                         ColumnType::ForeignKey {
                             table: parts[0].to_string(),
                             field: parts[1].to_string(),
+                            serialization_type: None,
                         }
                     } else {
                         ColumnType::Custom(type_str.to_string())
@@ -898,7 +911,7 @@ impl std::fmt::Display for ColumnType {
                     write!(f, "Id.Uuid<{}>", table)
                 }
             }
-            ColumnType::ForeignKey { table, field } => write!(f, "{}.{}", table, field),
+            ColumnType::ForeignKey { table, field, .. } => write!(f, "{}.{}", table, field),
             ColumnType::Custom(name) => write!(f, "{}", name),
         }
     }
@@ -1008,6 +1021,15 @@ pub enum DefaultValue {
 pub enum SerializationType {
     Concrete(ConcreteSerializationType),
     FromType(String), // defined as another named type.
+}
+
+impl SerializationType {
+    pub fn into_concrete(self) -> Option<ConcreteSerializationType> {
+        match self {
+            SerializationType::Concrete(type_) => Some(type_),
+            SerializationType::FromType(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1347,7 +1369,9 @@ pub fn resolve_id_brands(database: &mut Database) {
                                     // Set brand to the record name for ID types
                                     *table = record_name.clone();
                                 }
-                            } else if let ColumnType::ForeignKey { table, field } = &column.type_ {
+                            } else if let ColumnType::ForeignKey { table, field, .. } =
+                                &column.type_
+                            {
                                 // This is a foreign key reference like "User.id"
                                 // The brand should already be set during parsing, but let's resolve any additional info if needed
                                 let ref_table = table.clone();
@@ -1363,13 +1387,20 @@ pub fn resolve_id_brands(database: &mut Database) {
                                                 | ColumnType::IdUuid { table: ref_brand } =
                                                     &ref_col.type_
                                                 {
-                                                    if !ref_brand.is_empty() {
-                                                        // Use the referenced column's brand
-                                                        column.type_ = ColumnType::ForeignKey {
-                                                            table: ref_brand.clone(),
-                                                            field: ref_field.clone(),
-                                                        };
-                                                    }
+                                                    // Preserve the referenced ID's brand when set and
+                                                    // always retain its concrete storage representation.
+                                                    column.type_ = ColumnType::ForeignKey {
+                                                        table: if ref_brand.is_empty() {
+                                                            ref_table.clone()
+                                                        } else {
+                                                            ref_brand.clone()
+                                                        },
+                                                        field: ref_field.clone(),
+                                                        serialization_type: ref_col
+                                                            .type_
+                                                            .to_serialization_type()
+                                                            .into_concrete(),
+                                                    };
                                                 }
                                                 break;
                                             }

@@ -212,7 +212,8 @@ record Post {
         author_id_field.type_,
         ast::ColumnType::ForeignKey {
             table: "User".to_string(),
-            field: "id".to_string()
+            field: "id".to_string(),
+            serialization_type: None,
         }
     );
 }
