@@ -44,6 +44,45 @@ fn only_query(manifest: &Manifest) -> &QueryManifest {
         .expect("manifest should contain a query")
 }
 
+#[tokio::test]
+async fn run_query_accepts_uuid_record_id_parameter() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record ClocktowerGame {
+    @public
+    id Id.Uuid @id
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let id = "ab47fc00-f638-4ffd-8b08-4773181d6c3f";
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+query ClocktowerGameKeystone($id: ClocktowerGame.id) {
+    clocktowerGame {
+        @where { id == $id }
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let result = query::run(
+        &conn,
+        &manifest,
+        &only_query(&manifest).id,
+        json!({ "id": id }),
+        &session,
+    )
+    .await?;
+
+    assert!(result.response["clocktowerGame"].is_array());
+    Ok(())
+}
+
 fn query_by_operation<'a>(manifest: &'a Manifest, operation: &str) -> &'a QueryManifest {
     manifest
         .queries
@@ -639,6 +678,7 @@ query Dashboard {
     Ok(())
 }
 
+#[cfg(feature = "filesystem")]
 #[test]
 fn manifest_load_reads_generated_manifest_file() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = Manifest {

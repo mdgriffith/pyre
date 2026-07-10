@@ -107,7 +107,7 @@ fn query_module(context: &typecheck::Context, query: &ast::Query, module: &str) 
         query.interface_hash
     ));
     result.push_str("\n");
-    result.push_str(&input_struct(query));
+    result.push_str(&input_struct(context, query));
     result.push_str("\n");
     result.push_str(&output_structs(context, query));
     result.push_str("\n");
@@ -123,7 +123,7 @@ fn query_module(context: &typecheck::Context, query: &ast::Query, module: &str) 
     result
 }
 
-fn input_struct(query: &ast::Query) -> String {
+fn input_struct(context: &typecheck::Context, query: &ast::Query) -> String {
     let mut result = String::new();
     result.push_str("    #[derive(Clone, Debug, serde::Serialize)]\n");
     result.push_str("    pub struct Input {\n");
@@ -141,27 +141,27 @@ fn input_struct(query: &ast::Query) -> String {
                 result.push_str(&format!(
                     "        pub {}: OptionalField<{}>,\n",
                     field_name,
-                    rust_type(arg.type_.as_deref())
+                    rust_type(resolve_arg_type(context, arg).as_deref())
                 ));
             } else {
                 result.push_str("        #[serde(skip_serializing_if = \"Option::is_none\")]\n");
                 result.push_str(&format!(
                     "        pub {}: Option<{}>,\n",
                     field_name,
-                    rust_type(arg.type_.as_deref())
+                    rust_type(resolve_arg_type(context, arg).as_deref())
                 ));
             }
         } else if arg.nullable {
             result.push_str(&format!(
                 "        pub {}: Option<{}>,\n",
                 field_name,
-                rust_type(arg.type_.as_deref())
+                rust_type(resolve_arg_type(context, arg).as_deref())
             ));
         } else {
             result.push_str(&format!(
                 "        pub {}: {},\n",
                 field_name,
-                rust_type(arg.type_.as_deref())
+                rust_type(resolve_arg_type(context, arg).as_deref())
             ));
         }
     }
@@ -174,6 +174,15 @@ fn input_struct(query: &ast::Query) -> String {
     result.push_str("        }\n");
     result.push_str("    }\n");
     result
+}
+
+fn resolve_arg_type(
+    context: &typecheck::Context,
+    arg: &ast::QueryParamDefinition,
+) -> Option<String> {
+    arg.type_
+        .as_deref()
+        .map(|type_| typecheck::resolve_query_param_type(context, type_))
 }
 
 fn output_structs(context: &typecheck::Context, query: &ast::Query) -> String {

@@ -216,7 +216,8 @@ fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result
         "String" | "DateTime" => value.is_string(),
         "Int" | "Float" => value.is_number(),
         "Bool" => value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false),
-        type_ if type_.starts_with("Id.Int") || type_.starts_with("Id.Uuid") => value.is_number(),
+        type_ if type_.starts_with("Id.Int") => value.is_number(),
+        type_ if type_.starts_with("Id.Uuid") => value.is_string(),
         type_ if type_.starts_with("Json") => true,
         _ => true,
     };

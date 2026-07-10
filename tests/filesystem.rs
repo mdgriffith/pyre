@@ -1,3 +1,5 @@
+#![cfg(feature = "filesystem")]
+
 use pyre::{ast, filesystem, generate, parser, typecheck};
 use std::collections::HashMap;
 use tempfile::TempDir;

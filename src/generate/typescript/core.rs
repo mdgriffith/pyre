@@ -275,7 +275,9 @@ fn to_query_metadata_file(
     }
     imports.push_str("import * as Decode from '../../decode';\n");
 
-    let input_block = to_param_type_alias(&query.args).trim_end().to_string();
+    let input_block = to_param_type_alias(context, &query.args)
+        .trim_end()
+        .to_string();
 
     let query_shape_block = if query.operation == ast::QueryOperation::Query {
         Some(to_query_shape(context, query).trim_end().to_string())
@@ -1261,11 +1263,18 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
     }
 }
 
-fn to_param_type_alias(args: &Vec<ast::QueryParamDefinition>) -> String {
+fn to_param_type_alias(
+    context: &typecheck::Context,
+    args: &Vec<ast::QueryParamDefinition>,
+) -> String {
     let mut result = "const RawInputValidator = z.object({".to_string();
     let mut is_first = true;
     for arg in args {
-        let type_name = arg.type_.clone().unwrap_or("unknown".to_string());
+        let type_name = arg
+            .type_
+            .as_deref()
+            .map(|type_| typecheck::resolve_query_param_type(context, type_))
+            .unwrap_or("unknown".to_string());
         let mut type_string = to_zod_type(&type_name);
         if arg.nullable {
             type_string = format!("{}.nullable()", type_string);

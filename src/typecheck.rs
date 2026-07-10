@@ -827,6 +827,32 @@ pub fn query_param_type_for_column(table: &ast::RecordDetails, column: &ast::Col
     }
 }
 
+/// Resolves record field references used in query parameter declarations to the
+/// field's concrete type. Parsed references otherwise retain an integer fallback.
+pub fn resolve_query_param_type(context: &Context, type_: &str) -> String {
+    let ast::ColumnType::ForeignKey { table, field, .. } = ast::ColumnType::from_str(type_) else {
+        return type_.to_string();
+    };
+
+    context
+        .tables
+        .values()
+        .find(|candidate| candidate.record.name == table)
+        .and_then(|candidate| {
+            candidate
+                .record
+                .fields
+                .iter()
+                .find_map(|field_| match field_ {
+                    ast::Field::Column(column) if column.name == field => {
+                        Some(column.type_.query_type_string())
+                    }
+                    _ => None,
+                })
+        })
+        .unwrap_or_else(|| type_.to_string())
+}
+
 /// Gathers information for a context.
 /// Also checks for a number of errors
 pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>> {

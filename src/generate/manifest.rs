@@ -99,7 +99,7 @@ fn query_manifest(
         operation: operation_to_string(&query.operation),
         primary_db: query_info.primary_db.clone(),
         attached_dbs: sorted_strings(&query_info.attached_dbs),
-        input_schema: input_schema(query),
+        input_schema: input_schema(context, query),
         session_args: session_args(&query_info.variables),
         optional_input_args: query
             .args
@@ -133,7 +133,7 @@ fn sorted_strings(values: &std::collections::HashSet<String>) -> Vec<String> {
     result
 }
 
-fn input_schema(query: &ast::Query) -> BTreeMap<String, FieldSchema> {
+fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<String, FieldSchema> {
     query
         .args
         .iter()
@@ -141,7 +141,11 @@ fn input_schema(query: &ast::Query) -> BTreeMap<String, FieldSchema> {
             (
                 arg.name.clone(),
                 FieldSchema {
-                    type_: arg.type_.clone().unwrap_or_else(|| "Json".to_string()),
+                    type_: arg
+                        .type_
+                        .as_deref()
+                        .map(|type_| typecheck::resolve_query_param_type(context, type_))
+                        .unwrap_or_else(|| "Json".to_string()),
                     nullable: arg.nullable,
                     omittable: arg.omittable,
                 },

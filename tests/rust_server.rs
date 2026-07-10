@@ -126,3 +126,59 @@ record ClocktowerParticipant {
         .expect("ClocktowerParticipant create metadata");
     assert!(metadata.contents.contains("gameId: z.string()"));
 }
+
+#[test]
+fn generated_query_inputs_resolve_uuid_record_id_references() {
+    let schema_source = r#"
+record ClocktowerGame {
+    @public
+    id Id.Uuid @id
+}
+"#;
+    let query_source = r#"
+query ClocktowerGameKeystone($id: ClocktowerGame.id) {
+    clocktowerGame {
+        @where { id == $id }
+        id
+    }
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let query_list = parser::parse_query("query.pyre", query_source).expect("query parses");
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+
+    let mut rust_files = Vec::new();
+    rust::generate_queries(&context, &query_list, Path::new("rust"), &mut rust_files);
+    assert!(rust_files[0].contents.contains("pub id: String,"));
+
+    let mut typescript_files = Vec::new();
+    core::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("typescript"),
+        &mut typescript_files,
+    );
+    let metadata = typescript_files
+        .iter()
+        .find(|file| {
+            file.path == Path::new("typescript/queries/metadata/clocktowerGameKeystone.ts")
+        })
+        .expect("ClocktowerGameKeystone metadata");
+    assert!(metadata.contents.contains("id: z.string()"));
+
+    let mut manifest_files = Vec::new();
+    pyre::generate::manifest::generate_queries(
+        &context,
+        &query_list,
+        &query_info,
+        &mut manifest_files,
+    );
+    assert!(manifest_files[0].contents.contains("\"type\": \"Id.Uuid\""));
+}
