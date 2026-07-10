@@ -1,6 +1,7 @@
 pub mod cte;
 pub mod delete;
 pub mod json;
+pub mod returning;
 pub mod select;
 pub mod temp_table;
 pub mod to_sql;
@@ -158,8 +159,12 @@ pub fn to_string_with_affected_rows(
             include_affected_rows,
         ),
 
-        ast::QueryOperation::Delete => {
-            delete::delete_to_string(query_info, table, table_field, include_affected_rows)
-        }
+        ast::QueryOperation::Delete => delete::delete_to_string(
+            context,
+            query_info,
+            table,
+            table_field,
+            include_affected_rows,
+        ),
     }
 }

@@ -348,13 +348,16 @@ async fn test_insert_permissions() -> Result<(), TestError> {
     session.insert("userId".to_string(), libsql::Value::Integer(1));
 
     // This should succeed because authorId matches session userId
-    let result = db
+    let mut result = db
         .execute_insert_with_session(insert_query, params.clone(), session.clone())
         .await;
     assert!(
         result.is_ok(),
         "Insert should succeed when authorId matches session userId"
     );
+    for rows in result.as_mut().expect("insert result should be available") {
+        while rows.next().await.map_err(TestError::Database)?.is_some() {}
+    }
 
     // Verify the post was created
     let query = r#"

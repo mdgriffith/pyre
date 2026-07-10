@@ -371,27 +371,29 @@ fn format_response(result_sets: &[ResultSet]) -> Result<JsonValue, Error> {
     let mut response = serde_json::Map::new();
 
     for result_set in result_sets {
-        let Some(column) = result_set.columns.first() else {
-            continue;
-        };
-        if column.starts_with('_') {
-            continue;
-        }
-
-        for row in &result_set.rows {
-            let Some(JsonValue::String(raw)) = row.get(column) else {
+        for column in &result_set.columns {
+            if column.starts_with('_') {
                 continue;
-            };
-            let parsed = serde_json::from_str::<JsonValue>(raw).map_err(Error::Json)?;
-            response.insert(
-                column.clone(),
+            }
+            response
+                .entry(column.clone())
+                .or_insert_with(|| JsonValue::Array(Vec::new()));
+            for row in &result_set.rows {
+                let Some(JsonValue::String(raw)) = row.get(column) else {
+                    continue;
+                };
+                let parsed = serde_json::from_str::<JsonValue>(raw).map_err(Error::Json)?;
                 if parsed.is_array() {
-                    parsed
+                    response.insert(column.clone(), parsed);
                 } else {
-                    JsonValue::Array(vec![parsed])
-                },
-            );
-            break;
+                    response
+                        .entry(column.clone())
+                        .or_insert_with(|| JsonValue::Array(Vec::new()))
+                        .as_array_mut()
+                        .expect("mutation response values are arrays")
+                        .push(parsed);
+                }
+            }
         }
     }
 
@@ -402,7 +404,7 @@ fn extract_affected_rows(result_sets: &[ResultSet]) -> Result<Vec<AffectedRowTab
     let mut groups = Vec::new();
 
     for result_set in result_sets {
-        if result_set.columns.first().map(|column| column.as_str()) != Some("_affectedRows") {
+        if !result_set.columns.iter().any(|column| column == "_affectedRows") {
             continue;
         }
 

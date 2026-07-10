@@ -1,10 +1,11 @@
 use crate::ast;
 use crate::ext::string;
-use crate::generate::sql::select;
+use crate::generate::sql::returning;
 use crate::generate::sql::to_sql;
 use crate::typecheck;
 
 pub fn delete_to_string(
+    context: &typecheck::Context,
     query_info: &typecheck::QueryInfo,
     table: &typecheck::Table,
     query_field: &ast::QueryField,
@@ -28,62 +29,24 @@ pub fn delete_to_string(
     );
     sql.push_str(&where_clause);
 
-    // SQLite doesn't support DELETE in CTEs or aggregates in RETURNING
-    // So we use a temp table approach:
-    // 1. SELECT rows that will be deleted into a temp table (before deletion)
-    // 2. Execute DELETE
-    // 3. Format the results from the temp table
-    // Note: Temp tables are automatically cleaned up when the batch's logical connection closes
-    // (see docs/sql_remote.md for details). We don't drop them explicitly to avoid lock errors.
-    let temp_table_name = format!("temp_deleted_{}", table_name);
-    let quoted_table_name = string::quote(&table_name);
-
-    // Extract WHERE clause from delete SQL to use in SELECT
-    let where_clause_str = if let Some(where_pos) = sql.find("where") {
-        &sql[where_pos..]
-    } else {
-        ""
-    };
-
-    // Drop temp table if it exists (from previous batch) before creating a new one
-    // This prevents "table already exists" errors when reusing the same client connection
-    statements.push(to_sql::ignore(format!(
-        "drop table if exists {}",
-        temp_table_name
-    )));
-
-    // Always create temp table - we need it for the typed response query
-    statements.push(to_sql::ignore(format!(
-        "create temp table {} as select * from {} {}",
-        temp_table_name, quoted_table_name, where_clause_str
-    )));
-
-    // Execute DELETE
-    statements.push(to_sql::ignore(sql));
-
-    // Always generate the typed response query - mutations must return typed data
-    let primary_table_name = select::get_tablename(
-        &select::TableAliasKind::Normal,
-        table,
-        &ast::get_aliased_name(query_field),
-    );
-
-    let typed_response_sql =
-        generate_typed_response_query(table, query_field, &primary_table_name, &temp_table_name);
-    statements.push(to_sql::include(typed_response_sql));
-
-    // Generate affected rows query if requested
-    // Execute this BEFORE the final selection to avoid lock conflicts
+    let response = returning::response_expression(context, table, query_field);
+    sql.push_str(&format!(
+        " returning {} as {}",
+        response,
+        string::quote(&ast::get_aliased_name(query_field))
+    ));
     if include_affected_rows {
-        let affected_rows_sql = generate_affected_rows_query(table, &temp_table_name);
-        // Insert before the final selection (which now always exists)
-        let final_idx = statements.len() - 1;
-        statements.insert(final_idx, to_sql::include(affected_rows_sql));
+        sql.push_str(&format!(
+            ", json_array({}) as _affectedRows",
+            returning::affected_rows_expression(context, table)
+        ));
     }
+    statements.push(to_sql::include(sql));
 
     statements
 }
 
+#[allow(dead_code)]
 fn generate_typed_response_query(
     table: &typecheck::Table,
     query_field: &ast::QueryField,
@@ -155,6 +118,7 @@ fn generate_typed_response_query(
     sql
 }
 
+#[allow(dead_code)]
 fn generate_affected_rows_query(table: &typecheck::Table, temp_table_name: &str) -> String {
     let table_name = ast::get_tablename(&table.record.name, &table.record.fields);
     let columns = ast::collect_columns(&table.record.fields);

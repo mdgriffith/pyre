@@ -1,54 +1,56 @@
-# Remote SQL Execution (libsql)
+# Remote SQL Execution (libSQL/Turso)
 
-## Temporary Table Lifecycle
+## Compatibility
 
-**Important**: When reusing the same database client connection across multiple `batch()` calls, SQLite temporary tables persist between batches. They are only dropped when the connection closes.
+Turso remote databases do not support `CREATE TEMPORARY TABLE` or `CREATE
+TABLE ... AS SELECT`. Generated mutation SQL must not rely on temporary tables.
 
-### How It Works
+Turso supports parameterized statements, `INSERT`, `UPDATE`, `DELETE`,
+`RETURNING`, atomic batches, and interactive transactions. `last_insert_rowid()`
+is connection-scoped, so it must not be used to pass a generated ID between
+separate remote statements.
 
-According to the [libsql client documentation](https://tursodatabase.github.io/libsql-client-ts/interfaces/Client.html):
+## Mutation Strategy
 
-- The `batch()` method executes SQL statements within a single transaction
-- Each batch operation uses the **same underlying database connection** as the client
-- The connection remains open and can be reused for subsequent operations
-- Temporary tables created in one batch will persist to the next batch if the same client is reused
+Single-table mutations should use `RETURNING` as the source of typed mutation
+responses and sync affected rows:
 
-### Temporary Tables
+- `INSERT ... RETURNING` returns the inserted row.
+- `UPDATE ... RETURNING` returns the updated row.
+- `DELETE ... RETURNING` returns the deleted row.
 
-SQLite temporary tables (`CREATE TEMP TABLE`) are scoped to the database connection that created them:
+The runtime must consume each returned result set before issuing another write,
+and it must execute multi-statement mutations in one transaction.
 
-- **Temp tables persist across batches** when using the same client connection
-- Temp tables are only dropped when the connection closes (not after each batch)
-- If you reuse the same client for multiple queries, temp tables from previous batches will still exist
-- This can cause errors like `SQLITE_ERROR: table inserted_post already exists` if the same temp table name is used in subsequent batches
+## Nested Inserts
 
-### Implications for Pyre
+Nested inserts with generated integer IDs require dependent statements:
 
-Pyre generates SQL that creates temporary tables for:
-- Tracking affected rows in mutations (inserts, updates, deletes)
-- Managing nested inserts across multiple tables
-- Capturing deleted rows before deletion
+1. Insert the parent with `RETURNING id`.
+2. Bind the returned ID into each child insert.
+3. Repeat for descendants.
 
-**Current Behavior:**
-- When tracking affected rows, Pyre does NOT drop temp tables explicitly (to avoid lock errors while result sets are active)
-- When NOT tracking affected rows, Pyre drops temp tables explicitly
-- **This means temp tables persist across batches when tracking affected rows**, which can cause conflicts
+This is more remote round trips than a single batch, but it removes the
+unsupported temp-table statements. The manifest/runtime needs explicit
+prior-result bindings to express this safely.
 
-**Solution Needed:**
-- Use `CREATE TEMP TABLE IF NOT EXISTS` or `DROP TABLE IF EXISTS` patterns
-- Or explicitly drop temp tables after result sets are consumed
-- Or use unique temp table names per query execution
+### Pre-assigned IDs
 
-### Production Considerations
+Caller- or runtime-assigned IDs remove the dependency between parent and child
+inserts. UUID and ULID IDs are the preferred form: Pyre can assign every ID
+before execution, render child foreign keys directly, and send all nested
+inserts in one atomic remote batch. This is the future latency optimization for
+nested writes.
 
-In production environments:
-- The main libsql client should be created once and reused across requests (singleton pattern)
-- **Temp tables created in one batch will persist to the next batch** when using the same client
-- You must either:
-  1. Drop temp tables explicitly after each batch (when safe)
-  2. Use unique temp table names per execution
-  3. Use `IF NOT EXISTS` / `DROP IF EXISTS` patterns to handle existing tables
+Auto-increment integer IDs cannot use that optimization without changing the ID
+model or allocating IDs ahead of time.
 
-## References
+## Migration Plan
 
-- [libsql Client Interface Documentation](https://tursodatabase.github.io/libsql-client-ts/interfaces/Client.html) - Documents that batch() uses a logical connection that closes after completion
+1. Move single-table inserts, updates, and deletes to `RETURNING`.
+2. Make native and TypeScript runtimes consume returned rows for responses and
+   affected-row sync data.
+3. Wrap native multi-statement mutations in an interactive transaction.
+4. Add manifest support for binding prior `RETURNING` values into nested steps.
+5. Remove the legacy temp-table generator once nested inserts use result
+   bindings or pre-assigned UUID/ULID IDs.

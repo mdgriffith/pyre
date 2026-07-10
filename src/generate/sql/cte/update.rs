@@ -1,6 +1,7 @@
 use crate::ast;
 use crate::ext::string;
 use crate::generate::sql::json::select as json_select;
+use crate::generate::sql::returning;
 use crate::generate::sql::to_sql;
 use crate::typecheck;
 
@@ -54,30 +55,24 @@ pub fn update_to_string(
     );
     result.push_str(&where_clause);
 
-    // Always execute UPDATE (with or without RETURNING)
+    let response = returning::response_expression(context, table, query_field);
+    result.push_str(&format!(
+        " returning {} as {}",
+        response,
+        string::quote(&ast::get_aliased_name(query_field))
+    ));
     if include_affected_rows {
-        result.push_str(" returning *");
+        result.push_str(&format!(
+            ", json_array({}) as _affectedRows",
+            returning::affected_rows_expression(context, table)
+        ));
     }
-    statements.push(to_sql::ignore(result));
-
-    // Always generate the typed response query - mutations must return typed data
-    // Use the same table_name as the UPDATE statement for consistency
-    let typed_response_sql =
-        generate_typed_response_query(context, table, query_field, &table_name, &where_clause);
-    statements.push(to_sql::include(typed_response_sql));
-
-    // Generate affected rows query if requested
-    // Execute this BEFORE the final selection to avoid lock conflicts
-    if include_affected_rows {
-        let affected_rows_sql = generate_affected_rows_query(context, table, &where_clause);
-        // Insert before the final selection (which now always exists)
-        let final_idx = statements.len() - 1;
-        statements.insert(final_idx, to_sql::include(affected_rows_sql));
-    }
+    statements.push(to_sql::include(result));
 
     statements
 }
 
+#[allow(dead_code)]
 fn generate_typed_response_query(
     context: &typecheck::Context,
     table: &typecheck::Table,
@@ -172,6 +167,7 @@ fn generate_typed_response_query(
     sql
 }
 
+#[allow(dead_code)]
 fn generate_affected_rows_query(
     context: &typecheck::Context,
     table: &typecheck::Table,

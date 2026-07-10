@@ -1,4 +1,7 @@
-/*  A Temp table approach uses a temporary table to do nested inserts.
+/*  Legacy temporary-table approach for nested inserts.
+
+    Remote Turso does not support temporary tables. Keep this module only until
+    nested inserts use RETURNING result bindings or pre-assigned UUID/ULID IDs.
 
 This is because SQLite does not allow nested inserts for CTEs.
 

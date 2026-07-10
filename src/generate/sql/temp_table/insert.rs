@@ -1,6 +1,7 @@
 use crate::ast;
 use crate::ext::string;
 use crate::generate::sql::json::select as json_select;
+use crate::generate::sql::returning;
 use crate::generate::sql::select;
 use crate::generate::sql::to_sql;
 use crate::typecheck;
@@ -40,6 +41,34 @@ pub fn insert_to_string(
     let all_query_fields = ast::collect_query_fields(&query_table_field.fields);
 
     let mut statements = to_sql::format_attach(query_info);
+    let has_links = all_query_fields.iter().any(|query_field| {
+        matches!(
+            table
+                .record
+                .fields
+                .iter()
+                .find(|field| ast::has_field_or_linkname(field, &query_field.name)),
+            Some(ast::Field::FieldDirective(ast::FieldDirective::Link(_)))
+        )
+    });
+
+    if !has_links {
+        let mut statement = initial_select(0, context, query, table, query_table_field);
+        statement.push_str(&format!(
+            " returning {} as {}",
+            returning::response_expression(context, table, query_table_field),
+            string::quote(&ast::get_aliased_name(query_table_field))
+        ));
+        if include_affected_rows {
+            statement.push_str(&format!(
+                ", json_array({}) as _affectedRows",
+                returning::affected_rows_expression(context, table)
+            ));
+        }
+        statements.push(to_sql::include(statement));
+        return statements;
+    }
+
     statements.push(to_sql::ignore(initial_select(
         0,
         context,

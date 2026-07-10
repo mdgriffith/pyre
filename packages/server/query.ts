@@ -140,17 +140,16 @@ function extractAffectedRowGroups(sql: SqlInfo[], resultSets: any[]): any[] {
             continue;
         }
 
-        const colName = resultSet.columns[0];
-        if (colName !== "_affectedRows") {
+        if (!resultSet.columns.includes("_affectedRows")) {
             continue;
         }
 
         for (const row of resultSet.rows || []) {
-            if (!(colName in row)) {
+            if (!("_affectedRows" in row)) {
                 continue;
             }
 
-            const raw = row[colName];
+            const raw = row._affectedRows;
             let parsed: unknown;
 
             if (typeof raw === "string") {

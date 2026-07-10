@@ -690,6 +690,13 @@ impl TestDatabase {
                 continue;
             }
 
+            for i in 0..column_count {
+                let col_name = rows_set.column_name(i).ok_or(TestError::NoQueryFound)?;
+                if !col_name.starts_with('_') {
+                    result.entry(col_name.to_string()).or_insert_with(Vec::new);
+                }
+            }
+
             // Process rows - queries return JSON in columns named after field names
             while let Some(row) = rows_set.next().await.map_err(TestError::Database)? {
                 for i in 0..column_count {

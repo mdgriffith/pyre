@@ -76,15 +76,23 @@ export function formatResultData(sql: SqlInfo[], resultSets: unknown[]): Record<
     if (!resultSet?.columns?.length) {
       continue;
     }
-    const colName = resultSet.columns[0];
-    if (colName.startsWith('_')) {
-      continue;
-    }
-    for (const row of resultSet.rows || []) {
-      if (colName in row && typeof row[colName] === 'string') {
-        const parsed: unknown = JSON.parse(row[colName]);
-        formatted[colName] = Array.isArray(parsed) ? parsed : [parsed];
-        break;
+    for (const colName of resultSet.columns) {
+      if (colName.startsWith('_')) {
+        continue;
+      }
+      if (!(colName in formatted)) {
+        formatted[colName] = [];
+      }
+      for (const row of resultSet.rows || []) {
+        if (colName in row && typeof row[colName] === 'string') {
+          const parsed: unknown = JSON.parse(row[colName]);
+          if (Array.isArray(parsed)) {
+            formatted[colName] = parsed;
+          } else {
+            const existing = formatted[colName];
+            formatted[colName] = Array.isArray(existing) ? [...existing, parsed] : [parsed];
+          }
+        }
       }
     }
   }
