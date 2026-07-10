@@ -13,6 +13,7 @@ use walkdir::WalkDir;
 #[derive(Debug)]
 pub struct Found {
     pub schema_files: HashMap<String, Vec<SchemaFile>>,
+    pub session_file: Option<SchemaFile>,
     pub query_files: Vec<String>,
     pub namespaces: Vec<String>,
 }
@@ -24,7 +25,7 @@ pub struct SchemaFile {
 }
 
 pub fn is_schema_file(file_path: &str) -> bool {
-    file_path == "schema.pyre" || file_path.contains("schema")
+    file_path == "schema.pyre" || file_path == "session.pyre" || file_path.contains("schema")
 }
 
 pub fn get_schema_source<'a>(filepath: &'a str, found: &'a Found) -> Option<&'a str> {
@@ -39,6 +40,11 @@ pub fn get_schema_source<'a>(filepath: &'a str, found: &'a Found) -> Option<&'a 
             }
         }
     }
+    if let Some(session_file) = &found.session_file {
+        if session_file.path == filepath {
+            return Some(&session_file.content);
+        }
+    }
     let filepath_path = Path::new(filepath);
     for schema_files in found.schema_files.values() {
         for schema_file in schema_files {
@@ -46,6 +52,11 @@ pub fn get_schema_source<'a>(filepath: &'a str, found: &'a Found) -> Option<&'a 
             if schema_path.ends_with(filepath_path) {
                 return Some(&schema_file.content);
             }
+        }
+    }
+    if let Some(session_file) = &found.session_file {
+        if Path::new(&session_file.path).ends_with(filepath_path) {
+            return Some(&session_file.content);
         }
     }
     None
@@ -118,6 +129,7 @@ pub fn read_namespaces(dir: &Path) -> io::Result<NamespacesFound> {
 #[cfg(feature = "filesystem")]
 pub fn collect_filepaths(dir: &Path) -> io::Result<Found> {
     let mut schema_files: HashMap<String, Vec<SchemaFile>> = HashMap::new();
+    let mut session_file: Option<SchemaFile> = None;
     let mut query_files: Vec<String> = vec![];
     let mut namespaces: Vec<String> = vec![];
 
@@ -148,7 +160,15 @@ pub fn collect_filepaths(dir: &Path) -> io::Result<Found> {
                 Some(os_file_name) => match os_file_name.to_str() {
                     None => continue,
                     Some(_) => {
-                        if is_schema_file(relative_path.to_str().unwrap()) {
+                        if relative_path == Path::new("session.pyre") {
+                            let mut file = fs::File::open(file_str)?;
+                            let mut session_source = String::new();
+                            file.read_to_string(&mut session_source)?;
+                            session_file = Some(SchemaFile {
+                                path: file_str.to_string(),
+                                content: session_source,
+                            });
+                        } else if is_schema_file(relative_path.to_str().unwrap()) {
                             let mut file = fs::File::open(file_str)?;
                             let mut schema_source = String::new();
                             file.read_to_string(&mut schema_source)?;
@@ -180,6 +200,7 @@ pub fn collect_filepaths(dir: &Path) -> io::Result<Found> {
 
     Ok(Found {
         schema_files,
+        session_file,
         query_files,
         namespaces,
     })

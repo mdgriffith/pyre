@@ -22,6 +22,8 @@ pub fn init(options: &Options, multidb: bool) -> io::Result<()> {
         std::process::exit(1);
     }
 
+    fs::write(pyre_dir.join("session.pyre"), "session {\n}\n")?;
+
     if multidb {
         let schema_dir = pyre_dir.join("schema");
         crate::filesystem::create_dir_if_not_exists(&schema_dir)?;

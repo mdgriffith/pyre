@@ -87,7 +87,7 @@ For the exact persisted representation, discriminator layout, and migration impl
 
 ## Sessions
 
-Session definitions describe values supplied by the application runtime, often for authorization-aware queries.
+Session definitions describe values supplied by the application runtime, often for authorization-aware queries. Define the single shared session in `pyre/session.pyre`; it is available to every schema namespace.
 
 ```pyre
 session {

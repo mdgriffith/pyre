@@ -155,6 +155,26 @@ pub fn parse_database_schemas(
         schemas: Vec::new(),
     };
 
+    let session = match &paths.session_file {
+        Some(source) => {
+            let mut session_schema = ast::Schema::default();
+            match parser::run(&source.path, &source.content, &mut session_schema) {
+                Ok(()) => session_schema.session,
+                Err(err) => {
+                    eprintln!(
+                        "{}",
+                        parser::render_error(&source.content, err, enable_color)
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to parse session",
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+
     let mut schema_namespaces: Vec<_> = paths.schema_files.iter().collect();
     schema_namespaces.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -162,7 +182,7 @@ pub fn parse_database_schemas(
         let mut schema = ast::Schema {
             namespace: namespace.clone(),
             sync_mode: ast::SyncMode::Synced,
-            session: None,
+            session: session.clone(),
             files: vec![],
         };
 

@@ -4,6 +4,19 @@ use std::collections::BTreeMap;
 
 pub fn schema_to_string(namespace: &str, schema: &ast::Schema) -> String {
     let mut result = String::new();
+    let has_session_definition = schema.files.iter().any(|file| {
+        file.definitions
+            .iter()
+            .any(|definition| matches!(definition, ast::Definition::Session(_)))
+    });
+    if let Some(session) = &schema.session {
+        if !has_session_definition {
+            result.push_str(&to_string_definition(
+                namespace,
+                &ast::Definition::Session(session.clone()),
+            ));
+        }
+    }
     for schema_file in &schema.files {
         result.push_str(&schemafile_to_string(namespace, schema_file));
     }

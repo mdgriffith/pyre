@@ -21,6 +21,9 @@ pub fn check(options: &Options, _files: Vec<String>, json: bool) -> io::Result<(
             schema_file_contents.insert(schema_file.path.clone(), schema_file.content.clone());
         }
     }
+    if let Some(session_file) = &paths.session_file {
+        schema_file_contents.insert(session_file.path.clone(), session_file.content.clone());
+    }
 
     match run_check(paths, options.enable_color) {
         Ok(errors) => {
