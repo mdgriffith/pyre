@@ -27,6 +27,10 @@ enum Commands {
         /// Generate a setup that has multiple database schemas.
         #[arg(long, default_value_t = false)]
         multidb: bool,
+
+        /// Shared session declaration source to write to session.pyre.
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Generate files for querying your pyre schema.
@@ -188,8 +192,8 @@ async fn main() -> io::Result<()> {
     };
 
     match &cli.command {
-        Commands::Init { multidb } => {
-            command::init(&options, *multidb)?;
+        Commands::Init { multidb, session } => {
+            command::init(&options, *multidb, session.as_deref())?;
         }
         Commands::Generate { out } => {
             command::generate(&options, out)?;

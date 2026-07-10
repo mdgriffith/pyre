@@ -16,6 +16,7 @@ impl TestContext {
         let temp_dir = TempDir::new().unwrap();
         let workspace_path = temp_dir.path().to_path_buf();
         std::fs::create_dir(workspace_path.join("pyre")).unwrap();
+        std::fs::write(workspace_path.join("pyre/session.pyre"), "session {\n}\n").unwrap();
 
         let context = Self {
             temp_dir,
@@ -49,11 +50,18 @@ record User {
 
 fn write_session_schema(ctx: &TestContext) {
     std::fs::write(
-        ctx.workspace_path.join("pyre/schema.pyre"),
+        ctx.workspace_path.join("pyre/session.pyre"),
         r#"
 session {
     userId Int
 }
+        "#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
 
 record Note {
     id      Int    @id
@@ -466,6 +474,29 @@ fn schema_is_exposed_as_resource() {
         .as_str()
         .unwrap()
         .contains("record User"));
+    assert!(read["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("session {"));
+}
+
+#[test]
+fn init_rejects_session_declaration_in_schema_source() {
+    let ctx = TestContext::new();
+
+    let response = call_mcp_tool_error(
+        &ctx,
+        "pyre_init",
+        json!({
+            "dir": "app-pyre",
+            "schema": "session {\n    userId Int\n}\n\nrecord User {\n    id Int @id\n    @public\n}\n"
+        }),
+    );
+
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("must not contain a session declaration"));
 }
 
 #[test]
@@ -486,13 +517,35 @@ fn init_creates_single_database_schema_from_required_source() {
     assert_eq!(result["namespace"], "_default");
     assert_eq!(
         normalize_json_paths(&result["createdFiles"]),
-        json!(["app-pyre/schema.pyre"])
+        json!(["app-pyre/session.pyre", "app-pyre/schema.pyre"])
     );
 
+    assert!(ctx.workspace_path.join("app-pyre/session.pyre").exists());
     let schema_path = ctx.workspace_path.join("app-pyre/schema.pyre");
     let schema = std::fs::read_to_string(schema_path).unwrap();
     assert!(schema.contains("record User"));
     assert!(schema.contains("name String"));
+}
+
+#[test]
+fn init_accepts_shared_session_source() {
+    let ctx = TestContext::new();
+
+    let result = call_mcp_tool(
+        &ctx,
+        "pyre_init",
+        json!({
+            "dir": "app-pyre",
+            "session": "session {\n    userId Int\n}\n",
+            "schema": "record User {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n}\n"
+        }),
+    );
+
+    assert_eq!(result["ok"], true);
+    assert_eq!(
+        std::fs::read_to_string(ctx.workspace_path.join("app-pyre/session.pyre")).unwrap(),
+        "session {\n    userId Int\n}\n"
+    );
 }
 
 #[test]
@@ -513,8 +566,12 @@ fn init_creates_namespaced_schema() {
     assert_eq!(result["namespace"], "Billing");
     assert_eq!(
         normalize_json_paths(&result["createdFiles"]),
-        json!(["multi-pyre/schema/Billing/schema.pyre"])
+        json!([
+            "multi-pyre/session.pyre",
+            "multi-pyre/schema/Billing/schema.pyre"
+        ])
     );
+    assert!(ctx.workspace_path.join("multi-pyre/session.pyre").exists());
     assert!(ctx
         .workspace_path
         .join("multi-pyre/schema/Billing/schema.pyre")

@@ -102,6 +102,11 @@ fn format_all(options: &Options, paths: pyre::filesystem::Found) -> io::Result<(
 
     format::database(&mut database);
     write_db_schema(options, &database)?;
+    if let Some(session_file) = paths.session_file {
+        let mut session = parse_single_schema(&session_file.path, options.enable_color)?;
+        format::schema(&mut session);
+        write_schema(options, &false, &session)?;
+    }
 
     // Format queries
     for query_file_path in paths.query_files {

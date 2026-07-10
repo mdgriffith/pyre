@@ -134,6 +134,8 @@ async fn call_tool(options: &Options<'_>, params: Option<&JsonValue>) -> Result<
 async fn init_project(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonValue, String> {
     let dir = string_arg(arguments, "dir").unwrap_or_else(|| "pyre".to_string());
     let schema_source = required_string_arg(arguments, "schema")?;
+    let session_source =
+        string_arg(arguments, "session").unwrap_or_else(|| "session {\n}\n".to_string());
     let namespace = string_arg(arguments, "namespace");
     let database = string_arg(arguments, "database");
     validate_safe_path("dir", &dir)?;
@@ -169,6 +171,7 @@ async fn init_project(options: &Options<'_>, arguments: &JsonValue) -> Result<Js
         Some(namespace) => dir_path.join("schema").join(namespace).join("schema.pyre"),
         None => dir_path.join("schema.pyre"),
     };
+    let session_path = dir_path.join("session.pyre");
     let schema_path_string = schema_path.to_string_lossy().to_string();
     let real_namespace = namespace
         .clone()
@@ -187,6 +190,19 @@ async fn init_project(options: &Options<'_>, arguments: &JsonValue) -> Result<Js
             options.enable_color,
         ));
     }
+    if schema.files.iter().any(|file| {
+        file.definitions
+            .iter()
+            .any(|definition| matches!(definition, ast::Definition::Session(_)))
+    }) {
+        return Err(
+            "schema must not contain a session declaration; define it in session.pyre".to_string(),
+        );
+    }
+    let session =
+        super::shared::parse_session_source("session.pyre", &session_source, options.enable_color)
+            .map_err(|error| error.to_string())?;
+    schema.session = Some(session);
 
     let mut database_schema = ast::Database {
         schemas: vec![schema],
@@ -214,13 +230,14 @@ async fn init_project(options: &Options<'_>, arguments: &JsonValue) -> Result<Js
     if let Some(parent) = schema_path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    fs::write(&session_path, session_source).map_err(|error| error.to_string())?;
     fs::write(&schema_path, formatted).map_err(|error| error.to_string())?;
 
     let mut result = json!({
         "ok": true,
         "dir": dir,
         "namespace": real_namespace,
-        "createdFiles": [schema_path_string]
+        "createdFiles": [session_path.to_string_lossy(), schema_path_string]
     });
 
     if let Some(database) = database {
@@ -270,6 +287,7 @@ fn project_info(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonValu
         "migrationDirExists": Path::new(&migration_dir).exists(),
         "namespaces": sorted_keys(&found.schema_files),
         "schemaFileCount": found.schema_files.values().map(Vec::len).sum::<usize>(),
+        "sessionFile": found.session_file.as_ref().map(|file| &file.path),
         "queryFileCount": found.query_files.len(),
         "queryFiles": found.query_files
     }))
@@ -333,7 +351,13 @@ fn schema_from_dir(in_dir: &Path) -> Result<JsonValue, String> {
         }
     }
 
-    Ok(json!({ "schemas": schemas }))
+    Ok(json!({
+        "session": found.session_file.map(|file| json!({
+            "path": file.path,
+            "content": file.content
+        })),
+        "schemas": schemas
+    }))
 }
 
 fn run_format(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonValue, String> {
@@ -1007,7 +1031,7 @@ fn sorted_keys<T>(map: &HashMap<String, T>) -> Vec<String> {
 
 fn tools() -> Vec<JsonValue> {
     vec![
-        tool("pyre_init", "Initialize a new Pyre schema directory from provided schema source. Fails if the target directory already exists or the schema is invalid.", json!({"type":"object","required":["schema"],"properties":{"dir":{"type":"string","description":"Directory to initialize. Defaults to pyre."},"schema":{"type":"string","description":"Initial Pyre schema source to write."},"namespace":{"type":"string","description":"Optional schema namespace. If omitted, uses the default namespace."},"database":{"type":"string","description":"Optional local database path to create and migrate, for example pyre.db."}}})),
+        tool("pyre_init", "Initialize a new Pyre schema directory from provided schema source. Fails if the target directory already exists or the schema is invalid.", json!({"type":"object","required":["schema"],"properties":{"dir":{"type":"string","description":"Directory to initialize. Defaults to pyre."},"schema":{"type":"string","description":"Initial namespace schema source to write."},"session":{"type":"string","description":"Optional shared session declaration source to write to session.pyre."},"namespace":{"type":"string","description":"Optional schema namespace. If omitted, uses the default namespace."},"database":{"type":"string","description":"Optional local database path to create and migrate, for example pyre.db."}}})),
         tool("pyre_project_info", "Report basic information about the current Pyre project.", json!({"type":"object","properties":{"dir":{"type":"string"},"generated":{"type":"string"},"migration_dir":{"type":"string"}}})),
         tool("pyre_docs", "Return bundled Pyre documentation by topic.", json!({"type":"object","properties":{"topic":{"type":"string","enum":["getting-started","schema","query","namespacing","sync","migrations","project-structure","serve","troubleshooting","mcp"]}}})),
         tool("pyre_schema", "Return all Pyre schema files and their contents.", json!({"type":"object","properties":{"dir":{"type":"string"}}})),

@@ -23,6 +23,7 @@ impl TestContext {
 
         // Set up any initial files needed
         std::fs::create_dir(workspace_path.join("pyre")).unwrap();
+        std::fs::write(workspace_path.join("pyre/session.pyre"), "session {\n}\n").unwrap();
 
         let context = Self {
             temp_dir,
@@ -847,11 +848,18 @@ fn test_generate_manifest_includes_query_runtime_metadata() {
     let ctx = TestContext::new();
 
     std::fs::write(
-        ctx.workspace_path.join("pyre/schema.pyre"),
+        ctx.workspace_path.join("pyre/session.pyre"),
         r#"
 session {
     userId Int
 }
+        "#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
 
 record User {
     id Int @id
@@ -1090,6 +1098,7 @@ query GetUsers {
         name
     }
 }
+
         "#,
     )
     .unwrap();
@@ -1099,6 +1108,50 @@ query GetUsers {
         .success()
         .stdout(predicate::str::contains(
             "Success: checked 1 schema(s) and 1 query files",
+        ));
+}
+
+#[test]
+fn test_check_rejects_session_declaration_in_schema_file() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+session {
+    userId Int
+}
+
+record User {
+    id Int @id
+    @public
+}
+        "#,
+    )
+    .unwrap();
+
+    ctx.run_command("check")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Define the shared session in pyre/session.pyre",
+        ));
+}
+
+#[test]
+fn test_check_rejects_non_session_definitions_in_session_file() {
+    let ctx = TestContext::new();
+    write_basic_schema(&ctx);
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n    userId Int\n}\n\nrecord Invalid {\n    id Int @id\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("check")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "may only contain one session declaration",
         ));
 }
 

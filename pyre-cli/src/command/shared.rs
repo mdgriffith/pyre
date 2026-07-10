@@ -155,25 +155,14 @@ pub fn parse_database_schemas(
         schemas: Vec::new(),
     };
 
-    let session = match &paths.session_file {
-        Some(source) => {
-            let mut session_schema = ast::Schema::default();
-            match parser::run(&source.path, &source.content, &mut session_schema) {
-                Ok(()) => session_schema.session,
-                Err(err) => {
-                    eprintln!(
-                        "{}",
-                        parser::render_error(&source.content, err, enable_color)
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Failed to parse session",
-                    ));
-                }
-            }
-        }
-        None => None,
-    };
+    let session_source = paths.session_file.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Missing pyre/session.pyre. Define the shared session there.",
+        )
+    })?;
+    let session =
+        parse_session_source(&session_source.path, &session_source.content, enable_color)?;
 
     let mut schema_namespaces: Vec<_> = paths.schema_files.iter().collect();
     schema_namespaces.sort_by(|a, b| a.0.cmp(b.0));
@@ -182,13 +171,27 @@ pub fn parse_database_schemas(
         let mut schema = ast::Schema {
             namespace: namespace.clone(),
             sync_mode: ast::SyncMode::Synced,
-            session: session.clone(),
+            session: Some(session.clone()),
             files: vec![],
         };
 
         for source in schema_files.iter() {
             match parser::run(&source.path, &source.content, &mut schema) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if schema.files.last().is_some_and(|file| {
+                        file.definitions
+                            .iter()
+                            .any(|definition| matches!(definition, ast::Definition::Session(_)))
+                    }) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{} contains a session declaration. Define the shared session in pyre/session.pyre.",
+                                source.path
+                            ),
+                        ));
+                    }
+                }
                 Err(err) => {
                     eprintln!(
                         "{}",
@@ -206,6 +209,55 @@ pub fn parse_database_schemas(
     resolve_id_brands(&mut database);
 
     Ok(database)
+}
+
+pub fn parse_session_source(
+    path: &str,
+    source: &str,
+    enable_color: bool,
+) -> io::Result<ast::SessionDetails> {
+    let mut schema = ast::Schema::default();
+    match parser::run(path, source, &mut schema) {
+        Ok(()) => {
+            let definitions = schema
+                .files
+                .iter()
+                .flat_map(|file| &file.definitions)
+                .collect::<Vec<_>>();
+            if definitions
+                .iter()
+                .filter(|definition| matches!(definition, ast::Definition::Session(_)))
+                .count()
+                != 1
+                || definitions.iter().any(|definition| {
+                    !matches!(
+                        definition,
+                        ast::Definition::Session(_)
+                            | ast::Definition::Lines { .. }
+                            | ast::Definition::Comment { .. }
+                    )
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pyre/session.pyre may only contain one session declaration, comments, and blank lines.",
+                ));
+            }
+            schema.session.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pyre/session.pyre must contain a session declaration.",
+                )
+            })
+        }
+        Err(err) => {
+            eprintln!("{}", parser::render_error(source, err, enable_color));
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to parse session",
+            ))
+        }
+    }
 }
 
 pub fn write_schema(_options: &Options, to_stdout: &bool, schema: &ast::Schema) -> io::Result<()> {

@@ -1,17 +1,20 @@
 use std::fs;
 use std::io;
 
-use super::shared::{id_column, write_db_schema, Options};
+use super::shared::{id_column, parse_session_source, write_db_schema, Options};
 use pyre::ast;
 use pyre::error;
 use pyre::format;
 
-pub fn init(options: &Options, multidb: bool) -> io::Result<()> {
+pub fn init(options: &Options, multidb: bool, session: Option<&str>) -> io::Result<()> {
     let mut database = ast::Database {
         schemas: Vec::new(),
     };
     let cwd = std::env::current_dir().expect("Failed to get current directory");
     let pyre_dir = cwd.join("pyre");
+    let session_source = session.unwrap_or("session {\n}\n");
+    parse_session_source("session.pyre", session_source, options.enable_color)?;
+
     if !pyre_dir.exists() {
         fs::create_dir(&pyre_dir).expect("Failed to create pyre directory");
     } else {
@@ -22,7 +25,7 @@ pub fn init(options: &Options, multidb: bool) -> io::Result<()> {
         std::process::exit(1);
     }
 
-    fs::write(pyre_dir.join("session.pyre"), "session {\n}\n")?;
+    fs::write(pyre_dir.join("session.pyre"), session_source)?;
 
     if multidb {
         let schema_dir = pyre_dir.join("schema");
@@ -40,7 +43,12 @@ pub fn init(options: &Options, multidb: bool) -> io::Result<()> {
                 path: base_dir.join("schema.pyre").to_string_lossy().to_string(),
                 definitions: vec![ast::Definition::Record {
                     name: "User".to_string(),
-                    fields: vec![ast::Field::Column(id_column())],
+                    fields: vec![
+                        ast::Field::FieldDirective(ast::FieldDirective::Permissions(
+                            ast::PermissionDetails::Public,
+                        )),
+                        ast::Field::Column(id_column()),
+                    ],
                     start: None,
                     end: None,
                     start_name: None,
@@ -62,6 +70,9 @@ pub fn init(options: &Options, multidb: bool) -> io::Result<()> {
                 definitions: vec![ast::Definition::Record {
                     name: "Example".to_string(),
                     fields: vec![
+                        ast::Field::FieldDirective(ast::FieldDirective::Permissions(
+                            ast::PermissionDetails::Public,
+                        )),
                         ast::Field::FieldDirective(ast::FieldDirective::Link(ast::LinkDetails {
                             link_name: "user".to_string(),
                             local_ids: vec!["userId".to_string()],
@@ -99,7 +110,12 @@ pub fn init(options: &Options, multidb: bool) -> io::Result<()> {
     } else {
         let records = vec![ast::Definition::Record {
             name: "User".to_string(),
-            fields: vec![ast::Field::Column(id_column())],
+            fields: vec![
+                ast::Field::FieldDirective(ast::FieldDirective::Permissions(
+                    ast::PermissionDetails::Public,
+                )),
+                ast::Field::Column(id_column()),
+            ],
             start: None,
             end: None,
             start_name: None,
