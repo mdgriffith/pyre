@@ -1,6 +1,6 @@
 {
   "name": "@pyre/client",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Elm client for Pyre data synchronization and querying",
   "license": "MIT",
   "type": "module",
