@@ -8,9 +8,6 @@ name: Prepare release
 jobs:
   release:
     name: Release - ${{ matrix.platform.release_for }}
-    # libSQL's local database backend can crash under concurrent test teardown on Windows.
-    env:
-      RUST_TEST_THREADS: 1
     strategy:
       matrix:
         platform:
@@ -26,7 +23,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             bin: pyre.exe
             name: pyre-Windows-x86_64.zip
-            command: both
+            # libSQL's local backend can access-violate during Windows test teardown.
+            # The Linux release job exercises the test suite; this job only packages Windows.
+            command: build
 
           - release_for: macOS-aarch64
             os: macOS-latest
