@@ -213,7 +213,8 @@ fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result
     }
 
     let valid = match schema.type_.as_str() {
-        "String" | "DateTime" => value.is_string(),
+        "String" => value.is_string(),
+        "DateTime" => value.is_string() || value.is_number(),
         "Int" | "Float" => value.is_number(),
         "Bool" => value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false),
         type_ if type_.starts_with("Id.Int") => value.is_number(),

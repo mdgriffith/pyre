@@ -238,3 +238,37 @@ insert CreateOrder($status: Status, $delivery: Delivery, $statuses: Json<List<St
     assert!(!generated.contains("pub status: serde_json::Value,"));
     assert!(!generated.contains("pub delivery: serde_json::Value,"));
 }
+
+#[test]
+fn generated_rust_datetime_accepts_epoch_or_text() {
+    let schema_source = r#"
+record Event {
+    @public
+    id Id.Int @id
+    startsAt DateTime
+}
+"#;
+    let query_source = r#"
+insert CreateEvent($startsAt: DateTime) {
+    event {
+        startsAt = $startsAt
+    }
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    let query_list = parser::parse_query("query.pyre", query_source).expect("query parses");
+    let mut files = Vec::new();
+    rust::generate_queries(&context, &query_list, Path::new("rust"), &mut files);
+    let generated = &files[0].contents;
+
+    assert!(generated.contains("pub enum DateTime"));
+    assert!(generated.contains("UnixSeconds(i64)"));
+    assert!(generated.contains("Text(String)"));
+    assert!(generated.contains("pub starts_at: DateTime,"));
+}

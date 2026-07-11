@@ -117,6 +117,7 @@ record Document {
     id Int @id
     visibility DocumentVisibility
 }
+
 "#;
 
     let mut schema = ast::Schema::default();
@@ -138,4 +139,33 @@ record Document {
         "Expected Json<List<String>> variant field to validate as a string array. Generated:\n{}",
         decode_ts
     );
+}
+
+#[test]
+fn typescript_session_validator_uses_custom_type_decoder() {
+    let schema_source = r#"
+type Role
+    = Admin
+    | Member
+
+session {
+    role Role
+}
+
+record User {
+    @public
+    id Id.Int @id
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let env = typescript::to_env(&context, &database).expect("env should generate");
+
+    assert!(env.contains("import * as Db from './decode';"));
+    assert!(env.contains("role: Db.Role"));
+    assert!(!env.contains("role: z.any()"));
 }

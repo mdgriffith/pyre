@@ -116,7 +116,8 @@ impl PyreSession {
 
 fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result<(), Error> {
     let valid = match schema.type_.as_str() {
-        "String" | "DateTime" => value.is_string(),
+        "String" => value.is_string(),
+        "DateTime" => value.is_string() || value.is_number(),
         "Int" | "Float" => value.is_number(),
         "Bool" => value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false),
         type_ if type_.starts_with("Id.Int") => value.is_number(),
@@ -140,13 +141,29 @@ fn json_to_session_value(
     schema: &FieldSchema,
 ) -> Result<sync::SessionValue, Error> {
     match schema.type_.as_str() {
-        "String" | "DateTime" => value
+        "String" => value
             .as_str()
             .map(|value| sync::SessionValue::Text(value.to_string()))
             .ok_or_else(|| Error::InvalidFieldType {
                 field: String::new(),
                 expected: schema.type_.clone(),
             }),
+        "DateTime" => {
+            match value {
+                JsonValue::String(value) => Ok(sync::SessionValue::Text(value.clone())),
+                JsonValue::Number(value) => value
+                    .as_i64()
+                    .map(sync::SessionValue::Integer)
+                    .ok_or_else(|| Error::InvalidFieldType {
+                        field: String::new(),
+                        expected: schema.type_.clone(),
+                    }),
+                _ => Err(Error::InvalidFieldType {
+                    field: String::new(),
+                    expected: schema.type_.clone(),
+                }),
+            }
+        }
         "Int" => value
             .as_i64()
             .map(sync::SessionValue::Integer)

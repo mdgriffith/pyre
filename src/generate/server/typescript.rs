@@ -71,7 +71,7 @@ pub fn generate(
         DB_ENGINE.to_string(),
     ));
 
-    if let Some(config_ts) = to_env(database) {
+    if let Some(config_ts) = to_env(context, database) {
         files.push(generate_text_file(
             base_out_dir.join("db/env.ts"),
             config_ts,
@@ -297,10 +297,11 @@ fn to_ts_typename(qualified: bool, type_: &str) -> String {
     common::column_type_to_ts_type(&ast::ColumnType::from_str(type_), qualified)
 }
 
-pub fn to_env(database: &ast::Database) -> Option<String> {
+pub fn to_env(context: &typecheck::Context, database: &ast::Database) -> Option<String> {
     let mut result = String::new();
 
     result.push_str("import { z } from 'zod';\n");
+    result.push_str("import * as Db from './decode';\n");
     let session = database
         .schemas
         .iter()
@@ -319,14 +320,7 @@ pub fn to_env(database: &ast::Database) -> Option<String> {
     for field in &session.fields {
         match field {
             ast::Field::Column(column) => {
-                let validator = match column.type_.to_string().as_str() {
-                    "String" => "z.string()",
-                    "Int" | "Float" => "z.number()",
-                    "Bool" => "z.boolean()",
-                    "DateTime" => "z.coerce.date()",
-                    "Json" => "z.unknown()",
-                    _ => "z.any()",
-                };
+                let validator = session_validator(context, &column.type_);
                 let validator = if column.nullable {
                     format!("{}.optional()", validator)
                 } else {
@@ -381,4 +375,48 @@ pub fn to_env(database: &ast::Database) -> Option<String> {
     result.push_str("};\n\n");
 
     Some(result)
+}
+
+fn session_validator(context: &typecheck::Context, type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::String | ast::ColumnType::Date => "z.string()".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
+            "z.number()".to_string()
+        }
+        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(serialization_type),
+            ..
+        } => session_validator_for_serialization_type(serialization_type),
+        // Parsed but untypechecked foreign keys retain Pyre's historical integer fallback.
+        ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
+        ast::ColumnType::Bool => "z.boolean()".to_string(),
+        ast::ColumnType::DateTime => "z.union([z.date(), z.string(), z.number()])".to_string(),
+        ast::ColumnType::Json => "z.unknown()".to_string(),
+        ast::ColumnType::JsonTyped(inner) => session_validator(context, inner),
+        ast::ColumnType::List(inner) => format!("z.array({})", session_validator(context, inner)),
+        ast::ColumnType::Dict(inner) => format!("z.record({})", session_validator(context, inner)),
+        ast::ColumnType::Nullable(inner) => {
+            format!("{}.nullable()", session_validator(context, inner))
+        }
+        ast::ColumnType::Custom(name) if context.types.contains_key(name) => format!("Db.{}", name),
+        ast::ColumnType::Custom(_) => "z.unknown()".to_string(),
+    }
+}
+
+fn session_validator_for_serialization_type(type_: &ast::ConcreteSerializationType) -> String {
+    match type_ {
+        ast::ConcreteSerializationType::Integer
+        | ast::ConcreteSerializationType::Real
+        | ast::ConcreteSerializationType::IdInt => "z.number()".to_string(),
+        ast::ConcreteSerializationType::Text
+        | ast::ConcreteSerializationType::Date
+        | ast::ConcreteSerializationType::IdUuid => "z.string()".to_string(),
+        ast::ConcreteSerializationType::DateTime => {
+            "z.union([z.date(), z.string(), z.number()])".to_string()
+        }
+        ast::ConcreteSerializationType::Blob
+        | ast::ConcreteSerializationType::VectorBlob { .. }
+        | ast::ConcreteSerializationType::JsonB => "z.unknown()".to_string(),
+    }
 }

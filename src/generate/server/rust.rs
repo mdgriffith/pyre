@@ -42,6 +42,13 @@ fn to_server_file(context: &typecheck::Context, query_list: &ast::QueryList) -> 
     result.push_str("    serde_path_to_error::deserialize(&mut deserializer)\n");
     result.push_str("}\n");
     result.push_str("\n");
+    result.push_str("#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\n");
+    result.push_str("#[serde(untagged)]\n");
+    result.push_str("pub enum DateTime {\n");
+    result.push_str("    UnixSeconds(i64),\n");
+    result.push_str("    Text(String),\n");
+    result.push_str("}\n");
+    result.push_str("\n");
     result.push_str(&custom_types(context));
     result.push_str("\n");
     result.push_str("#[derive(Clone, Debug, Default)]\n");
@@ -241,7 +248,8 @@ fn output_rust_type(type_: &str, metadata: typealias::FieldMetadata) -> String {
 
 fn rust_type(type_: Option<&str>) -> String {
     match type_.map(ast::ColumnType::from_str) {
-        Some(ast::ColumnType::String) | Some(ast::ColumnType::DateTime) => "String".to_string(),
+        Some(ast::ColumnType::String) => "String".to_string(),
+        Some(ast::ColumnType::DateTime) => "DateTime".to_string(),
         Some(ast::ColumnType::Date) => "String".to_string(),
         Some(ast::ColumnType::Int)
         | Some(ast::ColumnType::IdInt { .. })
