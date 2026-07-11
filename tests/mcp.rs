@@ -894,6 +894,46 @@ fn pyre_query_executes_selection_and_mutation() {
 }
 
 #[test]
+fn pyre_query_binds_tagged_unit_enum_parameters() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+type Status
+    = Running
+    | Stopped
+
+record Game {
+    id Id.Int @id
+    status Status
+    @public
+}
+"#,
+    )
+    .unwrap();
+    ctx.run_command("migrate")
+        .arg(".yak/yak.db")
+        .arg("--push")
+        .assert()
+        .success();
+
+    let result = call_mcp_tool(
+        &ctx,
+        "pyre_query",
+        json!({
+            "database": ".yak/yak.db",
+            "query": "insert CreateGame($status: Status) { game { status = $status } }",
+            "params": { "status": { "_type": "Running" } }
+        }),
+    );
+    assert_eq!(result["ok"], true);
+    assert_eq!(
+        result["results"][0]["response"]["game"][0]["status"],
+        json!({ "_type": "Running" })
+    );
+}
+
+#[test]
 fn pyre_preview_query_returns_generated_sql_without_database() {
     let ctx = TestContext::new();
     write_schema(&ctx);

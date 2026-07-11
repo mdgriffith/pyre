@@ -295,11 +295,8 @@ fn custom_types(context: &typecheck::Context) -> String {
 
     let mut result = String::new();
     for (name, variants) in types {
-        let is_enum = variants.iter().all(|variant| variant.fields.is_none());
         result.push_str("#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\n");
-        if !is_enum {
-            result.push_str("#[serde(tag = \"_type\")]\n");
-        }
+        result.push_str("#[serde(tag = \"_type\")]\n");
         result.push_str(&format!("pub enum {} {{\n", to_pascal_name(name)));
         for variant in variants {
             result.push_str(&format!("    #[serde(rename = {:?})]\n", variant.name));

@@ -32,6 +32,8 @@ struct QueryManifest {
 struct FieldSchema {
     #[serde(rename = "type")]
     type_: String,
+    is_enum: bool,
+    enum_variants: Vec<String>,
     nullable: bool,
     omittable: bool,
 }
@@ -138,14 +140,18 @@ fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<St
         .args
         .iter()
         .map(|arg| {
+            let type_ = arg
+                .type_
+                .as_deref()
+                .map(|type_| typecheck::resolve_query_param_type(context, type_))
+                .unwrap_or_else(|| "Json".to_string());
+            let enum_variants = enum_variants(context, &type_);
             (
                 arg.name.clone(),
                 FieldSchema {
-                    type_: arg
-                        .type_
-                        .as_deref()
-                        .map(|type_| typecheck::resolve_query_param_type(context, type_))
-                        .unwrap_or_else(|| "Json".to_string()),
+                    is_enum: !enum_variants.is_empty(),
+                    enum_variants,
+                    type_,
                     nullable: arg.nullable,
                     omittable: arg.omittable,
                 },
@@ -163,19 +169,39 @@ fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSchema>
                 .fields
                 .iter()
                 .filter_map(|field| match field {
-                    ast::Field::Column(column) => Some((
-                        column.name.clone(),
-                        FieldSchema {
-                            type_: column.type_.to_string(),
-                            nullable: column.nullable,
-                            omittable: false,
-                        },
-                    )),
+                    ast::Field::Column(column) => {
+                        let type_ = column.type_.to_string();
+                        let enum_variants = enum_variants(context, &type_);
+                        Some((
+                            column.name.clone(),
+                            FieldSchema {
+                                is_enum: !enum_variants.is_empty(),
+                                enum_variants,
+                                type_,
+                                nullable: column.nullable,
+                                omittable: false,
+                            },
+                        ))
+                    }
                     _ => None,
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn enum_variants(context: &typecheck::Context, type_: &str) -> Vec<String> {
+    match context.types.get(type_) {
+        Some((crate::error::DefInfo::Def(_), typecheck::Type::OneOf { variants }))
+            if variants.iter().all(|variant| variant.fields.is_none()) =>
+        {
+            variants
+                .iter()
+                .map(|variant| variant.name.clone())
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn query_sql(

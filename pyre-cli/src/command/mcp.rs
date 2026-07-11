@@ -782,7 +782,7 @@ fn dynamic_manifest(
 
     Ok(Manifest {
         version: 1,
-        session_schema: session_schema(database),
+        session_schema: session_schema(context, database),
         queries,
     })
 }
@@ -819,7 +819,7 @@ fn dynamic_query_manifest(
         operation: format!("{:?}", query.operation).to_lowercase(),
         primary_db: query_info.primary_db.clone(),
         attached_dbs: query_info.attached_dbs.iter().cloned().collect(),
-        input_schema: input_schema(query_info),
+        input_schema: input_schema(context, query_info),
         session_args: session_args(query_info),
         optional_input_args: query
             .args
@@ -833,7 +833,10 @@ fn dynamic_query_manifest(
     })
 }
 
-fn input_schema(query_info: &pyre::typecheck::QueryInfo) -> HashMap<String, FieldSchema> {
+fn input_schema(
+    context: &pyre::typecheck::Context,
+    query_info: &pyre::typecheck::QueryInfo,
+) -> HashMap<String, FieldSchema> {
     let mut schema = HashMap::new();
     for param in query_info.variables.values() {
         if let pyre::typecheck::ParamInfo::Defined {
@@ -851,6 +854,10 @@ fn input_schema(query_info: &pyre::typecheck::QueryInfo) -> HashMap<String, Fiel
                 raw_variable_name.clone(),
                 FieldSchema {
                     type_: type_.clone().unwrap_or_else(|| "Json".to_string()),
+                    is_enum: type_
+                        .as_deref()
+                        .is_some_and(|type_| is_enum_type(context, type_)),
+                    enum_variants: enum_variants(context, type_.as_deref()),
                     nullable: *nullable,
                     omittable: false,
                 },
@@ -860,7 +867,10 @@ fn input_schema(query_info: &pyre::typecheck::QueryInfo) -> HashMap<String, Fiel
     schema
 }
 
-fn session_schema(database: &ast::Database) -> HashMap<String, FieldSchema> {
+fn session_schema(
+    context: &pyre::typecheck::Context,
+    database: &ast::Database,
+) -> HashMap<String, FieldSchema> {
     let session = database
         .schemas
         .iter()
@@ -873,6 +883,8 @@ fn session_schema(database: &ast::Database) -> HashMap<String, FieldSchema> {
                 column.name,
                 FieldSchema {
                     type_: column.type_.to_string(),
+                    is_enum: is_enum_type(context, &column.type_.to_string()),
+                    enum_variants: enum_variants(context, Some(&column.type_.to_string())),
                     nullable: column.nullable,
                     omittable: false,
                 },
@@ -880,6 +892,28 @@ fn session_schema(database: &ast::Database) -> HashMap<String, FieldSchema> {
         }
     }
     schema
+}
+
+fn is_enum_type(context: &pyre::typecheck::Context, type_: &str) -> bool {
+    matches!(
+        context.types.get(type_),
+        Some((pyre::error::DefInfo::Def(_), pyre::typecheck::Type::OneOf { variants }))
+            if variants.iter().all(|variant| variant.fields.is_none())
+    )
+}
+
+fn enum_variants(context: &pyre::typecheck::Context, type_: Option<&str>) -> Vec<String> {
+    match type_.and_then(|type_| context.types.get(type_)) {
+        Some((pyre::error::DefInfo::Def(_), pyre::typecheck::Type::OneOf { variants }))
+            if variants.iter().all(|variant| variant.fields.is_none()) =>
+        {
+            variants
+                .iter()
+                .map(|variant| variant.name.clone())
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn query_param_names(query: &ast::Query, query_info: &pyre::typecheck::QueryInfo) -> Vec<String> {

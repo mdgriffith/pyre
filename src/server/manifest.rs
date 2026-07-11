@@ -43,6 +43,10 @@ pub struct QueryManifest {
 pub struct FieldSchema {
     #[serde(rename = "type")]
     pub type_: String,
+    #[serde(default)]
+    pub is_enum: bool,
+    #[serde(default)]
+    pub enum_variants: Vec<String>,
     pub nullable: bool,
     pub omittable: bool,
 }
@@ -95,11 +99,12 @@ impl PyreSession {
             }
 
             validate_value(name, value, field_schema)?;
-            logical.insert(name.clone(), json_to_session_value(value, field_schema)?);
-            sql_args.insert(
-                format!("session_{}", name),
-                normalize_sql_value(value, field_schema),
+            let sql_value = normalize_sql_value(value, field_schema);
+            logical.insert(
+                name.clone(),
+                json_to_session_value(&sql_value, field_schema)?,
             );
+            sql_args.insert(format!("session_{}", name), sql_value);
         }
 
         Ok(Self { logical, sql_args })
@@ -115,15 +120,26 @@ impl PyreSession {
 }
 
 fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result<(), Error> {
-    let valid = match schema.type_.as_str() {
-        "String" => value.is_string(),
-        "DateTime" => value.is_string() || value.is_number(),
-        "Int" | "Float" => value.is_number(),
-        "Bool" => value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false),
-        type_ if type_.starts_with("Id.Int") => value.is_number(),
-        type_ if type_.starts_with("Id.Uuid") => value.is_string(),
-        type_ if type_.starts_with("Json") => true,
-        _ => true,
+    let valid = if schema.is_enum {
+        let tag = match value {
+            JsonValue::String(value) => Some(value.as_str()),
+            JsonValue::Object(_) => value.get("_type").and_then(JsonValue::as_str),
+            _ => None,
+        };
+        tag.is_some_and(|tag| schema.enum_variants.iter().any(|variant| variant == tag))
+    } else {
+        match schema.type_.as_str() {
+            "String" => value.is_string(),
+            "DateTime" => value.is_string() || value.is_number(),
+            "Int" | "Float" => value.is_number(),
+            "Bool" => {
+                value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false)
+            }
+            type_ if type_.starts_with("Id.Int") => value.is_number(),
+            type_ if type_.starts_with("Id.Uuid") => value.is_string(),
+            type_ if type_.starts_with("Json") => true,
+            _ => true,
+        }
     };
 
     if valid {
@@ -218,6 +234,12 @@ fn json_to_session_value(
 }
 
 fn normalize_sql_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
+    if schema.is_enum {
+        if let Some(tag) = value.get("_type").and_then(JsonValue::as_str) {
+            return JsonValue::String(tag.to_string());
+        }
+    }
+
     if schema.type_ == "Bool" {
         return JsonValue::from(
             if value == &JsonValue::Bool(true) || value.as_i64() == Some(1) {

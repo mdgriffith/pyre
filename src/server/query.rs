@@ -212,15 +212,26 @@ fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result
         };
     }
 
-    let valid = match schema.type_.as_str() {
-        "String" => value.is_string(),
-        "DateTime" => value.is_string() || value.is_number(),
-        "Int" | "Float" => value.is_number(),
-        "Bool" => value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false),
-        type_ if type_.starts_with("Id.Int") => value.is_number(),
-        type_ if type_.starts_with("Id.Uuid") => value.is_string(),
-        type_ if type_.starts_with("Json") => true,
-        _ => true,
+    let valid = if schema.is_enum {
+        let tag = match value {
+            JsonValue::String(value) => Some(value.as_str()),
+            JsonValue::Object(_) => value.get("_type").and_then(JsonValue::as_str),
+            _ => None,
+        };
+        tag.is_some_and(|tag| schema.enum_variants.iter().any(|variant| variant == tag))
+    } else {
+        match schema.type_.as_str() {
+            "String" => value.is_string(),
+            "DateTime" => value.is_string() || value.is_number(),
+            "Int" | "Float" => value.is_number(),
+            "Bool" => {
+                value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false)
+            }
+            type_ if type_.starts_with("Id.Int") => value.is_number(),
+            type_ if type_.starts_with("Id.Uuid") => value.is_string(),
+            type_ if type_.starts_with("Json") => true,
+            _ => true,
+        }
     };
 
     if valid {
@@ -234,6 +245,12 @@ fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result
 }
 
 fn normalize_sql_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
+    if schema.is_enum {
+        if let Some(tag) = value.get("_type").and_then(JsonValue::as_str) {
+            return JsonValue::String(tag.to_string());
+        }
+    }
+
     if schema.type_ == "Bool" {
         return JsonValue::from(
             if value == &JsonValue::Bool(true) || value.as_i64() == Some(1) {
@@ -405,7 +422,11 @@ fn extract_affected_rows(result_sets: &[ResultSet]) -> Result<Vec<AffectedRowTab
     let mut groups = Vec::new();
 
     for result_set in result_sets {
-        if !result_set.columns.iter().any(|column| column == "_affectedRows") {
+        if !result_set
+            .columns
+            .iter()
+            .any(|column| column == "_affectedRows")
+        {
             continue;
         }
 

@@ -1318,6 +1318,8 @@ async fn pyre_session_validates_record_and_builds_logical_and_sql_views(
             "userId".to_string(),
             FieldSchema {
                 type_: "Int".to_string(),
+                is_enum: false,
+                enum_variants: Vec::new(),
                 nullable: false,
                 omittable: false,
             },
@@ -1326,6 +1328,8 @@ async fn pyre_session_validates_record_and_builds_logical_and_sql_views(
             "role".to_string(),
             FieldSchema {
                 type_: "String".to_string(),
+                is_enum: false,
+                enum_variants: Vec::new(),
                 nullable: false,
                 omittable: false,
             },
@@ -1334,6 +1338,8 @@ async fn pyre_session_validates_record_and_builds_logical_and_sql_views(
             "enabled".to_string(),
             FieldSchema {
                 type_: "Bool".to_string(),
+                is_enum: false,
+                enum_variants: Vec::new(),
                 nullable: false,
                 omittable: false,
             },
@@ -1374,6 +1380,8 @@ async fn pyre_session_rejects_missing_or_invalid_fields() -> Result<(), Box<dyn 
         "userId".to_string(),
         FieldSchema {
             type_: "Int".to_string(),
+            is_enum: false,
+            enum_variants: Vec::new(),
             nullable: false,
             omittable: false,
         },
