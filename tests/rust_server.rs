@@ -182,3 +182,59 @@ query ClocktowerGameKeystone($id: ClocktowerGame.id) {
     );
     assert!(manifest_files[0].contents.contains("\"type\": \"Id.Uuid\""));
 }
+
+#[test]
+fn generated_rust_inputs_use_typed_custom_unions() {
+    let schema_source = r#"
+type Status
+    = Active
+    | Inactive
+
+type Delivery
+    = Pickup
+    | Courier { trackingCode String }
+
+record Order {
+    @public
+    id Id.Int @id
+    status Status
+    delivery Delivery
+    statuses Json<List<Status>>
+    deliveries Json<Dict<Delivery>>
+}
+"#;
+    let query_source = r#"
+insert CreateOrder($status: Status, $delivery: Delivery, $statuses: Json<List<Status>>, $deliveries: Json<Dict<Delivery>>) {
+    order {
+        status = $status
+        delivery = $delivery
+        statuses = $statuses
+        deliveries = $deliveries
+    }
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    let query_list = parser::parse_query("query.pyre", query_source).expect("query parses");
+
+    let mut files = Vec::new();
+    rust::generate_queries(&context, &query_list, Path::new("rust"), &mut files);
+    let generated = &files[0].contents;
+
+    assert!(generated.contains("pub enum Status"));
+    assert!(generated.contains("pub enum Delivery"));
+    assert!(generated.contains("#[serde(tag = \"_type\")]"));
+    assert!(generated.contains("Courier {"));
+    assert!(generated.contains("tracking_code: String,"));
+    assert!(generated.contains("pub status: Status,"));
+    assert!(generated.contains("pub delivery: Delivery,"));
+    assert!(generated.contains("pub statuses: Vec<Status>,"));
+    assert!(generated.contains("pub deliveries: std::collections::HashMap<String, Delivery>,"));
+    assert!(!generated.contains("pub status: serde_json::Value,"));
+    assert!(!generated.contains("pub delivery: serde_json::Value,"));
+}

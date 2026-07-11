@@ -42,6 +42,8 @@ fn to_server_file(context: &typecheck::Context, query_list: &ast::QueryList) -> 
     result.push_str("    serde_path_to_error::deserialize(&mut deserializer)\n");
     result.push_str("}\n");
     result.push_str("\n");
+    result.push_str(&custom_types(context));
+    result.push_str("\n");
     result.push_str("#[derive(Clone, Debug, Default)]\n");
     result.push_str("pub enum OptionalField<T> {\n");
     result.push_str("    #[default]\n");
@@ -100,7 +102,7 @@ fn to_server_file(context: &typecheck::Context, query_list: &ast::QueryList) -> 
 fn query_module(context: &typecheck::Context, query: &ast::Query, module: &str) -> String {
     let mut result = String::new();
     result.push_str(&format!("pub mod {} {{\n", module));
-    result.push_str("    use super::{decode_json, DecodeError, OptionalField};\n");
+    result.push_str("    use super::*;\n");
     result.push_str("\n");
     result.push_str(&format!(
         "    pub const ID: &str = {:?};\n",
@@ -240,15 +242,88 @@ fn output_rust_type(type_: &str, metadata: typealias::FieldMetadata) -> String {
 fn rust_type(type_: Option<&str>) -> String {
     match type_.map(ast::ColumnType::from_str) {
         Some(ast::ColumnType::String) | Some(ast::ColumnType::DateTime) => "String".to_string(),
+        Some(ast::ColumnType::Date) => "String".to_string(),
         Some(ast::ColumnType::Int)
         | Some(ast::ColumnType::IdInt { .. })
         | Some(ast::ColumnType::ForeignKey { .. }) => "i64".to_string(),
         Some(ast::ColumnType::IdUuid { .. }) => "String".to_string(),
         Some(ast::ColumnType::Float) => "f64".to_string(),
         Some(ast::ColumnType::Bool) => "bool".to_string(),
-        Some(type_) if type_.is_json_like() => "serde_json::Value".to_string(),
+        Some(ast::ColumnType::Json) => "serde_json::Value".to_string(),
+        Some(ast::ColumnType::JsonTyped(inner)) => rust_type_for_column(&inner),
+        Some(ast::ColumnType::List(inner)) => {
+            format!("Vec<{}>", rust_type_for_column(&inner))
+        }
+        Some(ast::ColumnType::Dict(inner)) => {
+            format!(
+                "std::collections::HashMap<String, {}>",
+                rust_type_for_column(&inner)
+            )
+        }
+        Some(ast::ColumnType::Nullable(inner)) => {
+            format!("Option<{}>", rust_type_for_column(&inner))
+        }
+        Some(ast::ColumnType::Custom(name)) => to_pascal_name(&name),
         _ => "serde_json::Value".to_string(),
     }
+}
+
+fn rust_type_for_column(type_: &ast::ColumnType) -> String {
+    rust_type(Some(&type_.to_string()))
+}
+
+fn custom_types(context: &typecheck::Context) -> String {
+    let mut types = context
+        .types
+        .iter()
+        .filter_map(|(name, (definition, type_))| match (definition, type_) {
+            (crate::error::DefInfo::Def(_), typecheck::Type::OneOf { variants }) => {
+                Some((name, variants))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    types.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut result = String::new();
+    for (name, variants) in types {
+        let is_enum = variants.iter().all(|variant| variant.fields.is_none());
+        result.push_str("#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\n");
+        if !is_enum {
+            result.push_str("#[serde(tag = \"_type\")]\n");
+        }
+        result.push_str(&format!("pub enum {} {{\n", to_pascal_name(name)));
+        for variant in variants {
+            result.push_str(&format!("    #[serde(rename = {:?})]\n", variant.name));
+            let variant_name = to_pascal_name(&variant.name);
+            match &variant.fields {
+                None => result.push_str(&format!("    {},\n", variant_name)),
+                Some(fields) => {
+                    result.push_str(&format!("    {} {{\n", variant_name));
+                    for field in fields {
+                        let ast::Field::Column(column) = field else {
+                            continue;
+                        };
+                        let field_name = to_field_name(&column.name);
+                        if field_name != column.name {
+                            result.push_str(&format!(
+                                "        #[serde(rename = {:?})]\n",
+                                column.name
+                            ));
+                        }
+                        let mut field_type = rust_type_for_column(&column.type_);
+                        if column.nullable {
+                            field_type = format!("Option<{}>", field_type);
+                        }
+                        result.push_str(&format!("        {}: {},\n", field_name, field_type));
+                    }
+                    result.push_str("    },\n");
+                }
+            }
+        }
+        result.push_str("}\n\n");
+    }
+    result
 }
 
 fn unique_name(name: &str, used: &mut HashSet<String>) -> String {

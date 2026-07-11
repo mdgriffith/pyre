@@ -43,10 +43,14 @@ pub fn response_expression(
             )
         } else {
             column_name
-        };
+        }
+        .trim_end()
+        .to_string();
+        let separator = if value.starts_with('\n') { "," } else { ", " };
         values.push(format!(
-            "'{}', {}",
+            "'{}'{}{}",
             ast::get_aliased_name(query_field),
+            separator,
             value
         ));
     }
