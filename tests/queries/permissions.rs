@@ -255,6 +255,65 @@ async fn test_select_permissions_filter_by_author() -> Result<(), TestError> {
 }
 
 #[tokio::test]
+async fn test_select_permissions_with_session_membership() -> Result<(), TestError> {
+    let schema = r#"
+session {
+    activeClocktowerGameIds Json<List<String>>
+}
+
+record ClocktowerGame {
+    id String @id
+    name String
+    @allow(query) { id in Session.activeClocktowerGameIds }
+}
+"#;
+    let db = TestDatabase::new(schema).await?;
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    conn.execute(
+        "insert into clocktowerGames (id, name) values (?, ?), (?, ?), (?, ?)",
+        libsql::params_from_iter(vec![
+            libsql::Value::Text("game-1".to_string()),
+            libsql::Value::Text("First".to_string()),
+            libsql::Value::Text("game-2".to_string()),
+            libsql::Value::Text("Second".to_string()),
+            libsql::Value::Text("game-3".to_string()),
+            libsql::Value::Text("Third".to_string()),
+        ]),
+    )
+    .await
+    .map_err(TestError::Database)?;
+
+    let query = r#"
+query GetClocktowerGames {
+    clocktowerGame {
+        id
+        name
+    }
+}
+"#;
+    let mut session = HashMap::new();
+    session.insert(
+        "activeClocktowerGameIds".to_string(),
+        libsql::Value::Text(r#"["game-1","game-3"]"#.to_string()),
+    );
+
+    let rows = db
+        .execute_query_with_session(query, HashMap::new(), session, false)
+        .await?;
+    let results = db.parse_query_results(rows).await?;
+    let games = results
+        .get("clocktowerGame")
+        .expect("query should return clocktower games");
+    let ids = games
+        .iter()
+        .map(|game| game.get("id").and_then(|id| id.as_str()).unwrap_or(""))
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["game-1", "game-3"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_select_permissions_with_or_condition() -> Result<(), TestError> {
     let db = TestDatabase::new(&permissions_schema()).await?;
     seed_permissions_data(&db).await?;

@@ -378,3 +378,61 @@ record Post {
         campaign_post_table.contents
     );
 }
+
+#[test]
+fn generated_elm_datetime_decodes_and_encodes_unix_seconds() {
+    let schema_source = r#"
+record Clocktower {
+    @public
+
+    id        Id.Uuid @id
+    startedAt DateTime
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    elm::generate(Path::new("client/elm"), &database, &mut files);
+
+    let decode = files
+        .iter()
+        .find(|f| path_ends_with(&f.path, "Db/Decode.elm"))
+        .expect("generated Db.Decode.elm file");
+    assert!(
+        decode.contents.contains(
+            "dateTime =\n    Decode.map (\\seconds -> Time.millisToPosix (seconds * 1000)) Decode.int"
+        ),
+        "Db.Decode.dateTime should decode unix seconds. Generated:\n{}",
+        decode.contents
+    );
+
+    let encode = files
+        .iter()
+        .find(|f| path_ends_with(&f.path, "Db/Encode.elm"))
+        .expect("generated Db.Encode.elm file");
+    assert!(
+        encode
+            .contents
+            .contains("Encode.int (Time.posixToMillis time // 1000)"),
+        "Db.Encode.dateTime should serialize as unix seconds. Generated:\n{}",
+        encode.contents
+    );
+
+    let table = files
+        .iter()
+        .find(|f| path_ends_with(&f.path, "Db/Table/Clocktowers.elm"))
+        .expect("generated clocktowers table module");
+    assert!(
+        table
+            .contents
+            .contains("|> Db.Decode.andField \"startedAt\" Db.Decode.dateTime"),
+        "entity stream rows should use the DateTime decoder. Generated:\n{}",
+        table.contents
+    );
+}

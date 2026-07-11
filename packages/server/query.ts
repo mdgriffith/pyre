@@ -664,6 +664,11 @@ async function normalizeSeedValues(
             continue;
         }
 
+        if (column.type === "DateTime") {
+            normalized[columnName] = toDateTimeSqlValue(value, `${table.name}.${columnName}`);
+            continue;
+        }
+
         if (isConstructedValue(value) && hasNestedPhysicalColumns(physicalColumns, columnName)) {
             flattenConstructedValue(normalized, physicalColumns, columnName, value);
             continue;
@@ -881,6 +886,33 @@ function toSqlSeedValue(value: SeedValue): SeedPrimitive {
         return value;
     }
     return JSON.stringify(value);
+}
+
+function toDateTimeSqlValue(value: SeedValue, path: string): SeedPrimitive {
+    if (value == null) {
+        return value;
+    }
+
+    if (typeof value === "number") {
+        return value;
+    }
+
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (trimmed.length > 0) {
+            const asNumber = Number(trimmed);
+            if (Number.isFinite(asNumber)) {
+                return Math.floor(asNumber);
+            }
+        }
+
+        const parsed = new Date(value);
+        if (!Number.isNaN(parsed.getTime())) {
+            return Math.floor(parsed.getTime() / 1000);
+        }
+    }
+
+    throw new SeedInputError(`invalid DateTime seed field '${path}'`);
 }
 
 function toJsonSqlValue(value: SeedValue): SeedPrimitive {

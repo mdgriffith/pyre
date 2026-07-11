@@ -99,6 +99,41 @@ record Note {
 }
 
 #[test]
+fn sync_status_sql_expands_session_membership_lists() {
+    let schema_source = r#"
+session {
+    activeClocktowerGameIds Json<List<String>>
+}
+
+record ClocktowerGame {
+    id String @id
+    updatedAt Int
+    @allow(query) { id in Session.activeClocktowerGameIds }
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema should parse");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema should typecheck");
+    let mut session = std::collections::HashMap::new();
+    session.insert(
+        "activeClocktowerGameIds".to_string(),
+        pyre::sync::SessionValue::Text(r#"["game-1"]"#.to_string()),
+    );
+
+    let statement = pyre::sync::get_sync_status_statement(&SyncCursor::new(), &context, &session)
+        .expect("sync status statement should generate");
+
+    assert!(statement
+        .sql
+        .contains("\"clocktowerGames\".\"id\" in (select value from json_each(?))"));
+    assert_eq!(statement.params.len(), 1);
+}
+
+#[test]
 fn sync_sql_caps_page_size() {
     let schema_source = r#"
 record Note {

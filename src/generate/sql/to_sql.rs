@@ -107,7 +107,7 @@ pub fn render_value(value: &ast::QueryValue) -> String {
     match value {
         ast::QueryValue::Fn(func) => {
             if func.name == "now" && func.args.is_empty() {
-                "CURRENT_TIMESTAMP".to_string()
+                "unixepoch()".to_string()
             } else {
                 format!(
                     "{}({})",
@@ -290,7 +290,7 @@ pub fn render_where_arg_with_table_ref(
 
             let operator = operator(op);
 
-            let value = if *is_session_var {
+            let rendered_value = if *is_session_var {
                 render_value(value)
             } else {
                 match table
@@ -302,6 +302,14 @@ pub fn render_where_arg_with_table_ref(
                     Some(ast::Field::Column(column)) => render_column_value(column, value),
                     _ => render_value(value),
                 }
+            };
+
+            let value = if matches!(op, ast::Operator::In | ast::Operator::NotIn)
+                && matches!(value, ast::QueryValue::Variable((_, var)) if var.session_field.is_some())
+            {
+                format!("(select value from json_each({}))", rendered_value)
+            } else {
+                rendered_value
             };
             format!("{} {} {}", qualified_column_name, operator, value)
         }

@@ -2,6 +2,7 @@ import { expect, mock, test } from "bun:test";
 import type { SchemaMetadata } from "@pyre/core";
 import { z } from "zod";
 import { run, seed } from "./query";
+import { buildArgs } from "./runtime/sql";
 
 test("sync wraps mutation responses with server revision metadata", async () => {
   const db = {
@@ -94,6 +95,22 @@ test("sync mode omits normal mutation result", async () => {
     sync: { type: "delta" },
   });
   expect(db.batch).toHaveBeenCalledWith([{ sql: "select _affectedRows", args: {} }]);
+});
+
+test("SQL args serialize Date values as unix seconds", () => {
+  const date = new Date("2026-07-11T16:36:52.000Z");
+
+  expect(buildArgs(
+    { startedAt: date, payload: date },
+    { visibleAfter: date },
+    ["visibleAfter"],
+    [],
+    ["payload"],
+  )).toEqual({
+    startedAt: 1783787812,
+    payload: JSON.stringify(date),
+    session_visibleAfter: 1783787812,
+  });
 });
 
 test("sync does not fan out when no affected rows are returned", async () => {
@@ -425,6 +442,35 @@ test("seed validates columns with generated validators when provided", async () 
   expect(db.execute).toHaveBeenCalledWith("rollback");
 });
 
+test("seed serializes DateTime columns as unix seconds", async () => {
+  const executed: any[] = [];
+  const db = {
+    execute: mock(async (statement: any) => {
+      executed.push(statement);
+      if (statement === "begin" || statement === "commit") {
+        return { rows: [] };
+      }
+      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
+        return { rows: [{ name: "id" }, { name: "startedAt" }] };
+      }
+      if (statement.sql.includes('"events"')) {
+        return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
+      }
+      throw new Error("unexpected statement");
+    }),
+  };
+
+  const result = await seed(db as any, eventSchema(), {
+    events: [{ startedAt: "2026-07-11T16:36:52.000Z" }],
+  });
+
+  expect(result.kind).toBe("success");
+  expect(executed).toContainEqual({
+    sql: 'insert into "events" ("startedAt") values ($seed_0) returning *',
+    args: { seed_0: 1783787812 },
+  });
+});
+
 function userPostSchema(): SchemaMetadata {
   return {
     tables: {
@@ -449,6 +495,23 @@ function userPostSchema(): SchemaMetadata {
           { name: "id", type: "Int", nullable: false, primary: true, unique: true, indexed: true },
           { name: "authorId", type: "Int", nullable: false, primary: false, unique: false, indexed: false },
           { name: "title", type: "String", nullable: false, primary: false, unique: false, indexed: false },
+        ],
+        links: {},
+        indices: [],
+      },
+    },
+    queryFieldToTable: {},
+  };
+}
+
+function eventSchema(): SchemaMetadata {
+  return {
+    tables: {
+      events: {
+        name: "events",
+        columns: [
+          { name: "id", type: "Int", nullable: false, primary: true, unique: true, indexed: true },
+          { name: "startedAt", type: "DateTime", nullable: false, primary: false, unique: false, indexed: false },
         ],
         links: {},
         indices: [],

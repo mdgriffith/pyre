@@ -443,6 +443,32 @@ query GetArticles {
 }
 
 #[test]
+fn snapshot_perm_select_session_membership() {
+    check_snapshot(
+        "perm_select_session_membership",
+        r#"
+session {
+    activeClocktowerGameIds Json<List<String>>
+}
+
+record ClocktowerGame {
+    id String @id
+    name String
+    @allow(query) { id in Session.activeClocktowerGameIds }
+}
+"#,
+        r#"
+query GetClocktowerGames {
+    clocktowerGame {
+        id
+        name
+    }
+}
+"#,
+    );
+}
+
+#[test]
 fn snapshot_perm_insert() {
     check_snapshot(
         "perm_insert",

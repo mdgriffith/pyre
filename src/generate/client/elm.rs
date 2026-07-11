@@ -1246,7 +1246,7 @@ bool =
 
 dateTime : Decode.Decoder Time.Posix
 dateTime =
-    Decode.map Time.millisToPosix Decode.int
+    Decode.map (\seconds -> Time.millisToPosix (seconds * 1000)) Decode.int
 
 
 json : Decode.Decoder Json
@@ -1456,7 +1456,7 @@ pub fn to_schema_encoders(database: &ast::Database) -> String {
 
     result.push_str("dateTime : Time.Posix -> Encode.Value\n");
     result.push_str("dateTime time =\n");
-    result.push_str("    Encode.int (Time.posixToMillis time)\n\n");
+    result.push_str("    Encode.int (Time.posixToMillis time // 1000)\n\n");
 
     result.push_str("json : Db.Json -> Encode.Value\n");
     result.push_str("json value =\n");

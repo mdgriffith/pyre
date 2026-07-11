@@ -130,7 +130,7 @@ fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result
     } else {
         match schema.type_.as_str() {
             "String" => value.is_string(),
-            "DateTime" => value.is_string() || value.is_number(),
+            "DateTime" => datetime_to_epoch_seconds(value).is_some(),
             "Int" | "Float" => value.is_number(),
             "Bool" => {
                 value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false)
@@ -250,7 +250,28 @@ fn normalize_sql_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
         );
     }
 
+    if schema.type_ == "DateTime" {
+        if let Some(seconds) = datetime_to_epoch_seconds(value) {
+            return JsonValue::from(seconds);
+        }
+    }
+
     value.clone()
+}
+
+fn datetime_to_epoch_seconds(value: &JsonValue) -> Option<i64> {
+    if let Some(seconds) = value.as_i64() {
+        return Some(seconds);
+    }
+
+    let raw = value.as_str()?.trim();
+    if let Ok(seconds) = raw.parse::<i64>() {
+        return Some(seconds);
+    }
+
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|datetime| datetime.timestamp())
 }
 
 #[derive(Debug)]

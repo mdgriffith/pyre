@@ -15,11 +15,19 @@ export function toSessionArgs(sessionArgs: string[], session: Record<string, unk
 
   for (const key of sessionArgs) {
     if (key in session) {
-      result[`session_${key}`] = session[key];
+      result[`session_${key}`] = normalizeSqlArg(session[key]);
     }
   }
 
   return result;
+}
+
+function normalizeSqlArg(value: unknown): unknown {
+  if (value instanceof Date) {
+    return Math.floor(value.getTime() / 1000);
+  }
+
+  return value;
 }
 
 export function buildArgs(
@@ -39,7 +47,7 @@ export function buildArgs(
   if (input) {
     for (const [key, value] of Object.entries(input)) {
       if (value !== undefined) {
-        args[key] = jsonInputArgSet.has(key) ? JSON.stringify(value) : value;
+        args[key] = jsonInputArgSet.has(key) ? JSON.stringify(value) : normalizeSqlArg(value);
         if (optionalInputArgs.includes(key)) {
           args[`${key}__is_set`] = true;
         }

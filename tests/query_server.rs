@@ -365,11 +365,11 @@ fn main() {
     };
     assert_eq!(event_seconds.into_json(), serde_json::json!({ "startsAt": 123 }));
     let event_text = server::create_event::Input {
-        starts_at: server::DateTime::Text("2026-01-02 03:04:05".to_string()),
+        starts_at: server::DateTime::Text("2026-01-02T03:04:05Z".to_string()),
     };
     assert_eq!(
         event_text.into_json(),
-        serde_json::json!({ "startsAt": "2026-01-02 03:04:05" })
+        serde_json::json!({ "startsAt": "2026-01-02T03:04:05Z" })
     );
     let uuid_game = server::get_uuid_game::Input {
         id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -513,7 +513,7 @@ fn main() {
         .expect("generated text event output decodes");
     assert!(matches!(
         &event_text.event[0].starts_at,
-        server::DateTime::Text(value) if value == "2026-01-02 03:04:05"
+        server::DateTime::UnixSeconds(1767323045)
     ));
     let deleted_game = server::delete_clocktower_game::Output::try_from(response("game_deleted"))
         .expect("generated unit enum delete output decodes");
@@ -978,7 +978,7 @@ insert CreateNullableGame($status: ClocktowerGameStatus?) {
         &conn,
         &manifest,
         &query_by_input_type(&manifest, "startsAt", "DateTime").id,
-        json!({ "startsAt": "2026-01-02 03:04:05" }),
+        json!({ "startsAt": "2026-01-02T03:04:05Z" }),
         &session,
     )
     .await?;

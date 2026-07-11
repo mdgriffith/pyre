@@ -120,7 +120,7 @@ int =
 
 dateTime : Decoder Time.Posix
 dateTime =
-    Decoder (\_ _ -> Json.map Time.millisToPosix Json.int)
+    Decoder (\_ _ -> Json.map (\seconds -> Time.millisToPosix (seconds * 1000)) Json.int)
 
 
 string : Decoder String

@@ -491,6 +491,13 @@ fn render_permission_where(
             };
 
             let value_str = render_permission_value(value, session, params);
+            let value_str = if matches!(op, ast::Operator::In | ast::Operator::NotIn)
+                && matches!(value, ast::QueryValue::Variable((_, var)) if var.session_field.is_some())
+            {
+                format!("(select value from json_each({}))", value_str)
+            } else {
+                value_str
+            };
             let is_null = match value {
                 ast::QueryValue::Variable((_, var)) => var
                     .session_field
