@@ -195,13 +195,33 @@ pyre/generated/
 High-level purpose:
 
 - `typescript/core/`: shared schema/query metadata
-- `typescript/run.ts`: direct query helpers and generated query functions
-- `typescript/server.ts`: server-oriented helpers
+- `typescript/run.ts`: typed query functions for direct execution
+- `typescript/server.ts`: query metadata used by `@pyre/server/query` and `@pyre/server/sync`
 - `client/elm/`: generated Elm surfaces for sync-enabled clients
 
 ## Step 5: Choose An Integration Style
 
 After generation, you have a few reasonable ways to use Pyre.
+
+### Install TypeScript Dependencies
+
+Pyre's TypeScript packages are distributed as versioned GitHub Release artifacts rather than through npm. Install all Pyre packages from the same release:
+
+```json
+{
+  "dependencies": {
+    "@libsql/client": "^0.14.0",
+    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-core-0.1.5.tgz",
+    "@pyre/server": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-server-0.1.5.tgz",
+    "zod": "^4.1.12"
+  },
+  "overrides": {
+    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-core-0.1.5.tgz"
+  }
+}
+```
+
+Then run `bun install`. Generated artifacts currently consume the packages as TypeScript source, so use Bun or a build tool that transpiles TypeScript dependencies. Commit the resulting lockfile and keep all `@pyre/*` packages on the same release version.
 
 ### Option 1: Use The Built-In Server
 
@@ -220,19 +240,22 @@ CLI shortcut: `pyre docs serve`
 ### Option 2: Use Generated TypeScript In Your Own Server
 
 ```typescript
-import * as Query from "./pyre/generated/typescript/server";
+import { createClient } from "@libsql/client";
+import { GetUser } from "./pyre/generated/typescript/run";
 
-const env = {
+const db = createClient({
     url: "file:./db/playground.db",
     authToken: undefined,
-};
+});
 
-const session = {};
+const result = await GetUser(db, { id: 1 });
 
-const result = await Query.run(env, "GetUser", session, { id: 1 });
+console.log(result.user);
 ```
 
-This is the most flexible path when your app already has its own HTTP server and auth model.
+Generated functions accept an existing libSQL client and return the decoded, typed query result. For session-aware queries, pass the session before the input: `GetUser(db, session, { id: 1 })`.
+
+This is the most flexible path when your app already has its own HTTP server and auth model. If the server dispatches generated client requests dynamically, use the `queries` map from `typescript/server.ts` with `@pyre/server/query` or `@pyre/server/sync` instead.
 
 ### Option 3: Use Live Sync With `@pyre/client`
 

@@ -6,6 +6,35 @@ on:
 
 name: Prepare release
 jobs:
+  typescript-packages:
+    name: Release TypeScript packages
+    if: startsWith(github.ref, 'refs/tags/version-')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Elm
+        run: npm install --global elm@0.19.1-6
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Pack and smoke-test TypeScript packages
+        run: bun run release:smoke
+
+      - name: Publish TypeScript package artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: .artifacts/tarballs/*.tgz
+
   release:
     name: Release - ${{ matrix.platform.release_for }}
     strategy:

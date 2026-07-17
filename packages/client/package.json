@@ -33,7 +33,7 @@
   ],
   "author": "",
   "dependencies": {
-    "@pyre/core": "file:../core"
+    "@pyre/core": "0.1.5"
   },
   "devDependencies": {
     "typescript": "^5.0.0"

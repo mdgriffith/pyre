@@ -96,7 +96,7 @@ pyre generate --out pyre/generated
 
 ```typescript
 import { createClient } from '@libsql/client';
-import { GetUser, CreateUser, Session } from './pyre/generated/typescript/run';
+import { GetUser, CreateUser, type Session } from './pyre/generated/typescript/run';
 
 // Create database connection
 const db = createClient({
@@ -110,13 +110,13 @@ const session: Session = {
 };
 
 // Create a user
-await CreateUser(db, { 
-  name: 'Alice', 
-  email: 'alice@example.com' 
-}, session);
+await CreateUser(db, session, {
+  name: 'Alice',
+  email: 'alice@example.com'
+});
 
 // Query users
-const result = await GetUser(db, { id: 1 }, session);
+const result = await GetUser(db, session, { id: 1 });
 console.log(result.user[0].name); // 'Alice'
 ```
 
@@ -137,32 +137,24 @@ For each query, Pyre generates:
 1. **Input type**: Typed parameters for the query
 2. **Return type**: Typed result structure
 3. **Session type**: Typed session for permission checking
-4. **Async function**: Complete function that executes SQL and decodes results
+4. **Async query runner**: Typed function that executes generated SQL and decodes results
 
-Example generated function:
+Simplified generated output:
 ```typescript
-export interface GetUserInput {
-  id: number;
-}
+import { toRunner } from '@pyre/server/runtime/runner';
+import type {
+  Input as GetUserInputType,
+  Result as GetUserResultType
+} from './core/queries/metadata/getUser';
+import { meta as GetUserMeta } from './core/queries/metadata/getUser';
+import { sql as GetUserSql } from './core/queries/sql/getUser';
 
-export interface GetUserResult {
-  user: User[];
-}
-
-export async function GetUser(
-  db: Client,
-  input: GetUserInput,
-  session: Session
-): Promise<GetUserResult> {
-  // SQL is generated at compile time
-  const results = await db.batch([{
-    sql: `...generated SQL...`,
-    args: { id: input.id, session_userId: session.userId }
-  }]);
-  
-  // Results are decoded into typed structure
-  return decodeGetUserResult(results);
-}
+export type GetUserInput = GetUserInputType;
+export type GetUserResult = GetUserResultType;
+export const GetUser = toRunner<GetUserInput, GetUserResult>(
+  GetUserMeta,
+  GetUserSql
+);
 ```
 
 ## Advantages

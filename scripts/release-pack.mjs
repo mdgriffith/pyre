@@ -8,6 +8,15 @@ const packageDirs = ["core", "server", "client"];
 rmSync(artifactsDir, { recursive: true, force: true });
 mkdirSync(artifactsDir, { recursive: true });
 
+const clientBuild = Bun.spawnSync(
+  ["bun", "run", "--cwd", "packages/client", "build"],
+  { cwd: rootDir, stdout: "inherit", stderr: "inherit" }
+);
+
+if (clientBuild.exitCode !== 0) {
+  throw new Error("Failed to build @pyre/client before packing");
+}
+
 for (const pkg of packageDirs) {
   const cwd = join(rootDir, "packages", pkg);
   const packed = Bun.spawnSync(

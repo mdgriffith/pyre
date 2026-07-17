@@ -23,6 +23,19 @@ The shortest sync path looks like this:
 
 The rest of this guide walks through those steps.
 
+For browser sync, add `@pyre/client` from the same GitHub Release used for `@pyre/core` and `@pyre/server` in [Getting Started](./getting-started.md):
+
+```json
+{
+  "dependencies": {
+    "@pyre/client": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-client-0.1.5.tgz"
+  },
+  "overrides": {
+    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-core-0.1.5.tgz"
+  }
+}
+```
+
 ## 1. Define Session-Aware Schema And Queries
 
 Create `pyre/schema.pyre` and a query file such as `pyre/query.pyre`:
@@ -90,7 +103,7 @@ The important pieces for sync are:
 
 - `typescript/core/`: schema metadata and query metadata
 - `client/elm/`: generated Elm sync/query surface
-- `typescript/server.ts`: server-oriented generated helpers
+- `typescript/server.ts`: query metadata consumed by the server sync runtime
 
 ## 4. Run A Pyre-Backed Server
 
@@ -119,25 +132,45 @@ See [pyre-serve.md](./pyre-serve.md) for operational details.
 Use the generated server target to run queries against your database inside your own app server:
 
 ```typescript
-import * as Query from './pyre/generated/typescript/server';
+import { createClient } from '@libsql/client';
+import * as Sync from '@pyre/server/sync';
+import { queries } from './pyre/generated/typescript/server';
 
-const env = {
+const db = createClient({
   url: 'file:./db/app.db',
-  authToken: undefined,
-};
+});
 
-const session = { userId: 1 };
+await Sync.init();
+await Sync.loadSchemaFromDatabase(db);
 
-const result = await Query.run(env, 'GetUser', session, { id: 1 });
+// These values normally come from the authenticated request and route.
+const queryId = request.params.queryId;
+const args = await request.json();
+const session = { userId: authenticatedUser.id };
+const databaseId = 'main';
 
-if (result.kind === 'success') {
-  console.log(result.data);
-} else {
-  console.error(result.message);
+const result = await Sync.run(
+  db,
+  queries,
+  queryId,
+  args,
+  session,
+  connectionsForDatabase(databaseId),
+  databaseId,
+);
+
+if (result.kind === 'error') {
+  throw new Error(result.error?.message ?? 'Query execution failed');
 }
+
+await result.sync((sessionId, message) => {
+  sendPyreSyncMessage(databaseId, sessionId, message);
+});
+
+return result.response;
 ```
 
-If you are building your own sync server, it must authenticate requests normally, construct the Pyre session object, and keep live-sync connections partitioned by database.
+`queryId` is the generated interface ID sent by the client, not a source-level name such as `GetUser`. If you are building your own sync server, it must authenticate requests normally, construct the Pyre session object, and keep live-sync connections partitioned by database.
 
 ## 5. Create A `PyreClient`
 

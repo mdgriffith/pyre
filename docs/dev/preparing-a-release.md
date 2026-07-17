@@ -83,8 +83,14 @@ tags:
   - version-*
 ```
 
-`version-*` tags build platform binaries and create a draft GitHub release with attached archives. `test-release` uploads build artifacts but does not create the versioned GitHub release.
+`version-*` tags build platform binaries and the `@pyre/core`, `@pyre/server`, and `@pyre/client` package tarballs. The workflow creates a draft GitHub release with all of those artifacts attached. `test-release` uploads binary build artifacts but does not create the versioned GitHub release.
 
 ## After Tagging
 
-Check the `Prepare release` GitHub Actions run. The workflow creates a draft GitHub release, so review the generated release, attached binaries, and release notes before publishing it.
+Check the `Prepare release` GitHub Actions run. The workflow creates a draft GitHub release, so review the generated release, release notes, platform binaries, and these TypeScript package assets before publishing it:
+
+```text
+pyre-core-X.Y.Z.tgz
+pyre-server-X.Y.Z.tgz
+pyre-client-X.Y.Z.tgz
+```

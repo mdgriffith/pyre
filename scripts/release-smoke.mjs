@@ -47,20 +47,23 @@ writeFileSync(
         "@pyre/server": `file:${serverTarball}`,
         "@pyre/client": `file:${clientTarball}`,
       },
+      overrides: {
+        "@pyre/core": `file:${coreTarball}`,
+      },
     },
     null,
     2
   )
 );
 
-const install = Bun.spawnSync(["npm", "install"], {
+const install = Bun.spawnSync(["bun", "install"], {
   cwd: smokeDir,
   stdout: "inherit",
   stderr: "inherit",
 });
 
 if (install.exitCode !== 0) {
-  throw new Error("Failed to install packed tarballs in smoke project");
+  throw new Error("Failed to install packed tarballs with Bun in smoke project");
 }
 
 writeFileSync(
