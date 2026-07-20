@@ -512,6 +512,58 @@ record Note {
 }
 
 #[tokio::test]
+async fn calculate_deltas_supports_json_session_membership_lists(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+session {
+    gameIds Json<List<String>>
+}
+
+record Game {
+    id String @id
+    updatedAt Int
+    @allow(query) { id in Session.gameIds }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let affected_rows = vec![AffectedRowTableGroup {
+        table_name: "games".to_string(),
+        headers: vec!["id".to_string(), "updatedAt".to_string()],
+        rows: vec![vec![json!("game-1"), json!(10)]],
+    }];
+    let connected_sessions = ConnectedSessions::from([
+        (
+            "allowed".to_string(),
+            SyncSession::from([(
+                "gameIds".to_string(),
+                pyre::sync::SessionValue::Text(r#"["game-1"]"#.to_string()),
+            )]),
+        ),
+        (
+            "denied".to_string(),
+            SyncSession::from([(
+                "gameIds".to_string(),
+                pyre::sync::SessionValue::Text(r#"["game-2"]"#.to_string()),
+            )]),
+        ),
+    ]);
+
+    let mut result = query_result(affected_rows);
+    let messages = SyncServer::new(&db.context)
+        .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
+        .await?;
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].session_id, "allowed");
+    assert_eq!(messages[0].message.data[0].rows[0][0], json!("game-1"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn calculate_deltas_reshapes_custom_type_columns() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"

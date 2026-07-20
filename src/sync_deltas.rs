@@ -98,22 +98,8 @@ fn evaluate_operator(op: &ast::Operator, lhs: &JsonValue, rhs: &JsonValue) -> bo
                 Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
             )
         }
-        ast::Operator::In => {
-            // rhs should be an array, check if lhs is in it
-            if let JsonValue::Array(arr) = rhs {
-                arr.iter().any(|item| json_values_equal(lhs, item))
-            } else {
-                false
-            }
-        }
-        ast::Operator::NotIn => {
-            // rhs should be an array, check if lhs is NOT in it
-            if let JsonValue::Array(arr) = rhs {
-                !arr.iter().any(|item| json_values_equal(lhs, item))
-            } else {
-                true
-            }
-        }
+        ast::Operator::In => json_array_contains(rhs, lhs),
+        ast::Operator::NotIn => !json_array_contains(rhs, lhs),
         ast::Operator::Like => {
             // Simple LIKE pattern matching (SQL LIKE semantics)
             if let (Some(lhs_str), Some(rhs_str)) = (lhs.as_str(), rhs.as_str()) {
@@ -130,6 +116,16 @@ fn evaluate_operator(op: &ast::Operator, lhs: &JsonValue, rhs: &JsonValue) -> bo
                 true
             }
         }
+    }
+}
+
+fn json_array_contains(value: &JsonValue, needle: &JsonValue) -> bool {
+    match value {
+        JsonValue::Array(values) => values.iter().any(|value| json_values_equal(needle, value)),
+        JsonValue::String(serialized) => serde_json::from_str::<Vec<JsonValue>>(serialized)
+            .map(|values| values.iter().any(|value| json_values_equal(needle, value)))
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
