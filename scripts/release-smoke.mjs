@@ -72,10 +72,13 @@ writeFileSync(
     "import * as core from '@pyre/core';",
     "import * as server from '@pyre/server';",
     "import * as client from '@pyre/client';",
+    "import { init } from '@pyre/server/wasm';",
     "",
     "if (!core || !server || !client) {",
     "  throw new Error('Failed to import one or more @pyre packages');",
     "}",
+    "",
+    "await init();",
     "",
     "console.log('Smoke imports OK:', Object.keys({ core, server, client }).join(', '));",
   ].join("\n")

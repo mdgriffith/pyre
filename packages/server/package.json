@@ -59,6 +59,7 @@
     "schema.ts",
     "sync-api.ts",
     "sync.ts",
+    "wasm-json.ts",
     "wasm.ts",
     "wasm",
     "README.md",
