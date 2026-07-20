@@ -120,7 +120,8 @@ pub fn select_to_string(
         table,
         query_table_field,
     );
-    let parent_table_alias = &get_temp_table_name(&query_table_field);
+    let query_path = ast::get_aliased_name(query_table_field);
+    let parent_table_alias = &get_temp_table_name_for_path(&query_path);
 
     let mut rendered_initial = false;
     let mut has_links = false;
@@ -151,7 +152,12 @@ pub fn select_to_string(
                                     rendered_initial = true;
                                 }
 
-                                let temp_table_alias = &get_temp_table_name(&query_field);
+                                let linked_path = format!(
+                                    "{}__{}",
+                                    query_path,
+                                    ast::get_aliased_name(query_field)
+                                );
+                                let temp_table_alias = &get_temp_table_name_for_path(&linked_path);
 
                                 result.push_str(",");
                                 result.push_str(" ");
@@ -166,6 +172,7 @@ pub fn select_to_string(
                                     parent_table_alias,
                                     linked_table,
                                     query_field,
+                                    &linked_path,
                                     link,
                                     &mut result,
                                 );
@@ -197,18 +204,33 @@ pub fn select_to_string(
     }
 
     // The final selection
-    final_select_formatted_as_json(0, context, table, query_table_field, &mut result);
+    final_select_formatted_as_json(
+        0,
+        context,
+        table,
+        query_table_field,
+        &query_path,
+        &mut result,
+    );
 
     statements.push(to_sql::include(result));
     statements
 }
 
 pub fn get_temp_table_name(query_field: &ast::QueryField) -> String {
-    format!("temp_selected_{}", &ast::get_aliased_name(&query_field))
+    get_temp_table_name_for_path(&ast::get_aliased_name(query_field))
 }
 
 pub fn get_json_temp_table_name(query_field: &ast::QueryField) -> String {
-    format!("json__{}", &ast::get_aliased_name(&query_field))
+    get_json_temp_table_name_for_path(&ast::get_aliased_name(query_field))
+}
+
+fn get_temp_table_name_for_path(path: &str) -> String {
+    format!("temp_selected_{}", path)
+}
+
+fn get_json_temp_table_name_for_path(path: &str) -> String {
+    format!("json__{}", path)
 }
 
 pub fn initial_select(
@@ -257,6 +279,7 @@ fn select_linked(
     parent_table_name: &String,
     table: &typecheck::Table,
     query_field: &ast::QueryField,
+    query_path: &str,
     link: &ast::LinkDetails,
 
     //
@@ -404,7 +427,7 @@ fn select_linked(
     // result.push_str(&format!("{}group by {}", indent_str, full_foreign_id));
 
     // Recursively define children
-    let parent_temp_table = &get_temp_table_name(&query_field);
+    let parent_temp_table = &get_temp_table_name_for_path(query_path);
 
     for query_field in all_query_fields {
         if let Some(table_field) = table
@@ -413,7 +436,8 @@ fn select_linked(
             .iter()
             .find(|&f| ast::has_field_or_linkname(&f, &query_field.name))
         {
-            let temp_table_name = &get_temp_table_name(&query_field);
+            let linked_path = format!("{}__{}", query_path, ast::get_aliased_name(query_field));
+            let temp_table_name = &get_temp_table_name_for_path(&linked_path);
 
             match table_field {
                 ast::Field::FieldDirective(ast::FieldDirective::Link(link)) => {
@@ -428,6 +452,7 @@ fn select_linked(
                             parent_temp_table,
                             linked_table,
                             query_field,
+                            &linked_path,
                             &link,
                             sql,
                         );
@@ -438,11 +463,11 @@ fn select_linked(
         }
     }
 
-    let json_table_name = &get_json_temp_table_name(&query_field);
+    let json_table_name = &get_json_temp_table_name_for_path(query_path);
 
     sql.push_str(&format!("), {} as (", json_table_name));
     // Format as JSON
-    select_formatted_as_json(indent, context, table, query_field, link, sql);
+    select_formatted_as_json(indent, context, table, query_field, query_path, link, sql);
 }
 
 fn selects_for_link(query: &ast::QueryField, table: &typecheck::Table) -> bool {
@@ -690,6 +715,7 @@ fn select_formatted_as_json(
 
     table: &typecheck::Table,
     query_table_field: &ast::QueryField,
+    query_path: &str,
     link: &ast::LinkDetails,
 
     //
@@ -699,7 +725,7 @@ fn select_formatted_as_json(
     let aggregate_to_array = !link_returns_singular_result(context, &table.record, link);
 
     let aliased_name = ast::get_aliased_name(query_table_field);
-    let base_table_name = format!("temp_selected_{}", &aliased_name);
+    let base_table_name = get_temp_table_name_for_path(query_path);
 
     // This is the link.foreign_id, which is the id on this table
     let mut full_foreign_id = String::new();
@@ -847,8 +873,13 @@ fn select_formatted_as_json(
                         ast::Field::FieldDirective(ast::FieldDirective::Link(link)) => {
                             if let Some(linked_table) = typecheck::get_linked_table(context, &link)
                             {
+                                let linked_path = format!(
+                                    "{}__{}",
+                                    query_path,
+                                    ast::get_aliased_name(query_field)
+                                );
                                 let query_temp_table =
-                                    to_temp_table_alias(query_field, linked_table);
+                                    to_temp_table_alias(&linked_path, query_field, linked_table);
                                 let local_temp_alias = format!("temp__{}", link.link_name);
 
                                 sql.push_str(&format!(
@@ -1136,14 +1167,14 @@ fn final_select_formatted_as_json(
     context: &typecheck::Context,
     table: &typecheck::Table,
     query_table_field: &ast::QueryField,
+    query_path: &str,
 
     //
     sql: &mut String,
 ) {
     let indent_str = " ".repeat(indent);
 
-    let aliased_name = ast::get_aliased_name(query_table_field);
-    let base_table_name = format!("temp_selected_{}", &aliased_name);
+    let base_table_name = get_temp_table_name_for_path(query_path);
     let query_field_name = &query_table_field.name;
 
     // initial selection - wrap in JSON_GROUP_ARRAY (no outer json_object wrapper)
@@ -1291,8 +1322,13 @@ fn final_select_formatted_as_json(
 
                             if let Some(linked_table) = typecheck::get_linked_table(context, &link)
                             {
+                                let linked_path = format!(
+                                    "{}__{}",
+                                    query_path,
+                                    ast::get_aliased_name(query_field)
+                                );
                                 let query_temp_table =
-                                    to_temp_table_alias(query_field, linked_table);
+                                    to_temp_table_alias(&linked_path, query_field, linked_table);
 
                                 let local_temp_alias = format!("temp__{}", link.link_name);
 
@@ -1343,13 +1379,15 @@ fn link_returns_singular_result(
     !is_one_to_many && linked_to_unique
 }
 
-fn to_temp_table_alias(query_field: &ast::QueryField, table: &typecheck::Table) -> String {
-    let query_alias = ast::get_aliased_name(query_field);
-
+fn to_temp_table_alias(
+    query_path: &str,
+    query_field: &ast::QueryField,
+    table: &typecheck::Table,
+) -> String {
     if selects_for_link(query_field, table) {
-        return format!("json__{}", query_alias);
+        get_json_temp_table_name_for_path(query_path)
     } else {
-        return format!("temp_selected_{}", query_alias);
+        get_temp_table_name_for_path(query_path)
     }
 }
 

@@ -4,7 +4,7 @@ with temp_selected_user as (
     select id
     from users
 
-), temp_selected_writings as (
+), temp_selected_user__writings as (
     select
       t.authorId,
       jsonb_group_array(jsonb_object(
@@ -15,7 +15,7 @@ with temp_selected_user as (
     where t.authorId in (select id from temp_selected_user)
     group by t.authorId
     order by t.authorId
-), temp_selected_accounts as (
+), temp_selected_user__accounts as (
     select
       t.userId,
       jsonb_group_array(jsonb_object(
@@ -36,6 +36,6 @@ select
     )
   ), json('[]')) as user
 from temp_selected_user
-  left join temp_selected_writings temp__posts on temp__posts.authorId = temp_selected_user.id
-  left join temp_selected_accounts temp__accounts on temp__accounts.userId = temp_selected_user.id
+  left join temp_selected_user__writings temp__posts on temp__posts.authorId = temp_selected_user.id
+  left join temp_selected_user__accounts temp__accounts on temp__accounts.userId = temp_selected_user.id
 

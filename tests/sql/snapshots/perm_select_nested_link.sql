@@ -6,7 +6,7 @@ with temp_selected_post as (
 where
  "posts"."authorId" = $session_userId
 
-), temp_selected_comments as (
+), temp_selected_post__comments as (
     select
       t.postId,
       jsonb_group_array(jsonb_object(
@@ -27,5 +27,5 @@ select
     )
   ), json('[]')) as post
 from temp_selected_post
-  left join temp_selected_comments temp__comments on temp__comments.postId = temp_selected_post.id
+  left join temp_selected_post__comments temp__comments on temp__comments.postId = temp_selected_post.id
 

@@ -7,7 +7,7 @@ where
  "users"."id" > 0
 order by "users"."name" Asc
 
-), temp_selected_posts as (
+), temp_selected_user__posts as (
     select
       t.authorId,
       jsonb_group_array(jsonb_object(
@@ -28,5 +28,5 @@ select
     )
   ), json('[]')) as user
 from temp_selected_user
-  left join temp_selected_posts temp__posts on temp__posts.authorId = temp_selected_user.id
+  left join temp_selected_user__posts temp__posts on temp__posts.authorId = temp_selected_user.id
 

@@ -158,3 +158,101 @@ record GameEntity {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_duplicate_nested_link_names_use_distinct_ctes() -> Result<(), TestError> {
+    let schema = r#"
+record Outfit {
+    id Int @id
+    garments @link(id, OutfitGarment.outfitId)
+    previews @link(id, Preview.outfitId)
+    @public
+}
+
+record OutfitGarment {
+    id Int @id
+    outfitId Int
+    garmentId Int
+    garment @link(garmentId, Garment.id)
+    @public
+}
+
+record Garment {
+    id Int @id
+    images @link(id, GarmentImage.garmentId)
+    @public
+}
+
+record GarmentImage {
+    id Int @id
+    garmentId Int
+    imageId Int
+    image @link(imageId, Image.id)
+    @public
+}
+
+record Preview {
+    id Int @id
+    outfitId Int
+    imageId Int
+    image @link(imageId, Image.id)
+    @public
+}
+
+record Image {
+    id Int @id
+    path String
+    @public
+}
+"#;
+
+    let db = TestDatabase::new(schema).await?;
+    db.execute_raw("insert into outfits (id) values (1)")
+        .await?;
+    db.execute_raw("insert into garments (id) values (10)")
+        .await?;
+    db.execute_raw("insert into images (id, path) values (20, 'garment.jpg'), (21, 'preview.jpg')")
+        .await?;
+    db.execute_raw("insert into outfitGarments (id, outfitId, garmentId) values (30, 1, 10)")
+        .await?;
+    db.execute_raw("insert into garmentImages (id, garmentId, imageId) values (40, 10, 20)")
+        .await?;
+    db.execute_raw("insert into previews (id, outfitId, imageId) values (50, 1, 21)")
+        .await?;
+
+    let query = r#"
+query ReproduceDuplicateImageCte {
+    outfit {
+        id
+        garments {
+            garment {
+                id
+                images {
+                    image {
+                        path
+                    }
+                }
+            }
+        }
+        previews {
+            id
+            image {
+                path
+            }
+        }
+    }
+}
+"#;
+
+    let rows = db.execute_query(query).await?;
+    let results = db.parse_query_results(rows).await?;
+    let outfit = &results["outfit"][0];
+
+    assert_eq!(
+        outfit["garments"][0]["garment"]["images"][0]["image"]["path"],
+        json!("garment.jpg")
+    );
+    assert_eq!(outfit["previews"][0]["image"]["path"], json!("preview.jpg"));
+
+    Ok(())
+}

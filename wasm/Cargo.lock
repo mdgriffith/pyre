@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "pyre"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "clap",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "pyre-wasm"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "console_log",
  "js-sys",

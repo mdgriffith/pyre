@@ -255,6 +255,88 @@ query GetUserGraph {
 }
 
 #[test]
+fn snapshot_select_duplicate_nested_link_names() {
+    check_snapshot(
+        "select_duplicate_nested_link_names",
+        duplicate_image_link_schema(),
+        duplicate_image_link_query(),
+    );
+}
+
+fn duplicate_image_link_schema() -> &'static str {
+    r#"
+record Outfit {
+    id Int @id
+    garments @link(id, OutfitGarment.outfitId)
+    previews @link(id, Preview.outfitId)
+    @public
+}
+
+record OutfitGarment {
+    id Int @id
+    outfitId Int
+    garmentId Int
+    garment @link(garmentId, Garment.id)
+    @public
+}
+
+record Garment {
+    id Int @id
+    images @link(id, GarmentImage.garmentId)
+    @public
+}
+
+record GarmentImage {
+    id Int @id
+    garmentId Int
+    imageId Int
+    image @link(imageId, Image.id)
+    @public
+}
+
+record Preview {
+    id Int @id
+    outfitId Int
+    imageId Int
+    image @link(imageId, Image.id)
+    @public
+}
+
+record Image {
+    id Int @id
+    path String
+    @public
+}
+"#
+}
+
+fn duplicate_image_link_query() -> &'static str {
+    r#"
+query ReproduceDuplicateImageCte {
+    outfit {
+        id
+        garments {
+            garment {
+                id
+                images {
+                    image {
+                        path
+                    }
+                }
+            }
+        }
+        previews {
+            id
+            image {
+                path
+            }
+        }
+    }
+}
+"#
+}
+
+#[test]
 fn snapshot_select_where_operators() {
     check_snapshot(
         "select_where_operators",
