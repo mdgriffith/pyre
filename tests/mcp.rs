@@ -388,6 +388,16 @@ fn docs_are_exposed_as_resources() {
         .as_str()
         .unwrap()
         .contains("Pyre Schema Guide"));
+    assert!(schema_docs["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("exists workspace.members"));
+
+    let schema_tool_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "schema" }));
+    assert!(schema_tool_docs["content"]
+        .as_str()
+        .unwrap()
+        .contains("exists workspace.members"));
 
     let query_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "query" }));
     assert!(query_docs["content"]

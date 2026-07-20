@@ -95,6 +95,59 @@ session {
 }
 ```
 
+## Permissions
+
+Permissions filter operations using fields from the current row and trusted,
+typed session values:
+
+```pyre
+record Post {
+    @allow(query) { published == True || authorId == Session.userId }
+    @allow(update, delete) { authorId == Session.userId }
+
+    id Post.id @id
+    authorId User.id
+    published Bool
+}
+```
+
+Use `exists` to authorize through declared links. The path starts at the
+protected record, and unqualified fields inside the block belong to the final
+linked record:
+
+```pyre
+type WorkspaceRole
+    = Admin
+    | Member
+    | Guest
+
+record Document {
+    @allow(query) {
+        exists workspace.members {
+            userId == Session.userId
+            role == Admin || role == Member
+        }
+    }
+
+    id Document.id @id
+    workspaceId Workspace.id
+    workspace @link(workspaceId, Workspace.id)
+}
+```
+
+`exists workspace.members` is one multi-hop expression: `Document` to
+`Workspace` to `WorkspaceMember`. An `exists` expression inside another
+`exists` block is not currently supported.
+
+Current relational-permission boundaries:
+
+- relational query permissions require a query-only namespace (`@syncable(false)`)
+- relational insert permissions are not supported
+- updates cannot modify columns used by the first link in the path
+- paths cannot cross namespaces
+- linked record permissions are not applied implicitly inside the block
+- `exists` is permission-only and cannot be used in a query `@where`
+
 ## Validation Flow
 
 After editing schema files, run:
