@@ -69,6 +69,7 @@ pub fn select_to_string(
 
     // WHERE
     to_sql::render_where(
+        context,
         table,
         query_info,
         query_field,

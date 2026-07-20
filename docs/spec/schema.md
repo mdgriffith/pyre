@@ -269,6 +269,34 @@ record Post {
 
 **Conditions**: Use `Session.fieldName` to reference session variables. Supported operators: `==` (equal), `&&` (and), `||` (or).
 
+Permissions may test related records through declared links with `exists`:
+
+```pyre
+record Document {
+    @allow(query) {
+        exists workspace.members {
+            userId == Session.userId
+            role == Admin || role == Member
+        }
+    }
+
+    workspaceId Workspace.id
+    workspace @link(workspaceId, Workspace.id)
+}
+```
+
+The path starts at the protected record, every path segment must be a declared
+link, and unqualified fields in the block belong to the final linked record.
+Linked record permissions are not applied implicitly. Nested `exists`
+expressions, cross-namespace paths, and relational insert permissions are not
+currently supported. Updates may not modify columns used by the first link in
+an `exists` path; relational update policies currently authorize the existing
+row rather than a proposed relationship change.
+
+Relational query permissions are currently limited to query-only namespaces
+(`@syncable(false)`). Synced namespaces require dependency invalidation and
+client-side revocation before related-table changes can be synchronized safely.
+
 **`@watch`** - Enable change watching for inserts
 ```pyre
 record Post {

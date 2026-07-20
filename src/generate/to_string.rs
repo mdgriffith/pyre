@@ -535,6 +535,12 @@ fn format_where_content(
             // Single expression: format as  userId = Session.userId  with spaces
             format!(" {} ", format_where(where_arg))
         }
+        ast::WhereArg::Exists(path, body) => format!(
+            "\n{}{}\n{}",
+            " ".repeat(base_indent + 4),
+            format_exists(path, body, base_indent + 4),
+            " ".repeat(base_indent)
+        ),
         ast::WhereArg::And(args) => {
             if args.len() == 1 {
                 // Single item in And - treat as single expression
@@ -550,7 +556,7 @@ fn format_where_content(
                         } else {
                             result.push_str(&inner_indent);
                         }
-                        result.push_str(&format_where(arg));
+                        result.push_str(&format_where_at(arg, base_indent + 4));
                         result.push_str("\n");
                     }
                     result.push_str(&" ".repeat(base_indent));
@@ -561,7 +567,11 @@ fn format_where_content(
                 let mut result = String::from("\n");
                 let inner_indent = " ".repeat(base_indent + 4);
                 for arg in args {
-                    result.push_str(&format!("{}{}\n", inner_indent, format_where(arg)));
+                    result.push_str(&format!(
+                        "{}{}\n",
+                        inner_indent,
+                        format_where_at(arg, base_indent + 4)
+                    ));
                 }
                 result.push_str(&format!("{}", " ".repeat(base_indent)));
                 result
@@ -581,7 +591,7 @@ fn format_where_content(
                         } else {
                             result.push_str(&inner_indent);
                         }
-                        result.push_str(&format_where(arg));
+                        result.push_str(&format_where_at(arg, base_indent + 4));
                         result.push_str("\n");
                     }
                     result.push_str(&" ".repeat(base_indent));
@@ -599,11 +609,12 @@ fn format_where_content(
                         items.len() <= 2
                             && items.iter().all(|a| matches!(a, ast::WhereArg::Column(..)))
                     }
+                    ast::WhereArg::Exists(..) => false,
                 });
 
                 if all_simple {
                     // Format as single-line using format_where
-                    format!(" {} ", format_where(where_arg))
+                    format!(" {} ", format_where_at(where_arg, base_indent))
                 } else {
                     // Multiple expressions: format as multi-line with || separator
                     let mut result = String::from("\n");
@@ -614,7 +625,7 @@ fn format_where_content(
                         } else {
                             result.push_str(&inner_indent);
                         }
-                        result.push_str(&format_where(arg));
+                        result.push_str(&format_where_at(arg, base_indent + 4));
                         result.push_str("\n");
                     }
                     result.push_str(&format!("{}", " ".repeat(base_indent)));
@@ -912,7 +923,27 @@ fn to_string_param(indent_size: usize, arg: &ast::Arg) -> String {
 }
 
 fn format_where(where_arg: &ast::WhereArg) -> String {
+    format_where_at(where_arg, 0)
+}
+
+fn format_exists(
+    path: &[(String, ast::Range)],
+    body: &ast::WhereArg,
+    base_indent: usize,
+) -> String {
+    format!(
+        "exists {} {}",
+        path.iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        format_where_for_braces_with_mode(body, base_indent, true)
+    )
+}
+
+fn format_where_at(where_arg: &ast::WhereArg, base_indent: usize) -> String {
     match where_arg {
+        ast::WhereArg::Exists(path, body) => format_exists(path, body, base_indent),
         ast::WhereArg::Column(is_session_var, column, operator, value, _field_name_range) => {
             let column_name = if *is_session_var {
                 format!("Session.{}", column)
@@ -927,7 +958,7 @@ fn format_where(where_arg: &ast::WhereArg) -> String {
             let mut result = String::new();
             let last_index = and.len() - 1;
             for (i, arg) in and.iter().enumerate() {
-                result.push_str(&format_where(arg));
+                result.push_str(&format_where_at(arg, base_indent));
                 if i != last_index {
                     result.push_str(" && ");
                 }
@@ -938,7 +969,7 @@ fn format_where(where_arg: &ast::WhereArg) -> String {
             let mut result = String::new();
             let last_index = or.len() - 1;
             for (i, arg) in or.iter().enumerate() {
-                result.push_str(&format_where(arg));
+                result.push_str(&format_where_at(arg, base_indent));
                 if i != last_index {
                     result.push_str(" || ");
                 }
