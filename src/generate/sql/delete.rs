@@ -21,6 +21,7 @@ pub fn delete_to_string(
 
     let mut where_clause = String::new();
     to_sql::render_where(
+        context,
         table,
         query_info,
         query_field,

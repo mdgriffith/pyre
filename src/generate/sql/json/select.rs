@@ -255,6 +255,7 @@ pub fn initial_select(
     result.push_str("\n");
 
     to_sql::render_where(
+        context,
         table,
         query_info,
         query_field,
@@ -342,6 +343,7 @@ fn select_linked(
         select_single_json(
             indent,
             context,
+            query_info,
             parent_table_name,
             table,
             query_field,
@@ -392,6 +394,7 @@ fn select_linked(
     // Check if render_where will add a WHERE clause
     let mut where_check = String::new();
     to_sql::render_where_with_table_ref(
+        context,
         table,
         query_info,
         query_field,
@@ -402,6 +405,7 @@ fn select_linked(
     let has_where = where_check.contains("where");
 
     to_sql::render_where_with_table_ref(
+        context,
         table,
         query_info,
         query_field,
@@ -513,6 +517,7 @@ A simple as possible json selection
 fn select_single_json(
     indent: usize,
     context: &typecheck::Context,
+    query_info: &typecheck::QueryInfo,
 
     parent_table_name: &String,
     table: &typecheck::Table,
@@ -654,10 +659,28 @@ fn select_single_json(
         full_local_id.push_str(local_id);
     }
 
-    // Use WHERE ... IN (SELECT ...) - JOIN optimization causes memory issues in some cases
+    let mut where_sql = String::new();
+    to_sql::render_where_with_table_ref(
+        context,
+        table,
+        query_info,
+        query_table_field,
+        &ast::QueryOperation::Query,
+        Some(table_alias),
+        &mut where_sql,
+    );
+    sql.push_str(&where_sql);
+
+    // Use WHERE ... IN (SELECT ...) - JOIN optimization causes memory issues in some cases.
+    let relationship_keyword = if where_sql.is_empty() { "where" } else { "and" };
     sql.push_str(&format!(
-        "{}where {}.{} in (select {} from {})\n",
-        indent_str, table_alias, full_foreign_id, full_local_id, parent_table_name
+        "{}{} {}.{} in (select {} from {})\n",
+        indent_str,
+        relationship_keyword,
+        table_alias,
+        full_foreign_id,
+        full_local_id,
+        parent_table_name
     ));
 
     if aggregate_to_array {

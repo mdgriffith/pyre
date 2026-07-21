@@ -220,6 +220,7 @@ pub fn extract_session_fields_from_permission(where_arg: &WhereArg) -> Vec<Strin
 
 fn extract_session_fields_recursive(where_arg: &WhereArg, fields: &mut Vec<String>) {
     match where_arg {
+        WhereArg::Exists(_, body) => extract_session_fields_recursive(body, fields),
         WhereArg::Column(is_session_var, fieldname, _, value, _field_name_range) => {
             if *is_session_var {
                 fields.push(fieldname.clone());
@@ -299,6 +300,15 @@ pub fn calculate_permission_hash(
 
 fn hash_permission_ast(hasher: &mut Sha256, where_arg: &WhereArg) {
     match where_arg {
+        WhereArg::Exists(path, body) => {
+            hasher.update("exists");
+            hasher.update((path.len() as u64).to_le_bytes());
+            for (segment, _) in path {
+                hasher.update((segment.len() as u64).to_le_bytes());
+                hasher.update(segment);
+            }
+            hash_permission_ast(hasher, body);
+        }
         WhereArg::Column(is_session, fieldname, op, value, _field_name_range) => {
             hasher.update("column");
             hasher.update(if *is_session { "session" } else { "table" });
@@ -476,6 +486,7 @@ fn render_permission_where(
     params: &mut Vec<SessionValue>,
 ) -> String {
     match where_arg {
+        WhereArg::Exists(..) => "0".to_string(),
         WhereArg::Column(is_session_var, fieldname, op, value, _field_name_range) => {
             let qualified_column_name = if *is_session_var {
                 let session_value = session

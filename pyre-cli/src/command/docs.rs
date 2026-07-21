@@ -20,8 +20,7 @@ pub const DOC_RESOURCES: &[DocResource] = &[
         topic: "schema",
         uri: "pyre://guides/schema",
         name: "Schema Guide",
-        description:
-            "How to write Pyre schemas: records, fields, links, directives, types, sessions.",
+        description: "How to write Pyre schemas: records, links, permissions, types, and sessions.",
         content: include_str!("../../../docs/usage/schema.md"),
     },
     DocResource {

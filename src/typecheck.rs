@@ -2150,6 +2150,22 @@ fn check_where_args(
 ) {
     let error_filepath = context.current_filepath.clone();
     match where_args {
+        ast::WhereArg::Exists(path, _) => {
+            errors.push(Error {
+                filepath: error_filepath,
+                error_type: ErrorType::InvalidRelationalPermission {
+                    message: "exists expressions are only allowed in permissions".to_string(),
+                },
+                locations: vec![Location {
+                    contexts: vec![],
+                    primary: path
+                        .first()
+                        .map(|(_, range)| convert_range(range))
+                        .into_iter()
+                        .collect(),
+                }],
+            });
+        }
         ast::WhereArg::And(ands) => {
             for and in ands {
                 check_where_args(
@@ -2328,6 +2344,105 @@ fn check_permissions_where_args(
     errors: &mut Vec<Error>,
 ) {
     match where_args {
+        ast::WhereArg::Exists(path, body) => {
+            let Some((_, first_range)) = path.first() else {
+                errors.push(Error {
+                    filepath: filepath.clone(),
+                    error_type: ErrorType::InvalidRelationalPermission {
+                        message: "An exists path must contain at least one link.".to_string(),
+                    },
+                    locations: vec![],
+                });
+                return;
+            };
+
+            if where_contains_exists(body) {
+                errors.push(Error {
+                    filepath: filepath.clone(),
+                    error_type: ErrorType::InvalidRelationalPermission {
+                        message: "Nested exists expressions are not supported yet.".to_string(),
+                    },
+                    locations: vec![Location {
+                        contexts: vec![],
+                        primary: vec![convert_range(first_range)],
+                    }],
+                });
+                return;
+            }
+
+            let mut current = table;
+            let root_schema = context
+                .tables
+                .values()
+                .find(|candidate| candidate.record.name == table.name)
+                .map(|candidate| candidate.schema.as_str());
+            for (segment, range) in path {
+                let link = current.fields.iter().find_map(|field| match field {
+                    ast::Field::FieldDirective(ast::FieldDirective::Link(link))
+                        if link.link_name == *segment =>
+                    {
+                        Some(link)
+                    }
+                    _ => None,
+                });
+                let Some(link) = link else {
+                    let kind = if current
+                        .fields
+                        .iter()
+                        .any(|field| ast::has_fieldname(field, segment))
+                    {
+                        "is a scalar field, not a materialized link"
+                    } else {
+                        "is not a declared materialized link"
+                    };
+                    errors.push(Error {
+                        filepath: filepath.clone(),
+                        error_type: ErrorType::InvalidRelationalPermission {
+                            message: format!("{}.{} {}.", current.name, segment, kind),
+                        },
+                        locations: vec![Location {
+                            contexts: vec![],
+                            primary: vec![convert_range(range)],
+                        }],
+                    });
+                    return;
+                };
+                if link.local_ids.is_empty()
+                    || link.foreign.fields.is_empty()
+                    || link.local_ids.len() != link.foreign.fields.len()
+                {
+                    errors.push(Error {
+                        filepath: filepath.clone(),
+                        error_type: ErrorType::InvalidRelationalPermission {
+                            message: format!("Link {} has an invalid column mapping.", segment),
+                        },
+                        locations: vec![Location {
+                            contexts: vec![],
+                            primary: vec![convert_range(range)],
+                        }],
+                    });
+                    return;
+                }
+                let Some(linked) = get_linked_table(context, link) else {
+                    return;
+                };
+                if root_schema.map_or(false, |schema| schema != linked.schema) {
+                    errors.push(Error {
+                        filepath: filepath.clone(),
+                        error_type: ErrorType::InvalidRelationalPermission {
+                            message: "Cross-namespace exists paths are not supported.".to_string(),
+                        },
+                        locations: vec![Location {
+                            contexts: vec![],
+                            primary: vec![convert_range(range)],
+                        }],
+                    });
+                    return;
+                }
+                current = &linked.record;
+            }
+            check_permissions_where_args(context, current, body, filepath, errors);
+        }
         ast::WhereArg::And(ands) => {
             for and in ands {
                 check_permissions_where_args(context, table, and, filepath, errors);
@@ -2510,6 +2625,21 @@ fn check_record_index_where(
     errors: &mut Vec<Error>,
 ) {
     match where_arg {
+        ast::WhereArg::Exists(path, _) => errors.push(Error {
+            filepath: filepath.clone(),
+            error_type: ErrorType::InvalidRelationalPermission {
+                message: "exists expressions are not allowed in partial-index predicates"
+                    .to_string(),
+            },
+            locations: vec![Location {
+                contexts: vec![],
+                primary: path
+                    .first()
+                    .map(|(_, range)| convert_range(range))
+                    .into_iter()
+                    .collect(),
+            }],
+        }),
         ast::WhereArg::And(items) | ast::WhereArg::Or(items) => {
             for item in items {
                 check_record_index_where(
@@ -2558,6 +2688,42 @@ fn check_record_index_where(
     }
 }
 
+fn where_contains_exists(where_arg: &ast::WhereArg) -> bool {
+    match where_arg {
+        ast::WhereArg::Exists(..) => true,
+        ast::WhereArg::And(items) | ast::WhereArg::Or(items) => {
+            items.iter().any(where_contains_exists)
+        }
+        ast::WhereArg::Column(..) => false,
+    }
+}
+
+fn first_exists_range(where_arg: &ast::WhereArg) -> Option<&ast::Range> {
+    match where_arg {
+        ast::WhereArg::Exists(path, _) => path.first().map(|(_, range)| range),
+        ast::WhereArg::And(items) | ast::WhereArg::Or(items) => {
+            items.iter().find_map(first_exists_range)
+        }
+        ast::WhereArg::Column(..) => None,
+    }
+}
+
+fn collect_exists_first_links<'a>(where_arg: &'a ast::WhereArg, links: &mut Vec<&'a str>) {
+    match where_arg {
+        ast::WhereArg::Exists(path, _) => {
+            if let Some((link, _)) = path.first() {
+                links.push(link);
+            }
+        }
+        ast::WhereArg::And(items) | ast::WhereArg::Or(items) => {
+            for item in items {
+                collect_exists_first_links(item, links);
+            }
+        }
+        ast::WhereArg::Column(..) => {}
+    }
+}
+
 /// Validate all permissions for a record during schema checking.
 fn check_record_permissions(
     context: &Context,
@@ -2565,6 +2731,77 @@ fn check_record_permissions(
     filepath: &String,
     errors: &mut Vec<Error>,
 ) {
+    let synced = context
+        .tables
+        .values()
+        .find(|table| table.record.name == record.name && table.record == *record)
+        .and_then(|table| context.namespace_sync_modes.get(&table.schema))
+        .copied()
+        .unwrap_or(ast::SyncMode::Synced)
+        == ast::SyncMode::Synced;
+
+    if synced {
+        for field in &record.fields {
+            let expressions: Vec<&ast::WhereArg> = match field {
+                ast::Field::FieldDirective(ast::FieldDirective::Permissions(
+                    ast::PermissionDetails::Star(where_),
+                )) => vec![where_],
+                ast::Field::FieldDirective(ast::FieldDirective::Permissions(
+                    ast::PermissionDetails::OnOperation(operations),
+                )) => operations
+                    .iter()
+                    .filter(|permission| {
+                        permission.operations.contains(&ast::QueryOperation::Query)
+                    })
+                    .map(|permission| &permission.where_)
+                    .collect(),
+                _ => vec![],
+            };
+            for expression in expressions {
+                if let Some(range) = first_exists_range(expression) {
+                    errors.push(Error {
+                        filepath: filepath.clone(),
+                        error_type: ErrorType::SyncedRelationalQueryPermission,
+                        locations: vec![Location {
+                            contexts: vec![],
+                            primary: vec![convert_range(range)],
+                        }],
+                    });
+                }
+            }
+        }
+    }
+
+    for field in &record.fields {
+        let expressions: Vec<&ast::WhereArg> = match field {
+            ast::Field::FieldDirective(ast::FieldDirective::Permissions(
+                ast::PermissionDetails::Star(where_),
+            )) => vec![where_],
+            ast::Field::FieldDirective(ast::FieldDirective::Permissions(
+                ast::PermissionDetails::OnOperation(operations),
+            )) => operations
+                .iter()
+                .filter(|permission| permission.operations.contains(&ast::QueryOperation::Insert))
+                .map(|permission| &permission.where_)
+                .collect(),
+            _ => vec![],
+        };
+        for expression in expressions {
+            if let Some(range) = first_exists_range(expression) {
+                errors.push(Error {
+                    filepath: filepath.clone(),
+                    error_type: ErrorType::InvalidRelationalPermission {
+                        message: "Relational insert permissions are not supported until insert policies are enforced against the proposed row.".to_string(),
+                    },
+                    locations: vec![Location {
+                        contexts: vec![],
+                        primary: vec![convert_range(range)],
+                    }],
+                });
+            }
+        }
+    }
+
     // Collect unique permissions to avoid checking the same permission expression multiple times.
     // When a single @allow(*) directive is used (PermissionDetails::Star), it applies to all
     // operations, so we'd otherwise check and report the same errors 4 times (once per operation).
@@ -2608,6 +2845,9 @@ fn mark_session_vars_in_where_as_used(
     params: &mut HashMap<String, ParamInfo>,
 ) {
     match where_args {
+        ast::WhereArg::Exists(_, body) => {
+            mark_session_vars_in_where_as_used(query_context, context, body, params)
+        }
         ast::WhereArg::And(ands) => {
             for and in ands {
                 mark_session_vars_in_where_as_used(query_context, context, and, params);
@@ -3211,6 +3451,46 @@ fn check_table_query(
     // Mark session variables in permissions as used
     if let Some(perms) = ast::get_permissions(&table.record, operation) {
         mark_session_vars_in_where_as_used(query_context, context, &perms, params);
+
+        if *operation == ast::QueryOperation::Update {
+            let mut first_links = Vec::new();
+            collect_exists_first_links(&perms, &mut first_links);
+            let protected_columns: HashSet<&str> = first_links
+                .iter()
+                .filter_map(|link_name| {
+                    table.record.fields.iter().find_map(|field| match field {
+                        ast::Field::FieldDirective(ast::FieldDirective::Link(link))
+                            if link.link_name == *link_name =>
+                        {
+                            Some(&link.local_ids)
+                        }
+                        _ => None,
+                    })
+                })
+                .flatten()
+                .map(String::as_str)
+                .collect();
+
+            for field in &query.fields {
+                if let ast::ArgField::Field(field) = field {
+                    if field.set.is_some() && protected_columns.contains(field.name.as_str()) {
+                        errors.push(Error {
+                            filepath: context.current_filepath.clone(),
+                            error_type: ErrorType::InvalidRelationalPermission {
+                                message: format!(
+                                    "Cannot update relationship key {} while authorization depends on that relationship.",
+                                    field.name
+                                ),
+                            },
+                            locations: vec![Location {
+                                contexts: vec![],
+                                primary: to_range(&field.start_fieldname, &field.end_fieldname),
+                            }],
+                        });
+                    }
+                }
+            }
+        }
     }
 
     if query.fields.is_empty() {

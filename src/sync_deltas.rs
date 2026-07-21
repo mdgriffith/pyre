@@ -46,6 +46,7 @@ fn evaluate_permission(
     session: &HashMap<String, SessionValue>,
 ) -> bool {
     match where_arg {
+        WhereArg::Exists(..) => false,
         WhereArg::Column(is_session_var, fieldname, op, value, _field_name_range) => {
             // Get the right-hand side value first (needed for both paths)
             let rhs_value = query_value_to_json(value, session);

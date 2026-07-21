@@ -15,7 +15,9 @@ order by "users"."name" Asc
         'title', t.title
       )) as posts
     from posts t
-    where t.authorId in (select id from temp_selected_user)
+where
+ t."id" >= $minId
+    and t.authorId in (select id from temp_selected_user)
     group by t.authorId
     order by t.authorId
 )

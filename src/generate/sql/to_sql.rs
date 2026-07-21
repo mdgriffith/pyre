@@ -216,16 +216,26 @@ pub fn operator(op: &ast::Operator) -> String {
 // WHERE
 
 pub fn render_where(
+    context: &typecheck::Context,
     table: &typecheck::Table,
     query_info: &typecheck::QueryInfo,
     query_field: &ast::QueryField,
     operation: &ast::QueryOperation,
     result: &mut String,
 ) {
-    render_where_with_table_ref(table, query_info, query_field, operation, None, result);
+    render_where_with_table_ref(
+        context,
+        table,
+        query_info,
+        query_field,
+        operation,
+        None,
+        result,
+    );
 }
 
 pub fn render_where_with_table_ref(
+    context: &typecheck::Context,
     table: &typecheck::Table,
     query_info: &typecheck::QueryInfo,
     query_field: &ast::QueryField,
@@ -250,33 +260,68 @@ pub fn render_where_with_table_ref(
 
     // Combine multiple WHERE clauses with AND
     if wheres.len() == 1 {
-        let where_str =
-            render_where_arg_with_table_ref(&wheres[0], table, query_info, query_field, table_ref);
+        let where_str = render_where_arg_with_table_ref(
+            context,
+            &wheres[0],
+            table,
+            query_info,
+            query_field,
+            table_ref,
+        );
         result.push_str(&format!(" {}\n", where_str));
     } else {
         // Multiple WHERE clauses need to be combined with AND
         let combined = ast::WhereArg::And(wheres.clone());
-        let where_str =
-            render_where_arg_with_table_ref(&combined, table, query_info, query_field, table_ref);
+        let where_str = render_where_arg_with_table_ref(
+            context,
+            &combined,
+            table,
+            query_info,
+            query_field,
+            table_ref,
+        );
         result.push_str(&format!(" {}\n", where_str));
     }
 }
 
 pub fn render_where_arg(
+    context: &typecheck::Context,
     arg: &ast::WhereArg,
     table: &typecheck::Table,
     query_info: &typecheck::QueryInfo,
     query_field: &ast::QueryField,
 ) -> String {
-    render_where_arg_with_table_ref(arg, table, query_info, query_field, None)
+    render_where_arg_with_table_ref(context, arg, table, query_info, query_field, None)
 }
 
 pub fn render_where_arg_with_table_ref(
+    context: &typecheck::Context,
     arg: &ast::WhereArg,
     table: &typecheck::Table,
     query_info: &typecheck::QueryInfo,
     query_field: &ast::QueryField,
     table_ref: Option<&str>,
+) -> String {
+    let mut next_alias = 0;
+    render_where_arg_inner(
+        context,
+        arg,
+        table,
+        query_info,
+        query_field,
+        table_ref,
+        &mut next_alias,
+    )
+}
+
+fn render_where_arg_inner(
+    context: &typecheck::Context,
+    arg: &ast::WhereArg,
+    table: &typecheck::Table,
+    query_info: &typecheck::QueryInfo,
+    query_field: &ast::QueryField,
+    table_ref: Option<&str>,
+    next_alias: &mut usize,
 ) -> String {
     match arg {
         ast::WhereArg::Column(is_session_var, fieldname, op, value, _field_name_range) => {
@@ -313,15 +358,113 @@ pub fn render_where_arg_with_table_ref(
             };
             format!("{} {} {}", qualified_column_name, operator, value)
         }
+        ast::WhereArg::Exists(path, body) => {
+            if path.is_empty() {
+                return "0".to_string();
+            }
+
+            let root_ref = table_ref.map(str::to_string).unwrap_or_else(|| {
+                string::quote(&ast::get_tablename(
+                    &table.record.name,
+                    &table.record.fields,
+                ))
+            });
+            let mut current = table;
+            let mut previous_ref = root_ref;
+            let mut from = String::new();
+            let mut correlations = Vec::new();
+
+            for (index, (segment, _)) in path.iter().enumerate() {
+                let Some(link) = current.record.fields.iter().find_map(|field| match field {
+                    ast::Field::FieldDirective(ast::FieldDirective::Link(link))
+                        if link.link_name == *segment =>
+                    {
+                        Some(link)
+                    }
+                    _ => None,
+                }) else {
+                    return "0".to_string();
+                };
+                if link.local_ids.is_empty() || link.local_ids.len() != link.foreign.fields.len() {
+                    return "0".to_string();
+                }
+                let Some(linked) = typecheck::get_linked_table(context, link) else {
+                    return "0".to_string();
+                };
+                let alias = loop {
+                    let candidate = format!("__pyre_exists_{}", *next_alias);
+                    *next_alias += 1;
+                    let conflicts_with_table = context.tables.values().any(|candidate_table| {
+                        ast::get_tablename(
+                            &candidate_table.record.name,
+                            &candidate_table.record.fields,
+                        )
+                        .eq_ignore_ascii_case(&candidate)
+                    });
+                    let conflicts_with_ref = table_ref
+                        .map(|table_ref| table_ref.eq_ignore_ascii_case(&candidate))
+                        .unwrap_or(false);
+                    if !conflicts_with_table && !conflicts_with_ref {
+                        break string::quote(&candidate);
+                    }
+                };
+                let source = string::quote(&ast::get_tablename(
+                    &linked.record.name,
+                    &linked.record.fields,
+                ));
+                let mappings = link
+                    .local_ids
+                    .iter()
+                    .zip(&link.foreign.fields)
+                    .map(|(local, foreign)| {
+                        format!(
+                            "{}.{} = {}.{}",
+                            alias,
+                            string::quote(foreign),
+                            previous_ref,
+                            string::quote(local)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+
+                if index == 0 {
+                    from = format!("{} as {}", source, alias);
+                    correlations.push(mappings);
+                } else {
+                    from.push_str(&format!(" join {} as {} on {}", source, alias, mappings));
+                }
+                previous_ref = alias;
+                current = linked;
+            }
+
+            let terminal = render_where_arg_inner(
+                context,
+                body,
+                current,
+                query_info,
+                query_field,
+                Some(&previous_ref),
+                next_alias,
+            );
+            correlations.push(terminal);
+            format!(
+                "exists (select 1 from {} where {})",
+                from,
+                correlations.join(" and ")
+            )
+        }
         ast::WhereArg::And(args) => {
             let mut inner_list = vec![];
             for arg in args {
-                inner_list.push(render_where_arg_with_table_ref(
+                inner_list.push(render_where_arg_inner(
+                    context,
                     arg,
                     table,
                     query_info,
                     query_field,
                     table_ref,
+                    next_alias,
                 ));
             }
             format!("({})", inner_list.join(" and "))
@@ -329,12 +472,14 @@ pub fn render_where_arg_with_table_ref(
         ast::WhereArg::Or(args) => {
             let mut inner_list = vec![];
             for arg in args {
-                inner_list.push(render_where_arg_with_table_ref(
+                inner_list.push(render_where_arg_inner(
+                    context,
                     arg,
                     table,
                     query_info,
                     query_field,
                     table_ref,
+                    next_alias,
                 ));
             }
             format!("({})", inner_list.join(" or "))

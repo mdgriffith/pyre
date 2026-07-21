@@ -736,7 +736,7 @@ fn parse_table_index_directive(is_unique: bool) -> impl Fn(Text) -> ParseResult<
                     let (input, _) = multispace0(input)?;
                     Ok((input, ()))
                 },
-                parse_where_arg_with_or_marker,
+                parse_plain_where_arg_with_or_marker,
             )(input)?;
 
             let (input, _) = multispace0(input)?;
@@ -1509,7 +1509,7 @@ fn parse_where(input: Text) -> ParseResult<ast::Arg> {
     let (input, _) = multispace0(input)?;
     let (input, _) = tag("where")(input)?;
     let (input, _) = space1(input)?;
-    let (input, where_arg) = with_comma_sep_braces(parse_where_arg)(input)?;
+    let (input, where_arg) = with_comma_sep_braces(parse_plain_where_arg)(input)?;
 
     if where_arg.len() == 1 {
         if let Some(where_val) = where_arg.into_iter().next() {
@@ -1525,6 +1525,17 @@ fn parse_where(input: Text) -> ParseResult<ast::Arg> {
 
 // Helper to parse where_arg and return a marker indicating if it starts with ||
 fn parse_where_arg_with_or_marker(input: Text) -> ParseResult<(ast::WhereArg, bool)> {
+    parse_where_arg_with_or_marker_mode(input, true)
+}
+
+fn parse_plain_where_arg_with_or_marker(input: Text) -> ParseResult<(ast::WhereArg, bool)> {
+    parse_where_arg_with_or_marker_mode(input, false)
+}
+
+fn parse_where_arg_with_or_marker_mode(
+    input: Text,
+    allow_exists: bool,
+) -> ParseResult<(ast::WhereArg, bool)> {
     // Only consume spaces/tabs, not newlines (newlines are separators in list context)
     let (input, _) = space0(input)?;
 
@@ -1539,7 +1550,7 @@ fn parse_where_arg_with_or_marker(input: Text) -> ParseResult<(ast::WhereArg, bo
         input_after_check
     };
 
-    let (input, where_arg) = parse_where_arg(input)?;
+    let (input, where_arg) = parse_where_arg_mode(input, allow_exists)?;
     Ok((input, (where_arg, starts_with_or)))
 }
 
@@ -1599,7 +1610,11 @@ fn group_where_args_with_or(args: Vec<(ast::WhereArg, bool)>) -> ast::WhereArg {
     }
 }
 
-fn parse_where_arg(input: Text) -> ParseResult<ast::WhereArg> {
+fn parse_plain_where_arg(input: Text) -> ParseResult<ast::WhereArg> {
+    parse_where_arg_mode(input, false)
+}
+
+fn parse_where_arg_mode(input: Text, allow_exists: bool) -> ParseResult<ast::WhereArg> {
     // Only consume spaces/tabs, not newlines (newlines are separators in list context)
     // This allows separated_list0 to properly detect newline separators
     let (input, _) = space0(input)?;
@@ -1611,19 +1626,19 @@ fn parse_where_arg(input: Text) -> ParseResult<ast::WhereArg> {
     if let Some(AndOr::And) = maybe_leading_and_or {
         // We have && at the start, so parse the where expression after it
         let (input, _) = multispace0(input_after_check)?;
-        let (input, where_col) = parse_query_where(input)?;
+        let (input, where_col) = parse_where_atom(input, allow_exists)?;
         // This is a continuation of a previous where expression
         Ok((input, where_col))
     } else if let Some(AndOr::Or) = maybe_leading_and_or {
         // We have || at the start, so parse the where expression after it
         let (input, _) = multispace0(input_after_check)?;
-        let (input, where_col) = parse_query_where(input)?;
+        let (input, where_col) = parse_where_atom(input, allow_exists)?;
         // This is a continuation of a previous where expression
         Ok((input, where_col))
     } else {
         // Normal case: parse a where expression, optionally followed by chained && or ||
         // Parse the first expression
-        let (mut input, mut result) = parse_query_where(input_after_check)?;
+        let (mut input, mut result) = parse_where_atom(input_after_check, allow_exists)?;
 
         // Continue parsing chained operators
         loop {
@@ -1634,7 +1649,7 @@ fn parse_where_arg(input: Text) -> ParseResult<ast::WhereArg> {
             if let Some(op) = maybe_and_or {
                 // Parse the next expression
                 let (input_after_op, _) = multispace0(input_after_check)?;
-                let (input_after_expr, next_expr) = parse_query_where(input_after_op)?;
+                let (input_after_expr, next_expr) = parse_where_atom(input_after_op, allow_exists)?;
 
                 match op {
                     AndOr::And => {
@@ -1669,6 +1684,52 @@ fn parse_where_arg(input: Text) -> ParseResult<ast::WhereArg> {
 
         Ok((input, result))
     }
+}
+
+fn parse_where_atom(input: Text, allow_exists: bool) -> ParseResult<ast::WhereArg> {
+    if allow_exists {
+        alt((parse_exists, parse_query_where))(input)
+    } else {
+        parse_query_where(input)
+    }
+}
+
+fn parse_exists(input: Text) -> ParseResult<ast::WhereArg> {
+    let (input, _) = tag("exists")(input)?;
+    let (input, _) = space1(input)?;
+    let (input, path) = separated_list1(tag("."), |input| {
+        let (input, start_pos) = position(input)?;
+        let (input, name) = parse_fieldname(input)?;
+        let (input, end_pos) = position(input)?;
+        Ok((
+            input,
+            (
+                name.to_string(),
+                ast::Range {
+                    start: to_location(&start_pos),
+                    end: to_location(&end_pos),
+                },
+            ),
+        ))
+    })(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = cut(tag("{"))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, args) = separated_list1(
+        |input| {
+            let (input, _) = space0(input)?;
+            let (input, _) = parse_block_separator(input)?;
+            let (input, _) = multispace0(input)?;
+            Ok((input, ()))
+        },
+        parse_where_arg_with_or_marker,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = cut(tag("}"))(input)?;
+    Ok((
+        input,
+        ast::WhereArg::Exists(path, Box::new(group_where_args_with_or(args))),
+    ))
 }
 
 fn parse_query_where(input: Text) -> ParseResult<ast::WhereArg> {

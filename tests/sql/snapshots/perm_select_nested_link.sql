@@ -14,7 +14,9 @@ where
         'content', t.content
       )) as comments
     from comments t
-    where t.postId in (select id from temp_selected_post)
+where
+ t."authorId" = $session_userId
+    and t.postId in (select id from temp_selected_post)
     group by t.postId
     order by t.postId
 )

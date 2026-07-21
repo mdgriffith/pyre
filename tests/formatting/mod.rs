@@ -402,6 +402,12 @@ fn permission_details_equal_ignoring_locations(
 
 fn where_arg_equal_ignoring_locations(a: &ast::WhereArg, b: &ast::WhereArg) -> bool {
     match (a, b) {
+        (ast::WhereArg::Exists(pa, ba), ast::WhereArg::Exists(pb, bb)) => {
+            pa.iter()
+                .map(|(name, _)| name)
+                .eq(pb.iter().map(|(name, _)| name))
+                && where_arg_equal_ignoring_locations(ba, bb)
+        }
         (ast::WhereArg::Column(sa, ca, oa, va, _), ast::WhereArg::Column(sb, cb, ob, vb, _)) => {
             sa == sb && ca == cb && oa == ob && query_value_equal_ignoring_locations(va, vb)
         }

@@ -47,6 +47,7 @@ pub fn update_to_string(
     result.push_str("\n");
     let mut where_clause = String::new();
     to_sql::render_where(
+        context,
         table,
         query_info,
         query_field,

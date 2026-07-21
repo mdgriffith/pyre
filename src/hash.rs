@@ -95,6 +95,15 @@ fn hash_arg(hasher: &mut Sha256, arg: &Arg) {
 
 fn hash_where_arg(hasher: &mut Sha256, where_arg: &WhereArg) {
     match where_arg {
+        WhereArg::Exists(path, body) => {
+            hasher.update("exists");
+            hasher.update((path.len() as u64).to_le_bytes());
+            for (segment, _) in path {
+                hasher.update((segment.len() as u64).to_le_bytes());
+                hasher.update(segment);
+            }
+            hash_where_arg(hasher, body);
+        }
         WhereArg::Column(is_session_var, column, operator, value, _field_name_range) => {
             hasher.update(&is_session_var.to_string());
             hasher.update(column);
