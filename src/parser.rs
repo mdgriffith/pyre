@@ -940,10 +940,11 @@ fn parse_default_directive(input: Text) -> ParseResult<ast::ColumnDirective> {
 
 fn parse_default_value(input: Text) -> ParseResult<(String, ast::DefaultValue)> {
     let start_offset = input.location_offset();
+    let original_fragment = *input.fragment();
     let (input_after, val) = parse_value(input)?;
     let end_offset = input_after.location_offset();
 
-    let original_text = &input_after.fragment()[..end_offset - start_offset];
+    let original_text = &original_fragment[..end_offset - start_offset];
     let id = original_text.to_string();
 
     Ok((input_after, (id, ast::DefaultValue::Value(val))))

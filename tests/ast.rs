@@ -4,6 +4,12 @@ use pyre::typecheck;
 #[path = "helpers/schema_v1.rs"]
 mod schema;
 
+fn parse_schema(source: &str) -> ast::Schema {
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).expect("schema should parse");
+    schema
+}
+
 /// Test helper to create a simple record with a field that has a specific directive
 fn create_record_with_directive(
     field_name: &str,
@@ -57,6 +63,117 @@ record TestRecord {{
         }
     }
     panic!("Failed to create test record");
+}
+
+fn column_default_id(schema: &ast::Schema, column_name: &str) -> String {
+    schema
+        .files
+        .iter()
+        .flat_map(|file| &file.definitions)
+        .find_map(|definition| match definition {
+            ast::Definition::Record { fields, .. } => ast::collect_columns(fields)
+                .into_iter()
+                .find(|column| column.name == column_name),
+            _ => None,
+        })
+        .and_then(|column| {
+            column
+                .directives
+                .iter()
+                .find_map(|directive| match directive {
+                    ast::ColumnDirective::Default { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+        })
+        .expect("column should have a default")
+}
+
+#[test]
+fn default_id_contains_only_the_parsed_value() {
+    let schema = parse_schema(
+        r#"record Example {
+    published Bool @default(False)
+
+    label String
+}"#,
+    );
+
+    assert_eq!(column_default_id(&schema, "published"), "False");
+}
+
+#[test]
+fn serialized_defaults_do_not_produce_migration_errors() {
+    let authored = parse_schema(
+        r#"record Example {
+    id        Int     @id
+    published Bool    @default(False)
+
+    label     String  @default("hello")
+
+    count     Int     @default(3)
+
+    ratio     Float   @default(1.5)
+
+    optional  String? @default(null)
+}"#,
+    );
+    let persisted_source = pyre::generate::to_string::schema_to_string("", &authored);
+    let persisted = parse_schema(&persisted_source);
+
+    let errors = ast::diff::to_errors(ast::diff::diff_schema(&persisted, &authored));
+
+    assert!(errors.is_empty(), "persisted schema:\n{persisted_source}");
+}
+
+#[test]
+fn changed_default_produces_a_modified_column_error() {
+    let old = parse_schema(
+        r#"record Example {
+    published Bool @default(False)
+}"#,
+    );
+    let new = parse_schema(
+        r#"record Example {
+    published Bool @default(True)
+}"#,
+    );
+
+    let errors = ast::diff::to_errors(ast::diff::diff_schema(&old, &new));
+
+    assert_eq!(errors.len(), 1);
+    match &errors[0].error_type {
+        pyre::error::ErrorType::MigrationColumnModified { changes, .. } => {
+            assert_eq!(changes.added_directives.len(), 1);
+            assert_eq!(changes.removed_directives.len(), 1);
+        }
+        error => panic!("expected modified column error, got {error:?}"),
+    }
+}
+
+#[test]
+fn adding_or_removing_a_default_produces_a_modified_column_error() {
+    let without_default = parse_schema(
+        r#"record Example {
+    published Bool
+}"#,
+    );
+    let with_default = parse_schema(
+        r#"record Example {
+    published Bool @default(False)
+}"#,
+    );
+
+    let added = ast::diff::to_errors(ast::diff::diff_schema(&without_default, &with_default));
+    let removed = ast::diff::to_errors(ast::diff::diff_schema(&with_default, &without_default));
+
+    assert!(matches!(
+        added[0].error_type,
+        pyre::error::ErrorType::MigrationColumnModified { .. }
+    ));
+    assert!(matches!(
+        removed[0].error_type,
+        pyre::error::ErrorType::MigrationColumnModified { .. }
+    ));
 }
 
 #[test]

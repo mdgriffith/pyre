@@ -295,6 +295,33 @@ fn diff_variants(
     changes
 }
 
+fn default_values_equal(old: &crate::ast::DefaultValue, new: &crate::ast::DefaultValue) -> bool {
+    use crate::ast::{DefaultValue, QueryValue};
+
+    match (old, new) {
+        (DefaultValue::Now, DefaultValue::Now) => true,
+        (DefaultValue::Value(old), DefaultValue::Value(new)) => match (old, new) {
+            (QueryValue::String((_, old)), QueryValue::String((_, new))) => old == new,
+            (QueryValue::Int((_, old)), QueryValue::Int((_, new))) => old == new,
+            (QueryValue::Float((_, old)), QueryValue::Float((_, new))) => old == new,
+            (QueryValue::Bool((_, old)), QueryValue::Bool((_, new))) => old == new,
+            (QueryValue::Null(_), QueryValue::Null(_)) => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn directives_equal(old: &crate::ast::ColumnDirective, new: &crate::ast::ColumnDirective) -> bool {
+    match (old, new) {
+        (
+            crate::ast::ColumnDirective::Default { value: old, .. },
+            crate::ast::ColumnDirective::Default { value: new, .. },
+        ) => default_values_equal(old, new),
+        _ => old == new,
+    }
+}
+
 fn diff_column(old: &crate::ast::Column, new: &crate::ast::Column) -> Option<ColumnDiff> {
     let mut has_changes = false;
     let mut diff = ColumnDiff {
@@ -316,7 +343,7 @@ fn diff_column(old: &crate::ast::Column, new: &crate::ast::Column) -> Option<Col
             crate::ast::ColumnDirective::Index => "_idx".to_string(),
             crate::ast::ColumnDirective::CreatedAt => "_createdAt".to_string(),
             crate::ast::ColumnDirective::UpdatedAt => "_updatedAt".to_string(),
-            crate::ast::ColumnDirective::Default { id, .. } => id.clone(),
+            crate::ast::ColumnDirective::Default { .. } => "_default".to_string(),
         }
     };
 
@@ -330,7 +357,10 @@ fn diff_column(old: &crate::ast::Column, new: &crate::ast::Column) -> Option<Col
 
     // Find added directives
     for (key, directive) in &new_directives {
-        if !old_directives.contains_key(key) {
+        if !old_directives
+            .get(key)
+            .is_some_and(|old| directives_equal(old, directive))
+        {
             diff.added_directives.push(directive.clone());
             has_changes = true;
         }
@@ -338,7 +368,10 @@ fn diff_column(old: &crate::ast::Column, new: &crate::ast::Column) -> Option<Col
 
     // Find removed directives
     for (key, directive) in &old_directives {
-        if !new_directives.contains_key(key) {
+        if !new_directives
+            .get(key)
+            .is_some_and(|new| directives_equal(directive, new))
+        {
             diff.removed_directives.push(directive.clone());
             has_changes = true;
         }
