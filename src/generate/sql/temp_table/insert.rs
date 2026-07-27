@@ -712,44 +712,45 @@ fn to_field_insert_values(
                             // Add discriminator value (variant name)
                             result.push(format!("'{}'", details.name));
 
-                            // Add variant field values in order
-                            if let Some(variant_fields) = &details.fields {
-                                // Get the union type definition to find variant field order
-                                if let ast::SerializationType::FromType(typename) =
-                                    col.type_.to_serialization_type()
+                            // Add variant field values in the same order as the columns.
+                            if let ast::SerializationType::FromType(typename) =
+                                col.type_.to_serialization_type()
+                            {
+                                if let Some((_, typecheck::Type::OneOf { variants })) =
+                                    context.types.get(&typename)
                                 {
-                                    if let Some((_, type_)) = context.types.get(&typename) {
-                                        if let typecheck::Type::OneOf { variants } = type_ {
-                                            if let Some(variant) =
-                                                variants.iter().find(|v| v.name == details.name)
-                                            {
-                                                if let Some(variant_field_defs) = &variant.fields {
-                                                    // Create a map of field names to values for quick lookup
-                                                    let field_map: std::collections::HashMap<
-                                                        &String,
-                                                        &ast::QueryValue,
-                                                    > = variant_fields
-                                                        .iter()
-                                                        .map(|(name, val)| (name, val))
-                                                        .collect();
+                                    if let Some(variant) =
+                                        variants.iter().find(|variant| variant.name == details.name)
+                                    {
+                                        let field_map: std::collections::HashMap<
+                                            &String,
+                                            &ast::QueryValue,
+                                        > = details
+                                            .fields
+                                            .as_ref()
+                                            .map(|fields| {
+                                                fields
+                                                    .iter()
+                                                    .map(|(name, value)| (name, value))
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
 
-                                                    // Add values in the order they appear in the variant definition
-                                                    for variant_field_def in variant_field_defs {
-                                                        if let ast::Field::Column(variant_col) =
-                                                            variant_field_def
-                                                        {
-                                                            if let Some(value) =
-                                                                field_map.get(&variant_col.name)
-                                                            {
-                                                                result.push(
-                                                                    to_sql::render_column_value(
-                                                                        variant_col,
-                                                                        value,
-                                                                    ),
-                                                                );
-                                                            }
-                                                        }
-                                                    }
+                                        if let Some(variant_fields) = &variant.fields {
+                                            for variant_field in variant_fields {
+                                                if let ast::Field::Column(variant_column) =
+                                                    variant_field
+                                                {
+                                                    let value = field_map
+                                                        .get(&variant_column.name)
+                                                        .map(|value| {
+                                                            to_sql::render_column_value(
+                                                                variant_column,
+                                                                value,
+                                                            )
+                                                        })
+                                                        .unwrap_or_else(|| "null".to_string());
+                                                    result.push(value);
                                                 }
                                             }
                                         }

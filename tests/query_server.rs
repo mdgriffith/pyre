@@ -1897,6 +1897,66 @@ insert CreateScene($visibility: Visibility) {
 }
 
 #[tokio::test]
+async fn literal_union_insert_binds_null_for_omitted_nullable_fields(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+type Lifecycle
+   = Running
+   | Finished {
+        reason  String
+        metadata Json<Dict<String>>?
+     }
+
+record Session {
+    @public
+    id        Int @id
+    lifecycle Lifecycle
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+insert CreateSession {
+    session {
+        lifecycle = Finished {
+            reason = "done"
+        }
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+
+    let result = query::run(
+        &conn,
+        &manifest,
+        &only_query(&manifest).id,
+        json!({}),
+        &session,
+    )
+    .await?;
+
+    assert_eq!(
+        result.response["session"][0]["lifecycle"]["_type"],
+        "Finished"
+    );
+    assert_eq!(result.response["session"][0]["lifecycle"]["reason"], "done");
+    let mut rows = conn
+        .query("select lifecycle__metadata from sessions", ())
+        .await?;
+    let row = rows.next().await?.expect("session row should exist");
+    assert!(matches!(row.get_value(0)?, libsql::Value::Null));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn generated_crud_reuses_shared_tagged_union_columns(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
