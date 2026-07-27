@@ -307,7 +307,9 @@ fn to_query_metadata_file(
             .filter(|arg| {
                 arg.type_
                     .as_ref()
-                    .map(|type_name| ast::ColumnType::from_str(type_name).is_json_like())
+                    .map(|type_name| {
+                        typecheck::query_param_requires_json_serialization(context, type_name)
+                    })
                     .unwrap_or(false)
             })
             .map(|arg| format!("\"{}\"", arg.name))
@@ -1225,7 +1227,10 @@ fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
             format!("z.array({})", input_zod_type_for_column_type(inner))
         }
         ast::ColumnType::Dict(inner) => {
-            format!("z.record({})", input_zod_type_for_column_type(inner))
+            format!(
+                "z.record(z.string(), {})",
+                input_zod_type_for_column_type(inner)
+            )
         }
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", input_zod_type_for_column_type(inner))
@@ -1251,7 +1256,10 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
             format!("z.array({})", output_zod_type_for_column_type(inner))
         }
         ast::ColumnType::Dict(inner) => {
-            format!("z.record({})", output_zod_type_for_column_type(inner))
+            format!(
+                "z.record(z.string(), {})",
+                output_zod_type_for_column_type(inner)
+            )
         }
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", output_zod_type_for_column_type(inner))

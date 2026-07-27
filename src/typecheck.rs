@@ -25,7 +25,29 @@ pub fn to_sql_column_info(context: &Context, fields: &Vec<ast::Field>) -> Vec<Sq
     for col in fields {
         field_to_sql_column(context, col, None, &mut infos);
     }
+    let mut seen = HashSet::new();
+    infos.retain(|info| seen.insert(info.name.clone()));
     infos
+}
+
+pub fn query_param_requires_json_serialization(context: &Context, type_name: &str) -> bool {
+    let resolved = resolve_query_param_type(context, type_name);
+    let type_ = ast::ColumnType::from_str(&resolved);
+    if type_.is_json_like() {
+        return true;
+    }
+
+    match type_ {
+        ast::ColumnType::Custom(name) => matches!(
+            context.types.get(&name),
+            Some((_, Type::OneOf { variants }))
+                if variants.iter().any(|variant| variant.fields.is_some())
+        ),
+        ast::ColumnType::Nullable(inner) => {
+            query_param_requires_json_serialization(context, &inner.to_string())
+        }
+        _ => false,
+    }
 }
 
 fn field_to_sql_column(

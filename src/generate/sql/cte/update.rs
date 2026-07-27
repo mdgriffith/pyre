@@ -283,6 +283,7 @@ fn to_field_set_values(
                                                 .collect()
                                         })
                                         .unwrap_or_default();
+                                    let mut seen_columns = std::collections::HashSet::new();
 
                                     for variant in variants {
                                         if let Some(variant_fields) = &variant.fields {
@@ -294,20 +295,18 @@ fn to_field_set_values(
                                                         "{}__{}",
                                                         column.name, variant_col.name
                                                     );
-                                                    let value_sql = if variant.name == details.name
-                                                    {
-                                                        field_map
-                                                            .get(&variant_col.name)
-                                                            .map(|value| {
-                                                                to_sql::render_column_value(
-                                                                    variant_col,
-                                                                    value,
-                                                                )
-                                                            })
-                                                            .unwrap_or_else(|| "null".to_string())
-                                                    } else {
-                                                        "null".to_string()
-                                                    };
+                                                    if !seen_columns.insert(column_name.clone()) {
+                                                        continue;
+                                                    }
+                                                    let value_sql = field_map
+                                                        .get(&variant_col.name)
+                                                        .map(|value| {
+                                                            to_sql::render_column_value(
+                                                                variant_col,
+                                                                value,
+                                                            )
+                                                        })
+                                                        .unwrap_or_else(|| "null".to_string());
                                                     result.push(format!(
                                                         "{} = {}",
                                                         column_name, value_sql
@@ -370,6 +369,7 @@ fn render_type_variable_update_values(
         column.name,
         render_update_type_json_extract(query, field_name, variable_name, "", &column.name)
     )];
+    let mut seen_columns = std::collections::HashSet::new();
 
     if let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(typename) {
         for variant in variants {
@@ -383,6 +383,7 @@ fn render_type_variable_update_values(
                         variable_name,
                         "",
                         variant_field,
+                        &mut seen_columns,
                         &mut result,
                     );
                 }
@@ -409,6 +410,7 @@ fn append_type_field_variable_update_values(
     variable_name: &str,
     json_prefix: &str,
     field: &ast::Field,
+    seen_columns: &mut std::collections::HashSet<String>,
     result: &mut Vec<String>,
 ) {
     let ast::Field::Column(inner_column) = field else {
@@ -421,6 +423,10 @@ fn append_type_field_variable_update_values(
     } else {
         format!("{}.{}", json_prefix, inner_column.name)
     };
+
+    if !seen_columns.insert(column_name.clone()) {
+        return;
+    }
 
     match inner_column.type_.to_serialization_type() {
         ast::SerializationType::Concrete(_) => {
@@ -461,6 +467,7 @@ fn append_type_field_variable_update_values(
                                 variable_name,
                                 &json_path,
                                 variant_field,
+                                seen_columns,
                                 result,
                             );
                         }

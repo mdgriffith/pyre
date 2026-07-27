@@ -1835,7 +1835,8 @@ type Visibility
    = Hidden
    | Everyone
    | Users {
-        userId Int
+        userId   Int
+        metadata Json<Dict<String>>
      }
 
 record Scene {
@@ -1862,21 +1863,119 @@ insert CreateScene($visibility: Visibility) {
         false,
     )?;
     let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    assert_eq!(only_query(&manifest).json_input_args, vec!["visibility"]);
 
     let result = query::run(
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "visibility": { "_type": "Hidden" } }),
+        json!({
+            "visibility": {
+                "_type": "Users",
+                "userId": 42,
+                "metadata": { "source": "import" }
+            }
+        }),
         &session,
     )
     .await?;
 
     assert_eq!(result.response["scene"][0]["id"], json!(1));
 
-    let mut rows = conn.query("select visibility from scenes", ()).await?;
+    let mut rows = conn
+        .query(
+            "select visibility, visibility__userId, visibility__metadata from scenes",
+            (),
+        )
+        .await?;
     let row = rows.next().await?.expect("scene row should exist");
-    assert_eq!(row.get::<String>(0)?, "Hidden");
+    assert_eq!(row.get::<String>(0)?, "Users");
+    assert_eq!(row.get::<i64>(1)?, 42);
+    assert_eq!(row.get::<String>(2)?, r#"{"source":"import"}"#);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn generated_crud_reuses_shared_tagged_union_columns(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+type ActionState
+   = Open {
+        startedAt String?
+     }
+   | Ongoing
+   | Completed {
+        startedAt   String?
+        completedAt String
+     }
+
+record Action {
+    @public
+    id    Int @id
+    state ActionState
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let create = query_by_operation(&manifest, "insert");
+    let update = query_by_operation(&manifest, "update");
+
+    assert_eq!(create.json_input_args, vec!["state"]);
+    assert_eq!(update.json_input_args, vec!["state"]);
+    assert!(!create.sql[0]
+        .sql
+        .contains("state__startedAt, state__startedAt"));
+    assert_eq!(update.sql[0].sql.matches("state__startedAt =").count(), 1);
+
+    let created = query::run_sync(
+        &conn,
+        &manifest,
+        &create.id,
+        json!({ "state": { "_type": "Open", "startedAt": "first" } }),
+        &session,
+    )
+    .await?;
+    assert_eq!(created.affected_rows.len(), 1);
+    assert_eq!(
+        created.affected_rows[0]
+            .headers
+            .iter()
+            .filter(|header| header.as_str() == "state__startedAt")
+            .count(),
+        1
+    );
+
+    query::run(
+        &conn,
+        &manifest,
+        &update.id,
+        json!({
+            "id": 1,
+            "state": {
+                "_type": "Completed",
+                "startedAt": "first",
+                "completedAt": "second"
+            }
+        }),
+        &session,
+    )
+    .await?;
+
+    let mut rows = conn
+        .query(
+            "select state, state__startedAt, state__completedAt from actions",
+            (),
+        )
+        .await?;
+    let row = rows.next().await?.expect("action row should exist");
+    assert_eq!(row.get::<String>(0)?, "Completed");
+    assert_eq!(row.get::<String>(1)?, "first");
+    assert_eq!(row.get::<String>(2)?, "second");
 
     Ok(())
 }

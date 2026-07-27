@@ -115,7 +115,9 @@ fn query_manifest(
             .filter(|arg| {
                 arg.type_
                     .as_ref()
-                    .map(|type_name| ast::ColumnType::from_str(type_name).is_json_like())
+                    .map(|type_name| {
+                        typecheck::query_param_requires_json_serialization(context, type_name)
+                    })
                     .unwrap_or(false)
             })
             .map(|arg| arg.name.clone())

@@ -261,12 +261,25 @@ type AiSessionLifecycle
        endedAt DateTime?
      }
 
+type Content
+   = Folder
+   | Markdown {
+       body String
+       metadata Json<Dict<String>>
+     }
+
 record AiSession {
     @public
     id         Id.Int            @id
     status     AiSessionStatus
     lifecycle  AiSessionLifecycle
     updatedAt  DateTime @default(now)
+}
+
+record Node {
+    @public
+    id      Id.Int @id
+    content Content
 }
         "#,
     )
@@ -327,6 +340,26 @@ update UpdateFinishedSession($id: AiSession.id, $updatedAt: DateTime, $endedAt: 
             endedAt = $endedAt
         }
         updatedAt = $updatedAt
+    }
+}
+
+insert SeedLifecycle($lifecycle: AiSessionLifecycle) {
+    aiSession {
+        status = Completed
+        lifecycle = $lifecycle
+    }
+}
+
+insert SeedNode($content: Content) {
+    node {
+        content = $content
+    }
+}
+
+query GetNodes {
+    node {
+        id
+        content
     }
 }
 
@@ -682,8 +715,11 @@ fn build_payload_union_verify_script(seed_calls: &[&str], expected_rows: &[&str]
     script.push_str("  SeedFinishedTimeout,\n");
     script.push_str("  SeedFinishedStringSeconds,\n");
     script.push_str("  SeedRunningIdle,\n");
+    script.push_str("  SeedLifecycle,\n");
+    script.push_str("  SeedNode,\n");
     script.push_str("  UpdateFinishedSession,\n");
     script.push_str("  GetAiSessions,\n");
+    script.push_str("  GetNodes,\n");
     script.push_str("} from \"./pyre/generated/typescript/run.ts\";\n\n");
     script.push_str("const db = createClient({ url: \"file:.yak/yak.db\" });\n");
 
@@ -693,13 +729,17 @@ fn build_payload_union_verify_script(seed_calls: &[&str], expected_rows: &[&str]
         script.push_str(";\n");
     }
 
+    script.push_str("await SeedNode(db, { content: { _type: \"Markdown\", body: \"hello\", metadata: { source: \"runner\" } } });\n");
+
     script.push_str("const result = await GetAiSessions(db, {});\n\n");
-    script.push_str(
-        "if (!result || !Array.isArray(result.aiSession) || result.aiSession.length !== 5) {\n",
-    );
-    script.push_str(
-        "  throw new Error(`Expected exactly 5 aiSession rows, got: ${JSON.stringify(result)}`);\n",
-    );
+    script.push_str(&format!(
+        "if (!result || !Array.isArray(result.aiSession) || result.aiSession.length !== {}) {{\n",
+        expected_rows.len()
+    ));
+    script.push_str(&format!(
+        "  throw new Error(`Expected exactly {} aiSession rows, got: ${{JSON.stringify(result)}}`);\n",
+        expected_rows.len()
+    ));
     script.push_str("}\n\n");
     script.push_str("function assertDate(label, value) {\n");
     script.push_str("  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {\n");
@@ -760,6 +800,11 @@ fn build_payload_union_verify_script(seed_calls: &[&str], expected_rows: &[&str]
     script.push_str("  } else {\n");
     script.push_str("    assertMaybeDate(`row ${id}.lifecycle.endedAt`, row.lifecycle.endedAt);\n");
     script.push_str("  }\n");
+    script.push_str("}\n\n");
+    script.push_str("const nodes = await GetNodes(db, {});\n");
+    script.push_str("const content = nodes.node[0]?.content;\n");
+    script.push_str("if (content?._type !== \"Markdown\" || content.body !== \"hello\" || content.metadata?.source !== \"runner\") {\n");
+    script.push_str("  throw new Error(`Direct union parameter did not preserve nested JSON: ${JSON.stringify(nodes)}`);\n");
     script.push_str("}\n\n");
     script.push_str("console.log(\"payload-union-and-date-check-passed\");\n");
 
@@ -1606,6 +1651,7 @@ async fn test_generated_typescript_runner_decodes_payload_unions_and_datetime_st
         "SeedFinishedTimeout(db, { endedAt: 1735776000 })",
         "SeedFinishedStringSeconds(db, { endedAt: \"1735948800\" })",
         "SeedRunningIdle(db, {})",
+        "SeedLifecycle(db, { lifecycle: { _type: \"Finished\", reason: \"direct\" } })",
         "UpdateFinishedSession(db, { id: 2, updatedAt: \"2026-02-02T00:00:00.000Z\", endedAt: \"1736035200\" })",
         "UpdateFinishedSession(db, { id: 3, updatedAt: 1736121600, endedAt: 1736208000 })",
     ];
@@ -1615,6 +1661,7 @@ async fn test_generated_typescript_runner_decodes_payload_unions_and_datetime_st
         "3: { status: \"Failed\", lifecycleType: \"Finished\", reason: \"updated-done\", endedAt: \"optional-date\" },",
         "4: { status: \"Completed\", lifecycleType: \"Finished\", reason: \"string-seconds\", endedAt: \"optional-date\" },",
         "5: { status: \"Idle\", lifecycleType: \"Running\" },",
+        "6: { status: \"Completed\", lifecycleType: \"Finished\", reason: \"direct\", endedAt: \"nullish\" },",
     ];
     let verify_script = build_payload_union_verify_script(&seed_calls, &expected_rows);
 

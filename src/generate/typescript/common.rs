@@ -140,7 +140,10 @@ pub fn column_type_to_zod_validator(type_: &ast::ColumnType) -> String {
             format!("z.array({})", column_type_to_zod_validator(inner))
         }
         ast::ColumnType::Dict(inner) => {
-            format!("z.record({})", column_type_to_zod_validator(inner))
+            format!(
+                "z.record(z.string(), {})",
+                column_type_to_zod_validator(inner)
+            )
         }
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", column_type_to_zod_validator(inner))
@@ -394,6 +397,8 @@ mod tests {
 
         let generated = generate_tagged_union("Attribute", &variants);
 
-        assert!(generated.contains("fields: z.record(z.lazy(() => Attribute)).optional()"));
+        assert!(
+            generated.contains("fields: z.record(z.string(), z.lazy(() => Attribute)).optional()")
+        );
     }
 }

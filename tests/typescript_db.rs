@@ -79,7 +79,7 @@ insert CreateEvent($payload: Json<Lifecycle>, $tags: Json<List<String>>, $counts
     assert!(
         content.contains("payload: Decode.Lifecycle")
             && content.contains("tags: z.array(z.string())")
-            && content.contains("counts: z.record(z.number())")
+            && content.contains("counts: z.record(z.string(), z.number())")
             && content.contains("json_input_args: [\"payload\", \"tags\", \"counts\"]"),
         "Expected typed Json fields to use recursive TypeScript query validators. Generated metadata:\n{}",
         content
@@ -130,7 +130,7 @@ record Document {
     let decode_ts = pyre::generate::server::typescript::to_schema_decoders(&database);
 
     assert!(
-        decode_ts.contains("fields: z.record(z.lazy(() => Attribute)).optional()"),
+        decode_ts.contains("fields: z.record(z.string(), z.lazy(() => Attribute)).optional()"),
         "Expected recursive custom type field to use z.lazy. Generated:\n{}",
         decode_ts
     );
@@ -168,4 +168,61 @@ record User {
     assert!(env.contains("import * as Db from './decode';"));
     assert!(env.contains("role: Db.Role"));
     assert!(!env.contains("role: z.any()"));
+}
+
+#[test]
+fn typescript_metadata_serializes_payload_union_parameters_but_not_unit_enums() {
+    let schema_source = r#"
+type Content
+   = Folder
+   | Markdown {
+        body     String
+        metadata Json<Dict<String>>
+     }
+
+type Visibility
+   = Hidden
+   | Public
+
+record Node {
+    @public
+    id         Int @id
+    content    Content
+    visibility Visibility
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let query_list = parser::parse_query(
+        "query.pyre",
+        r#"
+insert CreateNode($content: Content, $visibility: Visibility) {
+    node {
+        content = $content
+        visibility = $visibility
+    }
+}
+"#,
+    )
+    .expect("query parses");
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+    let mut files = Vec::new();
+
+    core::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+
+    let metadata = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "queries/metadata/createNode.ts"))
+        .expect("generated metadata file");
+    assert!(metadata.contents.contains("json_input_args: [\"content\"]"));
 }

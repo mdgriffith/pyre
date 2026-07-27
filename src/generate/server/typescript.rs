@@ -395,7 +395,10 @@ fn session_validator(context: &typecheck::Context, type_: &ast::ColumnType) -> S
         ast::ColumnType::Json => "z.unknown()".to_string(),
         ast::ColumnType::JsonTyped(inner) => session_validator(context, inner),
         ast::ColumnType::List(inner) => format!("z.array({})", session_validator(context, inner)),
-        ast::ColumnType::Dict(inner) => format!("z.record({})", session_validator(context, inner)),
+        ast::ColumnType::Dict(inner) => format!(
+            "z.record(z.string(), {})",
+            session_validator(context, inner)
+        ),
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", session_validator(context, inner))
         }

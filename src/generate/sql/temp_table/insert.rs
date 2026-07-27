@@ -992,6 +992,7 @@ fn render_type_variable_insert_values(
         variable_name,
         "",
     )];
+    let mut seen_columns = std::collections::HashSet::new();
 
     if let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(typename) {
         for variant in variants {
@@ -1002,8 +1003,10 @@ fn render_type_variable_insert_values(
                         query,
                         field_name,
                         variable_name,
+                        &column.name,
                         "",
                         variant_field,
+                        &mut seen_columns,
                         &mut result,
                     );
                 }
@@ -1027,8 +1030,10 @@ fn append_type_field_variable_insert_values(
     query: &ast::Query,
     field_name: &str,
     variable_name: &str,
+    column_prefix: &str,
     json_prefix: &str,
     field: &ast::Field,
+    seen_columns: &mut std::collections::HashSet<String>,
     result: &mut Vec<String>,
 ) {
     let ast::Field::Column(inner_column) = field else {
@@ -1040,6 +1045,11 @@ fn append_type_field_variable_insert_values(
     } else {
         format!("{}.{}", json_prefix, inner_column.name)
     };
+    let column_name = format!("{}__{}", column_prefix, inner_column.name);
+
+    if !seen_columns.insert(column_name.clone()) {
+        return;
+    }
 
     match inner_column.type_.to_serialization_type() {
         ast::SerializationType::Concrete(_) => {
@@ -1067,8 +1077,10 @@ fn append_type_field_variable_insert_values(
                                 query,
                                 field_name,
                                 variable_name,
+                                &column_name,
                                 &json_path,
                                 variant_field,
+                                seen_columns,
                                 result,
                             );
                         }

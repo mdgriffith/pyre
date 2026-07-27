@@ -124,7 +124,10 @@ fn seed_column_validator(type_: &ast::ColumnType, context: &typecheck::Context) 
             format!("z.array({})", seed_column_validator(inner, context))
         }
         ast::ColumnType::Dict(inner) => {
-            format!("z.record({})", seed_column_validator(inner, context))
+            format!(
+                "z.record(z.string(), {})",
+                seed_column_validator(inner, context)
+            )
         }
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", seed_column_validator(inner, context))
