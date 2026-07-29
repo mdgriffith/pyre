@@ -305,6 +305,64 @@ Filters records using conditions.
 
 **Note**: `@where(Null)` means no conditions (equivalent to omitting `@where`).
 
+### Tagged Union Predicates
+
+Use a variant-qualified path to filter on fields inside a tagged union payload:
+
+```pyre
+query RetryablePayments($errorCode: String) {
+    payment {
+        @where {
+            state.Failed.errorCode == $errorCode &&
+            state.Failed.retryable == True
+        }
+
+        id
+        state
+    }
+}
+```
+
+Each variant segment narrows and guards the rest of the path. For example,
+`state.Failed.errorCode == $errorCode` only matches when `state` is `Failed`;
+payload data from any inactive variant is ignored. Nested unions repeat the same
+field/variant pattern:
+
+```pyre
+@where {
+    state.Failed.reason.ProviderRejected.code == $code
+}
+```
+
+Payload fields must always be variant-qualified, even when multiple variants
+declare a field with the same name and type. Write the variants explicitly when
+more than one should match:
+
+```pyre
+@where {
+    state.Pending.externalId == $externalId ||
+    state.Failed.externalId == $externalId
+}
+```
+
+Discriminator comparisons and membership checks remain available directly on
+the union field:
+
+```pyre
+@where {
+    state == Failed
+}
+
+@where {
+    state in [Pending, Failed]
+}
+```
+
+Variant guards are retained for every comparison operator. In particular,
+`state.Failed.errorCode != "declined"` matches only `Failed` values with a
+different error code. Unary negation such as
+`!(state.Failed.errorCode == "declined")` is not supported.
+
 ### @sort
 
 Orders results.
