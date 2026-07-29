@@ -43,6 +43,10 @@ function validateSyncCursor(syncCursor: SyncCursor): void {
             throw new Error(`syncCursor entry for ${tableName} must be an object`);
         }
 
+        if (entry.last_seen_updated_at !== null && !Number.isSafeInteger(entry.last_seen_updated_at)) {
+            throw new Error(`syncCursor last_seen_updated_at for ${tableName} must be a safe integer or null`);
+        }
+
         if (typeof entry.permission_hash !== "string") {
             throw new Error(`syncCursor permission_hash for ${tableName} must be a string`);
         }
@@ -125,15 +129,18 @@ function reshapeSyncTableGroups(tableGroups: Array<{ table_name: string; headers
 }
 
 function coerceUnixSeconds(value: unknown): number {
-    if (typeof value === "number") {
+    if (typeof value === "number" && Number.isSafeInteger(value)) {
         return value;
     }
 
     if (typeof value === "bigint") {
-        return Number(value);
+        const number = Number(value);
+        if (Number.isSafeInteger(number)) {
+            return number;
+        }
     }
 
-    return new Date(value as string | Date).getTime() / 1000;
+    throw new Error("database updatedAt must be a safe integer number or bigint");
 }
 
 function rowsFromSyncQueryResult(queryResult: any, headers: string[]): Array<Record<string, any>> {

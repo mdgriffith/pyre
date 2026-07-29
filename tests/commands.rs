@@ -729,7 +729,22 @@ fn build_payload_union_verify_script(seed_calls: &[&str], expected_rows: &[&str]
         script.push_str(";\n");
     }
 
+    script
+        .push_str("for (const invalid of [1735776000.5, \"1735776000.5\", \"July 11, 2026\"]) {\n");
+    script.push_str("  let rejected = false;\n");
+    script.push_str(
+        "  try { await SeedFinishedDone(db, { endedAt: invalid }); } catch { rejected = true; }\n",
+    );
+    script.push_str("  if (!rejected) throw new Error(`Expected invalid DateTime to be rejected: ${JSON.stringify(invalid)}`);\n");
+    script.push_str("}\n");
+
     script.push_str("await SeedNode(db, { content: { _type: \"Markdown\", body: \"hello\", metadata: { source: \"runner\" } } });\n");
+
+    script.push_str("const storage = await db.execute('select typeof(updatedAt) as updatedAtType, typeof(lifecycle__endedAt) as endedAtType from aiSessions');\n");
+    script.push_str("for (const row of storage.rows) {\n");
+    script.push_str("  if (row.updatedAtType !== \"integer\") throw new Error(`Expected updatedAt INTEGER storage, got: ${JSON.stringify(row)}`);\n");
+    script.push_str("  if (row.endedAtType !== \"integer\" && row.endedAtType !== \"null\") throw new Error(`Expected endedAt INTEGER or NULL storage, got: ${JSON.stringify(row)}`);\n");
+    script.push_str("}\n");
 
     script.push_str("const result = await GetAiSessions(db, {});\n\n");
     script.push_str(&format!(
@@ -1648,7 +1663,7 @@ async fn test_generated_typescript_runner_decodes_payload_unions_and_datetime_st
     let seed_calls = [
         "SeedRunningNumber(db, {})",
         "SeedFinishedDone(db, { endedAt: \"2026-01-03T00:00:00.000Z\" })",
-        "SeedFinishedTimeout(db, { endedAt: 1735776000 })",
+        "SeedFinishedTimeout(db, { endedAt: new Date(1735776000 * 1000) })",
         "SeedFinishedStringSeconds(db, { endedAt: \"1735948800\" })",
         "SeedRunningIdle(db, {})",
         "SeedLifecycle(db, { lifecycle: { _type: \"Finished\", reason: \"direct\" } })",

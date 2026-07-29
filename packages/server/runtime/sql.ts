@@ -24,7 +24,20 @@ export function toSessionArgs(sessionArgs: string[], session: Record<string, unk
 
 function normalizeSqlArg(value: unknown): unknown {
   if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new Error("Invalid Date SQL argument");
+    }
     return Math.floor(value.getTime() / 1000);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(normalizeSqlArg);
+  }
+
+  if (value !== null && typeof value === "object" && !(value instanceof Uint8Array)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [key, normalizeSqlArg(nested)])
+    );
   }
 
   return value;
@@ -47,7 +60,7 @@ export function buildArgs(
   if (input) {
     for (const [key, value] of Object.entries(input)) {
       if (value !== undefined) {
-        args[key] = jsonInputArgSet.has(key) ? JSON.stringify(value) : normalizeSqlArg(value);
+        args[key] = jsonInputArgSet.has(key) ? JSON.stringify(normalizeSqlArg(value)) : normalizeSqlArg(value);
         if (optionalInputArgs.includes(key)) {
           args[`${key}__is_set`] = true;
         }

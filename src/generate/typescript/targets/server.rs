@@ -253,7 +253,7 @@ fn seed_column_type(column: &ast::Column) -> String {
 
 fn seed_column_type_inner(type_: &ast::ColumnType) -> String {
     match type_ {
-        ast::ColumnType::DateTime => "number | string".to_string(),
+        ast::ColumnType::DateTime => "Date | number | string".to_string(),
         ast::ColumnType::Date => "string".to_string(),
         ast::ColumnType::Json => "unknown".to_string(),
         ast::ColumnType::JsonTyped(inner) => {

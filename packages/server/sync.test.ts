@@ -409,3 +409,45 @@ test("catchup rejects oversized sync cursor permission hashes", async () => {
   }, {}, 1000)).rejects.toThrow("permission_hash");
   expect(db.execute).not.toHaveBeenCalled();
 });
+
+test("catchup rejects non-integer sync cursor timestamps before wasm work", async () => {
+  for (const last_seen_updated_at of [1.5, "1700000000", Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    const db = {
+      execute: mock(async () => ({ rows: [] })),
+      batch: mock(async () => ([])),
+    };
+
+    await expect(catchup(db as any, {
+      tables: {
+        maps: { last_seen_updated_at, permission_hash: "perm" },
+      },
+    } as any, {}, 1000)).rejects.toThrow("safe integer or null");
+    expect(db.execute).not.toHaveBeenCalled();
+  }
+});
+
+test("catchup rejects non-integer database timestamps", async () => {
+  for (const updatedAt of [1.5, "1700000000", new Date("2023-11-14T22:13:20Z"), Number.NaN, BigInt(Number.MAX_SAFE_INTEGER) + 1n]) {
+    const db = {
+      execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1 }] })),
+      batch: mock(async () => ([
+        {
+          columns: ["id", "name", "tiling", "tiling__tileRootKey", "tiling__tileWidth", "tiling__format", "updatedAt"],
+          rows: [{
+            id: 1,
+            name: "World",
+            tiling: null,
+            tiling__tileRootKey: null,
+            tiling__tileWidth: null,
+            tiling__format: null,
+            updatedAt,
+          }],
+        },
+      ])),
+    };
+
+    await expect(catchup(db as any, { tables: {} }, {}, 1000)).rejects.toThrow(
+      "database updatedAt must be a safe integer number or bigint",
+    );
+  }
+});
