@@ -108,7 +108,7 @@ function withoutServerRevision(message: unknown): unknown {
     return message;
   }
 
-  const { serverRevision: _serverRevision, ...rest } = message as Record<string, unknown>;
+  const { serverRevision: _serverRevision, databaseEpoch: _databaseEpoch, ...rest } = message as Record<string, unknown>;
   return rest;
 }
 
@@ -118,9 +118,9 @@ function syncDb() {
   return {
     execute: mock(async (sql: string) => {
       executedSql.push(sql);
-      if (sql.includes("returning value")) {
+      if (sql.includes("returning database_epoch, server_revision")) {
         revision += 1;
-        return { rows: [{ value: revision }] };
+        return { rows: [{ database_epoch: "test-epoch", server_revision: revision }] };
       }
 
       return { rows: [] };
@@ -315,6 +315,7 @@ test("runWithSync builds origin sync from executing session when origin is not l
   expect((result.response as any).sync).toEqual({
     type: "delta",
     serverRevision: 1,
+    databaseEpoch: "test-epoch",
     databaseId: "campaign:123",
     data: [
       {

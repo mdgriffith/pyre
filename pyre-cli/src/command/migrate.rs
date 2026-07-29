@@ -169,8 +169,9 @@ pub async fn push<'a>(
                                 let schema_source =
                                     pyre::generate::to_string::schema_to_string("", current_schema);
                                 sql.push(SqlAndParams::SqlWithParams {
-                                    sql: pyre::db::migrate::INSERT_SCHEMA.to_string(),
-                                    args: vec![schema_source],
+                                    sql: pyre::db::migrate::INSERT_MIGRATION_SUCCESS_WITH_SCHEMA
+                                        .to_string(),
+                                    args: vec!["push".to_string(), "".to_string(), schema_source],
                                 });
 
                                 match conn.connect() {

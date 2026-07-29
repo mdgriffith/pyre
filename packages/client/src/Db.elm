@@ -60,6 +60,12 @@ update msg db =
                     , Cmd.none
                     )
 
+                Data.IndexedDb.DatabaseEpochResetCompleted _ ->
+                    ( db, Cmd.none )
+
+                Data.IndexedDb.DatabaseEpochResetFailed _ _ ->
+                    ( db, Cmd.none )
+
         DeltaReceived delta ->
             let
                 updatedDb =

@@ -1289,7 +1289,7 @@ record Task {
 
     let mut schema_rows = conn
         .query(
-            "select schema from _pyre_schema order by created_at desc limit 1",
+            "select schema from _pyre_migrations where schema is not null order by id desc limit 1",
             (),
         )
         .await
@@ -1299,12 +1299,12 @@ record Task {
         .next()
         .await
         .unwrap()
-        .expect("_pyre_schema should contain at least one schema row");
+        .expect("_pyre_migrations should contain a schema-bearing row");
     let schema_source: String = schema_row.get(0).unwrap();
 
     assert!(
         schema_source.contains("status TaskStatus"),
-        "_pyre_schema should store the pushed schema source"
+        "_pyre_migrations should store the pushed schema source"
     );
 }
 

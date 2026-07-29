@@ -273,6 +273,39 @@ export class IndexedDBStorage {
     });
   }
 
+  async getDatabaseEpoch(): Promise<string | null> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const request = db.transaction(['meta'], 'readonly').objectStore('meta').get('databaseEpoch');
+      request.onsuccess = () => resolve(typeof request.result === 'string' ? request.result : null);
+      request.onerror = () => reject(new Error(`Failed to read database epoch: ${request.error}`));
+    });
+  }
+
+  async putDatabaseEpoch(databaseEpoch: string): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const request = db.transaction(['meta'], 'readwrite').objectStore('meta').put(databaseEpoch, 'databaseEpoch');
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(new Error(`Failed to write database epoch: ${request.error}`));
+    });
+  }
+
+  async resetForDatabaseEpoch(databaseEpoch: string): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['tables', 'syncCursor', 'meta'], 'readwrite');
+      tx.objectStore('tables').clear();
+      tx.objectStore('syncCursor').clear();
+      const meta = tx.objectStore('meta');
+      meta.delete('lastAppliedServerRevision');
+      meta.put(databaseEpoch, 'databaseEpoch');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(new Error(`Failed to reset database epoch: ${tx.error}`));
+      tx.onabort = () => reject(new Error(`Database epoch reset aborted: ${tx.error}`));
+    });
+  }
+
   async putRows(tableName: string, rows: Array<Record<string, unknown>>): Promise<PutRowsResult> {
     if (rows.length === 0) {
       return { tableName, received: 0, written: 0, skippedOlder: 0 };
@@ -378,15 +411,22 @@ export class IndexedDbService {
   private elmApp: ElmApp | null = null;
   private debugLog: (...args: unknown[]) => void;
   private onEntityDelta: ((tableGroups: ServerTableGroup[], source: EntityChangeBatchSource) => void) | null;
+  private onDatabaseEpochReset: (() => void) | null;
+  private onDatabaseEpochStored: ((databaseEpoch: string) => void) | null;
+  private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(
     storage: IndexedDBStorage,
     debugLog?: (...args: unknown[]) => void,
-    onEntityDelta?: (tableGroups: ServerTableGroup[], source: EntityChangeBatchSource) => void
+    onEntityDelta?: (tableGroups: ServerTableGroup[], source: EntityChangeBatchSource) => void,
+    onDatabaseEpochReset?: () => void,
+    onDatabaseEpochStored?: (databaseEpoch: string) => void,
   ) {
     this.storage = storage;
     this.debugLog = debugLog ?? (() => {});
     this.onEntityDelta = onEntityDelta ?? null;
+    this.onDatabaseEpochReset = onDatabaseEpochReset ?? null;
+    this.onDatabaseEpochStored = onDatabaseEpochStored ?? null;
   }
 
   attachPorts(elmApp: ElmApp): void {
@@ -395,14 +435,16 @@ export class IndexedDbService {
     if (elmApp.ports.indexedDbOut) {
       elmApp.ports.indexedDbOut.subscribe((message) => {
         this.debugLog('[PyreClient] port indexedDbOut <-', message);
-        this.handleMessage(message as { type?: string; tableGroups?: TableGroup[] }).catch((error) => {
-          console.error('[PyreClient] IndexedDB handler failed:', error);
-        });
+        this.operationQueue = this.operationQueue
+          .then(() => this.handleMessage(message as { type?: string; tableGroups?: TableGroup[]; databaseEpoch?: string }))
+          .catch((error) => {
+            console.error('[PyreClient] IndexedDB handler failed:', error);
+          });
       });
     }
   }
 
-  private async handleMessage(message: { type?: string; tableGroups?: TableGroup[]; cursor?: SyncCursor; serverRevision?: number; entityStreamSource?: string }): Promise<void> {
+  private async handleMessage(message: { type?: string; tableGroups?: TableGroup[]; cursor?: SyncCursor; serverRevision?: number; databaseEpoch?: string; entityStreamSource?: string }): Promise<void> {
     if (message.type === 'requestInitialData') {
       await this.sendInitialData();
       return;
@@ -420,6 +462,17 @@ export class IndexedDbService {
 
     if (message.type === 'writeServerRevision' && typeof message.serverRevision === 'number') {
       await this.writeServerRevision(message.serverRevision);
+      return;
+    }
+
+    if (message.type === 'writeDatabaseEpoch' && typeof message.databaseEpoch === 'string') {
+      await this.storage.putDatabaseEpoch(message.databaseEpoch);
+      this.onDatabaseEpochStored?.(message.databaseEpoch);
+      return;
+    }
+
+    if (message.type === 'resetForDatabaseEpoch' && typeof message.databaseEpoch === 'string') {
+      await this.resetForDatabaseEpoch(message.databaseEpoch);
     }
   }
 
@@ -435,6 +488,7 @@ export class IndexedDbService {
       const tables = await this.storage.getAllTables();
       const cursor = await this.storage.getSyncCursor();
       const lastAppliedServerRevision = await this.storage.getServerRevision();
+      const databaseEpoch = await this.storage.getDatabaseEpoch();
 
       const tableCounts = Object.fromEntries(
         Object.entries(tables).map(([tableName, rows]) => [tableName, rows.length])
@@ -443,7 +497,7 @@ export class IndexedDbService {
 
       this.elmApp.ports.receiveIndexedDbMessage.send({
         type: 'initialData',
-        data: { tables, cursor, lastAppliedServerRevision },
+        data: { tables, cursor, lastAppliedServerRevision, databaseEpoch },
       });
       this.debugLog('[PyreClient] IndexedDB initial data loaded', {
         tableCounts,
@@ -453,9 +507,30 @@ export class IndexedDbService {
       });
     } catch (error) {
       console.error('[PyreClient] Failed to load initial data:', error);
-      const fallbackMessage = { type: 'initialData', data: { tables: {}, cursor: { tables: {} }, lastAppliedServerRevision: null } };
+      const fallbackMessage = { type: 'initialData', data: { tables: {}, cursor: { tables: {} }, lastAppliedServerRevision: null, databaseEpoch: null } };
       this.elmApp.ports.receiveIndexedDbMessage.send(fallbackMessage);
       this.debugLog('[PyreClient] port receiveIndexedDbMessage ->', fallbackMessage);
+    }
+  }
+
+  private async resetForDatabaseEpoch(databaseEpoch: string): Promise<void> {
+    if (!this.elmApp?.ports.receiveIndexedDbMessage) {
+      return;
+    }
+    try {
+      await this.storage.resetForDatabaseEpoch(databaseEpoch);
+      this.onDatabaseEpochReset?.();
+      this.onDatabaseEpochStored?.(databaseEpoch);
+      this.elmApp.ports.receiveIndexedDbMessage.send({
+        type: 'databaseEpochResetCompleted',
+        databaseEpoch,
+      });
+    } catch (error) {
+      this.elmApp.ports.receiveIndexedDbMessage.send({
+        type: 'databaseEpochResetFailed',
+        databaseEpoch,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

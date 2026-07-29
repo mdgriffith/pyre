@@ -3,7 +3,7 @@ import * as wasm from "./wasm/pyre_wasm.js";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
 
 const DEFAULT_SCHEMA_KEY = "__default__";
-const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_schema", "_pyre_sync"]);
+const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync"]);
 const introspectionsByDatabaseId = new Map<string, unknown>();
 
 function schemaKey(databaseId?: DatabaseId): string {
@@ -89,7 +89,7 @@ function filterInternalTables(introspection: any): any {
 
 /**
  * Get the Pyre schema source from the database.
- * Returns the raw Pyre schema text stored in the _pyre_schema table.
+ * Returns the raw Pyre schema text stored with the latest successful migration.
  * 
  * @param db - The database client
  * @returns The Pyre schema source text, or empty string if not found
@@ -103,7 +103,7 @@ function filterInternalTables(introspection: any): any {
 export async function getPyreSchemaSource(db: Client): Promise<string> {
     try {
         const result = await db.execute(
-            "SELECT schema FROM _pyre_schema ORDER BY created_at DESC LIMIT 1"
+            "SELECT schema FROM _pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL AND schema IS NOT NULL ORDER BY id DESC LIMIT 1"
         );
 
         if (result.rows.length === 0) {

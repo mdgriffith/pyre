@@ -26,7 +26,7 @@ test('Elm catchup request includes restored syncCursor on startup', async () => 
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ tables: {}, has_more: false });
+    response = JSON.stringify({ databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
     c = false;
@@ -129,7 +129,7 @@ test('Elm catchup request includes databaseId when configured', async () => {
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseId: 'campaign:123', tables: {}, has_more: false });
+    response = JSON.stringify({ databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -226,7 +226,7 @@ test('Elm catchup waits for startSync when autoStart is false', async () => {
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseId: 'campaign:123', tables: {}, has_more: false });
+    response = JSON.stringify({ databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -318,7 +318,7 @@ test('Elm catchup rejects missing response databaseId when configured', async ()
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ tables: {}, has_more: false });
+    response = JSON.stringify({ databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -401,7 +401,7 @@ test('Elm catchup rejects mismatched response databaseId', async () => {
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseId: 'campaign:456', tables: {}, has_more: false });
+    response = JSON.stringify({ databaseId: 'campaign:456', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -485,7 +485,7 @@ test('Elm catchup request includes credentials and headers when configured', asy
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ tables: {}, has_more: false });
+    response = JSON.stringify({ databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -554,6 +554,93 @@ test('Elm catchup request includes credentials and headers when configured', asy
 
     expect(requestCredentials).toEqual([true]);
     expect(requestHeaders.Authorization).toBe('Bearer token-1');
+  } finally {
+    globalThis.XMLHttpRequest = previousXmlHttpRequest;
+  }
+});
+
+test('Elm destructively resets persisted state before retrying a changed database epoch', async () => {
+  const previousXmlHttpRequest = globalThis.XMLHttpRequest;
+  const requestBodies: unknown[] = [];
+
+  class MockXMLHttpRequest {
+    listeners: Record<string, Array<() => void>> = {};
+    status = 200;
+    statusText = 'OK';
+    responseURL = '';
+    responseType = '';
+    response = '';
+    timeout = 0;
+    withCredentials = false;
+    addEventListener(type: string, callback: () => void) {
+      this.listeners[type] = this.listeners[type] ?? [];
+      this.listeners[type].push(callback);
+    }
+    open(_method: string, url: string) { this.responseURL = url; }
+    setRequestHeader() {}
+    send(body?: string) {
+      requestBodies.push(JSON.parse(body ?? '{}'));
+      this.response = requestBodies.length === 1
+        ? JSON.stringify({
+            type: 'reset',
+            databaseEpoch: 'new-epoch',
+            operation: 'replace',
+            scope: 'database',
+            reason: 'database_epoch_changed',
+          })
+        : JSON.stringify({ databaseEpoch: 'new-epoch', tables: {}, has_more: false });
+      queueMicrotask(() => (this.listeners.load ?? []).forEach((listener) => listener()));
+    }
+    abort() {}
+    getAllResponseHeaders() { return ''; }
+  }
+
+  globalThis.XMLHttpRequest = MockXMLHttpRequest;
+  try {
+    const Elm = loadElm(Object.create(globalThis));
+    const app = Elm.Main.init({
+      flags: {
+        schema,
+        server: { baseUrl: 'http://example.test', catchupPath: '/sync' },
+        liveSync: { transport: 'sse' },
+      },
+    });
+    const resetMessages: unknown[] = [];
+    app.ports.indexedDbOut.subscribe((message) => {
+      if (message?.type === 'requestInitialData') {
+        app.ports.receiveIndexedDbMessage.send({
+          type: 'initialData',
+          data: {
+            tables: { maps: [{ id: 1, updatedAt: 9 }] },
+            cursor: { tables: { maps: { last_seen_updated_at: 9, permission_hash: 'old' } } },
+            lastAppliedServerRevision: 20,
+            databaseEpoch: 'old-epoch',
+          },
+        });
+      }
+      if (message?.type === 'resetForDatabaseEpoch') {
+        resetMessages.push(message);
+        app.ports.receiveIndexedDbMessage.send({
+          type: 'databaseEpochResetCompleted',
+          databaseEpoch: message.databaseEpoch,
+        });
+      }
+    });
+
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+
+    expect(resetMessages).toEqual([
+      { type: 'resetForDatabaseEpoch', databaseEpoch: 'new-epoch' },
+    ]);
+    expect(requestBodies).toEqual([
+      {
+        databaseEpoch: 'old-epoch',
+        syncCursor: { tables: { maps: { last_seen_updated_at: 9, permission_hash: 'old' } } },
+      },
+      { databaseEpoch: 'new-epoch', syncCursor: { tables: {} } },
+    ]);
   } finally {
     globalThis.XMLHttpRequest = previousXmlHttpRequest;
   }

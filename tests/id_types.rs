@@ -697,7 +697,7 @@ record GameDocument {
     conn.execute(pyre::db::migrate::CREATE_SYNC_TABLE, ())
         .await
         .expect("Failed creating _pyre_sync table");
-    conn.execute(pyre::db::migrate::INSERT_SYNC_REVISION_ROW, ())
+    conn.execute(pyre::db::migrate::INSERT_SYNC_STATE_ROW, ())
         .await
         .expect("Failed seeding _pyre_sync revision row");
 

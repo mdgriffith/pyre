@@ -60,8 +60,8 @@ impl MigrationDatabase {
 
         let schema_string = pyre::generate::to_string::schema_to_string("", &schema);
         migration_sql.push(pyre::generate::sql::to_sql::SqlAndParams::SqlWithParams {
-            sql: pyre::db::migrate::INSERT_SCHEMA.to_string(),
-            args: vec![schema_string],
+            sql: pyre::db::migrate::INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
+            args: vec!["test-init".to_string(), "".to_string(), schema_string],
         });
 
         let conn = db.connect().map_err(TestError::Database)?;
@@ -181,7 +181,10 @@ async fn migration_creates_single_pyre_sync_revision_row() -> Result<(), TestErr
     .await?;
     let conn = db.db.connect().map_err(TestError::Database)?;
     let mut rows = conn
-        .query("select key, value, count(*) over () from _pyre_sync", ())
+        .query(
+            "select id, database_epoch, server_revision, count(*) over () from _pyre_sync",
+            (),
+        )
         .await
         .map_err(TestError::Database)?;
 
@@ -191,13 +194,43 @@ async fn migration_creates_single_pyre_sync_revision_row() -> Result<(), TestErr
         .map_err(TestError::Database)?
         .ok_or_else(|| TestError::TypecheckError("_pyre_sync should have one row".to_string()))?;
 
-    let key: String = row.get(0).map_err(TestError::Database)?;
-    let value: i64 = row.get(1).map_err(TestError::Database)?;
-    let count: i64 = row.get(2).map_err(TestError::Database)?;
+    let id: i64 = row.get(0).map_err(TestError::Database)?;
+    let epoch: String = row.get(1).map_err(TestError::Database)?;
+    let revision: i64 = row.get(2).map_err(TestError::Database)?;
+    let count: i64 = row.get(3).map_err(TestError::Database)?;
 
-    assert_eq!(key, "server_revision");
-    assert_eq!(value, 0);
+    assert_eq!(id, 1);
+    assert_eq!(epoch.len(), 32);
+    assert_eq!(revision, 0);
     assert_eq!(count, 1);
+
+    let mut internal_tables = conn
+        .query(
+            "select name from sqlite_master where type = 'table' and name like '_pyre_%' order by name",
+            (),
+        )
+        .await
+        .map_err(TestError::Database)?;
+    let mut names = Vec::new();
+    while let Some(row) = internal_tables.next().await.map_err(TestError::Database)? {
+        names.push(row.get::<String>(0).map_err(TestError::Database)?);
+    }
+    assert_eq!(names, vec!["_pyre_migrations", "_pyre_sync"]);
+
+    let schema: String = conn
+        .query(
+            "select schema from _pyre_migrations where schema is not null order by id desc limit 1",
+            (),
+        )
+        .await
+        .map_err(TestError::Database)?
+        .next()
+        .await
+        .map_err(TestError::Database)?
+        .ok_or_else(|| TestError::TypecheckError("missing migration schema".to_string()))?
+        .get(0)
+        .map_err(TestError::Database)?;
+    assert!(schema.contains("record Note"));
 
     Ok(())
 }

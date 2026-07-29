@@ -1342,8 +1342,8 @@ record User {
 
 #[test]
 fn test_nullable_query_parameter_with_non_nullable_column() {
-    // Test that nullable query parameters cannot be used with non-nullable columns
-    // Null is not a valid value for non-nullable types
+    // Nullable values are safe to compare with non-nullable columns. A null value
+    // simply does not match under SQL comparison semantics.
     let schema = r#"
 record User {
     id   Int    @id
@@ -1361,8 +1361,6 @@ record User {
 
     let context = typecheck::check_schema(&database).expect("Failed to typecheck schema");
 
-    // Query with nullable parameter used against non-nullable column
-    // This should fail - nullable params cannot be used with non-nullable columns
     let query_source = r#"
         query GetUserByName($name: String?) {
             user {
@@ -1376,24 +1374,61 @@ record User {
     let query_list =
         parser::parse_query("query.pyre", query_source).expect("Failed to parse query");
 
-    let result = typecheck::check_queries(&query_list, &context);
+    typecheck::check_queries(&query_list, &context)
+        .expect("Nullable parameters should be comparable with non-nullable columns");
+}
 
-    match result {
-        Ok(_) => {
-            panic!("Nullable parameter with non-nullable column should fail typechecking");
-        }
-        Err(errors) => {
-            // Should fail with a type mismatch error
-            let has_type_mismatch = errors
-                .iter()
-                .any(|e| matches!(&e.error_type, error::ErrorType::TypeMismatch { .. }));
-            assert!(
-                has_type_mismatch,
-                "Should have a TypeMismatch error for nullable param with non-nullable column. Errors: {:?}",
-                errors
-            );
-        }
-    }
+#[test]
+fn nullable_session_id_is_comparable_with_non_nullable_id() {
+    let schema = r#"
+session {
+    currentClocktowerGameId ClocktowerGame.id?
+}
+
+record ClocktowerGame {
+    id Id.Int @id
+    @allow(query) { id == Session.currentClocktowerGameId }
+}
+"#;
+
+    let mut schema_ast = ast::Schema::default();
+    parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
+
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema_ast],
+    })
+    .expect("Nullable session IDs should be comparable with non-nullable IDs");
+}
+
+#[test]
+fn session_type_mismatch_uses_authored_name_and_nullable_syntax() {
+    let schema = r#"
+session {
+    currentClocktowerGameId String?
+}
+
+record ClocktowerGame {
+    id Id.Int @id
+    @allow(query) { id == Session.currentClocktowerGameId }
+}
+"#;
+
+    let mut schema_ast = ast::Schema::default();
+    parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
+    let errors = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema_ast],
+    })
+    .expect_err("Mismatched session and column types should fail");
+    let mismatch = errors
+        .iter()
+        .find(|error| matches!(error.error_type, ErrorType::TypeMismatch { .. }))
+        .expect("Expected a type mismatch");
+    let formatted = error::format_error(schema, mismatch, false);
+
+    assert!(formatted.contains(
+        "Session.currentClocktowerGameId is defined as\n\n    String?\n\nbut I'm expecting a\n\n    ClocktowerGame.id\n"
+    ));
+    assert!(!formatted.contains("$session_currentClocktowerGameId"));
 }
 
 #[test]

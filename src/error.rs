@@ -925,8 +925,8 @@ fn to_error_description(error: &Error, in_color: bool) -> String {
         } => {
             let mut result = "".to_string();
             result.push_str(&format!(
-                "{} is defined as {}, but I'm expecting a {}.\n",
-                yellow_if(in_color, &format!("${}", variable_name)),
+                "{} is defined as\n\n    {}\n\nbut I'm expecting a\n\n    {}\n",
+                yellow_if(in_color, variable_name),
                 yellow_if(in_color, variable_defined_as),
                 cyan_if(in_color, column_defined_as)
             ));

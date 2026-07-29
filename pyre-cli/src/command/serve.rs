@@ -76,6 +76,8 @@ struct Connection {
 struct SyncRequest {
     #[serde(rename = "databaseId")]
     database_id: Option<String>,
+    #[serde(rename = "databaseEpoch")]
+    database_epoch: Option<String>,
     #[serde(rename = "syncCursor")]
     sync_cursor: SyncCursor,
 }
@@ -290,12 +292,13 @@ async fn sync(
         .map_err(|error| ServeError::Internal(error.to_string()))?;
     let server = SyncServer::new(context);
     let result = server
-        .catchup(
+        .catchup_protocol(
             &conn,
             &body.sync_cursor,
             session.logical(),
             state.page_size,
             &state.database_id,
+            body.database_epoch.as_deref(),
         )
         .await
         .map_err(|error| ServeError::Internal(error.to_string()))?;
@@ -310,6 +313,21 @@ async fn sync_events(
 ) -> Result<Response, ServeError> {
     ensure_database_id(&state, query.database_id.as_deref())?;
     let session = pyre_session_from_request(&state, &headers)?;
+    let conn = state
+        .db
+        .connect()
+        .map_err(|error| ServeError::Internal(format!("database error: {}", error)))?;
+    let mut epoch_rows = conn
+        .query("SELECT database_epoch FROM _pyre_sync WHERE id = 1", ())
+        .await
+        .map_err(|error| ServeError::Internal(format!("database error: {}", error)))?;
+    let database_epoch: String = epoch_rows
+        .next()
+        .await
+        .map_err(|error| ServeError::Internal(format!("database error: {}", error)))?
+        .ok_or_else(|| ServeError::Internal("missing _pyre_sync row".to_string()))?
+        .get(0)
+        .map_err(|error| ServeError::Internal(format!("database error: {}", error)))?;
     let session_id = new_connection_id();
     let (sender, mut receiver) = mpsc::unbounded_channel();
     state.connections.lock().await.insert(
@@ -325,6 +343,7 @@ async fn sync_events(
         "sessionId": session_id,
         "connectionId": session_id,
         "databaseId": state.database_id,
+        "databaseEpoch": database_epoch,
     });
     let cleanup = ConnectionCleanup {
         state: Arc::clone(&state),

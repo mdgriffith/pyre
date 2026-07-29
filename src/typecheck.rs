@@ -2479,6 +2479,7 @@ fn check_where_args(
                         &table.name,
                         &column_type_string,
                         is_nullable,
+                        true,
                     );
                 }
             }
@@ -2740,6 +2741,7 @@ fn check_permissions_where_args(
                         &table.name,
                         &query_param_type_for_column(table, &column),
                         column.nullable,
+                        true,
                     );
                     for error in &mut errors[first_new_error..] {
                         error.filepath = filepath.clone();
@@ -3327,6 +3329,7 @@ fn check_value(
     table_name: &str,
     table_type_string: &str,
     is_nullable: bool,
+    allow_nullable_value: bool,
 ) {
     if let ast::ColumnType::JsonTyped(inner) = ast::ColumnType::from_str(table_type_string) {
         match value {
@@ -3343,6 +3346,7 @@ fn check_value(
                     table_name,
                     &inner.to_string(),
                     false,
+                    allow_nullable_value,
                 );
                 return;
             }
@@ -3484,6 +3488,7 @@ fn check_value(
                                 table_name,
                                 arg_type,
                                 false,
+                                false,
                             );
                         }
                         if !are_query_types_compatible(
@@ -3554,9 +3559,15 @@ fn check_value(
                                             filepath: context.current_filepath.clone(),
                                             error_type: ErrorType::TypeMismatch {
                                                 table: table_name.to_string(),
-                                                column_defined_as: table_type_string.to_string(),
-                                                variable_name: var.name.clone(),
-                                                variable_defined_as: type_name.clone(),
+                                                column_defined_as: format_query_type(
+                                                    table_type_string,
+                                                    is_nullable,
+                                                ),
+                                                variable_name: ast::to_pyre_variable_name(var),
+                                                variable_defined_as: format_query_type(
+                                                    type_name,
+                                                    *param_nullable,
+                                                ),
                                             },
                                             locations: vec![
                                                 Location {
@@ -3574,23 +3585,16 @@ fn check_value(
                                             ],
                                         })
                                     }
-                                    // 2. Check nullability: nullable params cannot be used with non-nullable columns
-                                    //    Null is not a valid value for non-nullable types, regardless of context
-                                    //    (WHERE clauses, SET operations, etc.)
-                                    if !is_nullable && *param_nullable {
+                                    // Comparisons can safely receive null. Assignments to required
+                                    // fields and other required values cannot.
+                                    if !allow_nullable_value && !is_nullable && *param_nullable {
                                         errors.push(Error {
                                             filepath: context.current_filepath.clone(),
                                             error_type: ErrorType::TypeMismatch {
                                                 table: table_name.to_string(),
-                                                column_defined_as: format!(
-                                                    "{} (non-nullable)",
-                                                    table_type_string
-                                                ),
-                                                variable_name: var.name.clone(),
-                                                variable_defined_as: format!(
-                                                    "{} (nullable)",
-                                                    type_name
-                                                ),
+                                                column_defined_as: table_type_string.to_string(),
+                                                variable_name: ast::to_pyre_variable_name(var),
+                                                variable_defined_as: format!("{}?", type_name),
                                             },
                                             locations: vec![
                                                 Location {
@@ -3673,6 +3677,14 @@ fn check_value(
                 }
             }
         }
+    }
+}
+
+fn format_query_type(type_name: &str, nullable: bool) -> String {
+    if nullable {
+        format!("{}?", type_name)
+    } else {
+        type_name.to_string()
     }
 }
 
@@ -3901,6 +3913,7 @@ fn check_table_query(
                             params,
                             &table.record.name,
                             "Int",
+                            false,
                             false,
                         );
                     }
@@ -4246,6 +4259,7 @@ fn check_field(
                 &column.name,
                 &column_type_str,
                 column.nullable,
+                false,
             );
 
             // If this is a union variant with nested fields (e.g., Success { message = $message }),
@@ -4290,6 +4304,7 @@ fn check_field(
                                                     &variant_col.name,
                                                     &variant_col_type_str,
                                                     variant_col.nullable,
+                                                    false,
                                                 );
                                             }
                                         }
@@ -4384,6 +4399,7 @@ fn check_field(
                                                             &variant_col.name,
                                                             &variant_col_type_str,
                                                             variant_col.nullable,
+                                                            false,
                                                         );
                                                     }
                                                 }

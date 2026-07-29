@@ -22,6 +22,7 @@ test('IndexedDbService restores persisted sync cursor with initial data', async 
     getAllTables: async () => ({ maps: [] }),
     getSyncCursor: async () => persistedCursor,
     getServerRevision: async () => serverRevision,
+    getDatabaseEpoch: async () => 'persisted-epoch',
     putSyncCursor: async (cursor: SyncCursor) => {
       Object.assign(persistedCursor, cursor);
     },
@@ -69,6 +70,7 @@ test('IndexedDbService restores persisted sync cursor with initial data', async 
         tables: { maps: [] },
         cursor: persistedCursor,
         lastAppliedServerRevision: 7,
+        databaseEpoch: 'persisted-epoch',
       },
     },
   ]);
@@ -83,6 +85,7 @@ test('IndexedDbService forwards catchup entity deltas after cache writes', async
     getAllTables: async () => ({}),
     getSyncCursor: async () => ({ tables: {} }),
     getServerRevision: async () => null,
+    getDatabaseEpoch: async () => null,
     putSyncCursor: async () => undefined,
     putServerRevision: async () => undefined,
     putRows: async () => {
@@ -115,4 +118,34 @@ test('IndexedDbService forwards catchup entity deltas after cache writes', async
 
   expect(entityDeltas).toEqual([{ tableGroups, source: 'catchup' }]);
   expect(operations).toEqual(['write', 'write', 'notify']);
+});
+
+test('IndexedDbService acknowledges an atomic database epoch reset', async () => {
+  let handleIndexedDbOut: ((message: unknown) => void | Promise<void>) | null = null;
+  const sentMessages: unknown[] = [];
+  const resets: string[] = [];
+  let callbackCount = 0;
+  const storage = {
+    resetForDatabaseEpoch: async (epoch: string) => {
+      resets.push(epoch);
+    },
+  };
+  const service = new IndexedDbService(storage as never, undefined, undefined, () => {
+    callbackCount += 1;
+  });
+  service.attachPorts({
+    ports: {
+      indexedDbOut: { subscribe: (callback) => { handleIndexedDbOut = callback; } },
+      receiveIndexedDbMessage: { send: (message) => sentMessages.push(message) },
+    },
+  });
+
+  handleIndexedDbOut?.({ type: 'resetForDatabaseEpoch', databaseEpoch: 'new-epoch' });
+  await Bun.sleep(0);
+
+  expect(resets).toEqual(['new-epoch']);
+  expect(callbackCount).toBe(1);
+  expect(sentMessages).toEqual([
+    { type: 'databaseEpochResetCompleted', databaseEpoch: 'new-epoch' },
+  ]);
 });

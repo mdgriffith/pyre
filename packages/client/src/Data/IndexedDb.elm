@@ -4,6 +4,8 @@ port module Data.IndexedDb exposing
     , SyncCursor
     , receiveIncoming
     , requestInitialData
+    , resetForDatabaseEpoch
+    , writeDatabaseEpoch
     , writeDelta
     , writeDeltaWithEntityNotification
     , writeServerRevision
@@ -25,6 +27,7 @@ type alias InitialData =
     { tables : Dict String (List (Dict String Value))
     , cursor : SyncCursor
     , lastAppliedServerRevision : Maybe Int
+    , databaseEpoch : Maybe String
     }
 
 
@@ -49,10 +52,14 @@ type Message
     | WriteDeltaWithEntityNotification String (List TableGroup)
     | WriteSyncCursor SyncCursor
     | WriteServerRevision Int
+    | WriteDatabaseEpoch String
+    | ResetForDatabaseEpoch String
 
 
 type Incoming
     = InitialDataReceived InitialData
+    | DatabaseEpochResetCompleted String
+    | DatabaseEpochResetFailed String String
 
 
 
@@ -102,6 +109,18 @@ encodeMessage msg =
                 , ( "serverRevision", Encode.int serverRevision )
                 ]
 
+        WriteDatabaseEpoch databaseEpoch ->
+            Encode.object
+                [ ( "type", Encode.string "writeDatabaseEpoch" )
+                , ( "databaseEpoch", Encode.string databaseEpoch )
+                ]
+
+        ResetForDatabaseEpoch databaseEpoch ->
+            Encode.object
+                [ ( "type", Encode.string "resetForDatabaseEpoch" )
+                , ( "databaseEpoch", Encode.string databaseEpoch )
+                ]
+
 
 
 -- Decoders
@@ -117,6 +136,15 @@ decodeIncoming =
                         Decode.field "data" decodeInitialData
                             |> Decode.map InitialDataReceived
 
+                    "databaseEpochResetCompleted" ->
+                        Decode.field "databaseEpoch" Decode.string
+                            |> Decode.map DatabaseEpochResetCompleted
+
+                    "databaseEpochResetFailed" ->
+                        Decode.map2 DatabaseEpochResetFailed
+                            (Decode.field "databaseEpoch" Decode.string)
+                            (Decode.field "error" Decode.string)
+
                     _ ->
                         Decode.fail ("Unknown IndexedDB incoming type: " ++ type_)
             )
@@ -124,10 +152,11 @@ decodeIncoming =
 
 decodeInitialData : Decode.Decoder InitialData
 decodeInitialData =
-    Decode.map3 InitialData
+    Decode.map4 InitialData
         (Decode.field "tables" (Decode.dict (Decode.list (Decode.dict Data.Value.decodeValue))))
         (Decode.field "cursor" decodeSyncCursor)
         (Decode.maybe (Decode.field "lastAppliedServerRevision" Decode.int))
+        (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
 
 
 decodeSyncCursor : Decode.Decoder SyncCursor
@@ -204,6 +233,16 @@ writeSyncCursor cursor =
 writeServerRevision : Int -> Cmd msg
 writeServerRevision serverRevision =
     sendMessage (WriteServerRevision serverRevision)
+
+
+writeDatabaseEpoch : String -> Cmd msg
+writeDatabaseEpoch databaseEpoch =
+    sendMessage (WriteDatabaseEpoch databaseEpoch)
+
+
+resetForDatabaseEpoch : String -> Cmd msg
+resetForDatabaseEpoch databaseEpoch =
+    sendMessage (ResetForDatabaseEpoch databaseEpoch)
 
 
 receiveIncoming : (Result Decode.Error Incoming -> msg) -> Sub msg

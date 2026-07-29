@@ -16,15 +16,16 @@ export const MAX_LIVE_SYNC_DELTA_ROWS = 5000;
 export const MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES = 1024 * 1024;
 export const MAX_LIVE_SYNC_FANOUT_RECIPIENTS = 1000;
 
-async function nextLiveSyncRevision(db: Client): Promise<number> {
-  const result = await db.execute("update _pyre_sync set value = value + 1 where key = 'server_revision' returning value");
-  const value = result.rows[0]?.value;
+async function nextLiveSyncRevision(db: Client): Promise<{ databaseEpoch: string; serverRevision: number }> {
+  const result = await db.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
+  const databaseEpoch = result.rows[0]?.database_epoch;
+  const value = result.rows[0]?.server_revision;
 
-  if (typeof value !== "number" && typeof value !== "bigint") {
+  if (typeof databaseEpoch !== "string" || (typeof value !== "number" && typeof value !== "bigint")) {
     throw new Error("Failed to allocate Pyre sync server revision");
   }
 
-  return Number(value);
+  return { databaseEpoch, serverRevision: Number(value) };
 }
 
 function countRows(tableGroups: unknown): number {
@@ -93,11 +94,11 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
       return;
     }
 
-    const serverRevision = await nextLiveSyncRevision(db);
+    const { databaseEpoch, serverRevision } = await nextLiveSyncRevision(db);
     const result = typeof deltasResult === "string" ? JSON.parse(deltasResult) : deltasResult;
 
     if ((!Array.isArray(result.groups) || result.groups.length === 0) && !originSession) {
-      return { serverRevision };
+      return { databaseEpoch, serverRevision };
     }
 
     for (const group of Array.isArray(result.groups) ? result.groups : []) {
@@ -115,6 +116,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
       const deltaMessage = {
         type: "delta",
         serverRevision,
+        databaseEpoch,
         ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
         data,
       };
@@ -123,6 +125,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
         ? {
           type: "syncRequired",
           serverRevision,
+          databaseEpoch,
           ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
         }
         : deltaMessage;
@@ -154,6 +157,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
             const deltaMessage = {
               type: "delta",
               serverRevision,
+              databaseEpoch,
               ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
               data,
             };
@@ -161,6 +165,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
               ? {
                 type: "syncRequired",
                 serverRevision,
+                databaseEpoch,
                 ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
               }
               : deltaMessage;
@@ -169,7 +174,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
       }
     }
 
-    return { serverRevision, ...(originMessage === undefined ? {} : { originMessage }) };
+    return { databaseEpoch, serverRevision, ...(originMessage === undefined ? {} : { originMessage }) };
   };
 }
 

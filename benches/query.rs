@@ -275,8 +275,8 @@ async fn setup_database() -> (Database, typecheck::Context, tempfile::TempDir) {
     // Add schema insertion
     let schema_string = pyre::generate::to_string::schema_to_string("", &schema);
     migration_sql.push(SqlAndParams::SqlWithParams {
-        sql: migrate::INSERT_SCHEMA.to_string(),
-        args: vec![schema_string],
+        sql: migrate::INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
+        args: vec!["bench-init".to_string(), "".to_string(), schema_string],
     });
 
     // Execute migration

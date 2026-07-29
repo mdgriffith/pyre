@@ -531,6 +531,7 @@ record Note {
     updatedAt Int
     @public
 }
+
 "#,
     )
     .await?;
@@ -577,6 +578,114 @@ record Note {
         .await?;
     assert_eq!(catchup_result.server_revision, Some(2));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn database_epoch_mismatch_returns_explicit_replacement(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let response = SyncServer::new(&db.context)
+        .catchup_protocol(
+            &conn,
+            &SyncCursor::new(),
+            &SyncSession::new(),
+            10,
+            "main",
+            Some("stale-epoch"),
+        )
+        .await?;
+
+    let json = serde_json::to_value(response)?;
+    assert_eq!(json["type"], json!("reset"));
+    assert_eq!(json["operation"], json!("replace"));
+    assert_eq!(json["scope"], json!("database"));
+    assert_eq!(json["reason"], json!("database_epoch_changed"));
+    assert_eq!(json["databaseId"], json!("main"));
+    assert_eq!(json["databaseEpoch"].as_str().map(str::len), Some(32));
+    assert!(json.get("tables").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn matching_database_epoch_returns_sync_page() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let page = SyncServer::new(&db.context)
+        .catchup(&conn, &SyncCursor::new(), &SyncSession::new(), 10, "main")
+        .await?;
+    let response = SyncServer::new(&db.context)
+        .catchup_protocol(
+            &conn,
+            &SyncCursor::new(),
+            &SyncSession::new(),
+            10,
+            "main",
+            Some(&page.database_epoch),
+        )
+        .await?;
+    let json = serde_json::to_value(response)?;
+
+    assert_eq!(json["databaseEpoch"], json!(page.database_epoch));
+    assert!(json.get("tables").is_some());
+    assert!(json.get("type").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotating_database_epoch_resets_the_revision() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute(
+        "update _pyre_sync set server_revision = 42 where id = 1",
+        (),
+    )
+    .await?;
+    let old_epoch = SyncServer::new(&db.context)
+        .catchup(&conn, &SyncCursor::new(), &SyncSession::new(), 10, "main")
+        .await?
+        .database_epoch;
+
+    let new_epoch = pyre::server::sync::rotate_database_epoch(&conn).await?;
+    let mut rows = conn
+        .query(
+            "select database_epoch, server_revision from _pyre_sync where id = 1",
+            (),
+        )
+        .await?;
+    let row = rows.next().await?.expect("sync singleton");
+
+    assert_ne!(new_epoch, old_epoch);
+    assert_eq!(row.get::<String>(0)?, new_epoch);
+    assert_eq!(row.get::<i64>(1)?, 0);
     Ok(())
 }
 
@@ -1325,7 +1434,7 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     conn.execute(
-        "update _pyre_schema set schema = ?",
+        "update _pyre_migrations set schema = ? where schema is not null",
         libsql::params_from_iter(vec![libsql::Value::Text("record {".to_string())]),
     )
     .await?;
@@ -1355,7 +1464,7 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     conn.execute(
-        "update _pyre_schema set schema = ?",
+        "update _pyre_migrations set schema = ? where schema is not null",
         libsql::params_from_iter(vec![libsql::Value::Text(
             r#"
 record Note {

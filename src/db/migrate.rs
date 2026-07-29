@@ -9,8 +9,6 @@ use crate::typecheck;
 
 pub const MIGRATION_TABLE: &str = "_pyre_migrations";
 
-pub const SCHEMA_TABLE: &str = "_pyre_schema";
-
 pub const SYNC_TABLE: &str = "_pyre_sync";
 
 pub const LIST_MIGRATIONS: &str = "select name from _pyre_migrations";
@@ -25,22 +23,18 @@ pub const CREATE_MIGRATION_TABLE: &str = "create table if not exists _pyre_migra
     name text not null,
     finished_at integer,
     error text,
-    sql text not null
-)";
-
-pub const CREATE_SCHEMA_TABLE: &str = "create table if not exists _pyre_schema (
-    id integer not null primary key autoincrement,
-    created_at integer not null default (unixepoch()),
-    schema text not null
+    sql text not null,
+    schema text
 )";
 
 pub const CREATE_SYNC_TABLE: &str = "create table if not exists _pyre_sync (
-    key text not null primary key check (key = 'server_revision'),
-    value integer not null
+    id integer not null primary key check (id = 1),
+    database_epoch text not null,
+    server_revision integer not null default 0 check (server_revision >= 0)
 )";
 
-pub const INSERT_SYNC_REVISION_ROW: &str =
-    "insert into _pyre_sync (key, value) values ('server_revision', 0) on conflict(key) do nothing";
+pub const INSERT_SYNC_STATE_ROW: &str =
+    "insert into _pyre_sync (id, database_epoch, server_revision) values (1, lower(hex(randomblob(16))), 0) on conflict(id) do nothing";
 
 pub const INSERT_MIGRATION_ERROR: &str =
     "insert into _pyre_migrations (name, sql, error) values (?, ?, ?)";
@@ -48,14 +42,14 @@ pub const INSERT_MIGRATION_ERROR: &str =
 pub const INSERT_MIGRATION_SUCCESS: &str =
     "insert into _pyre_migrations (name, sql, finished_at) values (?, ?, unixepoch())";
 
-pub const INSERT_SCHEMA: &str = "insert into _pyre_schema (schema) values (?)";
+pub const INSERT_MIGRATION_SUCCESS_WITH_SCHEMA: &str =
+    "insert into _pyre_migrations (name, sql, schema, finished_at) values (?, ?, ?, unixepoch())";
 
 pub fn internal_setup_sql() -> Vec<SqlAndParams> {
     vec![
         SqlAndParams::Sql(CREATE_MIGRATION_TABLE.to_string()),
-        SqlAndParams::Sql(CREATE_SCHEMA_TABLE.to_string()),
         SqlAndParams::Sql(CREATE_SYNC_TABLE.to_string()),
-        SqlAndParams::Sql(INSERT_SYNC_REVISION_ROW.to_string()),
+        SqlAndParams::Sql(INSERT_SYNC_STATE_ROW.to_string()),
     ]
 }
 
@@ -74,7 +68,6 @@ pub fn quoted_internal_setup_sql() -> Vec<SqlAndParams> {
 
 fn quote_internal_table_names(sql: &str) -> String {
     sql.replace(MIGRATION_TABLE, &crate::ext::string::quote(MIGRATION_TABLE))
-        .replace(SCHEMA_TABLE, &crate::ext::string::quote(SCHEMA_TABLE))
         .replace(SYNC_TABLE, &crate::ext::string::quote(SYNC_TABLE))
 }
 
@@ -149,8 +142,12 @@ pub fn migrate_dynamic(
         return Ok(MigrationSql {
             sql: vec![],
             mark_success: SqlAndParams::SqlWithParams {
-                sql: INSERT_MIGRATION_SUCCESS.to_string(),
-                args: vec![name.to_string(), "".to_string()],
+                sql: INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
+                args: vec![
+                    name.to_string(),
+                    "".to_string(),
+                    new_schema_source.to_string(),
+                ],
             },
             mark_failure: SqlAndParams::SqlWithParams {
                 sql: INSERT_MIGRATION_ERROR.to_string(),
@@ -166,17 +163,15 @@ pub fn migrate_dynamic(
 
     sql.splice(0..0, internal_setup_sql());
 
-    // Insert the new schema
-    sql.push(SqlAndParams::SqlWithParams {
-        sql: INSERT_SCHEMA.to_string(),
-        args: vec![new_schema_source.to_string()],
-    });
-
     Ok(MigrationSql {
         sql,
         mark_success: SqlAndParams::SqlWithParams {
-            sql: INSERT_MIGRATION_SUCCESS.to_string(),
-            args: vec![name.to_string(), sql_executed.clone()],
+            sql: INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
+            args: vec![
+                name.to_string(),
+                sql_executed.clone(),
+                new_schema_source.to_string(),
+            ],
         },
         mark_failure: SqlAndParams::SqlWithParams {
             sql: INSERT_MIGRATION_ERROR.to_string(),
@@ -201,8 +196,6 @@ pub fn migrate_dynamic(
 pub struct FileBasedMigrationPlan {
     /// Migrations that should be executed (name, sql_content)
     pub migrations_to_run: Vec<(String, String)>,
-    /// SQL to insert the schema after migrations
-    pub insert_schema_sql: String,
     /// Schema string to insert
     pub schema_string: String,
 }
@@ -233,13 +226,8 @@ pub fn plan_file_based_migrations(
     // Generate schema string
     let schema_string = crate::generate::to_string::schema_to_string("", schema);
 
-    // Use the centralized constant for inserting schema, formatting with quoted table name
-    let insert_schema_sql =
-        INSERT_SCHEMA.replace(SCHEMA_TABLE, &crate::ext::string::quote(SCHEMA_TABLE));
-
     FileBasedMigrationPlan {
         migrations_to_run,
-        insert_schema_sql,
         schema_string,
     }
 }

@@ -137,22 +137,31 @@ update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
         IndexedDbReceived incoming ->
-            let
-                ( updatedDb, dbCmd ) =
-                    Db.update (Db.FromIndexedDb model.schema incoming) model.db
+            case incoming of
+                IndexedDb.InitialDataReceived _ ->
+                    let
+                        ( updatedDb, dbCmd ) =
+                            Db.update (Db.FromIndexedDb model.schema incoming) model.db
 
-                baseModel =
-                    { model | db = updatedDb }
+                        baseModel =
+                            { model | db = updatedDb }
 
-                ( updatedModel, indexedDbCmd ) =
-                    handleIndexedDbIncoming incoming baseModel
-            in
-            ( updatedModel
-            , Cmd.batch
-                [ Cmd.map DbMsg dbCmd
-                , indexedDbCmd
-                ]
-            )
+                        ( updatedModel, indexedDbCmd ) =
+                            handleIndexedDbIncoming incoming baseModel
+                    in
+                    ( updatedModel
+                    , Cmd.batch [ Cmd.map DbMsg dbCmd, indexedDbCmd ]
+                    )
+
+                IndexedDb.DatabaseEpochResetCompleted databaseEpoch ->
+                    applyCatchupUpdate
+                        (Catchup.update (Catchup.DatabaseEpochResetCompleted databaseEpoch) model.catchup model.db)
+                        model
+
+                IndexedDb.DatabaseEpochResetFailed databaseEpoch message ->
+                    applyCatchupUpdate
+                        (Catchup.update (Catchup.DatabaseEpochResetFailed databaseEpoch message) model.catchup model.db)
+                        model
 
         LiveSyncReceived incoming ->
             let
@@ -241,17 +250,23 @@ handleIndexedDbIncoming incoming model =
                     }
 
                 ( catchupModel, catchupCmd ) =
-                    applyCatchupUpdate (Catchup.update (Catchup.InitialDataLoaded initialData.cursor) model.catchup model.db) baseModel
+                    applyCatchupUpdate (Catchup.update (Catchup.InitialDataLoaded initialData.cursor initialData.databaseEpoch) model.catchup model.db) baseModel
             in
             ( catchupModel
             , Cmd.batch [ Cmd.batch cmds, catchupCmd ]
             )
 
+        IndexedDb.DatabaseEpochResetCompleted _ ->
+            ( model, Cmd.none )
+
+        IndexedDb.DatabaseEpochResetFailed _ _ ->
+            ( model, Cmd.none )
+
 
 handleLiveSyncIncoming : LiveSync.Incoming -> Model -> ( Model, Cmd Msg )
 handleLiveSyncIncoming incoming model =
     case incoming of
-        LiveSync.DeltaReceived messageDatabaseId serverRevision delta ->
+        LiveSync.DeltaReceived messageDatabaseId messageEpoch serverRevision delta ->
             case validateLiveSyncDatabaseId model messageDatabaseId "delta" of
                 Just message ->
                     ( { model | syncError = Just message }
@@ -262,7 +277,10 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    if isStaleServerRevision serverRevision model.lastAppliedServerRevision then
+                    if liveEpochMismatch model messageEpoch then
+                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
+
+                    else if isStaleServerRevision serverRevision model.lastAppliedServerRevision then
                         ( model, Cmd.none )
 
                     else
@@ -285,7 +303,7 @@ handleLiveSyncIncoming incoming model =
                             ]
                         )
 
-        LiveSync.LiveSyncConnected messageDatabaseId _ ->
+        LiveSync.LiveSyncConnected messageDatabaseId messageEpoch _ ->
             case validateLiveSyncDatabaseId model messageDatabaseId "connected" of
                 Just message ->
                     ( { model | syncError = Just message }
@@ -293,7 +311,11 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    ( model, Cmd.none )
+                    if liveEpochMismatch model messageEpoch then
+                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
+
+                    else
+                        ( model, Cmd.none )
 
         LiveSync.LiveSyncError error ->
             ( { model | syncError = Just error }
@@ -339,7 +361,7 @@ handleLiveSyncIncoming incoming model =
                     , emitSyncState (toSyncState updatedModel)
                     )
 
-        LiveSync.SyncRequiredReceived messageDatabaseId serverRevision ->
+        LiveSync.SyncRequiredReceived messageDatabaseId messageEpoch serverRevision ->
             case validateLiveSyncDatabaseId model messageDatabaseId "syncRequired" of
                 Just message ->
                     ( { model | syncError = Just message }
@@ -347,11 +369,25 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    if isStaleServerRevision serverRevision model.lastAppliedServerRevision then
-                        ( model, Cmd.none )
+                    if not (liveEpochMismatch model messageEpoch) then
+                        if isStaleServerRevision serverRevision model.lastAppliedServerRevision then
+                            ( model, Cmd.none )
+
+                        else
+                            applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
 
                     else
                         applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
+
+
+liveEpochMismatch : Model -> Maybe String -> Bool
+liveEpochMismatch model messageEpoch =
+    case ( Catchup.databaseEpoch model.catchup, messageEpoch ) of
+        ( Just currentEpoch, Just incomingEpoch ) ->
+            currentEpoch /= incomingEpoch
+
+        _ ->
+            False
 
 
 validateLiveSyncDatabaseId : Model -> Maybe String -> String -> Maybe String
@@ -1001,12 +1037,16 @@ applyCatchupUpdate result model =
                     SyncState.markAllTablesLive model.tableSyncStatuses
 
         ( replayedDb, replayDbCmds ) =
-            case result.delta of
-                Just _ ->
-                    replayOptimisticMutations model result.db
+            if result.destructiveReset then
+                ( result.db, [] )
 
-                Nothing ->
-                    ( result.db, [] )
+            else
+                case result.delta of
+                    Just _ ->
+                        replayOptimisticMutations model result.db
+
+                    Nothing ->
+                        ( result.db, [] )
 
         updatedModel =
             { model
@@ -1014,7 +1054,24 @@ applyCatchupUpdate result model =
                 , db = replayedDb
                 , syncStatus = nextSyncStatus
                 , tableSyncStatuses = nextTableSyncStatuses
-                , lastAppliedServerRevision = updateLastAppliedServerRevision result.serverRevision model.lastAppliedServerRevision
+                , lastAppliedServerRevision =
+                    if result.destructiveReset then
+                        Nothing
+
+                    else
+                        updateLastAppliedServerRevision result.serverRevision model.lastAppliedServerRevision
+                , inFlightOptimistic =
+                    if result.destructiveReset then
+                        Dict.empty
+
+                    else
+                        model.inFlightOptimistic
+                , optimisticOrder =
+                    if result.destructiveReset then
+                        []
+
+                    else
+                        model.optimisticOrder
                 , syncError =
                     case result.error of
                         Just message ->
@@ -1032,12 +1089,16 @@ applyCatchupUpdate result model =
             startLiveSyncIfReady updatedModel
 
         ( updatedQueryManager, triggerCmds ) =
-            case result.delta of
-                Just delta ->
-                    QueryManager.notifyTablesChanged model.schema replayedDb model.queryManager delta
+            if result.destructiveReset then
+                reExecuteAllQueries model.schema replayedDb model.queryManager
 
-                Nothing ->
-                    ( model.queryManager, [] )
+            else
+                case result.delta of
+                    Just delta ->
+                        QueryManager.notifyTablesChanged model.schema replayedDb model.queryManager delta
+
+                    Nothing ->
+                        ( model.queryManager, [] )
 
         errorCmd =
             case result.error of
@@ -1057,7 +1118,11 @@ applyCatchupUpdate result model =
             , errorCmd
             , Cmd.batch triggerCmds
             , liveSyncCmd
-            , writeServerRevisionCmd result.serverRevision
+            , if result.destructiveReset then
+                Cmd.none
+
+              else
+                writeServerRevisionCmd result.serverRevision
             , emitSyncState (toSyncState liveSyncModel)
             , debugCmd "catchup-update"
                 [ ( "status", Encode.string (catchupStatusToString (Catchup.status result.model)) )
@@ -1189,13 +1254,13 @@ liveSyncTransportToString transport =
 liveSyncIncomingToString : LiveSync.Incoming -> String
 liveSyncIncomingToString incoming =
     case incoming of
-        LiveSync.DeltaReceived _ _ _ ->
+        LiveSync.DeltaReceived _ _ _ _ ->
             "delta"
 
         LiveSync.SyncProgressReceived _ _ ->
             "syncProgress"
 
-        LiveSync.LiveSyncConnected _ _ ->
+        LiveSync.LiveSyncConnected _ _ _ ->
             "connected"
 
         LiveSync.LiveSyncError _ ->
@@ -1204,7 +1269,7 @@ liveSyncIncomingToString incoming =
         LiveSync.SyncCompleteReceived _ ->
             "syncComplete"
 
-        LiveSync.SyncRequiredReceived _ _ ->
+        LiveSync.SyncRequiredReceived _ _ _ ->
             "syncRequired"
 
 

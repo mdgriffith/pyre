@@ -361,6 +361,7 @@ class SingleDatabasePyreClient {
   private pendingLiveState: SyncState | null = null;
   private pendingLiveQueries: Set<string> = new Set();
   private lastAppliedServerRevision: number | null = null;
+  private databaseEpoch: string | null = null;
   private queryManager: QueryManagerService;
   private queryClient: QueryClientService;
   private entityStream: EntityStreamService;
@@ -439,6 +440,10 @@ class SingleDatabasePyreClient {
     this.entityStream = new EntityStreamService();
     this.indexedDbService = new IndexedDbService(this.storage, this.logDebug, (tableGroups, source) => {
       this.entityStream.handleTableDelta(tableGroups, source, this.databaseId);
+    }, () => {
+      this.lastAppliedServerRevision = null;
+    }, (databaseEpoch) => {
+      this.databaseEpoch = databaseEpoch;
     });
     this.sseManager = new SSEManager({
       baseUrl: config.server.baseUrl,
@@ -529,6 +534,7 @@ class SingleDatabasePyreClient {
   async init(): Promise<void> {
     await this.storage.init();
     this.lastAppliedServerRevision = await this.storage.getServerRevision();
+    this.databaseEpoch = await this.storage.getDatabaseEpoch();
   }
 
   startSync(): void {
@@ -963,6 +969,10 @@ class SingleDatabasePyreClient {
       return false;
     }
 
+    if (this.databaseEpoch !== null && message.databaseEpoch !== undefined && message.databaseEpoch !== this.databaseEpoch) {
+      return false;
+    }
+
     if (this.isStaleServerRevision(message.serverRevision)) {
       return false;
     }
@@ -975,7 +985,10 @@ class SingleDatabasePyreClient {
   }
 
   private shouldAcceptLiveControlMessage(message: LiveSyncMessage): boolean {
-    if (this.isStaleServerRevision(message.serverRevision)) {
+    const epochChanged = this.databaseEpoch !== null
+      && message.databaseEpoch !== undefined
+      && message.databaseEpoch !== this.databaseEpoch;
+    if (!epochChanged && this.isStaleServerRevision(message.serverRevision)) {
       return false;
     }
 
