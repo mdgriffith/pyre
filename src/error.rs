@@ -174,6 +174,9 @@ pub enum ErrorType {
     InvalidRelationalPermission {
         message: String,
     },
+    InvalidPermissionPredicate {
+        message: String,
+    },
     SyncedRelationalQueryPermission,
     TypeMismatch {
         table: String,
@@ -1402,7 +1405,8 @@ fn to_error_description(error: &Error, in_color: bool) -> String {
 
             result
         }
-        ErrorType::InvalidRelationalPermission { message } => message.clone(),
+        ErrorType::InvalidRelationalPermission { message }
+        | ErrorType::InvalidPermissionPredicate { message } => message.clone(),
         ErrorType::SyncedRelationalQueryPermission => "Linked query permissions require a query-only namespace until dependency invalidation and permission revocation are supported.".to_string(),
         ErrorType::UnknownType { found, known_types } => {
             let mut result = "".to_string();
@@ -1626,6 +1630,7 @@ fn to_error_title(error_type: &ErrorType) -> String {
         ErrorType::MultipleWheres { .. } => "Multiple Wheres",
         ErrorType::WhereOnLinkIsntAllowed { .. } => "Where On Link Not Allowed",
         ErrorType::InvalidRelationalPermission { .. } => "Invalid Relational Permission",
+        ErrorType::InvalidPermissionPredicate { .. } => "Invalid Permission Predicate",
         ErrorType::SyncedRelationalQueryPermission => {
             "Linked Query Permission Requires Query-only Mode"
         }

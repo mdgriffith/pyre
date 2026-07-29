@@ -408,8 +408,8 @@ fn where_arg_equal_ignoring_locations(a: &ast::WhereArg, b: &ast::WhereArg) -> b
                 .eq(pb.iter().map(|(name, _)| name))
                 && where_arg_equal_ignoring_locations(ba, bb)
         }
-        (ast::WhereArg::Column(sa, ca, oa, va, _), ast::WhereArg::Column(sb, cb, ob, vb, _)) => {
-            sa == sb && ca == cb && oa == ob && query_value_equal_ignoring_locations(va, vb)
+        (ast::WhereArg::Column(sa, pa, oa, va, _), ast::WhereArg::Column(sb, pb, ob, vb, _)) => {
+            sa == sb && pa == pb && oa == ob && query_value_equal_ignoring_locations(va, vb)
         }
         (ast::WhereArg::And(va), ast::WhereArg::And(vb)) => {
             if va.len() != vb.len() {
@@ -1148,6 +1148,50 @@ record Test {
     "#;
 
     round_trip_schema(schema_source);
+}
+
+#[test]
+fn test_query_round_trip_tagged_union_predicate_paths() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+type Reason
+   = ProviderRejected {
+        code String
+     }
+   | Other
+
+type State
+   = Failed {
+        errorCode Int
+        reason Reason
+     }
+   | Ready
+
+record Job {
+    id Int @id
+    state State
+    @public
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    round_trip_query(
+        r#"
+query Jobs($code: Int) {
+    job {
+        @where { state.Failed.errorCode != $code && state.Failed.reason.ProviderRejected.code == "x" }
+        id
+    }
+}
+"#,
+        &database,
+    );
 }
 
 // ============================================================================

@@ -1925,15 +1925,15 @@ fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMeta
     let where_ = match wheres.as_slice() {
         [ast::WhereArg::Column(
             false,
-            field,
+            path,
             ast::Operator::Equal,
             ast::QueryValue::Variable((_, variable)),
             _,
         )] => {
-            if variable.session_field.is_some() {
+            if variable.session_field.is_some() || !path.is_simple() {
                 return None;
             }
-            (field.clone(), variable.name.clone())
+            (path.root().to_string(), variable.name.clone())
         }
         _ => return None,
     };
@@ -2456,11 +2456,11 @@ fn to_where_clause_elm(where_arg: &ast::WhereArg, indent_level: usize) -> String
 
     match where_arg {
         ast::WhereArg::Exists(..) => unreachable!("exists is permission-only"),
-        ast::WhereArg::Column(is_session_field, field_name, operator, value, _) => {
+        ast::WhereArg::Column(is_session_field, path, operator, value, _) => {
             let key = if *is_session_field {
-                format!("Session.{}", field_name)
+                format!("Session.{}", path.authored())
             } else {
-                field_name.clone()
+                path.authored()
             };
 
             match operator {

@@ -1,6 +1,66 @@
 pub mod fuzz;
 pub mod snapshot;
 
+pub fn union_predicate_schema(permission: bool) -> String {
+    format!(
+        r#"
+type ProviderReason
+   = ProviderRejected {{
+        code String?
+     }}
+   | ProviderUnavailable
+
+type JobState
+   = Failed {{
+        errorCode Int
+        reason ProviderReason
+     }}
+   | Ready {{
+        errorCode Int
+     }}
+
+record Job {{
+    id Int @id
+    state JobState
+    updatedAt Int
+    {}
+}}
+"#,
+        if permission {
+            "@allow(query) { state.Failed.reason.ProviderRejected.code != \"blocked\" }"
+        } else {
+            "@public"
+        }
+    )
+}
+
+pub fn relational_union_permission_schema() -> String {
+    r#"
+@syncable(false)
+
+type AccountState
+   = Failed {
+        code String?
+     }
+   | Ready
+
+record Workspace {
+    id Int @id
+    accounts @link(Account.workspaceId)
+    @allow(query) { exists accounts { state.Failed.code != "blocked" } }
+}
+
+record Account {
+    id Int @id
+    workspaceId Int
+    state AccountState
+    workspace @link(workspaceId, Workspace.id)
+    @public
+}
+"#
+    .to_string()
+}
+
 /// Schema with session + @allow permissions, mirroring the shapes that
 /// triggered the aliased-CTE permission predicate regression.
 pub fn permissions_schema() -> String {

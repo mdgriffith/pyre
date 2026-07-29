@@ -104,9 +104,24 @@ fn hash_where_arg(hasher: &mut Sha256, where_arg: &WhereArg) {
             }
             hash_where_arg(hasher, body);
         }
-        WhereArg::Column(is_session_var, column, operator, value, _field_name_range) => {
+        WhereArg::Column(is_session_var, path, operator, value, _field_name_range) => {
             hasher.update(&is_session_var.to_string());
-            hasher.update(column);
+            if path.is_simple() {
+                // Preserve pre-path query hashes for existing predicates.
+                hasher.update(path.root());
+            } else {
+                hasher.update("predicate_path_v1");
+                hasher.update((path.segments.len() as u64).to_le_bytes());
+                for segment in &path.segments {
+                    let (kind, name) = match segment {
+                        crate::ast::PredicatePathSegment::Field(name) => (0_u8, name),
+                        crate::ast::PredicatePathSegment::Variant(name) => (1_u8, name),
+                    };
+                    hasher.update([kind]);
+                    hasher.update((name.len() as u64).to_le_bytes());
+                    hasher.update(name);
+                }
+            }
             hasher.update(format!("{:?}", operator));
             hash_query_value(hasher, value);
         }

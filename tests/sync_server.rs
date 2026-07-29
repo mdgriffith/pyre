@@ -1314,7 +1314,7 @@ async fn session_value_permissions_handle_strings_booleans_and_nulls(
         r#"
 session {
     role String
-    enabled Int
+    enabled Bool
     region String?
 }
 

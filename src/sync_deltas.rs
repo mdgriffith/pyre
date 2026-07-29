@@ -41,13 +41,16 @@ pub struct SyncDeltasResult {
 ///
 /// Optimized to work directly with JsonValue::Object references, avoiding HashMap conversion
 fn evaluate_permission(
+    context: &typecheck::Context,
+    table: &typecheck::Table,
     where_arg: &WhereArg,
     row_data: &Map<String, JsonValue>,
     session: &HashMap<String, SessionValue>,
 ) -> bool {
     match where_arg {
         WhereArg::Exists(..) => false,
-        WhereArg::Column(is_session_var, fieldname, op, value, _field_name_range) => {
+        WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
+            let fieldname = path.root();
             // Get the right-hand side value first (needed for both paths)
             let rhs_value = query_value_to_json(value, session);
 
@@ -63,19 +66,34 @@ fn evaluate_permission(
             } else {
                 // Table column - use reference directly from Map (no clone!)
                 // This is the hot path - most permission checks are on row columns
-                let lhs_value_ref = row_data.get(fieldname).unwrap_or(&JsonValue::Null);
+                let Ok(resolved) =
+                    typecheck::resolve_predicate_path(context, &table.record.fields, path)
+                else {
+                    return false;
+                };
+                if !resolved.discriminators.iter().all(|(column, variant)| {
+                    row_data
+                        .get(column)
+                        .and_then(JsonValue::as_str)
+                        .map_or(false, |value| value == variant)
+                }) {
+                    return false;
+                }
+                let lhs_value_ref = row_data
+                    .get(&resolved.physical_column)
+                    .unwrap_or(&JsonValue::Null);
                 evaluate_operator(op, lhs_value_ref, &rhs_value)
             }
         }
         WhereArg::And(args) => {
             // All conditions must be true - short-circuit on first false
             args.iter()
-                .all(|arg| evaluate_permission(arg, row_data, session))
+                .all(|arg| evaluate_permission(context, table, arg, row_data, session))
         }
         WhereArg::Or(args) => {
             // At least one condition must be true - short-circuit on first true
             args.iter()
-                .any(|arg| evaluate_permission(arg, row_data, session))
+                .any(|arg| evaluate_permission(context, table, arg, row_data, session))
         }
     }
 }
@@ -358,11 +376,11 @@ pub fn calculate_sync_deltas(
     context: &typecheck::Context,
 ) -> Result<SyncDeltasResult, SyncDeltasError> {
     // OPTIMIZATION 1: Build table lookup map once (O(k) instead of O(n*m*k))
-    let mut table_map: HashMap<String, Option<WhereArg>> = HashMap::new();
+    let mut table_map: HashMap<String, (&typecheck::Table, Option<WhereArg>)> = HashMap::new();
     for table in context.tables.values() {
         let actual_table_name = ast::get_tablename(&table.record.name, &table.record.fields);
         let permission = ast::get_permissions(&table.record, &ast::QueryOperation::Query);
-        table_map.insert(actual_table_name, permission);
+        table_map.insert(actual_table_name, (table, permission));
     }
 
     // Build a flat index for permission checking while preserving group structure
@@ -396,14 +414,14 @@ pub fn calculate_sync_deltas(
         for (_flat_idx, (group_idx, row_idx, row_obj)) in flat_rows.iter().enumerate() {
             let table_name = &affected_row_groups[*group_idx].table_name;
 
-            let permission = table_map
+            let (table, permission) = table_map
                 .get(table_name)
-                .ok_or_else(|| SyncDeltasError::TableNotFound(table_name.clone()))?
-                .as_ref();
+                .ok_or_else(|| SyncDeltasError::TableNotFound(table_name.clone()))?;
+            let permission = permission.as_ref();
 
             // If no permission (public), all sessions can see it
             let should_receive = if let Some(perm) = permission {
-                evaluate_permission(perm, row_obj, session_data)
+                evaluate_permission(context, table, perm, row_obj, session_data)
             } else {
                 true // Public - all sessions can see it
             };
