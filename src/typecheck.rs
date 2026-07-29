@@ -19,6 +19,140 @@ pub struct SqlColumnInfo {
     pub directives: Vec<ast::ColumnDirective>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedPredicatePath {
+    pub column: ast::Column,
+    pub physical_column: String,
+    pub discriminators: Vec<(String, String)>,
+}
+
+pub fn resolve_predicate_path(
+    context: &Context,
+    fields: &[ast::Field],
+    path: &ast::PredicatePath,
+) -> Result<ResolvedPredicatePath, String> {
+    let Some(ast::PredicatePathSegment::Field(root)) = path.segments.first() else {
+        return Err("predicate paths must start with a field".to_string());
+    };
+    let Some(mut column) = fields.iter().find_map(|field| match field {
+        ast::Field::Column(column) if column.name == *root => Some(column.clone()),
+        _ => None,
+    }) else {
+        return Err(format!("unknown field '{}'", root));
+    };
+
+    let mut physical_column = root.clone();
+    let mut discriminators = Vec::new();
+    let mut index = 1;
+    while index < path.segments.len() {
+        if column.type_.is_json_like() {
+            return Err("predicate traversal through Json values is not supported".to_string());
+        }
+        let Some(type_name) = column.type_.get_custom_type_name() else {
+            return Err(format!("field '{}' is not a tagged union", column.name));
+        };
+        let Some((_, Type::OneOf { variants })) = context.types.get(type_name) else {
+            return Err(format!("field '{}' is not a tagged union", column.name));
+        };
+        let Some(ast::PredicatePathSegment::Variant(variant_name)) = path.segments.get(index)
+        else {
+            return Err("a tagged-union field must be followed by a variant".to_string());
+        };
+        let Some(variant) = variants
+            .iter()
+            .find(|variant| variant.name == *variant_name)
+        else {
+            return Err(format!(
+                "unknown variant '{}' for tagged union '{}'",
+                variant_name, type_name
+            ));
+        };
+        discriminators.push((physical_column.clone(), variant_name.clone()));
+        index += 1;
+
+        let Some(ast::PredicatePathSegment::Field(field_name)) = path.segments.get(index) else {
+            return Err(format!(
+                "variant '{}' must be followed by a payload field",
+                variant_name
+            ));
+        };
+        let Some(next_column) = variant.fields.as_ref().and_then(|fields| {
+            fields.iter().find_map(|field| match field {
+                ast::Field::Column(column) if column.name == *field_name => Some(column.clone()),
+                _ => None,
+            })
+        }) else {
+            return Err(format!(
+                "variant '{}' has no field '{}'",
+                variant_name, field_name
+            ));
+        };
+        physical_column.push_str("__");
+        physical_column.push_str(field_name);
+        column = next_column;
+        index += 1;
+    }
+
+    if !path.is_simple() && is_document_predicate_type(&column.type_) {
+        return Err(format!(
+            "predicate traversal to document field '{}' is not supported",
+            column.name
+        ));
+    }
+
+    Ok(ResolvedPredicatePath {
+        column,
+        physical_column,
+        discriminators,
+    })
+}
+
+fn is_document_predicate_type(type_: &ast::ColumnType) -> bool {
+    match type_ {
+        ast::ColumnType::Json
+        | ast::ColumnType::JsonTyped(_)
+        | ast::ColumnType::List(_)
+        | ast::ColumnType::Dict(_) => true,
+        ast::ColumnType::Nullable(inner) => is_document_predicate_type(inner),
+        _ => false,
+    }
+}
+
+pub fn predicate_operand_is_nullable(
+    context: &Context,
+    fields: &[ast::Field],
+    is_session: bool,
+    path: &ast::PredicatePath,
+) -> bool {
+    if is_session {
+        return context.session.as_ref().is_some_and(|session| {
+            session.fields.iter().any(|field| {
+                matches!(field, ast::Field::Column(column) if column.name == path.root() && column.nullable)
+            })
+        });
+    }
+
+    resolve_predicate_path(context, fields, path)
+        .map(|resolved| resolved.column.nullable)
+        .unwrap_or(false)
+}
+
+pub fn query_value_is_nullable(context: &Context, value: &ast::QueryValue) -> bool {
+    match value {
+        ast::QueryValue::Null(_) => true,
+        ast::QueryValue::Variable((_, variable)) => variable.session_field.as_ref().is_some_and(
+            |session_field| {
+                context.session.as_ref().is_some_and(|session| {
+                    session.fields.iter().any(|field| {
+                        matches!(field, ast::Field::Column(column) if column.name == *session_field && column.nullable)
+                    })
+                })
+            },
+        ),
+        _ => false,
+    }
+}
+
 pub fn to_sql_column_info(context: &Context, fields: &Vec<ast::Field>) -> Vec<SqlColumnInfo> {
     let mut infos = vec![];
 
@@ -2216,13 +2350,8 @@ fn check_where_args(
                 );
             }
         }
-        ast::WhereArg::Column(
-            is_session_var,
-            field_name,
-            _operator,
-            query_val,
-            field_name_range,
-        ) => {
+        ast::WhereArg::Column(is_session_var, path, _operator, query_val, field_name_range) => {
+            let field_name = path.root();
             // Check if this is a Session variable (e.g., Session.userId, Session.role)
             let mut is_known_field = false;
             let mut column_type: Option<String> = None;
@@ -2282,25 +2411,30 @@ fn check_where_args(
                 }
             } else {
                 // Validate against table fields
+                if let Ok(resolved) = resolve_predicate_path(context, &table.fields, path) {
+                    is_known_field = true;
+                    column_type = Some(query_param_type_for_column(table, &resolved.column));
+                    is_nullable = resolved.column.nullable;
+                }
                 for col in &table.fields {
                     if is_known_field {
                         continue;
                     }
                     match col {
                         ast::Field::Column(column) => {
-                            if &column.name == field_name {
+                            if path.is_simple() && column.name == field_name {
                                 is_known_field = true;
                                 column_type = Some(query_param_type_for_column(table, column));
                                 is_nullable = column.nullable;
                             }
                         }
                         ast::Field::FieldDirective(ast::FieldDirective::Link(link)) => {
-                            if &link.link_name == field_name {
+                            if path.is_simple() && link.link_name == field_name {
                                 is_known_field = true;
                                 errors.push(Error {
                                     filepath: error_filepath.clone(),
                                     error_type: ErrorType::WhereOnLinkIsntAllowed {
-                                        link_name: field_name.clone(),
+                                        link_name: field_name.to_string(),
                                     },
                                     locations: vec![Location {
                                         contexts: vec![],
@@ -2314,7 +2448,7 @@ fn check_where_args(
                 }
                 if !is_known_field {
                     let known_fields = get_column_reference(&table.fields);
-                    let error_found = field_name.clone();
+                    let error_found = path.authored();
 
                     errors.push(Error {
                         filepath: error_filepath.clone(),
@@ -2475,13 +2609,9 @@ fn check_permissions_where_args(
                 check_permissions_where_args(context, table, or, filepath, errors);
             }
         }
-        ast::WhereArg::Column(
-            is_session_var,
-            field_name,
-            _operator,
-            _query_val,
-            field_name_range,
-        ) => {
+        ast::WhereArg::Column(is_session_var, path, operator, query_val, field_name_range) => {
+            let field_name = path.root();
+            let mut terminal_column = None;
             if *is_session_var {
                 // Validate session variable exists
                 if let Some(session) = &context.session {
@@ -2491,6 +2621,7 @@ fn check_permissions_where_args(
                             ast::Field::Column(column) => {
                                 if &column.name == field_name {
                                     is_known_field = true;
+                                    terminal_column = Some(column.clone());
                                     break;
                                 }
                             }
@@ -2528,22 +2659,25 @@ fn check_permissions_where_args(
                 }
             } else {
                 // Validate table field exists
-                let mut is_known_field = false;
+                let resolved = resolve_predicate_path(context, &table.fields, path).ok();
+                terminal_column = resolved.as_ref().map(|resolved| resolved.column.clone());
+                let mut is_known_field = resolved.is_some();
                 for col in &table.fields {
                     match col {
                         ast::Field::Column(column) => {
-                            if &column.name == field_name {
+                            if path.is_simple() && column.name == field_name {
                                 is_known_field = true;
+                                terminal_column = Some(column.clone());
                                 break;
                             }
                         }
                         ast::Field::FieldDirective(ast::FieldDirective::Link(link)) => {
-                            if &link.link_name == field_name {
+                            if path.is_simple() && link.link_name == field_name {
                                 is_known_field = true;
                                 errors.push(Error {
                                     filepath: filepath.clone(),
                                     error_type: ErrorType::WhereOnLinkIsntAllowed {
-                                        link_name: field_name.clone(),
+                                        link_name: field_name.to_string(),
                                     },
                                     locations: vec![Location {
                                         contexts: vec![],
@@ -2561,7 +2695,7 @@ fn check_permissions_where_args(
                     errors.push(Error {
                         filepath: filepath.clone(),
                         error_type: ErrorType::UnknownField {
-                            found: field_name.clone(),
+                            found: path.authored(),
                             record_name: table.name.clone(),
                             known_fields,
                         },
@@ -2572,8 +2706,196 @@ fn check_permissions_where_args(
                     });
                 }
             }
+
+            if !matches!(operator, ast::Operator::In | ast::Operator::NotIn) {
+                if let Some(column) = terminal_column {
+                    if let Some(function_range) = first_query_value_function_range(query_val) {
+                        errors.push(Error {
+                            filepath: filepath.clone(),
+                            error_type: ErrorType::InvalidPermissionPredicate {
+                                message: "Functions are not supported in permission predicates because live sync cannot evaluate them.".to_string(),
+                            },
+                            locations: vec![Location {
+                                contexts: vec![],
+                                primary: vec![convert_range(function_range)],
+                            }],
+                        });
+                        return;
+                    }
+                    let query_context = QueryContext {
+                        top_level_field_alias: String::new(),
+                    };
+                    let mut params = permission_session_params(context);
+                    let start = Some(field_name_range.start.clone());
+                    let end = Some(field_name_range.end.clone());
+                    let first_new_error = errors.len();
+                    check_value(
+                        context,
+                        &query_context,
+                        query_val,
+                        &start,
+                        &end,
+                        errors,
+                        &mut params,
+                        &table.name,
+                        &query_param_type_for_column(table, &column),
+                        column.nullable,
+                    );
+                    for error in &mut errors[first_new_error..] {
+                        error.filepath = filepath.clone();
+                    }
+                }
+            } else if let Some(column) = terminal_column {
+                check_permission_membership_value(
+                    context, table, &column, query_val, filepath, errors,
+                );
+            }
         }
     }
+}
+
+fn first_query_value_function_range(value: &ast::QueryValue) -> Option<&ast::Range> {
+    match value {
+        ast::QueryValue::Fn(function) => Some(&function.location_fn_name),
+        ast::QueryValue::LiteralTypeValue((_, details)) => {
+            details.fields.as_ref().and_then(|fields| {
+                fields
+                    .iter()
+                    .find_map(|(_, value)| first_query_value_function_range(value))
+            })
+        }
+        _ => None,
+    }
+}
+
+fn check_permission_membership_value(
+    context: &Context,
+    table: &ast::RecordDetails,
+    terminal_column: &ast::Column,
+    value: &ast::QueryValue,
+    filepath: &String,
+    errors: &mut Vec<Error>,
+) {
+    let invalid = |message: String, range: &ast::Range, errors: &mut Vec<Error>| {
+        errors.push(Error {
+            filepath: filepath.clone(),
+            error_type: ErrorType::InvalidPermissionPredicate { message },
+            locations: vec![Location {
+                contexts: vec![],
+                primary: vec![convert_range(range)],
+            }],
+        });
+    };
+
+    if let Some(range) = first_query_value_function_range(value) {
+        invalid(
+            "Functions are not supported in permission predicates because live sync cannot evaluate them.".to_string(),
+            range,
+            errors,
+        );
+        return;
+    }
+
+    let ast::QueryValue::Variable((range, variable)) = value else {
+        invalid(
+            "Permission membership predicates require a declared Session list.".to_string(),
+            value_range(value),
+            errors,
+        );
+        return;
+    };
+    let Some(session_field) = &variable.session_field else {
+        invalid(
+            "Permission membership predicates require a declared Session list.".to_string(),
+            range,
+            errors,
+        );
+        return;
+    };
+    let session_column = context.session.as_ref().and_then(|session| {
+        session.fields.iter().find_map(|field| match field {
+            ast::Field::Column(column) if column.name == *session_field => Some(column),
+            _ => None,
+        })
+    });
+    let Some(session_column) = session_column else {
+        invalid(
+            format!("Unknown Session membership list '{}'.", session_field),
+            range,
+            errors,
+        );
+        return;
+    };
+    let Some(element_type) = membership_element_type(&session_column.type_) else {
+        invalid(
+            format!(
+                "Session.{} must be a Json<List<T>> membership list.",
+                session_field
+            ),
+            range,
+            errors,
+        );
+        return;
+    };
+    let terminal_type = query_param_type_for_column(table, terminal_column);
+    if !are_query_types_compatible(&element_type.to_string(), &terminal_type) {
+        invalid(
+            format!(
+                "Session.{} contains {}, but {}.{} requires {} values.",
+                session_field, element_type, table.name, terminal_column.name, terminal_type
+            ),
+            range,
+            errors,
+        );
+    }
+}
+
+fn membership_element_type(type_: &ast::ColumnType) -> Option<&ast::ColumnType> {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner) | ast::ColumnType::Nullable(inner) => {
+            membership_element_type(inner)
+        }
+        ast::ColumnType::List(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+fn value_range(value: &ast::QueryValue) -> &ast::Range {
+    match value {
+        ast::QueryValue::Fn(function) => &function.location,
+        ast::QueryValue::LiteralTypeValue((range, _))
+        | ast::QueryValue::Variable((range, _))
+        | ast::QueryValue::String((range, _))
+        | ast::QueryValue::Int((range, _))
+        | ast::QueryValue::Float((range, _))
+        | ast::QueryValue::Bool((range, _))
+        | ast::QueryValue::Null(range) => range,
+    }
+}
+
+fn permission_session_params(context: &Context) -> HashMap<String, ParamInfo> {
+    let mut params = HashMap::new();
+    if let Some(session) = &context.session {
+        for field in &session.fields {
+            if let ast::Field::Column(column) = field {
+                params.insert(
+                    ast::session_field_name(column),
+                    ParamInfo::Defined {
+                        raw_variable_name: format!("session_{}", column.name),
+                        defined_at: None,
+                        type_: Some(column.type_.to_string()),
+                        nullable: column.nullable,
+                        used_by_top_level_field_alias: HashSet::new(),
+                        used: false,
+                        type_inferred: false,
+                        from_session: true,
+                        session_name: Some(column.name.clone()),
+                    },
+                );
+            }
+        }
+    }
+    params
 }
 
 fn check_record_indexes(record: &ast::RecordDetails, filepath: &String, errors: &mut Vec<Error>) {
@@ -2674,14 +2996,16 @@ fn check_record_index_where(
                 );
             }
         }
-        ast::WhereArg::Column(is_session_var, field_name, _, value, _) => {
-            if *is_session_var || !known_fields.contains(field_name) {
+        ast::WhereArg::Column(is_session_var, path, _, value, _) => {
+            let field_name = path.root();
+            if *is_session_var || !path.is_simple() || !known_fields.iter().any(|f| f == field_name)
+            {
                 errors.push(Error {
                     filepath: filepath.clone(),
                     error_type: ErrorType::InvalidRecordIndexField {
                         record: record_name.to_string(),
                         directive: directive_name.to_string(),
-                        field: field_name.clone(),
+                        field: path.authored(),
                         known_fields: known_fields.clone(),
                     },
                     locations: vec![Location {
@@ -2697,7 +3021,7 @@ fn check_record_index_where(
                     error_type: ErrorType::InvalidRecordIndexField {
                         record: record_name.to_string(),
                         directive: directive_name.to_string(),
-                        field: field_name.clone(),
+                        field: path.authored(),
                         known_fields: known_fields.clone(),
                     },
                     locations: vec![Location {
@@ -2880,13 +3204,8 @@ fn mark_session_vars_in_where_as_used(
                 mark_session_vars_in_where_as_used(query_context, context, or, params);
             }
         }
-        ast::WhereArg::Column(
-            is_session_var,
-            field_name,
-            _operator,
-            query_val,
-            _field_name_range,
-        ) => {
+        ast::WhereArg::Column(is_session_var, path, _operator, query_val, _field_name_range) => {
+            let field_name = path.root();
             // Check if the column itself is a session variable (e.g., Session.userId = ...)
             if *is_session_var {
                 if let Some(session) = &context.session {
@@ -3078,7 +3397,7 @@ fn check_value(
             }
         }
         ast::QueryValue::Int((range, _)) => {
-            if table_type_string != "Int" {
+            if !are_query_types_compatible("Int", table_type_string) {
                 errors.push(Error {
                     filepath: context.current_filepath.clone(),
                     error_type: ErrorType::LiteralTypeMismatch {
@@ -3093,7 +3412,7 @@ fn check_value(
             }
         }
         ast::QueryValue::Float((range, _)) => {
-            if table_type_string != "Float" {
+            if !are_query_types_compatible("Float", table_type_string) {
                 errors.push(Error {
                     filepath: context.current_filepath.clone(),
                     error_type: ErrorType::LiteralTypeMismatch {
@@ -3166,6 +3485,25 @@ fn check_value(
                                 arg_type,
                                 false,
                             );
+                        }
+                        if !are_query_types_compatible(
+                            &func_definition.return_type,
+                            table_type_string,
+                        ) {
+                            errors.push(Error {
+                                filepath: context.current_filepath.clone(),
+                                error_type: ErrorType::LiteralTypeMismatch {
+                                    expecting_type: table_type_string.to_string(),
+                                    found: format!(
+                                        "{} (returned by {}())",
+                                        func_definition.return_type, func.name
+                                    ),
+                                },
+                                locations: vec![Location {
+                                    contexts: vec![],
+                                    primary: vec![convert_range(&func.location_fn_name)],
+                                }],
+                            });
                         }
                     }
                 }
@@ -3340,6 +3678,12 @@ fn check_value(
 
 fn are_query_types_compatible(left: &str, right: &str) -> bool {
     if left == right {
+        return true;
+    }
+
+    if (left == "number" && matches!(right, "Int" | "Float"))
+        || (right == "number" && matches!(left, "Int" | "Float"))
+    {
         return true;
     }
 

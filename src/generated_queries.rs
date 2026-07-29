@@ -317,7 +317,7 @@ fn where_equals_field(name: &str) -> ast::ArgField {
     ast::ArgField::Arg(ast::LocatedArg {
         arg: ast::Arg::Where(ast::WhereArg::Column(
             false,
-            name.to_string(),
+            ast::PredicatePath::field(name),
             ast::Operator::Equal,
             variable_value(name),
             ast::empty_range(),

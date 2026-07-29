@@ -944,11 +944,12 @@ fn format_exists(
 fn format_where_at(where_arg: &ast::WhereArg, base_indent: usize) -> String {
     match where_arg {
         ast::WhereArg::Exists(path, body) => format_exists(path, body, base_indent),
-        ast::WhereArg::Column(is_session_var, column, operator, value, _field_name_range) => {
+        ast::WhereArg::Column(is_session_var, path, operator, value, _field_name_range) => {
+            let column = path.authored();
             let column_name = if *is_session_var {
                 format!("Session.{}", column)
             } else {
-                column.clone()
+                column
             };
             let operator = operator_to_string(&operator);
             let value = value_to_string(&value);

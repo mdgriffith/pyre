@@ -221,9 +221,9 @@ pub fn extract_session_fields_from_permission(where_arg: &WhereArg) -> Vec<Strin
 fn extract_session_fields_recursive(where_arg: &WhereArg, fields: &mut Vec<String>) {
     match where_arg {
         WhereArg::Exists(_, body) => extract_session_fields_recursive(body, fields),
-        WhereArg::Column(is_session_var, fieldname, _, value, _field_name_range) => {
+        WhereArg::Column(is_session_var, path, _, value, _field_name_range) => {
             if *is_session_var {
-                fields.push(fieldname.clone());
+                fields.push(path.root().to_string());
             }
             extract_session_fields_from_query_value(value, fields);
         }
@@ -309,10 +309,25 @@ fn hash_permission_ast(hasher: &mut Sha256, where_arg: &WhereArg) {
             }
             hash_permission_ast(hasher, body);
         }
-        WhereArg::Column(is_session, fieldname, op, value, _field_name_range) => {
+        WhereArg::Column(is_session, path, op, value, _field_name_range) => {
             hasher.update("column");
             hasher.update(if *is_session { "session" } else { "table" });
-            hasher.update(fieldname);
+            if path.is_simple() {
+                // Preserve existing cursors for permissions that predate predicate paths.
+                hasher.update(path.root());
+            } else {
+                hasher.update("predicate_path_v1");
+                hasher.update((path.segments.len() as u64).to_le_bytes());
+                for segment in &path.segments {
+                    let (kind, name) = match segment {
+                        ast::PredicatePathSegment::Field(name) => (0_u8, name),
+                        ast::PredicatePathSegment::Variant(name) => (1_u8, name),
+                    };
+                    hasher.update([kind]);
+                    hasher.update((name.len() as u64).to_le_bytes());
+                    hasher.update(name);
+                }
+            }
             // Convert operator to string without Debug formatting
             let op_str = match op {
                 ast::Operator::Equal => "Equal",
@@ -480,6 +495,7 @@ fn render_permission_value(
 /// This is a custom renderer for sync operations that doesn't require QueryField or QueryInfo
 /// Handles session variable replacement internally
 fn render_permission_where(
+    context: &typecheck::Context,
     where_arg: &WhereArg,
     table: &typecheck::Table,
     session: &HashMap<String, SessionValue>,
@@ -487,7 +503,8 @@ fn render_permission_where(
 ) -> String {
     match where_arg {
         WhereArg::Exists(..) => "0".to_string(),
-        WhereArg::Column(is_session_var, fieldname, op, value, _field_name_range) => {
+        WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
+            let fieldname = path.root();
             let qualified_column_name = if *is_session_var {
                 let session_value = session
                     .get(fieldname)
@@ -498,7 +515,13 @@ fn render_permission_where(
                     &table.record.name,
                     &table.record.fields,
                 ));
-                format!("{}.{}", table_name, crate::ext::string::quote(fieldname))
+                let resolved =
+                    typecheck::resolve_predicate_path(context, &table.record.fields, path);
+                let physical = resolved
+                    .as_ref()
+                    .map(|path| path.physical_column.as_str())
+                    .unwrap_or(fieldname);
+                format!("{}.{}", table_name, crate::ext::string::quote(physical))
             };
 
             let value_str = render_permission_value(value, session, params);
@@ -509,7 +532,7 @@ fn render_permission_where(
             } else {
                 value_str
             };
-            let is_null = match value {
+            let runtime_value_is_null = match value {
                 ast::QueryValue::Variable((_, var)) => var
                     .session_field
                     .as_ref()
@@ -518,7 +541,15 @@ fn render_permission_where(
                     .unwrap_or(false),
                 _ => matches!(value, ast::QueryValue::Null(_)),
             };
-            let operator_str = if is_null {
+            let null_safe = runtime_value_is_null
+                || typecheck::predicate_operand_is_nullable(
+                    context,
+                    &table.record.fields,
+                    *is_session_var,
+                    path,
+                )
+                || typecheck::query_value_is_nullable(context, value);
+            let operator_str = if null_safe {
                 match op {
                     ast::Operator::Equal => "is".to_string(),
                     ast::Operator::NotEqual => "is not".to_string(),
@@ -527,19 +558,48 @@ fn render_permission_where(
             } else {
                 crate::generate::sql::to_sql::operator(op)
             };
-            format!("{} {} {}", qualified_column_name, operator_str, value_str)
+            let comparison = format!("{} {} {}", qualified_column_name, operator_str, value_str);
+            if *is_session_var {
+                return comparison;
+            }
+            let Ok(resolved) =
+                typecheck::resolve_predicate_path(context, &table.record.fields, path)
+            else {
+                return comparison;
+            };
+            if resolved.discriminators.is_empty() {
+                return comparison;
+            }
+            let table_name = crate::ext::string::quote(&ast::get_tablename(
+                &table.record.name,
+                &table.record.fields,
+            ));
+            let mut guards = resolved
+                .discriminators
+                .iter()
+                .map(|(column, variant)| {
+                    format!(
+                        "{}.{} = '{}'",
+                        table_name,
+                        crate::ext::string::quote(column),
+                        variant.replace("'", "''")
+                    )
+                })
+                .collect::<Vec<_>>();
+            guards.push(comparison);
+            format!("({})", guards.join(" and "))
         }
         WhereArg::And(args) => {
             let inner_list: Vec<String> = args
                 .iter()
-                .map(|arg| render_permission_where(arg, table, session, params))
+                .map(|arg| render_permission_where(context, arg, table, session, params))
                 .collect();
             format!("({})", inner_list.join(" and "))
         }
         WhereArg::Or(args) => {
             let inner_list: Vec<String> = args
                 .iter()
-                .map(|arg| render_permission_where(arg, table, session, params))
+                .map(|arg| render_permission_where(context, arg, table, session, params))
                 .collect();
             format!("({})", inner_list.join(" or "))
         }
@@ -608,7 +668,7 @@ fn get_sync_status_sql_with_params(
         let permission_where = if let Some(perm) = &permission {
             format!(
                 " WHERE {}",
-                render_permission_where(perm, table, session, params)
+                render_permission_where(context, perm, table, session, params)
             )
         } else {
             String::new()
@@ -816,7 +876,13 @@ pub fn get_sync_sql(
 
         // Add permission WHERE clause. Session values are emitted as bind parameters.
         if let Some(perm) = &permission {
-            where_parts.push(render_permission_where(perm, table, session, &mut params));
+            where_parts.push(render_permission_where(
+                context,
+                perm,
+                table,
+                session,
+                &mut params,
+            ));
         }
 
         // Add updatedAt filter if provided

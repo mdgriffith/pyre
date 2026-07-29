@@ -1278,10 +1278,51 @@ pub fn direction_to_string(direction: &Direction) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WhereArg {
-    Column(bool, String, Operator, QueryValue, Range), // bool indicates if column is from session, String is field name without Session. prefix, Range is the location of the field name (including "Session." if present)
+    Column(bool, PredicatePath, Operator, QueryValue, Range), // bool indicates if the path is a Session field
     Exists(Vec<(String, Range)>, Box<WhereArg>),
     And(Vec<WhereArg>),
     Or(Vec<WhereArg>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PredicatePath {
+    pub segments: Vec<PredicatePathSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PredicatePathSegment {
+    Field(String),
+    Variant(String),
+}
+
+impl PredicatePath {
+    pub fn field(name: impl Into<String>) -> Self {
+        Self {
+            segments: vec![PredicatePathSegment::Field(name.into())],
+        }
+    }
+
+    pub fn root(&self) -> &str {
+        match self.segments.first() {
+            Some(PredicatePathSegment::Field(name)) => name,
+            _ => "",
+        }
+    }
+
+    pub fn is_simple(&self) -> bool {
+        self.segments.len() == 1
+    }
+
+    pub fn authored(&self) -> String {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                PredicatePathSegment::Field(name) | PredicatePathSegment::Variant(name) => name,
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(".")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

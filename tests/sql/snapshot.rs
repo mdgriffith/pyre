@@ -386,6 +386,68 @@ query ActiveUsers {
     );
 }
 
+#[test]
+fn snapshot_select_where_nested_union_paths() {
+    check_snapshot(
+        "select_where_nested_union_paths",
+        &super::union_predicate_schema(false),
+        r#"
+query FailedJobs($code: Int) {
+    job {
+        @where { state.Failed.errorCode == $code && state.Failed.reason.ProviderRejected.code != "x" }
+        id
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn snapshot_select_with_nested_union_permission() {
+    check_snapshot(
+        "select_with_nested_union_permission",
+        &super::union_predicate_schema(true),
+        r#"
+query VisibleJobs {
+    job {
+        id
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn snapshot_relational_permission_with_union_path_uses_exists_alias() {
+    check_snapshot(
+        "relational_permission_with_union_path",
+        &super::relational_union_permission_schema(),
+        r#"
+query VisibleWorkspaces {
+    workspace {
+        id
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn snapshot_nullable_union_path_null_comparisons() {
+    check_snapshot(
+        "nullable_union_path_null_comparisons",
+        &super::union_predicate_schema(false),
+        r#"
+query NullCodes {
+    job {
+        @where { state.Failed.reason.ProviderRejected.code == Null || state.Failed.reason.ProviderRejected.code != Null }
+        id
+    }
+}
+"#,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Mutations on the standard schema
 // ---------------------------------------------------------------------------

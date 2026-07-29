@@ -6,6 +6,256 @@ use pyre::sync_shape::reshape_table_groups;
 use pyre::typecheck;
 use serde_json::json;
 
+fn union_permission_context() -> typecheck::Context {
+    let schema_source = r#"
+type ProviderReason
+   = ProviderRejected {
+        code String?
+     }
+   | Other
+
+type JobState
+   = Failed {
+        reason ProviderReason
+     }
+   | Ready
+
+record Job {
+    id Int @id
+    state JobState
+    updatedAt Int
+    @allow(query) { state.Failed.reason.ProviderRejected.code != "blocked" }
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema should parse");
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("permission path should typecheck")
+}
+
+#[test]
+fn union_permission_path_is_used_by_catch_up_sql() {
+    let statement = pyre::sync::get_sync_status_statement(
+        &SyncCursor::new(),
+        &union_permission_context(),
+        &Default::default(),
+    )
+    .expect("sync status statement should generate");
+    assert!(statement.sql.contains(
+        "\"jobs\".\"state\" = 'Failed' and \"jobs\".\"state__reason\" = 'ProviderRejected' and \"jobs\".\"state__reason__code\" is not 'blocked'"
+    ));
+}
+
+#[test]
+fn live_deltas_require_positive_union_guards_for_not_equal() {
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "jobs".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "state".to_string(),
+            "state__reason".to_string(),
+            "state__reason__code".to_string(),
+        ],
+        rows: vec![
+            vec![json!(1), json!("Ready"), json!(null), json!("allowed")],
+            vec![
+                json!(2),
+                json!("Failed"),
+                json!("ProviderRejected"),
+                json!("allowed"),
+            ],
+            vec![
+                json!(3),
+                json!("Failed"),
+                json!("ProviderRejected"),
+                json!("blocked"),
+            ],
+            vec![
+                json!(4),
+                json!("Failed"),
+                json!("ProviderRejected"),
+                json!(null),
+            ],
+        ],
+    }];
+    let sessions = std::collections::HashMap::from([(
+        "session".to_string(),
+        std::collections::HashMap::new(),
+    )]);
+    let result =
+        pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &union_permission_context())
+            .expect("deltas calculate");
+    assert_eq!(result.groups.len(), 1);
+    assert_eq!(
+        result.groups[0].table_groups[0].rows,
+        vec![affected[0].rows[1].clone(), affected[0].rows[3].clone()]
+    );
+}
+
+#[test]
+fn permission_hash_frames_nested_paths_without_changing_simple_hashes() {
+    use pyre::ast::{Operator, PredicatePath, PredicatePathSegment, QueryValue, WhereArg};
+
+    let range = ast::empty_range();
+    let value = QueryValue::String((range.clone(), "x".to_string()));
+    let simple = WhereArg::Column(
+        false,
+        PredicatePath::field("ownerId"),
+        Operator::Equal,
+        value.clone(),
+        range.clone(),
+    );
+    assert_eq!(
+        pyre::sync::calculate_permission_hash(&Some(simple), &Default::default()),
+        "6c2b8e201804e0d21d4560488fdd98074714fe44fccc21a9abc69e931c771673"
+    );
+
+    let formerly_colliding = WhereArg::Column(
+        false,
+        PredicatePath {
+            segments: vec![
+                PredicatePathSegment::Field("a".to_string()),
+                PredicatePathSegment::Variant("b".to_string()),
+                PredicatePathSegment::Field("c".to_string()),
+            ],
+        },
+        Operator::Equal,
+        value.clone(),
+        range.clone(),
+    );
+    let flat = WhereArg::Column(
+        false,
+        PredicatePath::field("avariantbfieldc"),
+        Operator::Equal,
+        value,
+        range,
+    );
+    assert_ne!(
+        pyre::sync::calculate_permission_hash(&Some(formerly_colliding), &Default::default()),
+        pyre::sync::calculate_permission_hash(&Some(flat), &Default::default())
+    );
+}
+
+fn nullable_session_union_permission_context() -> typecheck::Context {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+session {
+    blockedCode String?
+}
+
+type State
+   = Failed {
+        code String?
+     }
+   | Ready
+
+record Job {
+    id Int @id
+    state State
+    updatedAt Int
+    @allow(query) { state.Failed.code != Session.blockedCode }
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap()
+}
+
+#[test]
+fn nullable_session_rhs_matches_catch_up_and_live_delta_semantics() {
+    let context = nullable_session_union_permission_context();
+    let session = std::collections::HashMap::from([(
+        "blockedCode".to_string(),
+        pyre::sync::SessionValue::Null,
+    )]);
+    let statement =
+        pyre::sync::get_sync_status_statement(&SyncCursor::new(), &context, &session).unwrap();
+    assert!(statement.sql.contains("\"jobs\".\"state__code\" is not ?"));
+
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "jobs".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "state".to_string(),
+            "state__code".to_string(),
+        ],
+        rows: vec![
+            vec![json!(1), json!("Failed"), json!(null)],
+            vec![json!(2), json!("Failed"), json!("allowed")],
+            vec![json!(3), json!("Ready"), json!("allowed")],
+        ],
+    }];
+    let sessions = std::collections::HashMap::from([("session".to_string(), session)]);
+    let result = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &context).unwrap();
+    assert_eq!(
+        result.groups[0].table_groups[0].rows,
+        vec![affected[0].rows[1].clone()]
+    );
+}
+
+#[test]
+fn literal_null_matches_catch_up_and_live_delta_semantics() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+type State
+   = Failed {
+        code String?
+     }
+   | Ready
+
+record Job {
+    id Int @id
+    state State
+    updatedAt Int
+    @allow(query) { state.Failed.code == Null }
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap();
+    let statement =
+        pyre::sync::get_sync_status_statement(&SyncCursor::new(), &context, &Default::default())
+            .unwrap();
+    assert!(statement.sql.contains("\"jobs\".\"state__code\" is null"));
+
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "jobs".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "state".to_string(),
+            "state__code".to_string(),
+        ],
+        rows: vec![
+            vec![json!(1), json!("Failed"), json!(null)],
+            vec![json!(2), json!("Failed"), json!("set")],
+            vec![json!(3), json!("Ready"), json!(null)],
+        ],
+    }];
+    let sessions = std::collections::HashMap::from([(
+        "session".to_string(),
+        std::collections::HashMap::new(),
+    )]);
+    let result = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &context).unwrap();
+    assert_eq!(
+        result.groups[0].table_groups[0].rows,
+        vec![affected[0].rows[0].clone()]
+    );
+}
+
 #[test]
 fn sync_sql_marks_json_columns_for_runtime_decoding() {
     let schema_source = r#"

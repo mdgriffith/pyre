@@ -4,6 +4,175 @@ use pyre::parser;
 use pyre::typecheck;
 
 #[test]
+fn tagged_union_permission_rhs_uses_terminal_field_typechecking() {
+    for predicate in [
+        r#"state.Failed.code == "wrong""#,
+        "state.Failed.code == unknownPermissionFn()",
+    ] {
+        let source = format!(
+            r#"
+type State
+   = Failed {{
+        code Int
+     }}
+   | Ready
+
+record Job {{
+    id Int @id
+    state State
+    @allow(query) {{ {} }}
+}}
+"#,
+            predicate
+        );
+        let mut schema = ast::Schema::default();
+        parser::run("permissions.pyre", &source, &mut schema).unwrap();
+        let errors = typecheck::check_schema(&ast::Database {
+            schemas: vec![schema],
+        })
+        .unwrap_err();
+        assert!(errors
+            .iter()
+            .all(|error| error.filepath == "permissions.pyre"));
+    }
+}
+
+#[test]
+fn tagged_union_permission_rhs_is_typechecked_under_exists() {
+    let source = r#"
+type State
+   = Failed {
+        code String
+     }
+   | Ready
+
+record Parent {
+    id Int @id
+    children @link(Child.parentId)
+    @allow(query) { exists children { state.Failed.code == 1 } }
+}
+
+record Child {
+    id Int @id
+    parentId Int
+    state State
+    parent @link(parentId, Parent.id)
+    @public
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).unwrap();
+    assert!(typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .is_err());
+}
+
+#[test]
+fn tagged_union_permission_rhs_validates_declared_session_type() {
+    let source = r#"
+session {
+    code String
+}
+
+type State
+   = Failed {
+        code Int
+     }
+   | Ready
+
+record Job {
+    id Int @id
+    state State
+    @allow(query) { state.Failed.code == Session.code }
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).unwrap();
+    assert!(typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .is_err());
+}
+
+#[test]
+fn permission_functions_are_rejected_for_live_sync_consistency() {
+    let source = r#"
+record Job {
+    id Int @id
+    code Int
+    @allow(query) { code == length("value") }
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).unwrap();
+    let errors = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        &error.error_type,
+        ErrorType::InvalidPermissionPredicate { message }
+            if message.contains("live sync") && message.contains("Functions")
+    )));
+}
+
+fn membership_schema(session_type: &str, predicate: &str) -> String {
+    format!(
+        r#"
+session {{
+    activeIds {}
+}}
+
+record Job {{
+    id String @id
+    @allow(query) {{ {} }}
+}}
+"#,
+        session_type, predicate
+    )
+}
+
+#[test]
+fn permission_membership_validates_collection_and_element_types() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        &membership_schema("Json<List<String>>", "id in Session.activeIds"),
+        &mut schema,
+    )
+    .unwrap();
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("matching Session membership list should typecheck");
+
+    for (session_type, predicate) in [
+        ("String", "id in Session.activeIds"),
+        ("Json<List<Int>>", "id in Session.activeIds"),
+        ("Json<List<String>>", "id in Session.missing"),
+        ("Json<List<String>>", "id in \"scalar\""),
+        ("Json<List<String>>", "id in random()"),
+    ] {
+        let mut schema = ast::Schema::default();
+        parser::run(
+            "schema.pyre",
+            &membership_schema(session_type, predicate),
+            &mut schema,
+        )
+        .unwrap();
+        assert!(
+            typecheck::check_schema(&ast::Database {
+                schemas: vec![schema],
+            })
+            .is_err(),
+            "membership should be rejected: {}",
+            predicate
+        );
+    }
+}
+
+#[test]
 fn test_star_permission_simple() {
     let schema_source = r#"
 record Post {

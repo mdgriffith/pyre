@@ -16,11 +16,139 @@ use pyre::sync_deltas::AffectedRowTableGroup;
 use serde_json::json;
 use std::collections::HashMap;
 
+const UNION_PREDICATE_PARITY_SCHEMA: &str = r#"
+type ProviderReason
+   = ProviderRejected {
+        code String?
+     }
+   | Other
+
+type JobState
+   = Failed {
+        reason ProviderReason
+     }
+   | Ready
+
+record Job {
+    id Int @id
+    state JobState
+    updatedAt Int
+    @allow(query) { state.Failed.reason.ProviderRejected.code != "blocked" }
+}
+"#;
+
 fn query_result(affected_rows: Vec<AffectedRowTableGroup>) -> QueryResult {
     QueryResult {
         response: json!({}),
         affected_rows,
     }
+}
+
+#[tokio::test]
+async fn qualified_union_permission_has_query_catchup_and_live_delta_parity(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(UNION_PREDICATE_PARITY_SCHEMA).await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch(
+        r#"
+insert into jobs (id, state, state__reason, state__reason__code, updatedAt)
+values
+    (1, 'Failed', 'ProviderRejected', 'allowed', 10),
+    (2, 'Failed', 'ProviderRejected', 'blocked', 20),
+    (3, 'Failed', 'ProviderRejected', null, 30),
+    (4, 'Ready', 'ProviderRejected', 'allowed', 40);
+"#,
+    )
+    .await?;
+
+    let query_rows = db
+        .execute_query_with_session(
+            r#"
+query VisibleJobs {
+    job {
+        @sort(id, Asc)
+        id
+    }
+}
+"#,
+            HashMap::new(),
+            HashMap::new(),
+            false,
+        )
+        .await?;
+    let query_result = db.parse_query_results(query_rows).await?;
+    let query_ids = query_result["job"]
+        .iter()
+        .map(|row| row["id"].clone())
+        .collect::<Vec<_>>();
+
+    let catchup_result = catchup(
+        &conn,
+        &db.context,
+        &SyncCursor::new(),
+        &SyncSession::new(),
+        10,
+    )
+    .await?;
+    let catchup_ids = catchup_result.tables["jobs"]
+        .rows
+        .iter()
+        .map(|row| row["id"].clone())
+        .collect::<Vec<_>>();
+
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "jobs".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "state".to_string(),
+            "state__reason".to_string(),
+            "state__reason__code".to_string(),
+            "updatedAt".to_string(),
+        ],
+        rows: vec![
+            vec![
+                json!(1),
+                json!("Failed"),
+                json!("ProviderRejected"),
+                json!("allowed"),
+                json!(10),
+            ],
+            vec![
+                json!(2),
+                json!("Failed"),
+                json!("ProviderRejected"),
+                json!("blocked"),
+                json!(20),
+            ],
+            vec![
+                json!(3),
+                json!("Failed"),
+                json!("ProviderRejected"),
+                json!(null),
+                json!(30),
+            ],
+            vec![
+                json!(4),
+                json!("Ready"),
+                json!("ProviderRejected"),
+                json!("allowed"),
+                json!(40),
+            ],
+        ],
+    }];
+    let sessions = HashMap::from([("session".to_string(), SyncSession::new())]);
+    let deltas = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &db.context)
+        .map_err(|error| format!("failed to calculate sync deltas: {:?}", error))?;
+    let live_ids = deltas.groups[0].table_groups[0]
+        .rows
+        .iter()
+        .map(|row| row[0].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(query_ids, vec![json!(1), json!(3)]);
+    assert_eq!(catchup_ids, query_ids);
+    assert_eq!(live_ids, query_ids);
+    Ok(())
 }
 
 async fn extract_affected_rows(
@@ -1314,7 +1442,7 @@ async fn session_value_permissions_handle_strings_booleans_and_nulls(
         r#"
 session {
     role String
-    enabled Int
+    enabled Bool
     region String?
 }
 

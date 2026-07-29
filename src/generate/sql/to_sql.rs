@@ -79,7 +79,7 @@ pub fn render_real_where_field(
     table: &typecheck::Table,
     query_info: &typecheck::QueryInfo,
     is_session_var: bool,
-    fieldname: &String,
+    fieldname: &str,
 ) -> String {
     // Check if this is a Session variable (e.g., Session.userId, Session.role)
     if is_session_var {
@@ -324,29 +324,48 @@ fn render_where_arg_inner(
     next_alias: &mut usize,
 ) -> String {
     match arg {
-        ast::WhereArg::Column(is_session_var, fieldname, op, value, _field_name_range) => {
+        ast::WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
+            let fieldname = path.root();
+            let resolved = if *is_session_var {
+                None
+            } else {
+                typecheck::resolve_predicate_path(context, &table.record.fields, path).ok()
+            };
+            let physical_column = resolved
+                .as_ref()
+                .map(|resolved| resolved.physical_column.as_str())
+                .unwrap_or(fieldname);
             let qualified_column_name = if *is_session_var {
                 render_real_where_field(table, query_info, true, fieldname)
             } else if let Some(table_ref) = table_ref {
-                format!("{}.{}", table_ref, string::quote(fieldname))
+                format!("{}.{}", table_ref, string::quote(physical_column))
             } else {
-                render_real_where_field(table, query_info, false, fieldname)
+                render_real_where_field(table, query_info, false, physical_column)
             };
 
-            let operator = operator(op);
+            let null_safe = typecheck::predicate_operand_is_nullable(
+                context,
+                &table.record.fields,
+                *is_session_var,
+                path,
+            ) || typecheck::query_value_is_nullable(context, value);
+            let operator = if null_safe {
+                match op {
+                    ast::Operator::Equal => "is".to_string(),
+                    ast::Operator::NotEqual => "is not".to_string(),
+                    _ => operator(op),
+                }
+            } else {
+                operator(op)
+            };
 
             let rendered_value = if *is_session_var {
                 render_value(value)
             } else {
-                match table
-                    .record
-                    .fields
-                    .iter()
-                    .find(|field| ast::has_fieldname(field, fieldname))
-                {
-                    Some(ast::Field::Column(column)) => render_column_value(column, value),
-                    _ => render_value(value),
-                }
+                resolved
+                    .as_ref()
+                    .map(|resolved| render_column_value(&resolved.column, value))
+                    .unwrap_or_else(|| render_value(value))
             };
 
             let value = if matches!(op, ast::Operator::In | ast::Operator::NotIn)
@@ -356,7 +375,27 @@ fn render_where_arg_inner(
             } else {
                 rendered_value
             };
-            format!("{} {} {}", qualified_column_name, operator, value)
+            let comparison = format!("{} {} {}", qualified_column_name, operator, value);
+            let Some(resolved) = resolved else {
+                return comparison;
+            };
+            if resolved.discriminators.is_empty() {
+                return comparison;
+            }
+            let mut guards = resolved
+                .discriminators
+                .iter()
+                .map(|(column, variant)| {
+                    let qualified = if let Some(table_ref) = table_ref {
+                        format!("{}.{}", table_ref, string::quote(column))
+                    } else {
+                        render_real_where_field(table, query_info, false, column)
+                    };
+                    format!("{} = '{}'", qualified, variant.replace("'", "''"))
+                })
+                .collect::<Vec<_>>();
+            guards.push(comparison);
+            format!("({})", guards.join(" and "))
         }
         ast::WhereArg::Exists(path, body) => {
             if path.is_empty() {

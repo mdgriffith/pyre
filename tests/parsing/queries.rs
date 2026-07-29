@@ -1,4 +1,4 @@
-use pyre::parser;
+use pyre::{ast, parser, typecheck};
 
 /// Helper function to format errors without color for testing
 fn format_error_no_color(file_contents: &str, error: &pyre::error::Error) -> String {
@@ -41,6 +41,238 @@ fn test_valid_query() {
 
     let result = parser::parse_query("query.pyre", query_source);
     assert!(result.is_ok(), "Valid query should parse successfully");
+}
+
+fn union_predicate_context() -> typecheck::Context {
+    let source = r#"
+type ProviderReason
+   = ProviderRejected {
+        code String
+     }
+   | Other
+
+type JobState
+   = Failed {
+        errorCode Int
+        reason ProviderReason
+     }
+   | Ready {
+        errorCode Int
+     }
+
+record Job {
+    id Int @id
+    state JobState
+    @public
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).expect("schema parses");
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks")
+}
+
+#[test]
+fn tagged_union_predicate_paths_parse_and_typecheck() {
+    let source = r#"
+query Jobs($code: Int) {
+    job {
+        @where { state.Failed.errorCode == $code && state.Failed.reason.ProviderRejected.code != "x" }
+        id
+    }
+}
+"#;
+    let queries = parser::parse_query("query.pyre", source).expect("paths parse");
+    let query = match &queries.queries[0] {
+        ast::QueryDef::Query(query) => query,
+        _ => panic!("expected query"),
+    };
+    let field = match &query.fields[0] {
+        ast::TopLevelQueryField::Field(field) => field,
+        _ => panic!("expected field"),
+    };
+    let wheres = ast::collect_wheres(&field.fields);
+    let ast::WhereArg::And(paths) = &wheres[0] else {
+        panic!("expected conjunction");
+    };
+    let ast::WhereArg::Column(_, first, _, _, _) = &paths[0] else {
+        panic!("expected path");
+    };
+    let ast::WhereArg::Column(_, nested, ast::Operator::NotEqual, _, _) = &paths[1] else {
+        panic!("expected != path");
+    };
+    assert_eq!(first.authored(), "state.Failed.errorCode");
+    assert_eq!(
+        nested.authored(),
+        "state.Failed.reason.ProviderRejected.code"
+    );
+    typecheck::check_queries(&queries, &union_predicate_context()).expect("paths typecheck");
+}
+
+#[test]
+fn tagged_union_predicates_reject_unqualified_unknown_and_mismatched_paths() {
+    let context = union_predicate_context();
+    for predicate in [
+        "state.errorCode == 1",
+        "state.Unknown.errorCode == 1",
+        "state.Ready.reason == Other",
+    ] {
+        let source = format!("query Jobs {{ job {{ @where {{ {} }} id }} }}", predicate);
+        let queries = parser::parse_query("query.pyre", &source).expect("syntax parses");
+        assert!(
+            typecheck::check_queries(&queries, &context).is_err(),
+            "predicate should fail typechecking: {}",
+            predicate
+        );
+    }
+}
+
+#[test]
+fn unary_not_remains_invalid() {
+    assert!(parser::parse_query(
+        "query.pyre",
+        "query Jobs { job { @where { !(state.Failed.errorCode == 1) } id } }"
+    )
+    .is_err());
+}
+
+#[test]
+fn tagged_union_predicate_paths_reject_json_traversal() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+type State
+   = Failed {
+        code String
+     }
+   | Ready
+
+record Job {
+    id Int @id
+    payload Json<State>
+    @public
+}
+"#,
+        &mut schema,
+    )
+    .expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    let queries = parser::parse_query(
+        "query.pyre",
+        r#"query Jobs { job { @where { payload.Failed.code == "x" } id } }"#,
+    )
+    .expect("path syntax parses");
+    assert!(typecheck::check_queries(&queries, &context).is_err());
+}
+
+#[test]
+fn tagged_union_predicate_paths_reject_document_terminal_fields() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+type State
+   = Failed {
+        data Json
+     }
+   | Ready
+
+record Job {
+    id Int @id
+    state State
+    @public
+}
+"#,
+        &mut schema,
+    )
+    .expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    let queries = parser::parse_query(
+        "query.pyre",
+        r#"query Jobs($data: Json) { job { @where { state.Failed.data == $data } id } }"#,
+    )
+    .expect("path syntax parses");
+    assert!(typecheck::check_queries(&queries, &context).is_err());
+}
+
+#[test]
+fn simple_query_interface_hash_remains_stable_and_nested_paths_are_distinct() {
+    let simple = parser::parse_query(
+        "query.pyre",
+        "query Get($id: Int) { job { @where { id == $id } id } }",
+    )
+    .unwrap();
+    let ast::QueryDef::Query(simple_query) = &simple.queries[0] else {
+        panic!("expected query");
+    };
+    assert_eq!(
+        simple_query.interface_hash,
+        "238c9f549d32951ad23a103bd750e09cf58847b73a61ee72429b104422650648"
+    );
+
+    let first = parser::parse_query(
+        "query.pyre",
+        r#"query Get { job { @where { state.Failed.code == "x" } id } }"#,
+    )
+    .unwrap();
+    let second = parser::parse_query(
+        "query.pyre",
+        r#"query Get { job { @where { state.FailedCode.value == "x" } id } }"#,
+    )
+    .unwrap();
+    let ast::QueryDef::Query(first) = &first.queries[0] else {
+        panic!("expected query");
+    };
+    let ast::QueryDef::Query(second) = &second.queries[0] else {
+        panic!("expected query");
+    };
+    assert_ne!(first.interface_hash, second.interface_hash);
+}
+
+#[test]
+fn query_predicate_validates_function_return_type() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+record Metric {
+    id Int @id
+    label String
+    score Float
+    @public
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap();
+
+    let wrong = parser::parse_query(
+        "query.pyre",
+        r#"query Metrics { metric { @where { label == length("value") } id } }"#,
+    )
+    .unwrap();
+    assert!(typecheck::check_queries(&wrong, &context).is_err());
+
+    let numeric = parser::parse_query(
+        "query.pyre",
+        "query Metrics { metric { @where { score == abs(1) } id } }",
+    )
+    .unwrap();
+    typecheck::check_queries(&numeric, &context)
+        .expect("number arguments and Float return type should be compatible");
 }
 
 #[test]
