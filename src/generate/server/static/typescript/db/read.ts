@@ -62,7 +62,7 @@ export const dateTime: Decoder<Date> = {
         if (typeof json !== 'number') {
             throw new Error('Expected number for datetime');
         }
-        return Time.millisToPosix(json);
+        return Time.millisToPosix(json * 1000);
     }
 };
 

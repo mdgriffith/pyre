@@ -129,8 +129,8 @@ insert SeedEvent($payload: Json<Lifecycle>) {
     );
 
     assert!(
-        content.contains("const InputValidator = RawInputValidator;"),
-        "Expected typed Json param to pass through unchanged. Generated:\n{}",
+        content.contains("const InputValidator = z.object({\n  payload: Decode.Lifecycle"),
+        "Expected typed Json param to use its runtime decoder. Generated:\n{}",
         content
     );
 
@@ -145,4 +145,47 @@ insert SeedEvent($payload: Json<Lifecycle>) {
         "Did not expect typed Json param to be stringified. Generated:\n{}",
         content
     );
+}
+
+#[test]
+fn generated_typescript_datetime_input_preserves_public_type_and_coerces_at_runtime() {
+    let schema_source = r#"
+record Event {
+    @public
+    id Id.Int @id
+    startedAt DateTime
+}
+"#;
+    let query_source = r#"
+insert CreateEvent($startedAt: DateTime) {
+    event { startedAt = $startedAt }
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let query_list = parser::parse_query("query.pyre", query_source).expect("query parses");
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    core::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+
+    let generated = files
+        .iter()
+        .find(|f| path_ends_with(&f.path, "queries/metadata/createEvent.ts"))
+        .expect("generated metadata file");
+    let content = &generated.contents;
+
+    assert!(content.contains("startedAt: z.union([z.date(), z.string(), z.number()])"));
+    assert!(content.contains("startedAt: Decode.CoercedDate"));
+    assert!(content.contains("export type Input = z.infer<typeof RawInputValidator>;"));
 }

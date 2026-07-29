@@ -9,6 +9,7 @@ type RunnerMeta = {
   optional_input_args: string[];
   json_input_args: string[];
   InputValidator: Validator<any>;
+  SessionValidator: Validator<any>;
   ReturnData: Validator<any>;
 };
 
@@ -38,10 +39,15 @@ export function toRunner<Input, Result>(meta: RunnerMeta, sql: SqlInfo[]) {
       input ?? {},
       "input"
     ) as Record<string, unknown>;
+    const validatedSession = decodeOrThrow(
+      meta.SessionValidator,
+      session,
+      "session"
+    ) as Record<string, unknown>;
 
     const args = buildArgs(
       validatedInput,
-      session,
+      validatedSession,
       meta.session_args,
       meta.optional_input_args,
       meta.json_input_args,

@@ -286,7 +286,7 @@ SQLite uses dynamic typing (type affinity) rather than strict types. Pyre maps i
 | `Float` | REAL |
 | `String` | TEXT |
 | `Bool` | INTEGER (0 or 1) |
-| `DateTime` | INTEGER (Unix epoch) |
+| `DateTime` | INTEGER (whole Unix epoch seconds) |
 | `Date` | TEXT |
 | `JSON` | BLOB |
 | `Json<T>` | BLOB |

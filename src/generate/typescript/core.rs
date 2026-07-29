@@ -110,7 +110,7 @@ fn generate_decode_file(database: &ast::Database) -> String {
                 "String" => "string",
                 "Int" | "Float" => "number",
                 "Bool" => "boolean",
-                "DateTime" => "Date",
+                "DateTime" => "Date | string | number",
                 _ if type_str == "Id.Int"
                     || type_str == "Id.Uuid"
                     || type_str.starts_with("Id.Int<")
@@ -1214,6 +1214,10 @@ fn to_zod_type(type_: &str) -> String {
     input_zod_type_for_column_type(&ast::ColumnType::from_str(type_))
 }
 
+fn to_input_decoder_zod_type(type_: &str) -> String {
+    input_decoder_zod_type_for_column_type(&ast::ColumnType::from_str(type_))
+}
+
 fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
@@ -1240,6 +1244,26 @@ fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         }
         ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}", name),
+    }
+}
+
+fn input_decoder_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::DateTime => "Decode.CoercedDate".to_string(),
+        ast::ColumnType::List(inner) => {
+            format!("z.array({})", input_decoder_zod_type_for_column_type(inner))
+        }
+        ast::ColumnType::Dict(inner) => format!(
+            "z.record(z.string(), {})",
+            input_decoder_zod_type_for_column_type(inner)
+        ),
+        ast::ColumnType::Nullable(inner) => {
+            format!(
+                "{}.nullable()",
+                input_decoder_zod_type_for_column_type(inner)
+            )
+        }
+        _ => input_zod_type_for_column_type(type_),
     }
 }
 
@@ -1299,7 +1323,30 @@ fn to_param_type_alias(
         }
     }
     result.push_str("\n});\n");
-    result.push_str("const InputValidator = RawInputValidator;\n");
+
+    result.push_str("const InputValidator = z.object({");
+    let mut is_first = true;
+    for arg in args {
+        let type_name = arg
+            .type_
+            .as_deref()
+            .map(|type_| typecheck::resolve_query_param_type(context, type_))
+            .unwrap_or("unknown".to_string());
+        let mut type_string = to_input_decoder_zod_type(&type_name);
+        if arg.nullable {
+            type_string = format!("{}.nullable()", type_string);
+        }
+        if arg.omittable {
+            type_string = format!("{}.optional()", type_string);
+        }
+        if is_first {
+            result.push_str(&format!("\n  {}: {}", arg.name, type_string));
+            is_first = false;
+        } else {
+            result.push_str(&format!(",\n  {}: {}", arg.name, type_string));
+        }
+    }
+    result.push_str("\n});\n");
 
     result.push_str("export type Input = z.infer<typeof RawInputValidator>;");
     result

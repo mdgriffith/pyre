@@ -94,7 +94,7 @@ export interface RunOptions {
 
 export type SeedPrimitive = null | boolean | number | string | Uint8Array;
 export type SeedJsonObject = { [key: string]: SeedJsonValue };
-export type SeedJsonValue = SeedPrimitive | SeedJsonObject | SeedJsonValue[];
+export type SeedJsonValue = SeedPrimitive | Date | SeedJsonObject | SeedJsonValue[];
 export type SeedValue = SeedJsonValue;
 export type SeedRow = {
     [field: string]: SeedValue | SeedRow | SeedRow[];
@@ -498,11 +498,11 @@ async function prepareSeedRow(
                 throw new SeedInputError(`seed field '${path}.${key}' must be a scalar column value`);
             }
             assertCanonicalDiscriminators(value, `${path}.${key}`);
-            validateSeedColumnValue(context, table, key, value, `${path}.${key}`);
-            if (key in scalarValues && !sameSeedValue(scalarValues[key], value)) {
+            const validatedValue = validateSeedColumnValue(context, table, key, value, `${path}.${key}`);
+            if (key in scalarValues && !sameSeedValue(scalarValues[key], validatedValue)) {
                 throw new SeedInputError(`seed field '${path}.${key}' conflicts with a value derived from its parent link`);
             }
-            scalarValues[key] = value;
+            scalarValues[key] = validatedValue;
             continue;
         }
 
@@ -545,16 +545,17 @@ function validateSeedColumnValue(
     columnName: string,
     value: SeedValue,
     path: string,
-): void {
+): SeedValue {
     const validator = context.validators?.[table.name]?.[columnName];
     if (!validator || value == null) {
-        return;
+        return value;
     }
 
     const result = decodeOrError(validator, value, path);
     if (!result.valid) {
         throw new SeedInputError(`invalid seed field '${path}': ${result.error}`);
     }
+    return result.value as SeedValue;
 }
 
 async function insertScalarRow(
@@ -857,6 +858,9 @@ function assertCanonicalDiscriminators(value: unknown, path: string): void {
 }
 
 function sameSeedValue(a: SeedValue, b: SeedValue): boolean {
+    if (a instanceof Date || b instanceof Date) {
+        return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+    }
     if (a instanceof Uint8Array || b instanceof Uint8Array) {
         return a instanceof Uint8Array && b instanceof Uint8Array && a.length === b.length && a.every((value, index) => value === b[index]);
     }
@@ -882,10 +886,16 @@ function constructedDiscriminator(value: unknown): string | undefined {
 }
 
 function toSqlSeedValue(value: SeedValue): SeedPrimitive {
+    if (value instanceof Date) {
+        if (Number.isNaN(value.getTime())) {
+            throw new SeedInputError("invalid Date seed value");
+        }
+        return Math.floor(value.getTime() / 1000);
+    }
     if (value == null || typeof value === "boolean" || typeof value === "number" || typeof value === "string" || value instanceof Uint8Array) {
         return value;
     }
-    return JSON.stringify(value);
+    return JSON.stringify(normalizeSeedDates(value));
 }
 
 function toDateTimeSqlValue(value: SeedValue, path: string): SeedPrimitive {
@@ -893,21 +903,32 @@ function toDateTimeSqlValue(value: SeedValue, path: string): SeedPrimitive {
         return value;
     }
 
+    if (value instanceof Date) {
+        if (!Number.isNaN(value.getTime())) {
+            return Math.floor(value.getTime() / 1000);
+        }
+        throw new SeedInputError(`invalid DateTime seed field '${path}'`);
+    }
+
     if (typeof value === "number") {
-        return value;
+        if (Number.isSafeInteger(value)) {
+            return value;
+        }
+        throw new SeedInputError(`invalid DateTime seed field '${path}': expected whole Unix seconds`);
     }
 
     if (typeof value === "string") {
         const trimmed = value.trim();
-        if (trimmed.length > 0) {
+        if (/^[+-]?\d+$/.test(trimmed)) {
             const asNumber = Number(trimmed);
-            if (Number.isFinite(asNumber)) {
-                return Math.floor(asNumber);
+            if (Number.isSafeInteger(asNumber)) {
+                return asNumber;
             }
+            throw new SeedInputError(`invalid DateTime seed field '${path}': invalid Unix seconds`);
         }
 
-        const parsed = new Date(value);
-        if (!Number.isNaN(parsed.getTime())) {
+        const parsed = parseRfc3339(trimmed);
+        if (parsed) {
             return Math.floor(parsed.getTime() / 1000);
         }
     }
@@ -919,7 +940,44 @@ function toJsonSqlValue(value: SeedValue): SeedPrimitive {
     if (value == null || typeof value === "string" || value instanceof Uint8Array) {
         return value;
     }
-    return JSON.stringify(value);
+    return JSON.stringify(normalizeSeedDates(value));
+}
+
+function normalizeSeedDates(value: SeedValue): unknown {
+    if (value instanceof Date) {
+        if (Number.isNaN(value.getTime())) {
+            throw new SeedInputError("invalid Date seed value");
+        }
+        return Math.floor(value.getTime() / 1000);
+    }
+    if (Array.isArray(value)) {
+        return value.map(normalizeSeedDates);
+    }
+    if (value !== null && typeof value === "object" && !(value instanceof Uint8Array)) {
+        return Object.fromEntries(
+            Object.entries(value).map(([key, nested]) => [key, normalizeSeedDates(nested as SeedValue)])
+        );
+    }
+    return value;
+}
+
+function parseRfc3339(value: string): Date | null {
+    const match = /^(\d{4})-(\d{2})-(\d{2})[Tt](?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
+    if (!match) {
+        return null;
+    }
+
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]) {
+        return null;
+    }
+
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function parseJsonSqlValue(value: unknown): unknown {

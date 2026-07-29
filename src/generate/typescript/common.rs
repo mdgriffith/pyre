@@ -171,29 +171,54 @@ export const Json: z.ZodType<Json> = z.unknown();
 
 /// Generate the coercion helpers
 pub fn coercion_helpers() -> &'static str {
-    r#"export const CoercedDate = z.union([z.number(), z.string(), z.date()]).transform((val) => {
+    r#"function invalidDate(ctx: z.RefinementCtx, message: string): never {
+  ctx.addIssue({ code: 'custom', message });
+  return z.NEVER;
+}
+
+function parseRfc3339(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})[Tt](?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]) {
+    return null;
+  }
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+export const CoercedDate = z.union([z.number(), z.string(), z.date()]).transform((val, ctx) => {
   if (val instanceof Date) {
     return val;
   }
 
   if (typeof val === 'number') {
-    return new Date(val * 1000);
+    if (!Number.isSafeInteger(val)) {
+      return invalidDate(ctx, 'Expected whole Unix seconds');
+    }
+    const parsed = new Date(val * 1000);
+    return Number.isNaN(parsed.getTime()) ? invalidDate(ctx, 'Unix seconds are outside the supported range') : parsed;
   }
 
   const trimmed = val.trim();
-  if (trimmed.length > 0) {
-    const asNumber = Number(trimmed);
-    if (!Number.isNaN(asNumber)) {
-      return new Date(asNumber * 1000);
+  if (/^[+-]?\d+$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    if (!Number.isSafeInteger(seconds)) {
+      return invalidDate(ctx, 'Invalid Unix seconds');
     }
+    const parsed = new Date(seconds * 1000);
+    return Number.isNaN(parsed.getTime()) ? invalidDate(ctx, 'Unix seconds are outside the supported range') : parsed;
   }
 
-  const parsed = new Date(val);
-  if (Number.isNaN(parsed.getTime())) {
-    throw new Error(`Invalid date value: ${val}`);
-  }
-
-  return parsed;
+  return parseRfc3339(trimmed) ?? invalidDate(ctx, 'Expected whole Unix seconds or an RFC 3339 timestamp');
 });
 export const CoercedBool = z.union([z.boolean(), z.number()]).transform((val) => typeof val === 'number' ? val !== 0 : val);
 

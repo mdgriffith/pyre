@@ -32,9 +32,11 @@ Field types are type expressions. Pyre supports primitive types, named types, ge
 - `Float` - Floating point number (stored as REAL)
 - `String` - Text (stored as TEXT)
 - `Bool` - Boolean (stored as INTEGER, 0 or 1)
-- `DateTime` - Timestamp (stored as INTEGER, Unix epoch)
+- `DateTime` - Timestamp (stored as INTEGER, whole Unix epoch seconds)
 - `Date` - Date (stored as TEXT)
 - `JSON` - Untyped raw JSON data (stored as BLOB)
+
+`DateTime` inputs accept whole Unix seconds, a decimal string containing whole Unix seconds, or an RFC 3339 timestamp. TypeScript callers may also provide a valid JavaScript `Date`. Pyre normalizes these forms to whole Unix seconds before persistence and serializes database values as Unix seconds.
 
 **Named Types:**
 Reference `type` declarations defined elsewhere:

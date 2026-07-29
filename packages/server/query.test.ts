@@ -101,14 +101,14 @@ test("SQL args serialize Date values as unix seconds", () => {
   const date = new Date("2026-07-11T16:36:52.000Z");
 
   expect(buildArgs(
-    { startedAt: date, payload: date },
+    { startedAt: date, payload: { direct: date, nested: [date] } },
     { visibleAfter: date },
     ["visibleAfter"],
     [],
     ["payload"],
   )).toEqual({
     startedAt: 1783787812,
-    payload: JSON.stringify(date),
+    payload: JSON.stringify({ direct: 1783787812, nested: [1783787812] }),
     session_visibleAfter: 1783787812,
   });
 });
@@ -442,6 +442,35 @@ test("seed validates columns with generated validators when provided", async () 
   expect(db.execute).toHaveBeenCalledWith("rollback");
 });
 
+test("seed uses transformed validator values", async () => {
+  const executed: any[] = [];
+  const db = {
+    execute: mock(async (statement: any) => {
+      executed.push(statement);
+      if (statement === "begin" || statement === "commit") {
+        return { rows: [] };
+      }
+      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
+        return { rows: [{ name: "id" }, { name: "startedAt" }] };
+      }
+      return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
+    }),
+  };
+
+  const result = await seed(
+    db as any,
+    eventSchema(),
+    { events: [{ startedAt: "1783787812" }] },
+    { events: { startedAt: z.string().transform((value) => new Date(Number(value) * 1000)) } },
+  );
+
+  expect(result.kind).toBe("success");
+  expect(executed).toContainEqual({
+    sql: 'insert into "events" ("startedAt") values ($seed_0) returning *',
+    args: { seed_0: 1783787812 },
+  });
+});
+
 test("seed serializes DateTime columns as unix seconds", async () => {
   const executed: any[] = [];
   const db = {
@@ -469,6 +498,37 @@ test("seed serializes DateTime columns as unix seconds", async () => {
     sql: 'insert into "events" ("startedAt") values ($seed_0) returning *',
     args: { seed_0: 1783787812 },
   });
+});
+
+test("seed accepts canonical DateTime forms and rejects noncanonical values", async () => {
+  const accepted = [
+    new Date("2026-07-11T16:36:52.999Z"),
+    1783787812,
+    "1783787812",
+    "2026-07-11T16:36:52.999Z",
+    "2026-07-11T18:36:52.999+02:00",
+  ];
+
+  for (const startedAt of accepted) {
+    const db = {
+      execute: mock(async (statement: any) => {
+        if (statement === "begin" || statement === "commit") return { rows: [] };
+        if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
+          return { rows: [{ name: "id" }, { name: "startedAt" }] };
+        }
+        return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
+      }),
+    };
+    const result = await seed(db as any, eventSchema(), { events: [{ startedAt }] });
+    expect(result.kind).toBe("success");
+  }
+
+  for (const startedAt of [1783787812.5, "1783787812.5", "2026-07-11", "July 11, 2026", "2026-02-30T00:00:00Z"]) {
+    const db = { execute: mock(async () => ({ rows: [] })) };
+    const result = await seed(db as any, eventSchema(), { events: [{ startedAt }] });
+    expect(result.kind).toBe("error");
+    expect(result.error?.errorType).toBe("InvalidInput");
+  }
 });
 
 function userPostSchema(): SchemaMetadata {
