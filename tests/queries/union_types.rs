@@ -10,6 +10,161 @@ use crate::helpers::schema;
 use crate::helpers::test_database::TestDatabase;
 use crate::helpers::TestError;
 
+const UNION_PREDICATE_SCHEMA: &str = r#"
+type ProviderReason
+   = ProviderRejected {
+        code String?
+     }
+   | Other {
+        code String?
+     }
+
+type JobState
+   = Failed {
+        code String?
+        reason ProviderReason
+     }
+   | Ready {
+        code String?
+     }
+   | Paused {
+        code String?
+     }
+
+record Job {
+    id Int @id
+    label String
+    state JobState
+    updatedAt Int
+    @public
+}
+"#;
+
+async fn seed_union_predicate_jobs(db: &TestDatabase) -> Result<(), TestError> {
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    conn.execute_batch(
+        r#"
+insert into jobs (id, label, state, state__code, state__reason, state__reason__code, updatedAt)
+values
+    (1, 'active match', 'Failed', 'allowed', 'ProviderRejected', 'allowed', 10),
+    (2, 'active blocked', 'Failed', 'blocked', 'ProviderRejected', 'blocked', 20),
+    (3, 'active null', 'Failed', null, 'ProviderRejected', null, 30),
+    (4, 'inactive stale payload', 'Ready', 'allowed', 'ProviderRejected', 'allowed', 40),
+    (5, 'nested guard failure', 'Failed', 'allowed', 'Other', 'allowed', 50),
+    (6, 'paused stale payload', 'Paused', 'allowed', 'ProviderRejected', 'allowed', 60);
+"#,
+    )
+    .await
+    .map_err(TestError::Database)?;
+    Ok(())
+}
+
+async fn query_ids(db: &TestDatabase, query: &str) -> Result<Vec<i64>, TestError> {
+    let rows = db.execute_query(query).await?;
+    let results = db.parse_query_results(rows).await?;
+    Ok(results["job"]
+        .iter()
+        .map(|row| row["id"].as_i64().expect("job id should be an integer"))
+        .collect())
+}
+
+#[tokio::test]
+async fn qualified_union_predicates_execute_with_discriminator_guards() -> Result<(), TestError> {
+    let db = TestDatabase::new(UNION_PREDICATE_SCHEMA).await?;
+    seed_union_predicate_jobs(&db).await?;
+
+    let ids = query_ids(
+        &db,
+        r#"
+query VisibleJobs {
+    job {
+        @where {
+            state.Failed.code != "blocked"
+            && state.Failed.reason.ProviderRejected.code != "blocked"
+        }
+        @sort(id, Asc)
+        id
+    }
+}
+"#,
+    )
+    .await?;
+
+    assert_eq!(ids, vec![1, 3]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_union_payload_predicates_require_each_active_variant() -> Result<(), TestError> {
+    let db = TestDatabase::new(UNION_PREDICATE_SCHEMA).await?;
+    seed_union_predicate_jobs(&db).await?;
+
+    let ids = query_ids(
+        &db,
+        r#"
+query SharedPayloadJobs {
+    job {
+        @where { state.Failed.code == "allowed" || state.Ready.code == "allowed" }
+        @sort(id, Asc)
+        id
+    }
+}
+"#,
+    )
+    .await?;
+
+    assert_eq!(ids, vec![1, 4, 5]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn qualified_union_predicates_limit_update_and_delete_mutations() -> Result<(), TestError> {
+    let db = TestDatabase::new(UNION_PREDICATE_SCHEMA).await?;
+    seed_union_predicate_jobs(&db).await?;
+
+    db.execute_query(
+        r#"
+update MarkAllowedProviderFailures {
+    job {
+        @where { state.Failed.reason.ProviderRejected.code != "blocked" }
+        label = "updated"
+        id
+    }
+}
+"#,
+    )
+    .await?;
+
+    let mut rows = db
+        .execute_raw("select id from jobs where label = 'updated' order by id")
+        .await?;
+    let mut updated_ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(TestError::Database)? {
+        updated_ids.push(row.get::<i64>(0).map_err(TestError::Database)?);
+    }
+    assert_eq!(updated_ids, vec![1, 3]);
+
+    db.execute_query(
+        r#"
+delete DeleteAllowedFailedJobs {
+    job {
+        @where { state.Failed.code == "allowed" }
+        id
+    }
+}
+"#,
+    )
+    .await?;
+
+    let mut rows = db.execute_raw("select id from jobs order by id").await?;
+    let mut remaining_ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(TestError::Database)? {
+        remaining_ids.push(row.get::<i64>(0).map_err(TestError::Database)?);
+    }
+    assert_eq!(remaining_ids, vec![2, 3, 4, 6]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_union_type_in_schema() -> Result<(), TestError> {
     let db = TestDatabase::new(&schema::full_schema()).await?;
