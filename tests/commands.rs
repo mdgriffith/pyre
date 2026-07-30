@@ -833,7 +833,7 @@ fn test_generate_command() {
     // Create a sample schema file (Pyre format, not SQL)
     write_basic_schema(&ctx);
 
-    ctx.run_command("generate").assert().success();
+    let assert = ctx.run_command("generate").assert().success();
 
     // Verify generated files were created
     assert!(ctx.workspace_path.join("pyre/generated").exists());
@@ -842,6 +842,18 @@ fn test_generate_command() {
         .unwrap()
         .next()
         .is_some());
+    let generated_count = walkdir::WalkDir::new(ctx.workspace_path.join("pyre/generated"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .count();
+    assert_eq!(
+        String::from_utf8_lossy(&assert.get_output().stdout),
+        format!(
+            "Generated {} files from ./pyre into ./pyre/generated.\n",
+            generated_count
+        )
+    );
 }
 
 #[test]
@@ -1060,7 +1072,8 @@ fn test_format_command() {
     ctx.run_command("format")
         .arg("pyre/queries.pyre")
         .assert()
-        .success();
+        .success()
+        .stdout("Formatted 1 Pyre file in ./pyre.\n");
 
     // Verify formatted content (should be properly formatted Pyre query)
     let formatted = std::fs::read_to_string(ctx.workspace_path.join("pyre/queries.pyre")).unwrap();
@@ -1166,9 +1179,7 @@ query GetUsers {
     ctx.run_command("check")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Success: checked 1 schema(s) and 1 query files",
-        ));
+        .stdout("Checked 3 Pyre files in ./pyre.\n");
 }
 
 #[test]

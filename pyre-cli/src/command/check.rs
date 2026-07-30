@@ -1,7 +1,7 @@
 use serde_json;
 use std::io::{self, Read};
 
-use super::shared::{parse_database_schemas, FileError, Options};
+use super::shared::{display_path, parse_database_schemas, pyre_file_count, FileError, Options};
 use pyre::error;
 use pyre::filesystem;
 use pyre::generated_queries;
@@ -10,8 +10,7 @@ use pyre::typecheck;
 
 pub fn check(options: &Options, _files: Vec<String>, json: bool) -> io::Result<()> {
     let paths = crate::filesystem::collect_filepaths(&options.in_dir)?;
-    let schema_count = paths.schema_files.len();
-    let query_file_count = paths.query_files.len();
+    let file_count = pyre_file_count(&paths);
 
     // Build a map of schema filepaths to their contents for error formatting
     let mut schema_file_contents: std::collections::HashMap<String, String> =
@@ -57,8 +56,10 @@ pub fn check(options: &Options, _files: Vec<String>, json: bool) -> io::Result<(
                 std::process::exit(1);
             } else if !json {
                 println!(
-                    "Success: checked {} schema(s) and {} query files",
-                    schema_count, query_file_count,
+                    "Checked {} Pyre {} in {}.",
+                    file_count,
+                    if file_count == 1 { "file" } else { "files" },
+                    display_path(options.in_dir),
                 );
             }
         }

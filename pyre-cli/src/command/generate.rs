@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
-use super::shared::{parse_database_schemas, Options};
+use super::shared::{display_path, parse_database_schemas, Options};
 use pyre::ast;
 use pyre::error;
 use pyre::filesystem;
@@ -156,7 +156,15 @@ fn execute(options: &Options, paths: filesystem::Found, out_dir: &Path) -> io::R
                 );
             }
 
+            let file_count = files.len();
             crate::filesystem::write_generated_files(out_dir, files)?;
+            println!(
+                "Generated {} {} from {} into {}.",
+                file_count,
+                if file_count == 1 { "file" } else { "files" },
+                display_path(options.in_dir),
+                display_path(out_dir),
+            );
         }
     }
 

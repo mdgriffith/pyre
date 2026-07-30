@@ -3,8 +3,8 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use super::shared::{
-    get_stdin, parse_database_schemas, parse_single_schema, parse_single_schema_from_source,
-    write_db_schema, write_schema, Options,
+    display_path, get_stdin, parse_database_schemas, parse_single_schema,
+    parse_single_schema_from_source, pyre_file_count, write_db_schema, write_schema, Options,
 };
 use crate::filesystem;
 use pyre::ast;
@@ -23,8 +23,10 @@ pub fn format(options: &Options, files: &Vec<String>, to_stdout: bool) -> io::Re
                 format_query_to_std_out(&options, &schema, &stdin)?;
             }
             None => {
-                println!("Formatting all files in {}", options.in_dir.display());
-                format_all(&options, filesystem::collect_filepaths(&options.in_dir)?)?;
+                let paths = filesystem::collect_filepaths(&options.in_dir)?;
+                let file_count = pyre_file_count(&paths);
+                format_all(&options, paths)?;
+                print_summary(options, file_count);
             }
         },
         1 => {
@@ -64,6 +66,9 @@ pub fn format(options: &Options, files: &Vec<String>, to_stdout: bool) -> io::Re
 
                         format_query(&options, &database, &to_stdout, file_path)?;
                     }
+                    if !to_stdout {
+                        print_summary(options, 1);
+                    }
                 }
             }
         }
@@ -90,11 +95,21 @@ pub fn format(options: &Options, files: &Vec<String>, to_stdout: bool) -> io::Re
             }
 
             if !to_stdout {
-                println!("{} files were formatted", files.len());
+                let file_count = files.iter().filter(|path| path.ends_with(".pyre")).count();
+                print_summary(options, file_count);
             }
         }
     }
     Ok(())
+}
+
+fn print_summary(options: &Options, file_count: usize) {
+    println!(
+        "Formatted {} Pyre {} in {}.",
+        file_count,
+        if file_count == 1 { "file" } else { "files" },
+        display_path(options.in_dir),
+    );
 }
 
 fn format_all(options: &Options, paths: pyre::filesystem::Found) -> io::Result<()> {
