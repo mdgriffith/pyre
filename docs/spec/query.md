@@ -280,28 +280,38 @@ Filters records using conditions.
 
 **Multiple Conditions (AND):**
 ```pyre
-@where { 
-    published == True
-    authorId == Session.userId
+@where {
+    And(
+        published == True,
+        authorId == Session.userId,
+    )
 }
 ```
 
 **OR Conditions:**
 ```pyre
-@where { 
-    status == "active" || status == "pending"
+@where {
+    Or(
+        status == "active",
+        status == "pending",
+    )
 }
 ```
 
 **Complex Conditions:**
 ```pyre
 @where {
-    (authorId == Session.userId || Session.role == "admin") &&
-    published == True
+    And(
+        Or(
+            authorId == Session.userId,
+            Session.role == "admin",
+        ),
+        published == True,
+    )
 }
 ```
 
-**Note**: Multiple `@where` clauses are combined with AND. Use `||` within a single `@where` for OR conditions.
+**Note**: Multiple `@where` clauses are combined with AND. Use `Or(...)` within a single `@where` for OR conditions.
 
 **Note**: `@where(Null)` means no conditions (equivalent to omitting `@where`).
 
@@ -313,8 +323,10 @@ Use a variant-qualified path to filter on fields inside a tagged union payload:
 query RetryablePayments($errorCode: String) {
     payment {
         @where {
-            state.Failed.errorCode == $errorCode &&
-            state.Failed.retryable == True
+            And(
+                state.Failed.errorCode == $errorCode,
+                state.Failed.retryable == True,
+            )
         }
 
         id
@@ -340,8 +352,10 @@ more than one should match:
 
 ```pyre
 @where {
-    state.Pending.externalId == $externalId ||
-    state.Failed.externalId == $externalId
+    Or(
+        state.Pending.externalId == $externalId,
+        state.Failed.externalId == $externalId,
+    )
 }
 ```
 
@@ -431,10 +445,20 @@ Here is an example querying a `Task` table.
 - `in` - In array (e.g., `id in [1, 2, 3]`)
 
 **Logical Operators:**
-- `&&` - AND
-- `||` - OR
+- `And(predicate, predicate, ...)` - all predicates must match
+- `Or(predicate, predicate, ...)` - at least one predicate must match
 
-**Note**: Parentheses can be used for grouping: `(a == 1 || a == 2) && b == 3`
+Logical operators can be nested to express grouping explicitly:
+
+```pyre
+And(
+    Or(
+        a == 1,
+        a == 2,
+    ),
+    b == 3,
+)
+```
 
 ## Values
 
@@ -610,9 +634,14 @@ delete DeletePost($id: Int) {
 // Complex query with filters
 query GetPublishedPosts($limit: Int) {
     post {
-        @where { 
-            published == True &&
-            (authorId == Session.userId || Session.role == "admin")
+        @where {
+            And(
+                published == True,
+                Or(
+                    authorId == Session.userId,
+                    Session.role == "admin",
+                ),
+            )
         }
         @sort(createdAt, Desc)
         @limit($limit)
@@ -688,7 +717,7 @@ The mutation result is an acknowledgement channel, not the primary read path. Au
 
 1. **Field selection in deletes**: Delete queries require at least one field selection (typically `id`) even though the record is being deleted.
 
-2. **Multiple @where clauses**: Multiple `@where` directives are combined with AND, not OR. Use `||` within a single `@where` for OR conditions.
+2. **Multiple @where clauses**: Multiple `@where` directives are combined with AND, not OR. Use `Or(...)` within a single `@where` for OR conditions.
 
 3. **Nullable parameters**: In updates, nullable parameters (`String?`) allow omitting fields. Non-nullable parameters must be provided.
 

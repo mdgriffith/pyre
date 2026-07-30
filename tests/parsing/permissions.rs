@@ -4,6 +4,34 @@ use pyre::parser;
 use pyre::typecheck;
 
 #[test]
+fn structural_logical_predicates_require_multiple_operands() {
+    for logical in ["And", "Or"] {
+        for operands in ["", "published == True"] {
+            let source = format!(
+                r#"
+record Post {{
+    @allow(query) {{ {logical}({operands}) }}
+}}
+"#
+            );
+            let mut schema = ast::Schema::default();
+            assert!(parser::run("schema.pyre", &source, &mut schema).is_err());
+        }
+    }
+}
+
+#[test]
+fn permission_predicates_cannot_be_empty() {
+    let mut schema = ast::Schema::default();
+    assert!(parser::run(
+        "schema.pyre",
+        "record Post { @allow(query) {} }",
+        &mut schema
+    )
+    .is_err());
+}
+
+#[test]
 fn tagged_union_permission_rhs_uses_terminal_field_typechecking() {
     for predicate in [
         r#"state.Failed.code == "wrong""#,

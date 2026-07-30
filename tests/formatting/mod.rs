@@ -776,6 +776,13 @@ fn round_trip_schema(source: &str) {
 
     // Format again
     format::schema(&mut schema2);
+    let formatted_again = generate::to_string::schema_to_string(&schema2.namespace, &schema2);
+
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent. First format:\n{}\n\nSecond format:\n{}",
+        formatted, formatted_again
+    );
 
     // Compare ASTs (ignoring locations)
     assert!(
@@ -898,6 +905,13 @@ fn round_trip_query(source: &str, database: &ast::Database) {
 
     // Format again
     format::query_list(database, &mut query_list2);
+    let formatted_again = generate::to_string::query(&query_list2);
+
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent. First format:\n{}\n\nSecond format:\n{}",
+        formatted, formatted_again
+    );
 
     // Compare ASTs (ignoring locations)
     assert!(
@@ -1036,10 +1050,52 @@ record Game {
     let formatted = generate::to_string::schema_to_string(&schema.namespace, &schema);
 
     assert!(
-        formatted.contains("@allow(*) {\n        createdByUserId == Session.userId\n        || Session.isAdmin == True\n"),
-        "Expected multi-term @allow OR to format as multi-line. Got:\n{}",
+        formatted.contains(
+            "@allow(*) {\n        Or(\n            createdByUserId == Session.userId,\n            Session.isAdmin == True,\n        )\n    }"
+        ),
+        "Expected multi-term @allow OR to use structural syntax. Got:\n{}",
         formatted
     );
+}
+
+#[test]
+fn test_nested_structural_permissions_format_canonically() {
+    let schema_source = r#"
+record Game {
+    @allow(query) {
+        And(
+            ownerId == Session.userId,
+            Or(status == "active", status == "pending"),
+            published == True
+        )
+    }
+}
+    "#;
+
+    let formatted = format_schema_string(schema_source);
+
+    assert!(formatted.contains(
+        "@allow(query) {\n        And(\n            ownerId == Session.userId,\n            Or(\n                status == \"active\",\n                status == \"pending\",\n            ),\n            published == True,\n        )\n    }"
+    ));
+    round_trip_schema(schema_source);
+}
+
+#[test]
+fn test_mixed_legacy_and_structural_permissions_format_canonically() {
+    let schema_source = r#"
+record Game {
+    @allow(query) {
+        ownerId == Session.userId && Or(status == "active", status == "pending")
+    }
+}
+    "#;
+
+    let formatted = format_schema_string(schema_source);
+
+    assert!(formatted.contains(
+        "@allow(query) {\n        And(\n            ownerId == Session.userId,\n            Or(\n                status == \"active\",\n                status == \"pending\",\n            ),\n        )\n    }"
+    ));
+    round_trip_schema(schema_source);
 }
 
 #[test]
@@ -1425,6 +1481,30 @@ fn test_query_round_trip_complex_where() {
 query GetUsers {
     user {
         @where { id == 1 && name == "test" || email == "test@example.com" }
+        id
+        name
+    }
+}
+    "#;
+
+    round_trip_query(query_source, &database);
+}
+
+#[test]
+fn test_query_round_trip_structural_where() {
+    let database = create_test_database();
+    let query_source = r#"
+query GetUsers {
+    user {
+        @where {
+            And(
+                id == 1,
+                Or(
+                    name == "test",
+                    email == "test@example.com",
+                ),
+            )
+        }
         id
         name
     }

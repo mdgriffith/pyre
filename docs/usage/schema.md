@@ -102,7 +102,12 @@ typed session values:
 
 ```pyre
 record Post {
-    @allow(query) { published == True || authorId == Session.userId }
+    @allow(query) {
+        Or(
+            published == True,
+            authorId == Session.userId,
+        )
+    }
     @allow(update, delete) { authorId == Session.userId }
 
     id Post.id @id
@@ -124,8 +129,13 @@ type WorkspaceRole
 record Document {
     @allow(query) {
         exists workspace.members {
-            userId == Session.userId
-            role == Admin || role == Member
+            And(
+                userId == Session.userId,
+                Or(
+                    role == Admin,
+                    role == Member,
+                ),
+            )
         }
     }
 

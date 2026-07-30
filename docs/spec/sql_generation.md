@@ -299,7 +299,7 @@ Permission conditions use WHERE clause syntax and can reference:
 - **Table columns**: `authorId == Session.userId`
 - **Session variables**: `Session.role == "admin"`
 - **Literals**: `published == True`
-- **Logical operators**: `&&` (AND), `||` (OR)
+- **Logical operators**: `And(...)`, `Or(...)`
 - **Comparison operators**: `==`, `!=`, `>`, `<`, `>=`, `<=`
 
 ### Queries
@@ -313,7 +313,12 @@ record Post {
     title String
     authorId Int
     published Bool
-    @allow(query) { authorId == Session.userId || published == True }
+    @allow(query) {
+        Or(
+            authorId == Session.userId,
+            published == True,
+        )
+    }
 }
 ```
 
@@ -425,7 +430,12 @@ record Post {
     id Int @id
     authorId Int
     published Bool
-    @allow(query) { authorId == Session.userId || published == True }
+    @allow(query) {
+        Or(
+            authorId == Session.userId,
+            published == True,
+        )
+    }
     @allow(insert, update, delete) { authorId == Session.userId }
 }
 ```
@@ -437,7 +447,12 @@ record Post {
     id Int @id
     authorId Int
     @allow(query, insert, update) { authorId == Session.userId }
-    @allow(delete) { authorId == Session.userId || Session.role == "admin" }
+    @allow(delete) {
+        Or(
+            authorId == Session.userId,
+            Session.role == "admin",
+        )
+    }
 }
 ```
 Only admins can delete posts they don't own.

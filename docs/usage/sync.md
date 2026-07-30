@@ -55,7 +55,12 @@ record User {
 
 query GetUser($id: Int) {
     user {
-        @where { id == $id && ownerId == Session.userId }
+        @where {
+            And(
+                id == $id,
+                ownerId == Session.userId,
+            )
+        }
 
         id
         name

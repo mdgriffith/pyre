@@ -103,7 +103,12 @@ Permissions are defined in the schema and evaluated per session:
 
 ```pyre
 record Post {
-    @allow(query) { authorUserId == Session.userId || published == True }
+    @allow(query) {
+        Or(
+            authorUserId == Session.userId,
+            published == True,
+        )
+    }
     @allow(update, insert, delete) { authorUserId == Session.userId }
     // ...
 }
