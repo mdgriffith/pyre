@@ -1,4 +1,4 @@
-module Data.Catchup exposing (Model, Msg(..), ServerConfig, Status(..), UpdateResult, databaseEpoch, databaseId, init, status, update)
+module Data.Catchup exposing (Model, Msg(..), ServerConfig, Status(..), UpdateResult, databaseEpoch, databaseId, init, pendingDatabaseEpoch, status, update)
 
 import Data.Delta
 import Data.IndexedDb
@@ -125,6 +125,11 @@ databaseId model =
 databaseEpoch : Model -> Maybe String
 databaseEpoch model =
     model.databaseEpoch
+
+
+pendingDatabaseEpoch : Model -> Maybe String
+pendingDatabaseEpoch model =
+    model.pendingResetEpoch
 
 
 update : Msg -> Model -> Db.Db -> UpdateResult

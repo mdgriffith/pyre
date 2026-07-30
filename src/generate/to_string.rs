@@ -424,7 +424,28 @@ fn format_permissions_where(indent: String, where_arg: &ast::WhereArg) -> String
 
 fn format_where_for_braces(where_arg: &ast::WhereArg, base_indent: usize) -> String {
     match where_arg {
-        ast::WhereArg::Column(..) => format!("{{ {} }}", format_where_leaf(where_arg)),
+        ast::WhereArg::Column(_, _, _, value, _) if value_is_multiline(value) => format!(
+            "{{\n{}\n{}}}",
+            format_where_at(where_arg, base_indent + 4),
+            " ".repeat(base_indent)
+        ),
+        ast::WhereArg::Column(..) => {
+            format!("{{ {} }}", format_where_leaf(where_arg, base_indent))
+        }
+        ast::WhereArg::And(args) => {
+            if let [arg] = args.as_slice() {
+                return format_where_for_braces(arg, base_indent);
+            }
+
+            let mut result = String::from("{\n");
+            for arg in args {
+                result.push_str(&format_where_at(arg, base_indent + 4));
+                result.push('\n');
+            }
+            result.push_str(&" ".repeat(base_indent));
+            result.push('}');
+            result
+        }
         _ => format!(
             "{{\n{}\n{}}}",
             format_where_at(where_arg, base_indent + 4),
@@ -659,7 +680,7 @@ fn to_string_query_field(indent: usize, field: &ast::QueryField) -> String {
     match &field.set {
         Some(val) => {
             result.push_str(" = ");
-            result.push_str(&value_to_string(val));
+            result.push_str(&value_to_string_at(val, indent));
         }
         None => {}
     }
@@ -685,7 +706,11 @@ fn to_string_param(indent_size: usize, arg: &ast::Arg) -> String {
     let indent = " ".repeat(indent_size);
     match arg {
         ast::Arg::Limit(lim) => {
-            format!("{}@limit({})\n", indent, value_to_string(lim))
+            format!(
+                "{}@limit({})\n",
+                indent,
+                value_to_string_at(lim, indent_size)
+            )
         }
         ast::Arg::OrderBy(direction, column) => {
             format!(
@@ -714,13 +739,15 @@ fn format_where_at(where_arg: &ast::WhereArg, base_indent: usize) -> String {
                 .join("."),
             format_where_for_braces(body, base_indent)
         ),
-        ast::WhereArg::Column(..) => format!("{}{}", indent, format_where_leaf(where_arg)),
+        ast::WhereArg::Column(..) => {
+            format!("{}{}", indent, format_where_leaf(where_arg, base_indent))
+        }
         ast::WhereArg::And(args) => format_logical_where("And", args, base_indent),
         ast::WhereArg::Or(args) => format_logical_where("Or", args, base_indent),
     }
 }
 
-fn format_where_leaf(where_arg: &ast::WhereArg) -> String {
+fn format_where_leaf(where_arg: &ast::WhereArg, base_indent: usize) -> String {
     match where_arg {
         ast::WhereArg::Column(is_session_var, path, operator, value, _field_name_range) => {
             let column = path.authored();
@@ -730,7 +757,7 @@ fn format_where_leaf(where_arg: &ast::WhereArg) -> String {
                 column
             };
             let operator = operator_to_string(&operator);
-            let value = value_to_string(&value);
+            let value = value_to_string_at(value, base_indent);
             format!("{} {} {}", column_name, operator, value)
         }
         _ => unreachable!("compound predicates are formatted recursively"),
@@ -754,13 +781,17 @@ fn format_logical_where(name: &str, args: &[ast::WhereArg], base_indent: usize) 
 }
 
 fn value_to_string(value: &ast::QueryValue) -> String {
+    value_to_string_at(value, 0)
+}
+
+fn value_to_string_at(value: &ast::QueryValue, base_indent: usize) -> String {
     match value {
         ast::QueryValue::Fn(func) => format!(
             "{}({})",
             func.name,
             func.args
                 .iter()
-                .map(|value| value_to_string(value))
+                .map(|value| value_to_string_at(value, base_indent))
                 .collect::<Vec<String>>()
                 .join(", ")
         ),
@@ -771,7 +802,42 @@ fn value_to_string(value: &ast::QueryValue) -> String {
         ast::QueryValue::Bool((_, true)) => "True".to_string(),
         ast::QueryValue::Bool((_, false)) => "False".to_string(),
         ast::QueryValue::Null(_) => "null".to_string(),
-        ast::QueryValue::LiteralTypeValue((_, details)) => details.name.clone(),
+        ast::QueryValue::LiteralTypeValue((_, details)) => match &details.fields {
+            Some(fields) if fields.len() == 1 && !value_is_multiline(&fields[0].1) => format!(
+                "{} {{ {} = {} }}",
+                details.name,
+                fields[0].0,
+                value_to_string_at(&fields[0].1, base_indent)
+            ),
+            Some(fields) if !fields.is_empty() => {
+                let field_indent = " ".repeat(base_indent + 4);
+                let closing_indent = " ".repeat(base_indent);
+                let mut result = format!("{} {{\n", details.name);
+                for (name, value) in fields {
+                    result.push_str(&field_indent);
+                    result.push_str(name);
+                    result.push_str(" = ");
+                    result.push_str(&value_to_string_at(value, base_indent + 4));
+                    result.push('\n');
+                }
+                result.push_str(&closing_indent);
+                result.push('}');
+                result
+            }
+            _ => details.name.clone(),
+        },
+    }
+}
+
+fn value_is_multiline(value: &ast::QueryValue) -> bool {
+    match value {
+        ast::QueryValue::Fn(func) => func.args.iter().any(value_is_multiline),
+        ast::QueryValue::LiteralTypeValue((_, details)) => {
+            details.fields.as_ref().is_some_and(|fields| {
+                fields.len() > 1 || fields.iter().any(|(_, value)| value_is_multiline(value))
+            })
+        }
+        _ => false,
     }
 }
 

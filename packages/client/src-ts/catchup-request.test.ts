@@ -606,6 +606,8 @@ test('Elm destructively resets persisted state before retrying a changed databas
       },
     });
     const resetMessages: unknown[] = [];
+    const debugMessages: unknown[] = [];
+    app.ports.debugOut.subscribe((message) => debugMessages.push(message));
     app.ports.indexedDbOut.subscribe((message) => {
       if (message?.type === 'requestInitialData') {
         app.ports.receiveIndexedDbMessage.send({
@@ -634,6 +636,11 @@ test('Elm destructively resets persisted state before retrying a changed databas
     expect(resetMessages).toEqual([
       { type: 'resetForDatabaseEpoch', databaseEpoch: 'new-epoch' },
     ]);
+    expect(debugMessages).toContainEqual({
+      event: 'database-epoch-change',
+      fromEpoch: 'old-epoch',
+      toEpoch: 'new-epoch',
+    });
     expect(requestBodies).toEqual([
       {
         databaseEpoch: 'old-epoch',

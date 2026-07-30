@@ -478,7 +478,14 @@ class SingleDatabasePyreClient {
 
     if (this.elmApp.ports.debugOut) {
       this.elmApp.ports.debugOut.subscribe((message) => {
-        this.logDebug('[PyreClient] port debugOut <-', message);
+        const epochChange = databaseEpochChangeFromDebugMessage(message);
+        if (epochChange) {
+          this.logDebug(
+            `[PyreClient] Database epoch changed: going from epoch ${epochChange.fromEpoch} to epoch ${epochChange.toEpoch}; resetting local state.`,
+          );
+        } else {
+          this.logDebug('[PyreClient] port debugOut <-', message);
+        }
         const eventName = debugOutEventName(message);
         if (eventName) {
           this.emitDevtoolsEvent(`elm:${eventName}`, message);
@@ -2630,6 +2637,19 @@ function debugOutEventName(message: unknown): string | null {
   return typeof event === 'string' && event.trim() !== ''
     ? event.trim()
     : null;
+}
+
+function databaseEpochChangeFromDebugMessage(message: unknown): { fromEpoch: string; toEpoch: string } | null {
+  if (!message || typeof message !== 'object') {
+    return null;
+  }
+
+  const event = message as Record<string, unknown>;
+  if (event.event !== 'database-epoch-change' || typeof event.fromEpoch !== 'string' || typeof event.toEpoch !== 'string') {
+    return null;
+  }
+
+  return { fromEpoch: event.fromEpoch, toEpoch: event.toEpoch };
 }
 
 function internalDevtoolsEventType(event: PyreDevtoolsEvent): string {

@@ -113,7 +113,7 @@ fn formats_exists_canonically_and_round_trips() {
     let schema = parse_schema(QUERY_ONLY_SCHEMA);
     let formatted = generate::to_string::schema_to_string(&schema.namespace, &schema);
     assert!(formatted.contains(
-        "exists memberships {\n            And(\n                userId == Session.userId,\n                Or(\n                    role == Admin,\n                    role == Member,\n                ),\n            )\n        }"
+        "exists memberships {\n            userId == Session.userId\n            Or(\n                role == Admin,\n                role == Member,\n            )\n        }"
     ), "{formatted}");
     parse_schema(&formatted);
 }
