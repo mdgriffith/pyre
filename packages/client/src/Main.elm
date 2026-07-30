@@ -1113,6 +1113,17 @@ applyCatchupUpdate result model =
                 ++ replayDbCmds
                 |> List.map (Cmd.map DbMsg)
 
+        epochChangeCmd =
+            case ( Catchup.databaseEpoch model.catchup, Catchup.pendingDatabaseEpoch result.model ) of
+                ( Just fromEpoch, Just toEpoch ) ->
+                    debugCmd "database-epoch-change"
+                        [ ( "fromEpoch", Encode.string fromEpoch )
+                        , ( "toEpoch", Encode.string toEpoch )
+                        ]
+
+                _ ->
+                    Cmd.none
+
         cmds =
             [ Cmd.map CatchupMsg result.cmd
             , errorCmd
@@ -1124,6 +1135,7 @@ applyCatchupUpdate result model =
               else
                 writeServerRevisionCmd result.serverRevision
             , emitSyncState (toSyncState liveSyncModel)
+            , epochChangeCmd
             , debugCmd "catchup-update"
                 [ ( "status", Encode.string (catchupStatusToString (Catchup.status result.model)) )
                 , ( "touchedTables", Encode.list Encode.string result.touchedTables )
