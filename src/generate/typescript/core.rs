@@ -17,7 +17,7 @@ pub fn generate_schema(
 ) {
     files.push(generate_text_file(
         base_out_dir.join("decode.ts"),
-        generate_decode_file(database),
+        generate_decode_file(context, database),
     ));
     files.push(generate_text_file(
         base_out_dir.join("schema.ts"),
@@ -75,7 +75,7 @@ fn sql_types_file() -> String {
     result
 }
 
-fn generate_decode_file(database: &ast::Database) -> String {
+fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) -> String {
     let mut result = String::new();
 
     result.push_str("import { z } from 'zod';\n");
@@ -94,10 +94,9 @@ fn generate_decode_file(database: &ast::Database) -> String {
     result.push_str("}\n\n");
 
     // Get session definition
-    let session = database
-        .schemas
-        .iter()
-        .find_map(|s| s.session.clone())
+    let session = context
+        .session
+        .clone()
         .unwrap_or_else(|| ast::default_session_details());
 
     // Generate Session type
@@ -105,21 +104,20 @@ fn generate_decode_file(database: &ast::Database) -> String {
     result.push_str("export interface Session {\n");
     for field in &session.fields {
         if let ast::Field::Column(col) = field {
-            let type_str = col.type_.to_string();
-            let ts_type = match type_str.as_str() {
-                "String" => "string",
-                "Int" | "Float" => "number",
-                "Bool" => "boolean",
-                "DateTime" => "Date | string | number",
-                _ if type_str == "Id.Int"
-                    || type_str == "Id.Uuid"
-                    || type_str.starts_with("Id.Int<")
-                    || type_str.starts_with("Id.Uuid<")
-                    || type_str.contains('.') =>
-                {
-                    "number"
+            let ts_type = match &col.type_ {
+                ast::ColumnType::String => "string".to_string(),
+                ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
+                    "number".to_string()
                 }
-                other => other,
+                ast::ColumnType::IdUuid { .. }
+                | ast::ColumnType::ForeignKey {
+                    serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+                    ..
+                } => "string".to_string(),
+                ast::ColumnType::ForeignKey { .. } => "number".to_string(),
+                ast::ColumnType::Bool => "boolean".to_string(),
+                ast::ColumnType::DateTime => "Date | string | number".to_string(),
+                other => other.to_string(),
             };
             let optional = if col.nullable { "?" } else { "" };
             result.push_str(&format!("  {}{}: {};\n", col.name, optional, ts_type));
@@ -130,20 +128,19 @@ fn generate_decode_file(database: &ast::Database) -> String {
     result.push_str("export const SessionValidator = z.object({\n");
     for field in &session.fields {
         if let ast::Field::Column(col) = field {
-            let type_str = col.type_.to_string();
-            let validator = match type_str.as_str() {
-                "String" => "z.string()".to_string(),
-                "Int" | "Float" => "z.number()".to_string(),
-                "Bool" => "CoercedBool".to_string(),
-                "DateTime" => "CoercedDate".to_string(),
-                _ if type_str == "Id.Int"
-                    || type_str == "Id.Uuid"
-                    || type_str.starts_with("Id.Int<")
-                    || type_str.starts_with("Id.Uuid<")
-                    || type_str.contains('.') =>
-                {
+            let validator = match &col.type_ {
+                ast::ColumnType::String => "z.string()".to_string(),
+                ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
                     "z.number()".to_string()
                 }
+                ast::ColumnType::IdUuid { .. }
+                | ast::ColumnType::ForeignKey {
+                    serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+                    ..
+                } => "z.string()".to_string(),
+                ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
+                ast::ColumnType::Bool => "CoercedBool".to_string(),
+                ast::ColumnType::DateTime => "CoercedDate".to_string(),
                 other => format!("z.any() /* {} */", other),
             };
             let validator = if col.nullable {

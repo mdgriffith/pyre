@@ -1722,6 +1722,14 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
             }
         }
     }
+
+    if let Some(session) = &mut context.session {
+        for field in &mut session.fields {
+            if let ast::Field::Column(column) = field {
+                resolve_type(&mut column.type_, &foreign_key_types);
+            }
+        }
+    }
 }
 
 // Check for duplicate variants

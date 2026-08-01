@@ -171,6 +171,43 @@ record User {
 }
 
 #[test]
+fn typescript_session_reference_to_uuid_id_generates_string_metadata() {
+    let schema_source = r#"
+session {
+    hostedGameId HostedGame.id
+}
+
+record HostedGame {
+    @public
+    id Id.Uuid @id
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let mut files = Vec::new();
+    core::generate_schema(
+        &context,
+        &database,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+
+    let decode = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "typescript/core/decode.ts"))
+        .expect("generated decode file");
+    assert!(decode.contents.contains("hostedGameId: string;"));
+    assert!(decode.contents.contains("hostedGameId: z.string(),"));
+
+    let env = typescript::to_env(&context, &database).expect("env should generate");
+    assert!(env.contains("hostedGameId: z.string(),"));
+}
+
+#[test]
 fn typescript_metadata_serializes_payload_union_parameters_but_not_unit_enums() {
     let schema_source = r#"
 type Content

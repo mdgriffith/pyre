@@ -302,10 +302,9 @@ pub fn to_env(context: &typecheck::Context, database: &ast::Database) -> Option<
 
     result.push_str("import { z } from 'zod';\n");
     result.push_str("import * as Db from './decode';\n");
-    let session = database
-        .schemas
-        .iter()
-        .find_map(|schema| schema.session.clone())
+    let session = context
+        .session
+        .clone()
         .unwrap_or_else(|| ast::default_session_details());
 
     if database.schemas.len() == 1 {
