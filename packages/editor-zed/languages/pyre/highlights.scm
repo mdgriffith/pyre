@@ -5,7 +5,7 @@
 (null) @constant.builtin
 (variable) @variable.parameter
 (wildcard) @variable.special
-(directive name: (identifier) @attribute)
+(directive_name) @attribute @constant.builtin
 (record_declaration name: (type_identifier) @type)
 (type_declaration name: (type_identifier) @type)
 (session_declaration "session" @keyword)

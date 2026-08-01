@@ -78,11 +78,11 @@ module.exports = grammar({
     )),
 
     directive: $ => prec.right(seq(
-      "@",
-      field("name", $.identifier),
+      field("name", $.directive_name),
       optional($.argument_list),
       optional($.block),
     )),
+    directive_name: _ => token(seq("@", /[a-z_][A-Za-z0-9_]*/)),
     argument_list: $ => seq("(", optional(commaSep1($.expression)), ")"),
 
     expression: $ => choice(
