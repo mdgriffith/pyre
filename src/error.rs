@@ -728,7 +728,7 @@ fn format_yellow_or_list(items: &Vec<String>, in_color: bool) -> String {
     }
 }
 
-fn to_error_description(error: &Error, in_color: bool) -> String {
+pub fn to_error_description(error: &Error, in_color: bool) -> String {
     match &error.error_type {
         ErrorType::ParsingError(parsing_details) => {
             let mut result = "".to_string();
@@ -1593,7 +1593,7 @@ fn to_error_description(error: &Error, in_color: bool) -> String {
 }
 
 // JSON error format
-fn to_error_title(error_type: &ErrorType) -> String {
+pub fn to_error_title(error_type: &ErrorType) -> String {
     match error_type {
         ErrorType::ParsingError(_) => "Parsing Error",
         ErrorType::UnknownFunction { .. } => "Unknown Function",

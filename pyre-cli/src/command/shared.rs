@@ -217,7 +217,10 @@ pub fn parse_database_schemas(
                         "{}",
                         parser::render_error(&source.content, err, enable_color)
                     );
-                    std::process::exit(1);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to parse {}", source.path),
+                    ));
                 }
             }
         }

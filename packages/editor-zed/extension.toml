@@ -1,0 +1,18 @@
+id = "pyre"
+name = "Pyre"
+version = "0.1.0"
+schema_version = 1
+authors = ["Pyre contributors"]
+description = "Pyre language support: syntax highlighting, diagnostics, and formatting"
+repository = "https://github.com/mdgriffith/pyre"
+
+[grammars.pyre]
+repository = "https://github.com/mdgriffith/pyre"
+rev = "main"
+path = "packages/editor-zed/grammar"
+
+[language_servers.pyre-lsp]
+languages = ["Pyre"]
+
+[language_servers.pyre-lsp.language_ids]
+Pyre = "pyre"

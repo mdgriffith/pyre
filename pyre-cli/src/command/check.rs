@@ -1,4 +1,5 @@
 use serde_json;
+use std::collections::HashMap;
 use std::io::{self, Read};
 
 use super::shared::{display_path, parse_database_schemas, pyre_file_count, FileError, Options};
@@ -24,7 +25,7 @@ pub fn check(options: &Options, _files: Vec<String>, json: bool) -> io::Result<(
         schema_file_contents.insert(session_file.path.clone(), session_file.content.clone());
     }
 
-    match run_check(paths, options.enable_color) {
+    match run_check(paths, options.enable_color, None) {
         Ok(errors) => {
             let has_errors = !errors.is_empty();
             if json {
@@ -71,7 +72,11 @@ pub fn check(options: &Options, _files: Vec<String>, json: bool) -> io::Result<(
     Ok(())
 }
 
-fn run_check(paths: filesystem::Found, enable_color: bool) -> io::Result<Vec<FileError>> {
+pub(super) fn run_check(
+    paths: filesystem::Found,
+    enable_color: bool,
+    overlays: Option<&HashMap<String, String>>,
+) -> io::Result<Vec<FileError>> {
     let schema = parse_database_schemas(&paths, enable_color)?;
     let mut all_file_errors = Vec::new();
 
@@ -88,9 +93,16 @@ fn run_check(paths: filesystem::Found, enable_color: bool) -> io::Result<Vec<Fil
             };
             for query_file_path in paths.query_files {
                 let mut file_errors = Vec::new();
-                let mut query_file = std::fs::File::open(query_file_path.clone())?;
-                let mut query_source_str = String::new();
-                query_file.read_to_string(&mut query_source_str)?;
+                let query_source_str = match overlays.and_then(|items| items.get(&query_file_path))
+                {
+                    Some(source) => source.clone(),
+                    None => {
+                        let mut query_file = std::fs::File::open(query_file_path.clone())?;
+                        let mut source = String::new();
+                        query_file.read_to_string(&mut source)?;
+                        source
+                    }
+                };
 
                 context.current_filepath = query_file_path.clone();
                 match parser::parse_query(&query_file_path, &query_source_str) {
