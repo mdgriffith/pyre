@@ -8,7 +8,7 @@ repository = "https://github.com/mdgriffith/pyre"
 
 [grammars.pyre]
 repository = "https://github.com/mdgriffith/pyre"
-rev = "main"
+rev = "289fca012fede0b81aa952e4eea147a4368ee3cd"
 path = "packages/editor-zed/grammar"
 
 [language_servers.pyre-lsp]
