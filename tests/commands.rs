@@ -857,6 +857,55 @@ fn test_generate_command() {
 }
 
 #[test]
+fn test_generate_preserves_namespaced_session_id_storage_types() {
+    let ctx = TestContext::new();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Other")).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        r#"
+session {
+    uuidRecordId UuidRecord.id?
+    intRecordId  IntRecord.id?
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
+        r#"
+record UuidRecord {
+    id Id.Uuid @id
+    @public
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Other/schema.pyre"),
+        r#"
+record IntRecord {
+    id Id.Int @id
+    @public
+}
+"#,
+    )
+    .unwrap();
+
+    ctx.run_command("generate").assert().success();
+
+    let decode = std::fs::read_to_string(
+        ctx.workspace_path
+            .join("pyre/generated/typescript/core/decode.ts"),
+    )
+    .unwrap();
+    assert!(decode.contains("uuidRecordId?: string;"));
+    assert!(decode.contains("intRecordId?: number;"));
+    assert!(decode.contains("uuidRecordId: z.string().optional(),"));
+    assert!(decode.contains("intRecordId: z.number().optional(),"));
+}
+
+#[test]
 fn test_generated_typescript_server_includes_typed_seed_input() {
     let ctx = TestContext::new();
 

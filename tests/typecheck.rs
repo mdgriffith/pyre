@@ -2191,6 +2191,108 @@ query GetPosts {
 }
 
 #[test]
+fn foreign_key_requires_namespace_to_reference_external_table() {
+    let mut app_schema = ast::Schema::default();
+    app_schema.namespace = "App".to_string();
+    parser::run(
+        "pyre/schema/App/schema.pyre",
+        r#"
+record Post {
+    id Id.Int @id
+    userId User.id
+    @public
+}
+"#,
+        &mut app_schema,
+    )
+    .expect("App schema should parse");
+
+    let mut auth_schema = ast::Schema::default();
+    auth_schema.namespace = "Auth".to_string();
+    parser::run(
+        "pyre/schema/Auth/schema.pyre",
+        r#"
+record User {
+    id Id.Uuid @id
+    @public
+}
+"#,
+        &mut auth_schema,
+    )
+    .expect("Auth schema should parse");
+
+    let errors = typecheck::check_schema(&ast::Database {
+        schemas: vec![app_schema, auth_schema],
+    })
+    .expect_err("An unqualified foreign key must not resolve outside App");
+
+    assert!(errors.iter().any(|error| matches!(
+        &error.error_type,
+        ErrorType::ForeignKeyToUnknownTable {
+            field_name,
+            referenced_table,
+            ..
+        } if field_name == "userId" && referenced_table == "User"
+    )));
+}
+
+#[test]
+fn foreign_key_allows_explicit_external_namespace() {
+    let mut app_schema = ast::Schema::default();
+    app_schema.namespace = "App".to_string();
+    parser::run(
+        "pyre/schema/App/schema.pyre",
+        r#"
+record Post {
+    id Id.Int @id
+    userId Auth.User.id
+    @public
+}
+"#,
+        &mut app_schema,
+    )
+    .expect("App schema should parse");
+
+    let mut auth_schema = ast::Schema::default();
+    auth_schema.namespace = "Auth".to_string();
+    parser::run(
+        "pyre/schema/Auth/schema.pyre",
+        r#"
+record User {
+    id Id.Uuid @id
+    @public
+}
+"#,
+        &mut auth_schema,
+    )
+    .expect("Auth schema should parse");
+
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![app_schema, auth_schema],
+    })
+    .expect("The explicit Auth namespace should resolve");
+    let post = context.tables.get("post").expect("Post should exist");
+    let user_id = post
+        .record
+        .fields
+        .iter()
+        .find_map(|field| match field {
+            ast::Field::Column(column) if column.name == "userId" => Some(column),
+            _ => None,
+        })
+        .expect("userId should exist");
+
+    assert!(matches!(
+        user_id.type_,
+        ast::ColumnType::ForeignKey {
+            schema: Some(ref schema),
+            serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+            ..
+        } if schema == "Auth"
+    ));
+}
+
+#[test]
 fn test_duplicate_record_name_across_namespaces_fails_today() {
     let app_source = r#"
 record User {

@@ -200,6 +200,62 @@ pub struct FileBasedMigrationPlan {
     pub schema_string: String,
 }
 
+pub fn schema_to_storage_string(schema: &ast::Schema) -> String {
+    let mut stored_schema = schema.clone();
+
+    for file in &mut stored_schema.files {
+        for definition in &mut file.definitions {
+            let ast::Definition::Record { fields, .. } = definition else {
+                continue;
+            };
+
+            for field in fields {
+                let ast::Field::Column(column) = field else {
+                    continue;
+                };
+                let ast::ColumnType::ForeignKey {
+                    schema: Some(target_schema),
+                    serialization_type,
+                    ..
+                } = &column.type_
+                else {
+                    continue;
+                };
+
+                if *target_schema == stored_schema.namespace {
+                    if let ast::ColumnType::ForeignKey { schema, .. } = &mut column.type_ {
+                        *schema = None;
+                    }
+                    continue;
+                }
+
+                // The attached database is not available when this physical schema is reloaded.
+                // Persist the already-resolved SQLite storage type instead of an external lookup.
+                let stored_type = match serialization_type {
+                    Some(ast::ConcreteSerializationType::IdUuid)
+                    | Some(ast::ConcreteSerializationType::Text) => Some(ast::ColumnType::String),
+                    Some(ast::ConcreteSerializationType::Real) => Some(ast::ColumnType::Float),
+                    Some(ast::ConcreteSerializationType::DateTime) => {
+                        Some(ast::ColumnType::DateTime)
+                    }
+                    Some(ast::ConcreteSerializationType::Date) => Some(ast::ColumnType::Date),
+                    Some(ast::ConcreteSerializationType::JsonB) => Some(ast::ColumnType::Json),
+                    Some(ast::ConcreteSerializationType::Integer)
+                    | Some(ast::ConcreteSerializationType::IdInt) => Some(ast::ColumnType::Int),
+                    Some(ast::ConcreteSerializationType::Blob)
+                    | Some(ast::ConcreteSerializationType::VectorBlob { .. })
+                    | None => None,
+                };
+                if let Some(stored_type) = stored_type {
+                    column.type_ = stored_type;
+                }
+            }
+        }
+    }
+
+    crate::generate::to_string::schema_to_string("", &stored_schema)
+}
+
 /// Plan file-based migrations by determining which migration files need to be executed.
 /// Returns a plan that can be executed by the caller using their database connection.
 pub fn plan_file_based_migrations(
@@ -224,10 +280,60 @@ pub fn plan_file_based_migrations(
     };
 
     // Generate schema string
-    let schema_string = crate::generate::to_string::schema_to_string("", schema);
+    let schema_string = schema_to_storage_string(schema);
 
     FileBasedMigrationPlan {
         migrations_to_run,
         schema_string,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_schema_uses_resolved_type_for_external_foreign_key() {
+        let mut app = ast::Schema {
+            namespace: "App".to_string(),
+            ..ast::Schema::default()
+        };
+        parser::run(
+            "pyre/schema/App/schema.pyre",
+            "record Post {\n    @public\n    id Id.Int @id\n    userId Auth.User.id\n}\n",
+            &mut app,
+        )
+        .expect("App schema should parse");
+
+        let mut auth = ast::Schema {
+            namespace: "Auth".to_string(),
+            ..ast::Schema::default()
+        };
+        parser::run(
+            "pyre/schema/Auth/schema.pyre",
+            "record User {\n    @public\n    id Id.Uuid @id\n}\n",
+            &mut auth,
+        )
+        .expect("Auth schema should parse");
+
+        let mut database = ast::Database {
+            schemas: vec![app, auth],
+        };
+        ast::resolve_id_brands(&mut database);
+
+        let source = schema_to_storage_string(&database.schemas[0]);
+        assert!(source.contains("userId String"), "stored schema: {source}");
+        assert!(!source.contains("Auth.User.id"));
+
+        let introspection = introspect::from_raw(introspect::IntrospectionRaw {
+            tables: vec![],
+            migration_state: introspect::MigrationState::MigrationTable { migrations: vec![] },
+            schema_source: source,
+            links: vec![],
+        });
+        match introspection.schema {
+            introspect::SchemaResult::Success { .. } => {}
+            other => panic!("stored schema should typecheck: {other:?}"),
+        }
     }
 }

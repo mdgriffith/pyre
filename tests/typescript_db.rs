@@ -96,9 +96,18 @@ type Attribute
    | AttributeBool {
         value Bool
      }
-   | AttributeCustom {
+    | AttributeCustom {
+         variant String
+         fields  Dict<Attribute>
+      }
+   | AttributeSet {
+        items List<AttributeCustomValue>
+     }
+
+type AttributeCustomValue
+   = AttributeCustomValue {
         variant String
-        fields  Dict<Attribute>
+        fields Dict<Attribute>
      }
 
 type DocumentVisibility
@@ -135,10 +144,51 @@ record Document {
         decode_ts
     );
     assert!(
+        decode_ts.contains("export type Attribute =\n")
+            && decode_ts.contains("const AttributeDiscriminated: z.ZodType<Attribute>")
+            && decode_ts.contains("export const Attribute: z.ZodType<Attribute>")
+            && decode_ts.contains("export type AttributeCustomValue =\n")
+            && decode_ts.contains(
+                "const AttributeCustomValueDiscriminated: z.ZodType<AttributeCustomValue>"
+            )
+            && decode_ts
+                .contains("export const AttributeCustomValue: z.ZodType<AttributeCustomValue>"),
+        "Expected recursive groups to have explicit TypeScript and Zod types. Generated:\n{}",
+        decode_ts
+    );
+    assert!(
         decode_ts.contains("userIds: z.array(z.string()).optional()"),
         "Expected Json<List<String>> variant field to validate as a string array. Generated:\n{}",
         decode_ts
     );
+
+    let tsc = Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/tsc");
+    if tsc.exists() {
+        let temp_dir =
+            tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
+        std::fs::write(temp_dir.path().join("decode.ts"), &decode_ts)
+            .expect("write generated decoder");
+        let output = std::process::Command::new(tsc)
+            .args([
+                "--noEmit",
+                "--strict",
+                "--skipLibCheck",
+                "--module",
+                "preserve",
+                "--moduleResolution",
+                "bundler",
+                "decode.ts",
+            ])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("typecheck generated recursive decoder");
+        assert!(
+            output.status.success(),
+            "generated recursive decoder failed to compile\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -321,19 +371,26 @@ if (JSON.stringify(path) !== JSON.stringify(["clocktowerParticipantStatus"])) {
 }
 
 #[test]
-fn typescript_session_reference_to_uuid_id_generates_string_metadata() {
+fn typescript_session_references_preserve_id_storage_types() {
     let schema_source = r#"
 session {
-    hostedGameId HostedGame.id
+    uuidRecordId UuidRecord.id?
+    intRecordId  IntRecord.id?
 }
 
-record HostedGame {
+record UuidRecord {
     @public
     id Id.Uuid @id
+}
+
+record IntRecord {
+    @public
+    id Id.Int @id
 }
 "#;
     let mut schema = ast::Schema::default();
     parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    schema.namespace = "Records".to_string();
     let database = ast::Database {
         schemas: vec![schema],
     };
@@ -350,11 +407,58 @@ record HostedGame {
         .iter()
         .find(|file| path_ends_with(&file.path, "typescript/core/decode.ts"))
         .expect("generated decode file");
-    assert!(decode.contents.contains("hostedGameId: string;"));
-    assert!(decode.contents.contains("hostedGameId: z.string(),"));
+    assert!(decode.contents.contains("uuidRecordId?: string;"));
+    assert!(decode.contents.contains("intRecordId?: number;"));
+    assert!(decode
+        .contents
+        .contains("uuidRecordId: z.string().optional(),"));
+    assert!(decode
+        .contents
+        .contains("intRecordId: z.number().optional(),"));
 
     let env = typescript::to_env(&context, &database).expect("env should generate");
-    assert!(env.contains("hostedGameId: z.string(),"));
+    assert!(env.contains("uuidRecordId: z.string().optional(),"));
+    assert!(env.contains("intRecordId: z.number().optional(),"));
+
+    if std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping generated session validator runtime test: bun not available");
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
+    std::fs::write(temp_dir.path().join("decode.ts"), &decode.contents)
+        .expect("write generated decoder");
+    std::fs::write(
+        temp_dir.path().join("verify.ts"),
+        r#"
+import { SessionValidator } from "./decode.ts";
+
+SessionValidator.parse({ uuidRecordId: "550e8400-e29b-41d4-a716-446655440000" });
+SessionValidator.parse({ intRecordId: 42 });
+
+if (SessionValidator.safeParse({ uuidRecordId: 42 }).success) {
+  throw new Error("Expected numeric UUID record ID to fail");
+}
+"#,
+    )
+    .expect("write runtime verification");
+
+    let output = std::process::Command::new("bun")
+        .arg("run")
+        .arg("verify.ts")
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("run generated session validator");
+    assert!(
+        output.status.success(),
+        "generated session validator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

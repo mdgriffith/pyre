@@ -211,11 +211,48 @@ record Post {
     assert_eq!(
         author_id_field.type_,
         ast::ColumnType::ForeignKey {
+            schema: None,
             table: "User".to_string(),
             field: "id".to_string(),
             serialization_type: None,
         }
     );
+}
+
+#[test]
+fn test_namespaced_foreign_key_field_reference_parsing() {
+    let schema_source = r#"
+record Post {
+    id Id.Int @id
+    authorId Auth.User.id
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("Schema should parse");
+
+    let author_id = schema.files[0]
+        .definitions
+        .iter()
+        .find_map(|definition| match definition {
+            ast::Definition::Record { fields, .. } => fields.iter().find_map(|field| match field {
+                ast::Field::Column(column) if column.name == "authorId" => Some(column),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("authorId should exist");
+
+    assert_eq!(
+        author_id.type_,
+        ast::ColumnType::ForeignKey {
+            schema: Some("Auth".to_string()),
+            table: "User".to_string(),
+            field: "id".to_string(),
+            serialization_type: None,
+        }
+    );
+    assert_eq!(author_id.type_.to_string(), "Auth.User.id");
 }
 
 #[test]

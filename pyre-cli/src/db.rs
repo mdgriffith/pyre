@@ -133,7 +133,6 @@ pub enum MigrationError {
     MigrationValidationFailed {
         changes: Vec<String>,
     },
-    SchemaTypecheckFailed,
 }
 
 impl MigrationError {
@@ -207,10 +206,6 @@ impl MigrationError {
                         .collect::<Vec<_>>()
                         .join("\n")
                 ),
-            ),
-            MigrationError::SchemaTypecheckFailed => pyre::error::format_custom_error(
-                "Schema Typecheck Failed",
-                "The schema could not be typechecked while validating migrations.",
             ),
         }
     }
@@ -318,6 +313,7 @@ impl MigrateOutcome {
 
 pub struct MigrateOptions<'a> {
     pub schema: &'a ast::Schema,
+    pub context: &'a typecheck::Context,
     pub migration_folder: &'a Path,
     pub migration_root: &'a Path,
     pub namespace: Option<&'a str>,
@@ -496,12 +492,6 @@ pub async fn migrate(
 
     let migrations_applied = migration_plan.migrations_to_run.len();
 
-    let schema_database = ast::Database {
-        schemas: vec![schema.clone()],
-    };
-    let schema_context = typecheck::check_schema(&schema_database)
-        .map_err(|_| MigrationError::SchemaTypecheckFailed)?;
-
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
@@ -548,7 +538,7 @@ pub async fn migrate(
     let introspection = introspect::introspect_connection(&tx)
         .await
         .map_err(MigrationError::SqlError)?;
-    let validation_diff = diff::diff(&schema_context, schema, &introspection);
+    let validation_diff = diff::diff(options.context, schema, &introspection);
     if !diff::is_empty(&validation_diff) {
         let changes = migration_validation_changes(&validation_diff);
         tx.rollback().await.map_err(MigrationError::SqlError)?;

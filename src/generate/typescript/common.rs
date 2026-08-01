@@ -2,10 +2,10 @@ use crate::ast;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-/// Collect all type definitions and sort them by dependency order
-pub fn sort_types_by_dependency(database: &ast::Database) -> Vec<(String, Vec<ast::Variant>)> {
-    // Collect all tagged union types
-    let mut types: HashMap<String, (Vec<ast::Variant>, HashSet<String>)> = HashMap::new();
+fn collect_tagged_types(
+    database: &ast::Database,
+) -> HashMap<String, (Vec<ast::Variant>, HashSet<String>)> {
+    let mut types = HashMap::new();
 
     for schema in &database.schemas {
         for file in &schema.files {
@@ -13,16 +13,13 @@ pub fn sort_types_by_dependency(database: &ast::Database) -> Vec<(String, Vec<as
                 if let ast::Definition::Tagged { name, variants, .. } = def {
                     let mut deps = HashSet::new();
 
-                    // Collect dependencies from all variant fields
                     for variant in variants {
                         if let Some(fields) = &variant.fields {
                             for field in fields {
                                 if let ast::Field::Column(col) = field {
                                     let mut type_names = Vec::new();
                                     col.type_.collect_custom_type_names(&mut type_names);
-                                    for type_name in type_names {
-                                        deps.insert(type_name);
-                                    }
+                                    deps.extend(type_names);
                                 }
                             }
                         }
@@ -33,6 +30,47 @@ pub fn sort_types_by_dependency(database: &ast::Database) -> Vec<(String, Vec<as
             }
         }
     }
+
+    types
+}
+
+fn reaches_type(
+    current: &str,
+    target: &str,
+    types: &HashMap<String, (Vec<ast::Variant>, HashSet<String>)>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(current.to_string()) {
+        return false;
+    }
+
+    types.get(current).is_some_and(|(_, deps)| {
+        deps.iter().any(|dep| {
+            types.contains_key(dep) && (dep == target || reaches_type(dep, target, types, visited))
+        })
+    })
+}
+
+/// Return every tagged type that belongs to a recursive dependency group.
+pub fn recursive_type_names(database: &ast::Database) -> HashSet<String> {
+    let types = collect_tagged_types(database);
+
+    types
+        .iter()
+        .filter_map(|(name, (_, deps))| {
+            let recursive = deps.iter().any(|dep| {
+                dep == name
+                    || (types.contains_key(dep)
+                        && reaches_type(dep, name, &types, &mut HashSet::new()))
+            });
+            recursive.then(|| name.clone())
+        })
+        .collect()
+}
+
+/// Collect all type definitions and sort them by dependency order
+pub fn sort_types_by_dependency(database: &ast::Database) -> Vec<(String, Vec<ast::Variant>)> {
+    let mut types = collect_tagged_types(database);
 
     // Topological sort using Kahn's algorithm
     let mut sorted = Vec::new();
@@ -226,7 +264,7 @@ export const CoercedBool = z.union([z.boolean(), z.number()]).transform((val) =>
 }
 
 /// Generate a tagged union decoder using Zod
-pub fn generate_tagged_union(name: &str, variants: &[ast::Variant]) -> String {
+pub fn generate_tagged_union(name: &str, variants: &[ast::Variant], recursive: bool) -> String {
     let mut result = String::new();
 
     let is_enum = variants.iter().all(|variant| variant.fields.is_none());
@@ -266,6 +304,26 @@ pub fn generate_tagged_union(name: &str, variants: &[ast::Variant]) -> String {
         return result;
     }
 
+    if recursive {
+        result.push_str(&format!("export type {} =\n", name));
+        for variant in variants {
+            result.push_str(&format!("  | {{ _type: \"{}\"", variant.name));
+            if let Some(fields) = &variant.fields {
+                for field in fields {
+                    if let ast::Field::Column(col) = field {
+                        let mut ts_type = column_type_to_ts_type(&col.type_, false);
+                        if col.nullable {
+                            ts_type.push_str(" | null");
+                        }
+                        result.push_str(&format!("; {}?: {}", col.name, ts_type));
+                    }
+                }
+            }
+            result.push_str(" }\n");
+        }
+        result.push_str(";\n\n");
+    }
+
     let mut variant_field_names: Vec<String> = Vec::new();
     for variant in variants {
         if let Some(fields) = &variant.fields {
@@ -284,9 +342,14 @@ pub fn generate_tagged_union(name: &str, variants: &[ast::Variant]) -> String {
         .collect::<Vec<String>>()
         .join(", ");
 
+    let discriminated_annotation = if recursive {
+        format!(": z.ZodType<{}>", name)
+    } else {
+        String::new()
+    };
     result.push_str(&format!(
-        "const {0}Discriminated = z.discriminatedUnion(\"_type\", [\n",
-        name
+        "const {0}Discriminated{1} = z.discriminatedUnion(\"_type\", [\n",
+        name, discriminated_annotation
     ));
     for variant in variants {
         result.push_str("  z.object({\n");
@@ -309,9 +372,14 @@ pub fn generate_tagged_union(name: &str, variants: &[ast::Variant]) -> String {
     }
     result.push_str("]);\n\n");
 
+    let validator_annotation = if recursive {
+        format!(": z.ZodType<{}>", name)
+    } else {
+        String::new()
+    };
     result.push_str(&format!(
-        "export const {0} = z.preprocess((value) => {{\n",
-        name
+        "export const {0}{1} = z.preprocess((value) => {{\n",
+        name, validator_annotation
     ));
     result
         .push_str("  if (value != null && typeof value === 'object' && !Array.isArray(value)) {\n");
@@ -334,11 +402,12 @@ pub fn generate_tagged_union(name: &str, variants: &[ast::Variant]) -> String {
     result.push_str("  return value;\n");
     result.push_str(&format!("}}, {0}Discriminated);\n\n", name));
 
-    // Type inference
-    result.push_str(&format!(
-        "export type {} = z.infer<typeof {}>;\n\n",
-        name, name
-    ));
+    if !recursive {
+        result.push_str(&format!(
+            "export type {} = z.infer<typeof {}>;\n\n",
+            name, name
+        ));
+    }
 
     result
 }
@@ -386,6 +455,7 @@ mod tests {
             fields: Some(vec![column(
                 "userId",
                 ast::ColumnType::ForeignKey {
+                    schema: None,
                     table: "User".to_string(),
                     field: "id".to_string(),
                     serialization_type: None,
@@ -398,7 +468,7 @@ mod tests {
             inline_comment: None,
         }];
 
-        let generated = generate_tagged_union("InviteTarget", &variants);
+        let generated = generate_tagged_union("InviteTarget", &variants, false);
 
         assert!(generated.contains("userId: z.number().optional()"));
         assert!(!generated.contains("userId: User.id.optional()"));
@@ -420,7 +490,7 @@ mod tests {
             inline_comment: None,
         }];
 
-        let generated = generate_tagged_union("Attribute", &variants);
+        let generated = generate_tagged_union("Attribute", &variants, true);
 
         assert!(
             generated.contains("fields: z.record(z.string(), z.lazy(() => Attribute)).optional()")

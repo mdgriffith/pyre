@@ -986,14 +986,26 @@ pub fn query_param_type_for_column(table: &ast::RecordDetails, column: &ast::Col
 /// Resolves record field references used in query parameter declarations to the
 /// field's concrete type. Parsed references otherwise retain an integer fallback.
 pub fn resolve_query_param_type(context: &Context, type_: &str) -> String {
-    let ast::ColumnType::ForeignKey { table, field, .. } = ast::ColumnType::from_str(type_) else {
+    let ast::ColumnType::ForeignKey {
+        schema,
+        table,
+        field,
+        ..
+    } = ast::ColumnType::from_str(type_)
+    else {
         return type_.to_string();
     };
 
     context
         .tables
         .values()
-        .find(|candidate| candidate.record.name == table)
+        .find(|candidate| {
+            candidate.record.name == table
+                && schema
+                    .as_ref()
+                    .map(|schema| candidate.schema == *schema)
+                    .unwrap_or(true)
+        })
         .and_then(|candidate| {
             candidate
                 .record
@@ -1258,15 +1270,24 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
 
                                     // Validate foreign key references
                                     if let ast::ColumnType::ForeignKey {
+                                        schema: ref_schema,
                                         table: ref_table,
                                         field: ref_field,
                                         ..
                                     } = &column.type_
                                     {
-                                        // Check if the referenced table exists
-                                        let ref_table_lower =
-                                            crate::ext::string::decapitalize(ref_table);
-                                        match context.tables.get(&ref_table_lower) {
+                                        let target_schema =
+                                            ref_schema.as_ref().unwrap_or(&schema.namespace);
+                                        let referenced_table = ref_schema
+                                            .as_ref()
+                                            .map(|schema| format!("{}.{}", schema, ref_table))
+                                            .unwrap_or_else(|| ref_table.clone());
+                                        let foreign_table = context.tables.values().find(|table| {
+                                            table.schema == *target_schema
+                                                && table.record.name == *ref_table
+                                        });
+
+                                        match foreign_table {
                                             Some(foreign_table) => {
                                                 // Check if the referenced field exists
                                                 let ref_column =
@@ -1292,8 +1313,9 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                                                         field_name: column
                                                                             .name
                                                                             .clone(),
-                                                                        referenced_table: ref_table
-                                                                            .clone(),
+                                                                        referenced_table:
+                                                                            referenced_table
+                                                                                .clone(),
                                                                         referenced_field: ref_field
                                                                             .clone(),
                                                                         referenced_field_type: ref_col
@@ -1329,8 +1351,8 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                                             error_type:
                                                                 ErrorType::ForeignKeyToUnknownField {
                                                                     field_name: column.name.clone(),
-                                                                    referenced_table: ref_table
-                                                                        .clone(),
+                                                                    referenced_table:
+                                                                        referenced_table.clone(),
                                                                     referenced_field: ref_field
                                                                         .clone(),
                                                                     existing_fields,
@@ -1348,14 +1370,18 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                             }
                                             None => {
                                                 // Table doesn't exist
-                                                let existing_tables: Vec<String> =
-                                                    context.tables.keys().cloned().collect();
+                                                let existing_tables: Vec<String> = context
+                                                    .tables
+                                                    .values()
+                                                    .filter(|table| table.schema == *target_schema)
+                                                    .map(|table| table.record.name.clone())
+                                                    .collect();
                                                 errors.push(Error {
                                                     filepath: file.path.clone(),
                                                     error_type:
                                                         ErrorType::ForeignKeyToUnknownTable {
                                                             field_name: column.name.clone(),
-                                                            referenced_table: ref_table.clone(),
+                                                            referenced_table,
                                                             existing_tables,
                                                         },
                                                     locations: vec![Location {
@@ -1670,47 +1696,63 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
 }
 
 fn resolve_foreign_key_serialization_types(context: &mut Context) {
-    let foreign_key_types: HashMap<String, HashMap<String, ast::ConcreteSerializationType>> =
-        context
-            .tables
-            .iter()
-            .map(|(table_name, table)| {
-                let columns = table
-                    .record
-                    .fields
-                    .iter()
-                    .filter_map(|field| match field {
-                        ast::Field::Column(column) => column
-                            .type_
-                            .to_serialization_type()
-                            .into_concrete()
-                            .map(|type_| (column.name.clone(), type_)),
-                        _ => None,
-                    })
-                    .collect();
-                (table_name.clone(), columns)
-            })
-            .collect();
+    let foreign_key_types: HashMap<
+        (String, String),
+        HashMap<String, ast::ConcreteSerializationType>,
+    > = context
+        .tables
+        .iter()
+        .map(|(_, table)| {
+            let columns = table
+                .record
+                .fields
+                .iter()
+                .filter_map(|field| match field {
+                    ast::Field::Column(column) => column
+                        .type_
+                        .to_serialization_type()
+                        .into_concrete()
+                        .map(|type_| (column.name.clone(), type_)),
+                    _ => None,
+                })
+                .collect();
+            ((table.schema.clone(), table.record.name.clone()), columns)
+        })
+        .collect();
 
     fn resolve_type(
         type_: &mut ast::ColumnType,
-        foreign_key_types: &HashMap<String, HashMap<String, ast::ConcreteSerializationType>>,
+        current_schema: Option<&str>,
+        foreign_key_types: &HashMap<
+            (String, String),
+            HashMap<String, ast::ConcreteSerializationType>,
+        >,
     ) {
         match type_ {
             ast::ColumnType::ForeignKey {
+                schema,
                 table,
                 field,
                 serialization_type,
             } => {
-                *serialization_type = foreign_key_types
-                    .get(&crate::ext::string::decapitalize(table))
-                    .and_then(|columns| columns.get(field))
-                    .cloned();
+                let columns = match schema.as_deref().or(current_schema) {
+                    Some(target_schema) => {
+                        foreign_key_types.get(&(target_schema.to_string(), table.clone()))
+                    }
+                    None => foreign_key_types
+                        .iter()
+                        .find_map(|((_, candidate), columns)| {
+                            (candidate == table).then_some(columns)
+                        }),
+                };
+                *serialization_type = columns.and_then(|columns| columns.get(field)).cloned();
             }
             ast::ColumnType::JsonTyped(inner)
             | ast::ColumnType::List(inner)
             | ast::ColumnType::Dict(inner)
-            | ast::ColumnType::Nullable(inner) => resolve_type(inner, foreign_key_types),
+            | ast::ColumnType::Nullable(inner) => {
+                resolve_type(inner, current_schema, foreign_key_types)
+            }
             _ => {}
         }
     }
@@ -1718,7 +1760,7 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
     for table in context.tables.values_mut() {
         for field in &mut table.record.fields {
             if let ast::Field::Column(column) = field {
-                resolve_type(&mut column.type_, &foreign_key_types);
+                resolve_type(&mut column.type_, Some(&table.schema), &foreign_key_types);
             }
         }
     }
@@ -1726,7 +1768,7 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
     if let Some(session) = &mut context.session {
         for field in &mut session.fields {
             if let ast::Field::Column(column) = field {
-                resolve_type(&mut column.type_, &foreign_key_types);
+                resolve_type(&mut column.type_, None, &foreign_key_types);
             }
         }
     }

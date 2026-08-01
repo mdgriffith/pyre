@@ -251,9 +251,14 @@ pub fn to_schema_decoders(database: &ast::Database) -> String {
     result.push_str(common::json_type_definition());
 
     // Generate types in dependency order
+    let recursive_types = common::recursive_type_names(database);
     let sorted_types = common::sort_types_by_dependency(database);
     for (name, variants) in sorted_types {
-        result.push_str(&common::generate_tagged_union(&name, &variants));
+        result.push_str(&common::generate_tagged_union(
+            &name,
+            &variants,
+            recursive_types.contains(&name),
+        ));
     }
 
     // Generate non-tagged definitions (Comments, Lines, Session, Records)
@@ -283,7 +288,7 @@ fn to_decoder_definition(definition: &ast::Definition) -> String {
         ast::Definition::Session(_) => "".to_string(),
         ast::Definition::Tagged { name, variants, .. } => {
             // Use the shared generate_tagged_union function for consistency
-            common::generate_tagged_union(name, variants)
+            common::generate_tagged_union(name, variants, false)
         }
         ast::Definition::Record { .. } => "".to_string(),
     }
