@@ -69,6 +69,36 @@ async fn query_ids(db: &TestDatabase, query: &str) -> Result<Vec<i64>, TestError
 }
 
 #[tokio::test]
+async fn selected_nested_union_projects_descendant_columns() -> Result<(), TestError> {
+    let db = TestDatabase::new(UNION_PREDICATE_SCHEMA).await?;
+    seed_union_predicate_jobs(&db).await?;
+
+    let rows = db
+        .execute_query(
+            r#"
+query FailedJobs {
+    job {
+        @where { state == Failed }
+        @sort(id, Asc)
+        id
+        state
+    }
+}
+"#,
+        )
+        .await?;
+    let results = db.parse_query_results(rows).await?;
+
+    assert_eq!(results["job"][0]["state"]["_type"], "Failed");
+    assert_eq!(
+        results["job"][0]["state"]["reason"]["_type"],
+        "ProviderRejected"
+    );
+    assert_eq!(results["job"][0]["state"]["reason"]["code"], "allowed");
+    Ok(())
+}
+
+#[tokio::test]
 async fn qualified_union_predicates_execute_with_discriminator_guards() -> Result<(), TestError> {
     let db = TestDatabase::new(UNION_PREDICATE_SCHEMA).await?;
     seed_union_predicate_jobs(&db).await?;

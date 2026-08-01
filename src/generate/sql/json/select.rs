@@ -1198,7 +1198,7 @@ fn final_select_formatted_as_json(
     let indent_str = " ".repeat(indent);
 
     let base_table_name = get_temp_table_name_for_path(query_path);
-    let query_field_name = &query_table_field.name;
+    let query_field_name = ast::get_aliased_name(query_table_field);
 
     // initial selection - wrap in JSON_GROUP_ARRAY (no outer json_object wrapper)
     sql.push_str(&format!(
@@ -1463,40 +1463,7 @@ fn add_concret_fieldnames(
 ) {
     match table_field {
         ast::Field::Column(column) => {
-            let query_field_name = query_field.name.clone();
-            selected_set.insert(query_field_name.clone());
-
-            // Look up custom types in the context
-            let type_lookup = column
-                .type_
-                .get_custom_type_name()
-                .and_then(|name| context.types.get(name));
-            match type_lookup {
-                None => (),
-                Some((_, type_)) => match type_ {
-                    typecheck::Type::OneOf { variants, .. } => {
-                        for variant in variants {
-                            match &variant.fields {
-                                None => (),
-                                Some(fields) => {
-                                    for field in fields {
-                                        match field {
-                                            ast::Field::Column(inner_column) => {
-                                                selected_set.insert(format!(
-                                                    "{}__{}",
-                                                    query_field_name, &inner_column.name
-                                                ));
-                                            }
-                                            _ => (),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => (),
-                },
-            };
+            add_column_fieldnames_at_path(context, column, &query_field.name, selected_set);
         }
         ast::Field::FieldDirective(ast::FieldDirective::Link(link)) => {
             for local_id in &link.local_ids {
@@ -1512,7 +1479,16 @@ fn add_column_fieldnames(
     column: &ast::Column,
     selected_set: &mut HashSet<String>,
 ) {
-    selected_set.insert(column.name.clone());
+    add_column_fieldnames_at_path(context, column, &column.name, selected_set);
+}
+
+fn add_column_fieldnames_at_path(
+    context: &typecheck::Context,
+    column: &ast::Column,
+    path: &str,
+    selected_set: &mut HashSet<String>,
+) {
+    selected_set.insert(path.to_string());
 
     let type_lookup = column
         .type_
@@ -1529,10 +1505,12 @@ fn add_column_fieldnames(
                             for field in fields {
                                 match field {
                                     ast::Field::Column(inner_column) => {
-                                        selected_set.insert(format!(
-                                            "{}__{}",
-                                            column.name, &inner_column.name
-                                        ));
+                                        add_column_fieldnames_at_path(
+                                            context,
+                                            inner_column,
+                                            &format!("{}__{}", path, inner_column.name),
+                                            selected_set,
+                                        );
                                     }
                                     _ => (),
                                 }
