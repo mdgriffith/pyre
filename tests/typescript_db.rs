@@ -171,6 +171,156 @@ record User {
 }
 
 #[test]
+fn core_session_validator_composes_named_type_decoders() {
+    let schema_source = r#"
+type ParticipantStatus
+    = Storyteller
+    | Player
+
+type CampaignRole
+    = Owner { campaignId String }
+    | Member { campaignId String }
+
+session {
+    clocktowerParticipantStatus ParticipantStatus?
+    campaignRole                CampaignRole?
+}
+
+record User {
+    @public
+    id Id.Int @id
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let mut files = Vec::new();
+    core::generate_schema(
+        &context,
+        &database,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+    let decode = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "typescript/core/decode.ts"))
+        .expect("generated decode file");
+
+    assert!(decode.contents.contains(
+        "clocktowerParticipantStatus?: ParticipantStatus;\n  campaignRole?: CampaignRole;"
+    ));
+    assert!(decode.contents.contains(
+        "clocktowerParticipantStatus: ParticipantStatus.optional(),\n  campaignRole: CampaignRole.optional(),"
+    ));
+    assert!(!decode.contents.contains("z.any() /* ParticipantStatus */"));
+    assert!(!decode.contents.contains("z.any() /* CampaignRole */"));
+
+    let participant_validator = decode
+        .contents
+        .find("export const ParticipantStatus =")
+        .expect("participant validator");
+    let session_validator = decode
+        .contents
+        .find("export const SessionValidator =")
+        .expect("session validator");
+    assert!(participant_validator < session_validator);
+
+    if std::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping generated session validator runtime test: bun not available");
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
+    std::fs::write(temp_dir.path().join("decode.ts"), &decode.contents)
+        .expect("write generated decoder");
+    std::fs::write(
+        temp_dir.path().join("verify.ts"),
+        r#"
+import { SessionValidator, type Session } from "./decode.ts";
+
+const validSession: Session = {
+  clocktowerParticipantStatus: "Player",
+  campaignRole: { _type: "Member", campaignId: "campaign-1" },
+};
+SessionValidator.parse(validSession);
+// @ts-expect-error Invalid variants must not be part of the generated Session type.
+const invalidSession: Session = { clocktowerParticipantStatus: "Observer" };
+
+const scalar = SessionValidator.parse({
+  clocktowerParticipantStatus: { _type: "Storyteller" },
+});
+const scalarSession: Session = scalar;
+if (scalarSession.clocktowerParticipantStatus !== "Storyteller") {
+  throw new Error(`Expected scalar normalization, got ${JSON.stringify(scalarSession)}`);
+}
+
+const constructed = SessionValidator.parse({
+  campaignRole: { _type: "Owner", campaignId: "campaign-1" },
+});
+const constructedSession: Session = constructed;
+if (constructedSession.campaignRole?._type !== "Owner") {
+  throw new Error(`Expected constructed value, got ${JSON.stringify(constructedSession)}`);
+}
+
+const invalid = SessionValidator.safeParse({ clocktowerParticipantStatus: "Observer" });
+if (invalid.success) {
+  throw new Error("Expected invalid participant status to fail");
+}
+const path = invalid.error.issues[0]?.path;
+if (JSON.stringify(path) !== JSON.stringify(["clocktowerParticipantStatus"])) {
+  throw new Error(`Expected precise session field path, got ${JSON.stringify(path)}`);
+}
+"#,
+    )
+    .expect("write runtime verification");
+
+    let tsc = Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/tsc");
+    if tsc.exists() {
+        let output = std::process::Command::new(tsc)
+            .args([
+                "--noEmit",
+                "--strict",
+                "--skipLibCheck",
+                "--module",
+                "preserve",
+                "--moduleResolution",
+                "bundler",
+                "--allowImportingTsExtensions",
+                "verify.ts",
+            ])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("typecheck generated session validator");
+        assert!(
+            output.status.success(),
+            "generated session types failed to compile\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = std::process::Command::new("bun")
+        .arg("run")
+        .arg("verify.ts")
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("run generated session validator");
+    assert!(
+        output.status.success(),
+        "generated session validator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn typescript_session_reference_to_uuid_id_generates_string_metadata() {
     let schema_source = r#"
 session {

@@ -1845,6 +1845,16 @@ record Token {
     @public
 }
 
+record Game {
+    id Id.Uuid @id
+    kind GameKind
+    @public
+}
+
+type GameKind
+   = Campaign
+   | Clocktower
+
 type TokenPayload
    = TokenPayload {
         labels List<String>
@@ -1872,6 +1882,13 @@ query GetTokens {
         placement
     }
 }
+
+query GetGames {
+    game {
+        id
+        kind
+    }
+}
         "#,
     )
     .unwrap();
@@ -1881,11 +1898,21 @@ query GetTokens {
     let verify_script = r#"
 import { createClient } from "@libsql/client";
 import { seed } from "./pyre/generated/typescript/server.ts";
-import { GetTokens } from "./pyre/generated/typescript/run.ts";
+import { GetGames, GetTokens } from "./pyre/generated/typescript/run.ts";
 
 const db = createClient({ url: "file:.yak/yak.db" });
 
 const seeded = await seed(db, {
+  games: [
+    {
+      id: "00000000-0000-4000-8000-000000000001",
+      kind: { _type: "Campaign" },
+    },
+    {
+      id: "00000000-0000-4000-8000-000000000002",
+      kind: "Clocktower",
+    },
+  ],
   tokens: [
     {
       id: 1,
@@ -1902,6 +1929,19 @@ const seeded = await seed(db, {
 
 if (seeded.kind !== "success") {
   throw new Error(`Seed failed: ${JSON.stringify(seeded)}`);
+}
+
+const gamesResult = await GetGames(db, {});
+const games = gamesResult?.game;
+if (!Array.isArray(games) || games.length !== 2) {
+  throw new Error(`Expected two game rows, got: ${JSON.stringify(gamesResult)}`);
+}
+const gameKinds = Object.fromEntries(games.map((game) => [game.id, game.kind]));
+if (gameKinds["00000000-0000-4000-8000-000000000001"] !== "Campaign") {
+  throw new Error(`Expected tagged Campaign seed input to normalize and decode, got: ${JSON.stringify(games)}`);
+}
+if (gameKinds["00000000-0000-4000-8000-000000000002"] !== "Clocktower") {
+  throw new Error(`Expected scalar Clocktower seed input to decode, got: ${JSON.stringify(games)}`);
 }
 
 const result = await GetTokens(db, {});

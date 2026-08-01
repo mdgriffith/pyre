@@ -93,6 +93,12 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
     result.push_str("  return decoded.data;\n");
     result.push_str("}\n\n");
 
+    // Generate custom type definitions (tagged unions) in dependency order
+    let sorted_types = common::sort_types_by_dependency(database);
+    for (name, variants) in sorted_types {
+        result.push_str(&common::generate_tagged_union(&name, &variants));
+    }
+
     // Get session definition
     let session = context
         .session
@@ -141,6 +147,7 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
                 ast::ColumnType::Bool => "CoercedBool".to_string(),
                 ast::ColumnType::DateTime => "CoercedDate".to_string(),
+                ast::ColumnType::Custom(name) => name.clone(),
                 other => format!("z.any() /* {} */", other),
             };
             let validator = if col.nullable {
@@ -152,12 +159,6 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
         }
     }
     result.push_str("});\n\n");
-
-    // Generate custom type definitions (tagged unions) in dependency order
-    let sorted_types = common::sort_types_by_dependency(database);
-    for (name, variants) in sorted_types {
-        result.push_str(&common::generate_tagged_union(&name, &variants));
-    }
 
     result
 }
