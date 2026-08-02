@@ -906,6 +906,46 @@ record IntRecord {
 }
 
 #[test]
+fn test_generate_embeds_namespaced_database_initializers() {
+    let ctx = TestContext::new();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Campaign")).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
+        "record User {\n    id Id.Int @id\n    @public\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Campaign/schema.pyre"),
+        "record Encounter {\n    id Id.Int @id\n    @public\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("generate").assert().success();
+
+    let typescript = std::fs::read_to_string(
+        ctx.workspace_path
+            .join("pyre/generated/typescript/databases.ts"),
+    )
+    .unwrap();
+    assert!(typescript.contains("\"Main\": database(\"Main\""));
+    assert!(typescript.contains("\"Campaign\": database(\"Campaign\""));
+    assert!(typescript.contains("record User"));
+    assert!(typescript.contains("record Encounter"));
+
+    let rust = std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/rust/databases.rs"))
+        .unwrap();
+    assert!(rust.contains("pub mod main"));
+    assert!(rust.contains("pub mod campaign"));
+    assert!(rust.contains("pub async fn ensure_database"));
+}
+
+#[test]
 fn test_generated_typescript_server_includes_typed_seed_input() {
     let ctx = TestContext::new();
 

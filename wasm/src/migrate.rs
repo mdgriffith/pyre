@@ -39,3 +39,20 @@ pub fn migrate_wasm(
 
     migrate(name, &introspection, &schema_source)
 }
+
+pub fn migrate_with_introspection_wasm(
+    name: String,
+    schema_source: String,
+    introspection: wasm_bindgen::JsValue,
+) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
+    let raw = serde_wasm_bindgen::from_value::<introspect::IntrospectionRaw>(introspection)
+        .map_err(|error| {
+            wasm_bindgen::JsValue::from_str(&format!("Invalid database introspection: {error}"))
+        })?;
+    let introspection = introspect::from_raw(raw);
+    let result = migrate(name, &introspection, &schema_source);
+
+    serde_wasm_bindgen::to_value(&result).map_err(|error| {
+        wasm_bindgen::JsValue::from_str(&format!("Failed to serialize migration plan: {error}"))
+    })
+}

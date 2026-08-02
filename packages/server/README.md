@@ -5,9 +5,34 @@ Server runtime helpers for executing generated Pyre queries.
 Typical usage:
 
 - import generated `queries` map from `pyre/generated/typescript/server`
+- initialize schema-specific databases through the generated `databases` map
 - execute with `run` from `@pyre/server/query`
 - seed fixture data with the generated `seed` helper from `pyre/generated/typescript/server`
 - use sync helpers from `@pyre/server/sync` and `@pyre/server/query-sync`
+
+## Database Provisioning
+
+Generated output embeds each namespaced schema and binds it to the transactional
+`ensureDatabase` runtime helper:
+
+```ts
+import { createClient } from "@libsql/client";
+import { init } from "@pyre/server/wasm";
+import { databases } from "./pyre/generated/typescript/server";
+
+await init();
+
+const main = createClient({ url: "file:main.db" });
+const campaign = createClient({ url: "file:campaign-123.db" });
+
+await databases.Main.ensureDatabase(main);
+await databases.Campaign.ensureDatabase(campaign);
+```
+
+The call returns `"created"`, `"migrated"`, or `"up-to-date"`. It is safe to
+call whenever a database is opened: introspection, planning, DDL, and migration
+recording happen in one write transaction. Pyre rejects non-empty databases
+that do not already contain Pyre migration metadata.
 
 ## Seed Data
 

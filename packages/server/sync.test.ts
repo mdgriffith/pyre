@@ -46,6 +46,7 @@ let getSyncStatusSqlMock = () => "select 1";
 let reshapeSyncTableGroupsMock = defaultReshapeSyncTableGroups;
 let introspectionResult = { schema_source: "" };
 let setSchemaCalls: unknown[] = [];
+let migrationResult: any = { Ok: { sql: [], mark_success: "record migration" } };
 
 mock.module("./wasm/pyre_wasm.js", () => ({
   sql_is_initialized: () => "select 1 as is_initialized",
@@ -55,10 +56,12 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   calculate_sync_deltas: () => ({ groups: [] }),
   reshape_sync_table_groups: (groups: any) => reshapeSyncTableGroupsMock(groups),
   set_schema: (introspection: unknown) => setSchemaCalls.push(introspection),
+  migrate_with_introspection: () => migrationResult,
+  sql_introspect_uninitialized: () => "select uninitialized introspection",
 }));
 
 const { catchup, rotateDatabaseEpoch } = await import("./sync");
-const { loadSchemaFromDatabase } = await import("./schema");
+const { ensureDatabase, loadSchemaFromDatabase } = await import("./schema");
 
 afterEach(() => {
   getSyncSqlMock = defaultSyncSql;
@@ -66,6 +69,87 @@ afterEach(() => {
   reshapeSyncTableGroupsMock = defaultReshapeSyncTableGroups;
   introspectionResult = { schema_source: "" };
   setSchemaCalls = [];
+  migrationResult = { Ok: { sql: [], mark_success: "record migration" } };
+});
+
+function initializationDatabase(initialized: boolean, introspection: any) {
+  const batches: unknown[][] = [];
+  let closed = false;
+  const tx = {
+    execute: mock(async (sql: string) => {
+      if (sql.includes("is_initialized")) {
+        return { rows: [{ is_initialized: initialized ? 1 : 0 }] };
+      }
+      return { rows: [{ result: JSON.stringify(introspection) }] };
+    }),
+    batch: mock(async (statements: unknown[]) => {
+      batches.push(statements);
+      return [];
+    }),
+    commit: mock(async () => { closed = true; }),
+    rollback: mock(async () => { closed = true; }),
+    close: mock(() => { closed = true; }),
+    get closed() { return closed; },
+  };
+  return {
+    db: { transaction: mock(async () => tx) },
+    tx,
+    batches,
+  };
+}
+
+test("ensureDatabase creates a database in one write transaction", async () => {
+  migrationResult = {
+    Ok: {
+      sql: ["create table notes (id integer primary key)"],
+      mark_success: "record migration",
+    },
+  };
+  const database = initializationDatabase(false, {
+    tables: [],
+    migration_state: { NoMigrationTable: null },
+    schema_source: "",
+    links: [],
+  });
+
+  const outcome = await ensureDatabase(database.db as any, "Campaign", "record Note {}");
+
+  expect(outcome).toBe("created");
+  expect(database.db.transaction).toHaveBeenCalledWith("write");
+  expect(database.batches).toEqual([[
+    "create table notes (id integer primary key)",
+    "record migration",
+  ]]);
+  expect(database.tx.commit).toHaveBeenCalledTimes(1);
+});
+
+test("ensureDatabase reuses an unchanged database", async () => {
+  const database = initializationDatabase(true, {
+    tables: [{ name: "notes" }],
+    migration_state: { MigrationTable: { migrations: [] } },
+    schema_source: "record Note {}",
+    links: [],
+  });
+
+  const outcome = await ensureDatabase(database.db as any, "Campaign", "record Note {}");
+
+  expect(outcome).toBe("up-to-date");
+  expect(database.batches).toEqual([]);
+  expect(database.tx.rollback).toHaveBeenCalledTimes(1);
+});
+
+test("ensureDatabase rejects unmanaged tables", async () => {
+  const database = initializationDatabase(false, {
+    tables: [{ name: "legacy" }],
+    migration_state: { NoMigrationTable: null },
+    schema_source: "",
+    links: [],
+  });
+
+  await expect(
+    ensureDatabase(database.db as any, "Campaign", "record Note {}"),
+  ).rejects.toThrow("not managed by Pyre");
+  expect(database.tx.rollback).toHaveBeenCalledTimes(1);
 });
 
 test("catchup activates the schema loaded for its databaseId", async () => {

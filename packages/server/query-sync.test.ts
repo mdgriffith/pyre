@@ -8,6 +8,13 @@ let reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", t
 mock.module("./wasm/pyre_wasm.js", () => ({
   sql_is_initialized: () => "select 1 as is_initialized",
   sql_introspect: () => "select introspection",
+  sql_introspect_uninitialized: () => "select uninitialized introspection",
+  migrate_with_introspection: (_name: string, _source: string, introspection: any) => ({
+    Ok: {
+      sql: introspection.schema_source ? [] : ["create table notes (id integer primary key)"],
+      mark_success: "record migration",
+    },
+  }),
   set_schema: () => undefined,
   get_sync_status_sql: () => "select 1",
   get_sync_sql: () => ({ tables: [] }),
