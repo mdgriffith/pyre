@@ -70,11 +70,12 @@ pub async fn ensure_database(
     }
 
     let migration_name = format!("ensure:{schema_name}");
-    let plan = migrate::migrate_dynamic(
+    let plan = migrate::migrate_dynamic_for_schema(
         migration_name,
         &introspection,
         schema_source,
         "generated-schema.pyre",
+        schema_name,
     )
     .map_err(EnsureDatabaseError::Migration)?;
 

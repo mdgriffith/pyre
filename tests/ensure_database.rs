@@ -1,11 +1,33 @@
 use pyre::server::schema::{ensure_database, EnsureDatabaseError, EnsureDatabaseOutcome};
 
-const SCHEMA: &str = r#"record Note {
-    id Int @id
-    body String
+const SCHEMA: &str = r#"record World {
+    id          Id.Int @id
+    assetLayers @link(Campaign.AssetLayer.worldId)
+    @public
+}
+
+record AssetLayer {
+    id      Id.Int @id
+    worldId World.id
     @public
 }
 "#;
+
+mod pyre_generated {
+    pub mod campaign {
+        pub const NAME: &str = "Campaign";
+        pub const SCHEMA_SOURCE: &str = super::super::SCHEMA;
+
+        pub async fn ensure_database(
+            conn: &libsql::Connection,
+        ) -> Result<
+            pyre::server::schema::EnsureDatabaseOutcome,
+            pyre::server::schema::EnsureDatabaseError,
+        > {
+            pyre::server::schema::ensure_database(conn, NAME, SCHEMA_SOURCE).await
+        }
+    }
+}
 
 async fn connection() -> Result<(tempfile::TempDir, libsql::Connection), Box<dyn std::error::Error>>
 {
@@ -23,17 +45,17 @@ async fn ensure_database_creates_and_reuses_a_database() -> Result<(), Box<dyn s
     let (_temp, conn) = connection().await?;
 
     assert_eq!(
-        ensure_database(&conn, "Campaign", SCHEMA).await?,
+        pyre_generated::campaign::ensure_database(&conn).await?,
         EnsureDatabaseOutcome::Created
     );
     assert_eq!(
-        ensure_database(&conn, "Campaign", SCHEMA).await?,
+        pyre_generated::campaign::ensure_database(&conn).await?,
         EnsureDatabaseOutcome::UpToDate
     );
 
     let table_count: i64 = conn
         .query(
-            "select count(*) from sqlite_master where name = 'notes'",
+            "select count(*) from sqlite_master where name in ('worlds', 'assetLayers')",
             (),
         )
         .await?
@@ -49,7 +71,7 @@ async fn ensure_database_creates_and_reuses_a_database() -> Result<(), Box<dyn s
         .expect("migration count row")
         .get(0)?;
 
-    assert_eq!(table_count, 1);
+    assert_eq!(table_count, 2);
     assert_eq!(migration_count, 1);
     Ok(())
 }

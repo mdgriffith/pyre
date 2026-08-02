@@ -91,8 +91,27 @@ pub fn migrate_dynamic(
     new_schema_source: &str,
     schema_filepath: &str,
 ) -> Result<MigrationSql, Vec<error::Error>> {
+    migrate_dynamic_for_schema(
+        name,
+        introspection,
+        new_schema_source,
+        schema_filepath,
+        ast::DEFAULT_SCHEMANAME,
+    )
+}
+
+pub(crate) fn migrate_dynamic_for_schema(
+    name: String,
+    introspection: &introspect::Introspection,
+    new_schema_source: &str,
+    schema_filepath: &str,
+    schema_name: &str,
+) -> Result<MigrationSql, Vec<error::Error>> {
     // Parse the schema source into a Schema
-    let mut new_schema = ast::Schema::default();
+    let mut new_schema = ast::Schema {
+        namespace: schema_name.to_string(),
+        ..ast::Schema::default()
+    };
     let parse_result = parser::run(schema_filepath, new_schema_source, &mut new_schema);
     if let Err(e) = parse_result {
         return match parser::convert_parsing_error(e) {
