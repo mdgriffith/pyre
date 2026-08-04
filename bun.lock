@@ -3,6 +3,10 @@
   "workspaces": {
     "": {
       "name": "pyre-monorepo",
+      "devDependencies": {
+        "typescript": "5.9.3",
+        "zod": "4.3.6",
+      },
     },
     "packages/cli": {
       "name": "pyre",
@@ -40,6 +44,11 @@
       "dependencies": {
         "@libsql/client": "^0.14.0",
         "@pyre/core": "0.1.9",
+      },
+      "devDependencies": {
+        "zod": "4.3.6",
+      },
+      "peerDependencies": {
         "zod": "^4.1.12",
       },
     },

@@ -11,5 +11,9 @@
     "release:pack": "bun run ./scripts/release-pack.mjs",
     "release:smoke": "bun run ./scripts/release-smoke.mjs",
     "release:clean": "bun run ./scripts/release-clean.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "zod": "4.3.6"
   }
 }

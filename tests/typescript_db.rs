@@ -91,17 +91,40 @@ fn typescript_decoders_render_recursive_typed_json_with_lazy_validators() {
     let schema_source = r#"
 type Attribute
    = AttributeInt {
-        value Int
+        value    Int
+        fallback Int?
      }
    | AttributeBool {
         value Bool
+     }
+   | AttributeTimestamp {
+        value DateTime
      }
     | AttributeCustom {
          variant String
          fields  Dict<Attribute>
       }
    | AttributeSet {
-        items List<AttributeCustomValue>
+        elementType String
+        items       List<AttributeCustomValue>
+     }
+   | AttributeChoiceList {
+        choiceType String
+        items      List<AttributeCustomValue>
+     }
+   | AttributePool {
+        keyType String
+        entries List<AttributePoolEntry>
+     }
+   | AttributeNested {
+        items List<Dict<AttributeCustomValue>>
+     }
+
+type AttributePoolEntry
+   = AttributePoolEntry {
+        key       String
+        max       Int
+        remaining Int
      }
 
 type AttributeCustomValue
@@ -145,15 +168,22 @@ record Document {
     );
     assert!(
         decode_ts.contains("export type Attribute =\n")
-            && decode_ts.contains("const AttributeDiscriminated: z.ZodType<Attribute>")
-            && decode_ts.contains("export const Attribute: z.ZodType<Attribute>")
+            && decode_ts.contains("type AttributeInput =\n")
+            && decode_ts.contains("fields?: Record<string, unknown>")
+            && decode_ts.contains("items?: Array<unknown>")
+            && decode_ts.contains("entries?: Array<unknown>")
+            && decode_ts.contains("fallback?: number | null")
+            && decode_ts.contains("value?: boolean | number")
+            && decode_ts.contains("value?: number | string | Date")
+            && decode_ts.contains("items?: Array<Record<string, unknown>>")
+            && decode_ts.contains("const AttributeDiscriminated: z.ZodType<Attribute, AttributeInput>")
+            && decode_ts.contains("export const Attribute: z.ZodType<Attribute, unknown>")
             && decode_ts.contains("export type AttributeCustomValue =\n")
-            && decode_ts.contains(
-                "const AttributeCustomValueDiscriminated: z.ZodType<AttributeCustomValue>"
-            )
-            && decode_ts
-                .contains("export const AttributeCustomValue: z.ZodType<AttributeCustomValue>"),
-        "Expected recursive groups to have explicit TypeScript and Zod types. Generated:\n{}",
+            && decode_ts.contains("type AttributeCustomValueInput =\n")
+            && decode_ts.contains("const AttributeCustomValueDiscriminated: z.ZodType<AttributeCustomValue, AttributeCustomValueInput>")
+            && decode_ts.contains("export const AttributeCustomValue: z.ZodType<AttributeCustomValue, unknown>")
+            && decode_ts.contains("entries: z.array(z.lazy(() => AttributePoolEntry)).optional()"),
+        "Expected recursive groups to separate decoder input and output types. Generated:\n{}",
         decode_ts
     );
     assert!(
@@ -163,32 +193,50 @@ record Document {
     );
 
     let tsc = Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/tsc");
-    if tsc.exists() {
-        let temp_dir =
-            tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
-        std::fs::write(temp_dir.path().join("decode.ts"), &decode_ts)
-            .expect("write generated decoder");
-        let output = std::process::Command::new(tsc)
-            .args([
-                "--noEmit",
-                "--strict",
-                "--skipLibCheck",
-                "--module",
-                "preserve",
-                "--moduleResolution",
-                "bundler",
-                "decode.ts",
-            ])
-            .current_dir(temp_dir.path())
-            .output()
-            .expect("typecheck generated recursive decoder");
-        assert!(
-            output.status.success(),
-            "generated recursive decoder failed to compile\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        tsc.exists(),
+        "TypeScript is required for generated decoder regression tests; run `bun install`"
+    );
+    let temp_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
+    std::fs::write(temp_dir.path().join("decode.ts"), &decode_ts).expect("write generated decoder");
+    std::fs::write(
+        temp_dir.path().join("verify.ts"),
+        include_str!("fixtures/typescript/recursive_preprocess_verify.ts.fixture"),
+    )
+    .expect("write recursive decoder verification");
+    let output = std::process::Command::new(&tsc)
+        .args([
+            "--noEmit",
+            "--strict",
+            "--skipLibCheck",
+            "--module",
+            "preserve",
+            "--moduleResolution",
+            "bundler",
+            "decode.ts",
+            "verify.ts",
+        ])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("typecheck generated recursive decoder");
+    assert!(
+        output.status.success(),
+        "generated recursive decoder failed to compile\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = std::process::Command::new("bun")
+        .args(["run", "verify.ts"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("Bun is required for generated decoder regression tests; run `bun install`");
+    assert!(
+        output.status.success(),
+        "generated recursive decoder failed at runtime\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -278,15 +326,6 @@ record User {
         .expect("session validator");
     assert!(participant_validator < session_validator);
 
-    if std::process::Command::new("bun")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("Skipping generated session validator runtime test: bun not available");
-        return;
-    }
-
     let temp_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
     std::fs::write(temp_dir.path().join("decode.ts"), &decode.contents)
         .expect("write generated decoder");
@@ -332,29 +371,31 @@ if (JSON.stringify(path) !== JSON.stringify(["clocktowerParticipantStatus"])) {
     .expect("write runtime verification");
 
     let tsc = Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/tsc");
-    if tsc.exists() {
-        let output = std::process::Command::new(tsc)
-            .args([
-                "--noEmit",
-                "--strict",
-                "--skipLibCheck",
-                "--module",
-                "preserve",
-                "--moduleResolution",
-                "bundler",
-                "--allowImportingTsExtensions",
-                "verify.ts",
-            ])
-            .current_dir(temp_dir.path())
-            .output()
-            .expect("typecheck generated session validator");
-        assert!(
-            output.status.success(),
-            "generated session types failed to compile\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        tsc.exists(),
+        "TypeScript is required for generated decoder regression tests; run `bun install`"
+    );
+    let output = std::process::Command::new(tsc)
+        .args([
+            "--noEmit",
+            "--strict",
+            "--skipLibCheck",
+            "--module",
+            "preserve",
+            "--moduleResolution",
+            "bundler",
+            "--allowImportingTsExtensions",
+            "verify.ts",
+        ])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("typecheck generated session validator");
+    assert!(
+        output.status.success(),
+        "generated session types failed to compile\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let output = std::process::Command::new("bun")
         .arg("run")
@@ -419,15 +460,6 @@ record IntRecord {
     let env = typescript::to_env(&context, &database).expect("env should generate");
     assert!(env.contains("uuidRecordId: z.string().optional(),"));
     assert!(env.contains("intRecordId: z.number().optional(),"));
-
-    if std::process::Command::new("bun")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("Skipping generated session validator runtime test: bun not available");
-        return;
-    }
 
     let temp_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
     std::fs::write(temp_dir.path().join("decode.ts"), &decode.contents)

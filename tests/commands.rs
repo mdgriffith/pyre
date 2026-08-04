@@ -547,10 +547,6 @@ query GetGame($id: Game.id) {
     .unwrap();
 }
 
-fn bun_is_available() -> bool {
-    StdCommand::new("bun").arg("--version").output().is_ok()
-}
-
 fn elm_is_available() -> bool {
     StdCommand::new("elm").arg("--version").output().is_ok()
 }
@@ -1701,11 +1697,6 @@ fn test_generated_elm_client_compiles_nested_lenses() {
 
 #[tokio::test]
 async fn test_generated_typescript_runner_decodes_enum_unions_and_dates() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based TypeScript runtime test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     write_ai_session_schema_and_query(&ctx);
 
@@ -1750,11 +1741,6 @@ console.log("decoder-check-passed");
 
 #[tokio::test]
 async fn test_generated_typescript_runner_decodes_payload_unions_and_datetime_strings() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based TypeScript runtime test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     write_union_payload_schema_and_query(&ctx);
 
@@ -1791,11 +1777,6 @@ async fn test_generated_typescript_runner_decodes_payload_unions_and_datetime_st
 
 #[tokio::test]
 async fn test_generated_typescript_runner_roundtrips_json_values() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based TypeScript runtime test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     write_json_schema_and_query(&ctx);
 
@@ -1858,11 +1839,6 @@ console.log("json-roundtrip-check-passed");
 
 #[tokio::test]
 async fn test_generated_typescript_runner_roundtrips_typed_json_values() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based TypeScript runtime test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     write_typed_json_schema_and_query(&ctx);
 
@@ -1916,11 +1892,6 @@ console.log("typed-json-roundtrip-check-passed");
 
 #[tokio::test]
 async fn test_generated_seed_data_decodes_through_generated_query() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based seed decode test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),

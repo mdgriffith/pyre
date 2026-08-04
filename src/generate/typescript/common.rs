@@ -165,6 +165,34 @@ pub fn column_type_to_ts_type(type_: &ast::ColumnType, qualify_custom: bool) -> 
     }
 }
 
+fn column_type_to_ts_input_type(type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::String => "string".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::Float => "number".to_string(),
+        ast::ColumnType::Bool => "boolean | number".to_string(),
+        ast::ColumnType::DateTime => "number | string | Date".to_string(),
+        ast::ColumnType::Date => "string".to_string(),
+        ast::ColumnType::Json | ast::ColumnType::Custom(_) => "unknown".to_string(),
+        ast::ColumnType::JsonTyped(inner) => column_type_to_ts_input_type(inner),
+        ast::ColumnType::List(inner) => {
+            format!("Array<{}>", column_type_to_ts_input_type(inner))
+        }
+        ast::ColumnType::Dict(inner) => {
+            format!("Record<string, {}>", column_type_to_ts_input_type(inner))
+        }
+        ast::ColumnType::Nullable(inner) => {
+            format!("{} | null", column_type_to_ts_input_type(inner))
+        }
+        ast::ColumnType::IdInt { .. } => "number".to_string(),
+        ast::ColumnType::IdUuid { .. } => "string".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+            ..
+        } => "string".to_string(),
+        ast::ColumnType::ForeignKey { .. } => "number".to_string(),
+    }
+}
+
 pub fn column_type_to_zod_validator(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
@@ -322,6 +350,24 @@ pub fn generate_tagged_union(name: &str, variants: &[ast::Variant], recursive: b
             result.push_str(" }\n");
         }
         result.push_str(";\n\n");
+
+        result.push_str(&format!("type {}Input =\n", name));
+        for variant in variants {
+            result.push_str(&format!("  | {{ _type: \"{}\"", variant.name));
+            if let Some(fields) = &variant.fields {
+                for field in fields {
+                    if let ast::Field::Column(col) = field {
+                        let mut ts_type = column_type_to_ts_input_type(&col.type_);
+                        if col.nullable {
+                            ts_type.push_str(" | null");
+                        }
+                        result.push_str(&format!("; {}?: {}", col.name, ts_type));
+                    }
+                }
+            }
+            result.push_str(" }\n");
+        }
+        result.push_str(";\n\n");
     }
 
     let mut variant_field_names: Vec<String> = Vec::new();
@@ -343,7 +389,7 @@ pub fn generate_tagged_union(name: &str, variants: &[ast::Variant], recursive: b
         .join(", ");
 
     let discriminated_annotation = if recursive {
-        format!(": z.ZodType<{}>", name)
+        format!(": z.ZodType<{0}, {0}Input>", name)
     } else {
         String::new()
     };
@@ -373,7 +419,7 @@ pub fn generate_tagged_union(name: &str, variants: &[ast::Variant], recursive: b
     result.push_str("]);\n\n");
 
     let validator_annotation = if recursive {
-        format!(": z.ZodType<{}>", name)
+        format!(": z.ZodType<{}, unknown>", name)
     } else {
         String::new()
     };

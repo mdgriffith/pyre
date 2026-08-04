@@ -66,8 +66,10 @@ Seed currently bypasses Pyre query permissions and does not update Pyre sync met
 ## Install
 
 ```bash
-bun add @pyre/server
+bun add @pyre/server zod@^4
 ```
+
+Pyre-generated TypeScript and `@pyre/server` support Zod 4. Zod 3 is not supported.
 
 ## Sync Lifecycle Profiling
 

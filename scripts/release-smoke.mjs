@@ -46,6 +46,7 @@ writeFileSync(
         "@pyre/core": `file:${coreTarball}`,
         "@pyre/server": `file:${serverTarball}`,
         "@pyre/client": `file:${clientTarball}`,
+        zod: "^4.1.12",
       },
       overrides: {
         "@pyre/core": `file:${coreTarball}`,
