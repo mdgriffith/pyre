@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "pyre"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "assert_cmd",
  "async-stream",
