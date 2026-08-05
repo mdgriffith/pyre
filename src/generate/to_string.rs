@@ -1,5 +1,96 @@
 use crate::ast;
+use crate::typecheck;
 use nom::ToUsize;
+use std::collections::HashSet;
+
+pub fn standalone_schema_to_string(context: &typecheck::Context, schema: &ast::Schema) -> String {
+    let mut standalone = schema.clone();
+    standalone.session = context.session.clone();
+
+    let local_types = standalone
+        .files
+        .iter()
+        .flat_map(|file| &file.definitions)
+        .filter_map(|definition| match definition {
+            ast::Definition::Tagged { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut required_types = Vec::new();
+
+    if let Some(session) = &standalone.session {
+        collect_field_type_names(&session.fields, &mut required_types);
+    }
+    for file in &standalone.files {
+        for definition in &file.definitions {
+            match definition {
+                ast::Definition::Record { fields, .. } => {
+                    collect_field_type_names(fields, &mut required_types)
+                }
+                ast::Definition::Tagged { variants, .. } => {
+                    collect_variant_type_names(variants, &mut required_types)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut included_types = local_types.clone();
+    let mut external_definitions = Vec::new();
+    while let Some(name) = required_types.pop() {
+        if !included_types.insert(name.clone()) {
+            continue;
+        }
+        let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(&name) else {
+            continue;
+        };
+
+        collect_variant_type_names(variants, &mut required_types);
+        external_definitions.push(ast::Definition::Tagged {
+            name,
+            variants: variants.clone(),
+            start: None,
+            end: None,
+        });
+    }
+
+    if !external_definitions.is_empty() {
+        external_definitions.sort_by(|left, right| {
+            let ast::Definition::Tagged { name: left, .. } = left else {
+                unreachable!()
+            };
+            let ast::Definition::Tagged { name: right, .. } = right else {
+                unreachable!()
+            };
+            left.cmp(right)
+        });
+        standalone.files.insert(
+            0,
+            ast::SchemaFile {
+                path: "session-types.pyre".to_string(),
+                definitions: external_definitions,
+            },
+        );
+    }
+
+    schema_to_string("", &standalone)
+}
+
+fn collect_field_type_names(fields: &[ast::Field], names: &mut Vec<String>) {
+    for field in fields {
+        if let ast::Field::Column(column) = field {
+            column.type_.collect_custom_type_names(names);
+        }
+    }
+}
+
+fn collect_variant_type_names(variants: &[ast::Variant], names: &mut Vec<String>) {
+    for variant in variants {
+        if let Some(fields) = &variant.fields {
+            collect_field_type_names(fields, names);
+        }
+    }
+}
 
 pub fn schema_to_string(namespace: &str, schema: &ast::Schema) -> String {
     let mut result = String::new();

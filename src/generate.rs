@@ -29,7 +29,7 @@ pub fn generate_schema(
         files,
     );
     generate::typescript::targets::simple::generate_schema(database, typescript_dir, files);
-    generate::server::rust::generate_schema(database, Path::new("rust"), files);
+    generate::server::rust::generate_schema(context, database, Path::new("rust"), files);
     generate::manifest::generate_schema(context, files);
 }
 

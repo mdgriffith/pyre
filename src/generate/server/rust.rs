@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub fn generate_schema(
+    context: &typecheck::Context,
     database: &ast::Database,
     base_out_dir: &Path,
     files: &mut Vec<filesystem::GeneratedFile<String>>,
@@ -17,7 +18,7 @@ pub fn generate_schema(
     let mut used_modules = HashSet::new();
     for schema in &database.schemas {
         let module = unique_name(&to_snake_name(&schema.namespace), &mut used_modules);
-        let source = crate::generate::to_string::schema_to_string("", schema);
+        let source = crate::generate::to_string::standalone_schema_to_string(context, schema);
         result.push_str(&format!("pub mod {module} {{\n"));
         result.push_str(&format!(
             "    pub const NAME: &str = {:?};\n",

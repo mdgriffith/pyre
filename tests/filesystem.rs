@@ -139,3 +139,58 @@ fn test_schema_serialization_includes_shared_session() {
     .expect("stored schema should retain session context");
     assert!(context.session.is_some());
 }
+
+#[test]
+fn standalone_namespace_serialization_includes_shared_session_types() {
+    let mut session_schema = ast::Schema::default();
+    parser::run(
+        "session.pyre",
+        "session {\n    role MemberRole?\n}\n",
+        &mut session_schema,
+    )
+    .expect("session should parse");
+    let session = session_schema.session.expect("session should exist");
+
+    let mut main = ast::Schema {
+        namespace: "Main".to_string(),
+        session: Some(session.clone()),
+        ..ast::Schema::default()
+    };
+    parser::run(
+        "schema/Main/schema.pyre",
+        "type MemberRole\n   = Admin\n   | Player\n\nrecord Member {\n    @public\n    id Id.Int @id\n    role MemberRole\n}\n",
+        &mut main,
+    )
+    .expect("Main schema should parse");
+
+    let mut child = ast::Schema {
+        namespace: "Child".to_string(),
+        session: Some(session),
+        ..ast::Schema::default()
+    };
+    parser::run(
+        "schema/Child/schema.pyre",
+        "record Document {\n    @allow(query) { Or(Session.role == Admin, Session.role == Player) }\n    @allow(insert, update, delete) { False }\n    id Id.Int @id\n}\n",
+        &mut child,
+    )
+    .expect("Child schema should parse");
+
+    let database = ast::Database {
+        schemas: vec![main, child.clone()],
+    };
+    let context = typecheck::check_schema(&database).expect("project schema should typecheck");
+    let source = generate::to_string::standalone_schema_to_string(&context, &child);
+
+    assert!(source.contains("type MemberRole\n   = Admin\n   | Player\n"));
+
+    let mut standalone = ast::Schema {
+        namespace: "Child".to_string(),
+        ..ast::Schema::default()
+    };
+    parser::run("schema.pyre", &source, &mut standalone)
+        .expect("standalone Child schema should parse");
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![standalone],
+    })
+    .expect("standalone Child schema should typecheck like the runtime source");
+}

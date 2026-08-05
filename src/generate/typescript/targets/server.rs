@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub fn generate_schema(
-    _context: &typecheck::Context,
+    context: &typecheck::Context,
     database: &ast::Database,
     base_out_dir: &Path,
     files: &mut Vec<filesystem::GeneratedFile<String>>,
@@ -27,7 +27,7 @@ pub fn generate_schema(
     content.push_str("});\n\n");
     content.push_str("export const databases = {\n");
     for schema in &database.schemas {
-        let source = crate::generate::to_string::schema_to_string("", schema);
+        let source = crate::generate::to_string::standalone_schema_to_string(context, schema);
         content.push_str(&format!(
             "  {}: database({}, {}),\n",
             serde_json::to_string(&schema.namespace).expect("namespace should serialize"),

@@ -942,6 +942,41 @@ fn test_generate_embeds_namespaced_database_initializers() {
 }
 
 #[test]
+fn test_generate_embeds_shared_session_type_in_each_standalone_schema() {
+    let ctx = TestContext::new();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Child")).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n    role MemberRole?\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
+        "type MemberRole\n   = Admin\n   | Player\n\nrecord Member {\n    @public\n    id Id.Int @id\n    role MemberRole\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Child/schema.pyre"),
+        "record Document {\n    @allow(query) { Or(Session.role == Admin, Session.role == Player) }\n    @allow(insert, update, delete) { False }\n    id Id.Int @id\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("generate").assert().success();
+
+    let typescript = std::fs::read_to_string(
+        ctx.workspace_path
+            .join("pyre/generated/typescript/databases.ts"),
+    )
+    .unwrap();
+    assert_eq!(typescript.matches("type MemberRole").count(), 2);
+
+    let rust = std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/rust/databases.rs"))
+        .unwrap();
+    assert_eq!(rust.matches("type MemberRole").count(), 2);
+}
+
+#[test]
 fn test_generated_typescript_server_includes_typed_seed_input() {
     let ctx = TestContext::new();
 
