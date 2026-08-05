@@ -2156,6 +2156,157 @@ insert CreateSession {
 }
 
 #[tokio::test]
+async fn nullable_typed_json_null_roundtrips_and_matches_predicates(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+type Ended
+   = Ended {
+        reason String
+     }
+
+record ClocktowerLifecycle {
+    @public
+    id     Id.Uuid @id
+    end    Json<Ended>?
+    status String
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let session = PyreSession::new(
+        json!({}),
+        &manifest_for(&db.context, "", true)?.session_schema,
+    )?;
+    let id = "7f4d3a18-8b6c-4e2f-a901-5c7d9e3b2f60";
+
+    let insert_manifest = manifest_for(
+        &db.context,
+        r#"
+insert SeedLifecycle($id: ClocktowerLifecycle.id, $end: Json<Ended>?) {
+    clocktowerLifecycle {
+        id = $id
+        end = $end
+        status = "running"
+    }
+}
+"#,
+        false,
+    )?;
+    query::run(
+        &conn,
+        &insert_manifest,
+        &only_query(&insert_manifest).id,
+        json!({ "id": id, "end": null }),
+        &session,
+    )
+    .await?;
+
+    let mut storage_rows = conn
+        .query("select typeof(\"end\") from clocktowerLifecycles", ())
+        .await?;
+    let storage_row = storage_rows
+        .next()
+        .await?
+        .expect("inserted row should exist");
+    assert_eq!(storage_row.get::<String>(0)?, "null");
+
+    let read_manifest = manifest_for(
+        &db.context,
+        r#"
+query GetLifecycles {
+    clocktowerLifecycle {
+        id
+        end
+        status
+    }
+}
+"#,
+        false,
+    )?;
+    let read = query::run(
+        &conn,
+        &read_manifest,
+        &only_query(&read_manifest).id,
+        json!({}),
+        &session,
+    )
+    .await?;
+    assert_eq!(
+        read.response["clocktowerLifecycle"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(read.response["clocktowerLifecycle"][0]["end"].is_null());
+
+    let filtered_manifest = manifest_for(
+        &db.context,
+        r#"
+query GetNullLifecycles {
+    clocktowerLifecycle {
+        @where { end == null }
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    assert!(only_query(&filtered_manifest).sql[0]
+        .sql
+        .contains(".\"end\" is null"));
+    let filtered = query::run(
+        &conn,
+        &filtered_manifest,
+        &only_query(&filtered_manifest).id,
+        json!({}),
+        &session,
+    )
+    .await?;
+    assert_eq!(
+        filtered.response["clocktowerLifecycle"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let update_manifest = manifest_for(
+        &db.context,
+        r#"
+update EndLifecycle {
+    clocktowerLifecycle {
+        @where { end == null }
+        status = "ended"
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let updated = query::run_sync(
+        &conn,
+        &update_manifest,
+        &only_query(&update_manifest).id,
+        json!({}),
+        &session,
+    )
+    .await?;
+    assert_eq!(updated.affected_rows.len(), 1);
+    assert_eq!(updated.affected_rows[0].rows.len(), 1);
+
+    let mut status_rows = conn
+        .query("select status from clocktowerLifecycles where id = ?", [id])
+        .await?;
+    let status_row = status_rows.next().await?.expect("updated row should exist");
+    assert_eq!(status_row.get::<String>(0)?, "ended");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn generated_crud_reuses_shared_tagged_union_columns(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(

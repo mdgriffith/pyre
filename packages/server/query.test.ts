@@ -125,6 +125,12 @@ test("SQL args serialize Date values as unix seconds", () => {
   });
 });
 
+test("SQL args preserve nullable JSON null as SQL null", () => {
+  expect(buildArgs({ payload: null }, {}, [], [], ["payload"])).toEqual({
+    payload: null,
+  });
+});
+
 test("SQL args bind logical tagged-union sessions to physical paths", () => {
   const date = new Date("2026-07-11T16:36:52.000Z");
 

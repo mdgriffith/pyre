@@ -187,6 +187,10 @@ fn render_typed_json_value(value: &ast::QueryValue) -> String {
 }
 
 pub fn render_column_value(column: &ast::Column, value: &ast::QueryValue) -> String {
+    if column.nullable && matches!(value, ast::QueryValue::Null(_)) {
+        return "null".to_string();
+    }
+
     if matches!(column.type_, ast::ColumnType::Json) {
         return render_json_value(value);
     }

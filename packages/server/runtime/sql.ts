@@ -96,7 +96,9 @@ export function buildArgs(
     for (const [key, value] of Object.entries(input)) {
       if (value !== undefined) {
         args[key] = jsonInputArgSet.has(key)
-          ? JSON.stringify(normalizeSqlArg(value))
+          ? value === null
+            ? null
+            : JSON.stringify(normalizeSqlArg(value))
           : normalizeSqlArg(value);
         if (optionalInputArgs.includes(key)) {
           args[`${key}__is_set`] = true;

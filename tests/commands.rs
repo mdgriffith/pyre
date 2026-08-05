@@ -456,6 +456,58 @@ query GetEvents {
     .unwrap();
 }
 
+fn write_nullable_typed_json_schema_and_query(ctx: &TestContext) {
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+type Ended
+   = Ended {
+        reason String
+     }
+
+record ClocktowerLifecycle {
+    @public
+    id     Id.Uuid @id
+    end    Json<Ended>?
+    status String
+}
+        "#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        ctx.workspace_path.join("pyre/queries.pyre"),
+        r#"
+query GetLifecycles {
+    clocktowerLifecycle {
+        id
+        end
+        status
+    }
+}
+
+query GetNullLifecycles {
+    clocktowerLifecycle {
+        @where { end == null }
+        id
+        end
+        status
+    }
+}
+
+update EndLifecycle($end: Json<Ended>) {
+    clocktowerLifecycle {
+        @where { end == null }
+        end = $end
+        id
+        status
+    }
+}
+        "#,
+    )
+    .unwrap();
+}
+
 fn write_game_lens_schema_and_query(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
@@ -1922,6 +1974,63 @@ console.log("typed-json-roundtrip-check-passed");
         verify_script,
         "typed-json-roundtrip-check-passed",
         "bun typed json runtime verification",
+    );
+}
+
+#[tokio::test]
+async fn test_generated_typescript_runner_matches_nullable_typed_json_null() {
+    let ctx = TestContext::new();
+    write_nullable_typed_json_schema_and_query(&ctx);
+
+    generate_runtime(&ctx);
+
+    let verify_script = r#"
+import { createClient } from "@libsql/client";
+import { seed } from "./pyre/generated/typescript/server.ts";
+import { EndLifecycle, GetLifecycles, GetNullLifecycles } from "./pyre/generated/typescript/run.ts";
+
+const db = createClient({ url: "file:.yak/yak.db" });
+const id = "7f4d3a18-8b6c-4e2f-a901-5c7d9e3b2f60";
+
+const seeded = await seed(db, {
+  clocktowerLifecycles: [{ id, end: null, status: "running" }],
+});
+if (seeded.kind !== "success") {
+  throw new Error(`Seed failed: ${JSON.stringify(seeded)}`);
+}
+
+const all = await GetLifecycles(db, {});
+if (all?.clocktowerLifecycle?.length !== 1 || all.clocktowerLifecycle[0]?.end !== null) {
+  throw new Error(`Expected nullable JSON row, got: ${JSON.stringify(all)}`);
+}
+
+const filtered = await GetNullLifecycles(db, {});
+if (filtered?.clocktowerLifecycle?.length !== 1) {
+  throw new Error(`Expected null predicate to match one row, got: ${JSON.stringify(filtered)}`);
+}
+
+const updated = await EndLifecycle(db, { end: { _type: "Ended", reason: "complete" } });
+if (updated?.clocktowerLifecycle?.length !== 1) {
+  throw new Error(`Expected exactly one updated row, got: ${JSON.stringify(updated)}`);
+}
+
+const raw = await db.execute({
+  sql: 'select typeof("end") as storage, status from clocktowerLifecycles where id = ?',
+  args: [id],
+});
+if (raw.rows.length !== 1 || raw.rows[0]?.storage !== "blob" || raw.rows[0]?.status !== "running") {
+  throw new Error(`Unexpected updated storage: ${JSON.stringify(raw.rows)}`);
+}
+
+console.log("nullable-typed-json-null-check-passed");
+"#;
+
+    run_bun_verification_script(
+        &ctx,
+        "verify-nullable-typed-json-null.ts",
+        verify_script,
+        "nullable-typed-json-null-check-passed",
+        "bun nullable typed json null verification",
     );
 }
 

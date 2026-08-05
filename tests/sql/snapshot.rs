@@ -760,3 +760,53 @@ update UpdateEvent($id: Int, $payload: Json<Lifecycle>) {
 "#,
     );
 }
+
+#[test]
+fn snapshot_nullable_typed_json_null_semantics() {
+    check_snapshot(
+        "nullable_typed_json_null_semantics",
+        r#"
+type Ended
+   = Ended {
+        reason String
+     }
+
+record ClocktowerLifecycle {
+    id     Id.Uuid @id
+    end    Json<Ended>?
+    status String
+    @public
+}
+"#,
+        r#"
+insert SeedNull($id: ClocktowerLifecycle.id) {
+    clocktowerLifecycle {
+        id = $id
+        end = null
+        status = "running"
+    }
+}
+
+query GetNull {
+    clocktowerLifecycle {
+        @where { end == null }
+        id
+        end
+    }
+}
+
+update EndLifecycle {
+    clocktowerLifecycle {
+        @where { end == null }
+        status = "ended"
+    }
+}
+
+delete DeleteNull {
+    clocktowerLifecycle {
+        @where { end == null }
+    }
+}
+"#,
+    );
+}
