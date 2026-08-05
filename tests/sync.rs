@@ -95,23 +95,11 @@ fn live_deltas_require_positive_union_guards_for_not_equal() {
 }
 
 #[test]
-fn permission_hash_frames_nested_paths_without_changing_simple_hashes() {
+fn permission_hash_frames_nested_paths() {
     use pyre::ast::{Operator, PredicatePath, PredicatePathSegment, QueryValue, WhereArg};
 
     let range = ast::empty_range();
     let value = QueryValue::String((range.clone(), "x".to_string()));
-    let simple = WhereArg::Column(
-        false,
-        PredicatePath::field("ownerId"),
-        Operator::Equal,
-        value.clone(),
-        range.clone(),
-    );
-    assert_eq!(
-        pyre::sync::calculate_permission_hash(&Some(simple), &Default::default()),
-        "6c2b8e201804e0d21d4560488fdd98074714fe44fccc21a9abc69e931c771673"
-    );
-
     let formerly_colliding = WhereArg::Column(
         false,
         PredicatePath {
@@ -135,6 +123,71 @@ fn permission_hash_frames_nested_paths_without_changing_simple_hashes() {
     assert_ne!(
         pyre::sync::calculate_permission_hash(&Some(formerly_colliding), &Default::default()),
         pyre::sync::calculate_permission_hash(&Some(flat), &Default::default())
+    );
+}
+
+#[test]
+fn permission_hash_frames_session_values_and_signed_integer_minima() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+session {
+    a String
+    b String
+}
+
+record Resource {
+    id Int @id
+    first String
+    second String
+    updatedAt Int
+    @allow(query) { first == Session.a && second == Session.b }
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap();
+    let permission = ast::get_permissions(
+        &context.tables["resource"].record,
+        &ast::QueryOperation::Query,
+    );
+    let first = std::collections::HashMap::from([
+        (
+            "a".to_string(),
+            pyre::sync::SessionValue::Text("x".to_string()),
+        ),
+        (
+            "b".to_string(),
+            pyre::sync::SessionValue::Text("btexty".to_string()),
+        ),
+    ]);
+    let second = std::collections::HashMap::from([
+        (
+            "a".to_string(),
+            pyre::sync::SessionValue::Text("xbtext".to_string()),
+        ),
+        (
+            "b".to_string(),
+            pyre::sync::SessionValue::Text("y".to_string()),
+        ),
+    ]);
+    assert_ne!(
+        pyre::sync::calculate_permission_hash(&permission, &first),
+        pyre::sync::calculate_permission_hash(&permission, &second)
+    );
+
+    let minimum = std::collections::HashMap::from([
+        ("a".to_string(), pyre::sync::SessionValue::Integer(i64::MIN)),
+        ("b".to_string(), pyre::sync::SessionValue::Integer(i64::MIN)),
+    ]);
+    assert_eq!(
+        pyre::sync::calculate_permission_hash(&permission, &minimum).len(),
+        64
     );
 }
 
@@ -379,6 +432,7 @@ record GameEntity {
     let context = typecheck::check_schema(&database).expect("schema should typecheck");
 
     let sync_status = SyncStatusResult {
+        database_epoch: "test-epoch".to_string(),
         server_revision: None,
         tables: vec![TableSyncStatus {
             table_name: "gameEntities".to_string(),
@@ -503,6 +557,7 @@ record Note {
     };
     let context = typecheck::check_schema(&database).expect("schema should typecheck");
     let sync_status = SyncStatusResult {
+        database_epoch: "test-epoch".to_string(),
         server_revision: None,
         tables: vec![TableSyncStatus {
             table_name: "notes".to_string(),
@@ -645,6 +700,7 @@ record Quest {
     assert!(!status_sql.contains("accounts"));
 
     let sync_status = SyncStatusResult {
+        database_epoch: "test-epoch".to_string(),
         server_revision: None,
         tables: vec![
             TableSyncStatus {
@@ -701,7 +757,7 @@ record Account {
 
     assert_eq!(
         status_sql,
-        "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, (SELECT value FROM _pyre_sync WHERE key = 'server_revision') AS server_revision"
+        "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch"
     );
 }
 
@@ -736,6 +792,7 @@ record Map {
     let context = typecheck::check_schema(&database).expect("schema should typecheck");
 
     let sync_status = SyncStatusResult {
+        database_epoch: "test-epoch".to_string(),
         server_revision: None,
         tables: vec![TableSyncStatus {
             table_name: "maps".to_string(),

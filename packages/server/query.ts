@@ -85,6 +85,7 @@ export interface QueryResult {
 }
 
 export interface SyncResult {
+    databaseEpoch?: string;
     serverRevision?: number;
     originMessage?: unknown;
 }
@@ -313,6 +314,7 @@ export async function run(
         const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId) ?? {};
         if (typeof syncResult.serverRevision === "number") {
             queryResult.response = {
+                ...(syncResult.databaseEpoch === undefined ? {} : { databaseEpoch: syncResult.databaseEpoch }),
                 serverRevision: syncResult.serverRevision,
                 ...(syncResult.originMessage === undefined ? {} : { sync: syncResult.originMessage }),
                 ...(includeResult ? { result: queryResult.response } : {}),

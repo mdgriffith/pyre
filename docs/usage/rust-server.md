@@ -6,6 +6,7 @@ The app still runs `pyre generate`. Generated output includes:
 
 - `pyre/generated/manifest.json`, which powers dynamic query and mutation execution in Rust
 - `pyre/generated/rust/server.rs`, which exposes generated query ID constants and typed JSON boundary shapes for server-owned workflows
+- `pyre/generated/rust/databases.rs`, which embeds one initializer per schema namespace
 
 ## Main Modules
 
@@ -18,6 +19,22 @@ pyre::server::sync
 ```
 
 ## Startup
+
+Create or migrate each physical database with its schema-bound generated helper:
+
+```rust
+mod generated_databases {
+    include!("../pyre/generated/rust/databases.rs");
+}
+
+generated_databases::main::ensure_database(&main_conn).await?;
+generated_databases::campaign::ensure_database(&campaign_conn).await?;
+```
+
+The helper returns `Created`, `Migrated`, or `UpToDate`. It performs
+introspection, migration planning, DDL, and schema recording in one immediate
+transaction and rejects non-empty databases that are not already managed by
+Pyre.
 
 Load the generated manifest:
 

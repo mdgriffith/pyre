@@ -18,9 +18,11 @@ export function toSessionArgs(
 
   for (const key of sessionArgs) {
     const resolved = resolveSessionArg(key, session);
-    if (resolved.found) {
-      result[`session_${key}`] = normalizeSqlArg(resolved.value);
-    }
+    const normalized = normalizeSqlArg(resolved.value);
+    result[`session_${key}`] =
+      normalized !== null && typeof normalized === "object"
+        ? JSON.stringify(normalized)
+        : normalized;
   }
 
   return result;
@@ -29,13 +31,13 @@ export function toSessionArgs(
 function resolveSessionArg(
   key: string,
   session: Record<string, unknown>,
-): { found: boolean; value?: unknown } {
+): { value: unknown } {
   let value: unknown = key in session ? session[key] : session;
 
   if (!(key in session)) {
     for (const part of key.split("__")) {
       if (value === null || typeof value !== "object" || !(part in value)) {
-        return { found: true, value: null };
+        return { value: null };
       }
       value = (value as Record<string, unknown>)[part];
     }
@@ -45,7 +47,7 @@ function resolveSessionArg(
     value = (value as Record<string, unknown>)._type;
   }
 
-  return { found: true, value };
+  return { value };
 }
 
 function normalizeSqlArg(value: unknown): unknown {
@@ -115,9 +117,7 @@ export function toSqlStatements(
   return sql.map(({ sql: statement, params }) => {
     const filtered: Record<string, any> = {};
     for (const key of params) {
-      if (key in args) {
-        filtered[key] = args[key];
-      }
+      filtered[key] = key in args ? args[key] : null;
     }
 
     return { sql: statement, args: filtered };

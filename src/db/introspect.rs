@@ -9,8 +9,6 @@ pub mod to_schema;
 
 pub const MIGRATION_TABLE: &str = "_pyre_migrations";
 
-pub const SCHEMA_TABLE: &str = "_pyre_schema";
-
 // List all tables
 // Returns list of string
 pub const LIST_TABLES: &str = "SELECT name FROM sqlite_master WHERE type='table';";
@@ -18,13 +16,12 @@ pub const LIST_TABLES: &str = "SELECT name FROM sqlite_master WHERE type='table'
 pub const LIST_MIGRATIONS: &str = "SELECT name FROM _pyre_migrations;";
 
 // Add this near the top with other constants
-pub const GET_SCHEMA: &str = "SELECT schema FROM _pyre_schema LIMIT 1;";
+pub const GET_SCHEMA: &str = "SELECT schema FROM _pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL AND schema IS NOT NULL ORDER BY id DESC LIMIT 1;";
 
 pub const IS_INITIALIZED: &str = r#"
 SELECT 
   CASE 
     WHEN EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='_pyre_migrations')
-    AND EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='_pyre_schema')
     THEN 1
     ELSE 0
   END as is_initialized
@@ -38,7 +35,7 @@ WITH RECURSIVE
     SELECT name 
     FROM sqlite_master 
     WHERE type='table' 
-    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_schema', '_pyre_sync')
+    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync')
   ),
   -- Get table info for each table
   table_info AS (
@@ -160,7 +157,7 @@ SELECT json_object(
   ),
   'migration_state', json((SELECT state_json FROM migration_state)),
   'schema_source', COALESCE(
-    (SELECT schema FROM _pyre_schema ORDER BY created_at DESC LIMIT 1),
+    (SELECT schema FROM _pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL AND schema IS NOT NULL ORDER BY id DESC LIMIT 1),
     ''
   ),
   'links', jsonb('[]')
@@ -180,7 +177,7 @@ WITH RECURSIVE
     SELECT name 
     FROM sqlite_master 
     WHERE type='table' 
-    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_schema', '_pyre_sync')
+    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync')
   ),
   -- Get table info for each table
   table_info AS (

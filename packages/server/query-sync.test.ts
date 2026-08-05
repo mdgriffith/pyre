@@ -4,14 +4,23 @@ import { beforeEach, expect, mock, test } from "bun:test";
 let introspectionResult = { schema_source: "test schema" };
 let sessionIds = ["s1"];
 let reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]];
+let deltaError: string | undefined;
 
 mock.module("./wasm/pyre_wasm.js", () => ({
   sql_is_initialized: () => "select 1 as is_initialized",
   sql_introspect: () => "select introspection",
+  sql_introspect_uninitialized: () => "select uninitialized introspection",
+  migrate_with_introspection: (_name: string, _source: string, introspection: any) => ({
+    Ok: {
+      sql: introspection.schema_source ? [] : ["create table notes (id integer primary key)"],
+      mark_success: "record migration",
+    },
+  }),
   set_schema: () => undefined,
   get_sync_status_sql: () => "select 1",
   get_sync_sql: () => ({ tables: [] }),
   calculate_sync_deltas: (_affectedRows: unknown, connectedSessions: Map<string, unknown>) => {
+    if (deltaError) return deltaError;
     const recipientIds = Array.from(connectedSessions.keys()).filter((sessionId) => sessionIds.includes(sessionId));
     return {
       groups: recipientIds.length === 0 ? [] : [
@@ -101,6 +110,7 @@ beforeEach(() => {
   introspectionResult = { schema_source: "test schema" };
   sessionIds = ["s1"];
   reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]];
+  deltaError = undefined;
 });
 
 function withoutServerRevision(message: unknown): unknown {
@@ -108,7 +118,7 @@ function withoutServerRevision(message: unknown): unknown {
     return message;
   }
 
-  const { serverRevision: _serverRevision, ...rest } = message as Record<string, unknown>;
+  const { serverRevision: _serverRevision, databaseEpoch: _databaseEpoch, ...rest } = message as Record<string, unknown>;
   return rest;
 }
 
@@ -118,9 +128,9 @@ function syncDb() {
   return {
     execute: mock(async (sql: string) => {
       executedSql.push(sql);
-      if (sql.includes("returning value")) {
+      if (sql.includes("returning database_epoch, server_revision")) {
         revision += 1;
-        return { rows: [{ value: revision }] };
+        return { rows: [{ database_epoch: "test-epoch", server_revision: revision }] };
       }
 
       return { rows: [] };
@@ -315,6 +325,7 @@ test("runWithSync builds origin sync from executing session when origin is not l
   expect((result.response as any).sync).toEqual({
     type: "delta",
     serverRevision: 1,
+    databaseEpoch: "test-epoch",
     databaseId: "campaign:123",
     data: [
       {
@@ -396,4 +407,39 @@ test("runWithSync sends syncRequired when payload bytes exceed cap", async () =>
   expect(sent[0].message.type).toBe("syncRequired");
   expect(sent[0].message.databaseId).toBe("campaign:123");
   expect(typeof sent[0].message.serverRevision).toBe("number");
+});
+
+test("runWithSync advances revision and requires catchup when delta calculation fails", async () => {
+  deltaError = "Error: invalid connected session";
+  await loadSchemaFromDatabase(schemaDb as any);
+  const db = syncDb();
+  const result = await runWithSync(
+    db as any,
+    {} as any,
+    "query-id",
+    {},
+    {},
+    new Map([
+      ["origin", { session: {} }],
+      ["recipient", { session: { invalid: true } }],
+    ]),
+    undefined,
+    "origin",
+  );
+  const sent: Array<{ sessionId: string; message: any }> = [];
+  const syncResult = await result.sync((sessionId, message) => sent.push({ sessionId, message }));
+
+  expect(syncResult.serverRevision).toBe(1);
+  expect(syncResult.originMessage.type).toBe("syncRequired");
+  expect(sent).toEqual([
+    {
+      sessionId: "recipient",
+      message: {
+        type: "syncRequired",
+        serverRevision: 1,
+        databaseEpoch: "test-epoch",
+      },
+    },
+  ]);
+  expect(db.executedSql.some((sql) => sql.includes("returning database_epoch, server_revision"))).toBe(true);
 });

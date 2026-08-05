@@ -294,11 +294,12 @@ fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result
         match schema.type_.as_str() {
             "String" => value.is_string(),
             "DateTime" => datetime_to_epoch_seconds(value).is_some(),
-            "Int" | "Float" => value.is_number(),
+            "Int" => value.as_i64().is_some(),
+            "Float" => value.is_number(),
             "Bool" => {
                 value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false)
             }
-            type_ if type_.starts_with("Id.Int") => value.is_number(),
+            type_ if type_.starts_with("Id.Int") => value.as_i64().is_some(),
             type_ if type_.starts_with("Id.Uuid") => value.is_string(),
             type_ if type_.starts_with("Json") => true,
             _ => true,

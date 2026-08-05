@@ -70,8 +70,12 @@ async fn setup_database(row_count: i64) -> BenchState {
     let mut migration_sql = diff::to_sql::to_sql(&db_diff);
     migration_sql.splice(0..0, migrate::internal_setup_sql());
     migration_sql.push(SqlAndParams::SqlWithParams {
-        sql: migrate::INSERT_SCHEMA.to_string(),
-        args: vec![pyre::generate::to_string::schema_to_string("", &schema)],
+        sql: migrate::INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
+        args: vec![
+            "bench-init".to_string(),
+            "".to_string(),
+            pyre::generate::to_string::schema_to_string("", &schema),
+        ],
     });
 
     let conn = db.connect().unwrap();

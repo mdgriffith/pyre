@@ -1,11 +1,13 @@
 {
   "name": "@pyre/server",
-  "version": "0.1.8",
+  "version": "0.1.10",
   "description": "Server runtime for executing generated Pyre queries",
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "profile:sync": "bun run ./sync-lifecycle.profile.ts"
+    "profile:sync": "bun run ./sync-lifecycle.profile.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "main": "./index.ts",
   "module": "./index.ts",
@@ -45,9 +47,14 @@
     }
   },
   "dependencies": {
-    "@pyre/core": "0.1.8",
-    "@libsql/client": "^0.14.0",
+    "@pyre/core": "0.1.10",
+    "@libsql/client": "^0.14.0"
+  },
+  "peerDependencies": {
     "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "zod": "4.3.6"
   },
   "files": [
     "index.ts",

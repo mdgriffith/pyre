@@ -728,7 +728,7 @@ fn format_yellow_or_list(items: &Vec<String>, in_color: bool) -> String {
     }
 }
 
-fn to_error_description(error: &Error, in_color: bool) -> String {
+pub fn to_error_description(error: &Error, in_color: bool) -> String {
     match &error.error_type {
         ErrorType::ParsingError(parsing_details) => {
             let mut result = "".to_string();
@@ -925,8 +925,8 @@ fn to_error_description(error: &Error, in_color: bool) -> String {
         } => {
             let mut result = "".to_string();
             result.push_str(&format!(
-                "{} is defined as {}, but I'm expecting a {}.\n",
-                yellow_if(in_color, &format!("${}", variable_name)),
+                "{} is defined as\n\n    {}\n\nbut I'm expecting a\n\n    {}\n",
+                yellow_if(in_color, variable_name),
                 yellow_if(in_color, variable_defined_as),
                 cyan_if(in_color, column_defined_as)
             ));
@@ -1593,7 +1593,7 @@ fn to_error_description(error: &Error, in_color: bool) -> String {
 }
 
 // JSON error format
-fn to_error_title(error_type: &ErrorType) -> String {
+pub fn to_error_title(error_type: &ErrorType) -> String {
     match error_type {
         ErrorType::ParsingError(_) => "Parsing Error",
         ErrorType::UnknownFunction { .. } => "Unknown Function",

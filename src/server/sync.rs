@@ -36,6 +36,32 @@ impl<'a> SyncServer<'a> {
         database_id::with_database_id(database_id, result).map_err(Error::DatabaseId)
     }
 
+    pub async fn catchup_protocol(
+        &self,
+        conn: &libsql::Connection,
+        sync_cursor: &SyncCursor,
+        session: &SyncSession,
+        page_size: usize,
+        database_id: impl AsRef<str>,
+        client_database_epoch: Option<&str>,
+    ) -> Result<CatchupResponse, Error> {
+        let page = self
+            .catchup(conn, sync_cursor, session, page_size, database_id)
+            .await?;
+        if client_database_epoch.is_some_and(|client_epoch| client_epoch != page.database_epoch) {
+            return Ok(CatchupResponse::Reset(DatabaseReset {
+                type_: "reset".to_string(),
+                database_id: page.database_id.clone(),
+                database_epoch: page.database_epoch,
+                operation: "replace".to_string(),
+                scope: "database".to_string(),
+                reason: "database_epoch_changed".to_string(),
+            }));
+        }
+
+        Ok(CatchupResponse::Page(page))
+    }
+
     pub async fn calculate_deltas(
         &self,
         conn: &libsql::Connection,
@@ -113,6 +139,8 @@ pub struct DeltaMessage {
     pub type_: String,
     #[serde(rename = "serverRevision", skip_serializing_if = "Option::is_none")]
     pub server_revision: Option<i64>,
+    #[serde(rename = "databaseEpoch", skip_serializing_if = "Option::is_none")]
+    pub database_epoch: Option<String>,
     #[serde(rename = "databaseId", skip_serializing_if = "Option::is_none")]
     pub database_id: Option<DatabaseId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -124,6 +152,7 @@ impl DeltaMessage {
         Self {
             type_: "delta".to_string(),
             server_revision: None,
+            database_epoch: None,
             database_id: None,
             data,
         }
@@ -136,6 +165,7 @@ impl DeltaMessage {
         Ok(Self {
             type_: "delta".to_string(),
             server_revision: None,
+            database_epoch: None,
             database_id: Some(
                 database_id::require_database_id(database_id).map_err(Error::DatabaseId)?,
             ),
@@ -147,6 +177,7 @@ impl DeltaMessage {
         Self {
             type_: "syncRequired".to_string(),
             server_revision: None,
+            database_epoch: None,
             database_id: None,
             data: Vec::new(),
         }
@@ -156,12 +187,33 @@ impl DeltaMessage {
         Ok(Self {
             type_: "syncRequired".to_string(),
             server_revision: None,
+            database_epoch: None,
             database_id: Some(
                 database_id::require_database_id(database_id).map_err(Error::DatabaseId)?,
             ),
             data: Vec::new(),
         })
     }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum CatchupResponse {
+    Reset(DatabaseReset),
+    Page(SyncPageResult),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DatabaseReset {
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(rename = "databaseId", skip_serializing_if = "Option::is_none")]
+    pub database_id: Option<DatabaseId>,
+    #[serde(rename = "databaseEpoch")]
+    pub database_epoch: String,
+    pub operation: String,
+    pub scope: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -192,6 +244,7 @@ pub async fn catchup(
     let mut result = SyncPageResult {
         database_id: None,
         server_revision: sync_status.server_revision,
+        database_epoch: sync_status.database_epoch,
         tables: HashMap::new(),
         has_more: false,
     };
@@ -285,10 +338,10 @@ pub async fn catchup(
     Ok(result)
 }
 
-async fn next_server_revision(conn: &libsql::Connection) -> Result<i64, Error> {
+async fn next_server_revision(conn: &libsql::Connection) -> Result<(String, i64), Error> {
     let mut rows = conn
         .query(
-            "UPDATE _pyre_sync SET value = value + 1 WHERE key = 'server_revision' RETURNING value",
+            "UPDATE _pyre_sync SET server_revision = server_revision + 1 WHERE id = 1 RETURNING database_epoch, server_revision",
             (),
         )
         .await
@@ -300,7 +353,27 @@ async fn next_server_revision(conn: &libsql::Connection) -> Result<i64, Error> {
         )));
     };
 
-    row.get::<i64>(0).map_err(Error::Database)
+    Ok((
+        row.get::<String>(0).map_err(Error::Database)?,
+        row.get::<i64>(1).map_err(Error::Database)?,
+    ))
+}
+
+/// Start a new database sync lifetime and reset its revision sequence.
+pub async fn rotate_database_epoch(conn: &libsql::Connection) -> Result<String, Error> {
+    let mut rows = conn
+        .query(
+            "UPDATE _pyre_sync SET database_epoch = lower(hex(randomblob(16))), server_revision = 0 WHERE id = 1 RETURNING database_epoch",
+            (),
+        )
+        .await
+        .map_err(Error::Database)?;
+    let Some(row) = rows.next().await.map_err(Error::Database)? else {
+        return Err(Error::Sync(sync::SyncError::DatabaseError(
+            "failed to rotate Pyre database epoch".to_string(),
+        )));
+    };
+    row.get::<String>(0).map_err(Error::Database)
 }
 
 async fn stamp_messages_and_response_with_next_server_revision(
@@ -313,12 +386,14 @@ async fn stamp_messages_and_response_with_next_server_revision(
         return Ok(messages);
     }
 
-    let server_revision = next_server_revision(conn).await?;
+    let (database_epoch, server_revision) = next_server_revision(conn).await?;
     for message in &mut messages {
         message.message.server_revision = Some(server_revision);
+        message.message.database_epoch = Some(database_epoch.clone());
     }
     if let Some(origin_message) = &mut origin_message {
         origin_message.server_revision = Some(server_revision);
+        origin_message.database_epoch = Some(database_epoch.clone());
     }
 
     let mut envelope = serde_json::Map::new();
@@ -326,6 +401,7 @@ async fn stamp_messages_and_response_with_next_server_revision(
         "serverRevision".to_string(),
         JsonValue::from(server_revision),
     );
+    envelope.insert("databaseEpoch".to_string(), JsonValue::from(database_epoch));
     if let Some(origin_message) = origin_message {
         envelope.insert(
             "sync".to_string(),

@@ -60,6 +60,21 @@ record Post {
 
 If the namespace exists but that table does not exist in that namespace, typecheck fails.
 
+Foreign-key column types follow the same rule. An unqualified reference such as
+`User.id` only resolves within the current namespace. Reference an ID in another
+namespace explicitly:
+
+```pyre
+record Post {
+    id Id.Int @id
+    authorId Auth.User.id
+    author @link(authorId, Auth.User.id)
+}
+```
+
+Pyre uses cross-namespace ID references for type information; it does not emit a
+cross-database SQLite foreign-key constraint.
+
 ## Naming rules and current constraints
 
 - Non-default namespace names must be capitalized (`App`, not `app`).
@@ -87,5 +102,6 @@ For a main/campaign split, mark the `Main` namespace with `@syncable(false)` and
 - Use `pyre/schema/<Namespace>/schema.pyre` when splitting domains.
 - Use `@link(..., Table.field)` for same-namespace links.
 - Use `@link(..., Namespace.Table.field)` for cross-namespace links.
+- Use `Namespace.Table.field` for cross-namespace foreign-key column types.
 - Use `@syncable(false)` for namespaces that should be queried but not stored in frontend sync state.
 - When migrating multi-namespace projects, always pass `--namespace`.

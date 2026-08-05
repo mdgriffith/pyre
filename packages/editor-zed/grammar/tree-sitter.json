@@ -1,0 +1,18 @@
+{
+  "grammars": [
+    {
+      "name": "pyre",
+      "camelcase": "Pyre",
+      "scope": "source.pyre",
+      "path": ".",
+      "file-types": ["pyre"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for Pyre",
+    "authors": [{ "name": "Pyre contributors" }],
+    "links": { "repository": "https://github.com/mdgriffith/pyre" }
+  }
+}

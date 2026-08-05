@@ -242,6 +242,24 @@ export const to_runner = <Session, Input, Output>(
 
 type KeyValues = { [key: string]: unknown };
 
+const normalize_sql_arg = (value: unknown): unknown => {
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new Error("Invalid Date SQL argument");
+    }
+    return Math.floor(value.getTime() / 1000);
+  }
+  if (Array.isArray(value)) {
+    return value.map(normalize_sql_arg);
+  }
+  if (value !== null && typeof value === "object" && !(value instanceof Uint8Array)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [key, normalize_sql_arg(nested)]),
+    );
+  }
+  return value;
+};
+
 const to_session_args = (
   allowed_keys: string[],
   session: Record<string, unknown>,
@@ -253,7 +271,6 @@ const to_session_args = (
   const session_args: KeyValues = {};
   for (const key of allowed_keys) {
     let value: unknown = key in session ? session[key] : session;
-    let found = true;
     if (!(key in session)) {
       for (const part of key.split("__")) {
         if (value === null || typeof value !== "object" || !(part in value)) {
@@ -263,12 +280,14 @@ const to_session_args = (
         value = (value as Record<string, unknown>)[part];
       }
     }
-    if (found) {
-      session_args["session_" + key] =
-        value !== null && typeof value === "object" && "_type" in value
-          ? (value as Record<string, unknown>)._type
-          : value;
+    if (value !== null && typeof value === "object" && "_type" in value) {
+      value = (value as Record<string, unknown>)._type;
     }
+    const normalized = normalize_sql_arg(value);
+    session_args["session_" + key] =
+      normalized !== null && typeof normalized === "object"
+        ? JSON.stringify(normalized)
+        : normalized;
   }
   return session_args;
 };

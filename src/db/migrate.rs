@@ -9,8 +9,6 @@ use crate::typecheck;
 
 pub const MIGRATION_TABLE: &str = "_pyre_migrations";
 
-pub const SCHEMA_TABLE: &str = "_pyre_schema";
-
 pub const SYNC_TABLE: &str = "_pyre_sync";
 
 pub const LIST_MIGRATIONS: &str = "select name from _pyre_migrations";
@@ -25,22 +23,18 @@ pub const CREATE_MIGRATION_TABLE: &str = "create table if not exists _pyre_migra
     name text not null,
     finished_at integer,
     error text,
-    sql text not null
-)";
-
-pub const CREATE_SCHEMA_TABLE: &str = "create table if not exists _pyre_schema (
-    id integer not null primary key autoincrement,
-    created_at integer not null default (unixepoch()),
-    schema text not null
+    sql text not null,
+    schema text
 )";
 
 pub const CREATE_SYNC_TABLE: &str = "create table if not exists _pyre_sync (
-    key text not null primary key check (key = 'server_revision'),
-    value integer not null
+    id integer not null primary key check (id = 1),
+    database_epoch text not null,
+    server_revision integer not null default 0 check (server_revision >= 0)
 )";
 
-pub const INSERT_SYNC_REVISION_ROW: &str =
-    "insert into _pyre_sync (key, value) values ('server_revision', 0) on conflict(key) do nothing";
+pub const INSERT_SYNC_STATE_ROW: &str =
+    "insert into _pyre_sync (id, database_epoch, server_revision) values (1, lower(hex(randomblob(16))), 0) on conflict(id) do nothing";
 
 pub const INSERT_MIGRATION_ERROR: &str =
     "insert into _pyre_migrations (name, sql, error) values (?, ?, ?)";
@@ -48,14 +42,14 @@ pub const INSERT_MIGRATION_ERROR: &str =
 pub const INSERT_MIGRATION_SUCCESS: &str =
     "insert into _pyre_migrations (name, sql, finished_at) values (?, ?, unixepoch())";
 
-pub const INSERT_SCHEMA: &str = "insert into _pyre_schema (schema) values (?)";
+pub const INSERT_MIGRATION_SUCCESS_WITH_SCHEMA: &str =
+    "insert into _pyre_migrations (name, sql, schema, finished_at) values (?, ?, ?, unixepoch())";
 
 pub fn internal_setup_sql() -> Vec<SqlAndParams> {
     vec![
         SqlAndParams::Sql(CREATE_MIGRATION_TABLE.to_string()),
-        SqlAndParams::Sql(CREATE_SCHEMA_TABLE.to_string()),
         SqlAndParams::Sql(CREATE_SYNC_TABLE.to_string()),
-        SqlAndParams::Sql(INSERT_SYNC_REVISION_ROW.to_string()),
+        SqlAndParams::Sql(INSERT_SYNC_STATE_ROW.to_string()),
     ]
 }
 
@@ -74,7 +68,6 @@ pub fn quoted_internal_setup_sql() -> Vec<SqlAndParams> {
 
 fn quote_internal_table_names(sql: &str) -> String {
     sql.replace(MIGRATION_TABLE, &crate::ext::string::quote(MIGRATION_TABLE))
-        .replace(SCHEMA_TABLE, &crate::ext::string::quote(SCHEMA_TABLE))
         .replace(SYNC_TABLE, &crate::ext::string::quote(SYNC_TABLE))
 }
 
@@ -98,8 +91,27 @@ pub fn migrate_dynamic(
     new_schema_source: &str,
     schema_filepath: &str,
 ) -> Result<MigrationSql, Vec<error::Error>> {
+    migrate_dynamic_for_schema(
+        name,
+        introspection,
+        new_schema_source,
+        schema_filepath,
+        ast::DEFAULT_SCHEMANAME,
+    )
+}
+
+pub(crate) fn migrate_dynamic_for_schema(
+    name: String,
+    introspection: &introspect::Introspection,
+    new_schema_source: &str,
+    schema_filepath: &str,
+    schema_name: &str,
+) -> Result<MigrationSql, Vec<error::Error>> {
     // Parse the schema source into a Schema
-    let mut new_schema = ast::Schema::default();
+    let mut new_schema = ast::Schema {
+        namespace: schema_name.to_string(),
+        ..ast::Schema::default()
+    };
     let parse_result = parser::run(schema_filepath, new_schema_source, &mut new_schema);
     if let Err(e) = parse_result {
         return match parser::convert_parsing_error(e) {
@@ -149,8 +161,12 @@ pub fn migrate_dynamic(
         return Ok(MigrationSql {
             sql: vec![],
             mark_success: SqlAndParams::SqlWithParams {
-                sql: INSERT_MIGRATION_SUCCESS.to_string(),
-                args: vec![name.to_string(), "".to_string()],
+                sql: INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
+                args: vec![
+                    name.to_string(),
+                    "".to_string(),
+                    new_schema_source.to_string(),
+                ],
             },
             mark_failure: SqlAndParams::SqlWithParams {
                 sql: INSERT_MIGRATION_ERROR.to_string(),
@@ -166,17 +182,15 @@ pub fn migrate_dynamic(
 
     sql.splice(0..0, internal_setup_sql());
 
-    // Insert the new schema
-    sql.push(SqlAndParams::SqlWithParams {
-        sql: INSERT_SCHEMA.to_string(),
-        args: vec![new_schema_source.to_string()],
-    });
-
     Ok(MigrationSql {
         sql,
         mark_success: SqlAndParams::SqlWithParams {
-            sql: INSERT_MIGRATION_SUCCESS.to_string(),
-            args: vec![name.to_string(), sql_executed.clone()],
+            sql: INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
+            args: vec![
+                name.to_string(),
+                sql_executed.clone(),
+                new_schema_source.to_string(),
+            ],
         },
         mark_failure: SqlAndParams::SqlWithParams {
             sql: INSERT_MIGRATION_ERROR.to_string(),
@@ -201,10 +215,64 @@ pub fn migrate_dynamic(
 pub struct FileBasedMigrationPlan {
     /// Migrations that should be executed (name, sql_content)
     pub migrations_to_run: Vec<(String, String)>,
-    /// SQL to insert the schema after migrations
-    pub insert_schema_sql: String,
     /// Schema string to insert
     pub schema_string: String,
+}
+
+pub fn schema_to_storage_string(schema: &ast::Schema) -> String {
+    let mut stored_schema = schema.clone();
+
+    for file in &mut stored_schema.files {
+        for definition in &mut file.definitions {
+            let ast::Definition::Record { fields, .. } = definition else {
+                continue;
+            };
+
+            for field in fields {
+                let ast::Field::Column(column) = field else {
+                    continue;
+                };
+                let ast::ColumnType::ForeignKey {
+                    schema: Some(target_schema),
+                    serialization_type,
+                    ..
+                } = &column.type_
+                else {
+                    continue;
+                };
+
+                if *target_schema == stored_schema.namespace {
+                    if let ast::ColumnType::ForeignKey { schema, .. } = &mut column.type_ {
+                        *schema = None;
+                    }
+                    continue;
+                }
+
+                // The attached database is not available when this physical schema is reloaded.
+                // Persist the already-resolved SQLite storage type instead of an external lookup.
+                let stored_type = match serialization_type {
+                    Some(ast::ConcreteSerializationType::IdUuid)
+                    | Some(ast::ConcreteSerializationType::Text) => Some(ast::ColumnType::String),
+                    Some(ast::ConcreteSerializationType::Real) => Some(ast::ColumnType::Float),
+                    Some(ast::ConcreteSerializationType::DateTime) => {
+                        Some(ast::ColumnType::DateTime)
+                    }
+                    Some(ast::ConcreteSerializationType::Date) => Some(ast::ColumnType::Date),
+                    Some(ast::ConcreteSerializationType::JsonB) => Some(ast::ColumnType::Json),
+                    Some(ast::ConcreteSerializationType::Integer)
+                    | Some(ast::ConcreteSerializationType::IdInt) => Some(ast::ColumnType::Int),
+                    Some(ast::ConcreteSerializationType::Blob)
+                    | Some(ast::ConcreteSerializationType::VectorBlob { .. })
+                    | None => None,
+                };
+                if let Some(stored_type) = stored_type {
+                    column.type_ = stored_type;
+                }
+            }
+        }
+    }
+
+    crate::generate::to_string::schema_to_string("", &stored_schema)
 }
 
 /// Plan file-based migrations by determining which migration files need to be executed.
@@ -231,15 +299,60 @@ pub fn plan_file_based_migrations(
     };
 
     // Generate schema string
-    let schema_string = crate::generate::to_string::schema_to_string("", schema);
-
-    // Use the centralized constant for inserting schema, formatting with quoted table name
-    let insert_schema_sql =
-        INSERT_SCHEMA.replace(SCHEMA_TABLE, &crate::ext::string::quote(SCHEMA_TABLE));
+    let schema_string = schema_to_storage_string(schema);
 
     FileBasedMigrationPlan {
         migrations_to_run,
-        insert_schema_sql,
         schema_string,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_schema_uses_resolved_type_for_external_foreign_key() {
+        let mut app = ast::Schema {
+            namespace: "App".to_string(),
+            ..ast::Schema::default()
+        };
+        parser::run(
+            "pyre/schema/App/schema.pyre",
+            "record Post {\n    @public\n    id Id.Int @id\n    userId Auth.User.id\n}\n",
+            &mut app,
+        )
+        .expect("App schema should parse");
+
+        let mut auth = ast::Schema {
+            namespace: "Auth".to_string(),
+            ..ast::Schema::default()
+        };
+        parser::run(
+            "pyre/schema/Auth/schema.pyre",
+            "record User {\n    @public\n    id Id.Uuid @id\n}\n",
+            &mut auth,
+        )
+        .expect("Auth schema should parse");
+
+        let mut database = ast::Database {
+            schemas: vec![app, auth],
+        };
+        ast::resolve_id_brands(&mut database);
+
+        let source = schema_to_storage_string(&database.schemas[0]);
+        assert!(source.contains("userId String"), "stored schema: {source}");
+        assert!(!source.contains("Auth.User.id"));
+
+        let introspection = introspect::from_raw(introspect::IntrospectionRaw {
+            tables: vec![],
+            migration_state: introspect::MigrationState::MigrationTable { migrations: vec![] },
+            schema_source: source,
+            links: vec![],
+        });
+        match introspection.schema {
+            introspect::SchemaResult::Success { .. } => {}
+            other => panic!("stored schema should typecheck: {other:?}"),
+        }
     }
 }

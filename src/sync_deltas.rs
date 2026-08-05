@@ -332,7 +332,9 @@ fn session_path_value<'a>(
     path: &ast::PredicatePath,
     session: &'a HashMap<String, SessionValue>,
 ) -> Option<&'a SessionValue> {
-    let session_schema = context.session.as_ref()?;
+    let Some(session_schema) = context.session.as_ref() else {
+        return session.get(&path.flattened());
+    };
     let resolved = typecheck::resolve_predicate_path(context, &session_schema.fields, path).ok()?;
     if !resolved.discriminators.iter().all(|(column, variant)| {
         matches!(session.get(column), Some(SessionValue::Text(value)) if value == variant)

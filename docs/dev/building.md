@@ -6,10 +6,11 @@ This guide covers how to build the Pyre project and its components.
 
 You'll need:
 - **Rust** and **Cargo** installed
+- **Bun** installed for generated TypeScript compile and runtime tests
 - **iconv** installed (for character encoding support)
 - **wasm-pack** (for building the WASM component)
 
-Alternatively, you can use [devbox](https://www.jetify.com/devbox) to get all the right dependencies without polluting your system:
+Alternatively, you can use [devbox](https://www.jetify.com/devbox) for the Rust and iconv dependencies without polluting your system. Bun and wasm-pack still need to be installed separately:
 
 ```bash
 devbox shell
@@ -83,8 +84,11 @@ cargo run -- migrate db/playground.db
 Run the test suite:
 
 ```bash
+bun install --frozen-lockfile
 cargo test
 ```
+
+Generated TypeScript tests require the pinned TypeScript and Zod 4 dependencies installed by Bun. They fail rather than skip when the JavaScript toolchain is unavailable.
 
 ## Benchmarks
 
@@ -93,4 +97,3 @@ Run benchmarks:
 ```bash
 cargo bench
 ```
-

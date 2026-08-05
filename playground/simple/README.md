@@ -54,7 +54,12 @@ record User {
 }
 
 record Post {
-    @allow(query) { authorUserId == Session.userId || published == true }
+    @allow(query) {
+        Or(
+            authorUserId == Session.userId,
+            published == true,
+        )
+    }
     @allow(insert) { authorUserId == Session.userId }
     id           Int     @id
     authorUserId Int

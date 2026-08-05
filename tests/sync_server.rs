@@ -378,6 +378,97 @@ insert into notes (id, tenant, body, updatedAt) values (2, 'x'' OR 1=1 --', 'two
 }
 
 #[tokio::test]
+async fn catchup_allows_optional_union_session_variant() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+session {
+    campaignRole CampaignRole?
+}
+
+type CampaignRole
+   = CampaignGM
+   | CampaignPlayer { controlled Json }
+   | CampaignObserver
+
+record World {
+    id Int @id
+    name String
+    updatedAt Int
+    @allow(query) { Session.campaignRole == CampaignGM }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("insert into worlds (id, name, updatedAt) values (1, 'Allowed', 10);")
+        .await?;
+    let session_schema = HashMap::from([(
+        "campaignRole".to_string(),
+        FieldSchema {
+            type_: "CampaignRole".to_string(),
+            is_enum: false,
+            enum_variants: Vec::new(),
+            tagged_union_variants: HashMap::from([
+                ("CampaignGM".to_string(), HashMap::new()),
+                (
+                    "CampaignPlayer".to_string(),
+                    HashMap::from([(
+                        "controlled".to_string(),
+                        FieldSchema {
+                            type_: "Json".to_string(),
+                            is_enum: false,
+                            enum_variants: Vec::new(),
+                            tagged_union_variants: HashMap::new(),
+                            tagged_union_types: HashMap::new(),
+                            nullable: false,
+                            omittable: false,
+                        },
+                    )]),
+                ),
+                ("CampaignObserver".to_string(), HashMap::new()),
+            ]),
+            tagged_union_types: HashMap::new(),
+            nullable: true,
+            omittable: false,
+        },
+    )]);
+    let session = PyreSession::new(
+        json!({ "campaignRole": { "_type": "CampaignGM" } }),
+        &session_schema,
+    )?;
+
+    let result = catchup(
+        &conn,
+        &db.context,
+        &SyncCursor::new(),
+        session.logical(),
+        10,
+    )
+    .await?;
+    let worlds = result.tables.get("worlds").expect("worlds should sync");
+
+    assert_eq!(worlds.rows.len(), 1);
+    assert_eq!(worlds.rows[0]["id"], json!(1));
+
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "worlds".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "name".to_string(),
+            "updatedAt".to_string(),
+        ],
+        rows: vec![vec![json!(1), json!("Allowed"), json!(10)]],
+    }];
+    let sessions = HashMap::from([("session".to_string(), session.logical().clone())]);
+    let deltas = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &db.context)
+        .map_err(|error| format!("failed to calculate sync deltas: {:?}", error))?;
+
+    assert_eq!(deltas.groups[0].table_groups[0].rows.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn catchup_shapes_json_and_custom_type_columns() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
@@ -531,6 +622,7 @@ record Note {
     updatedAt Int
     @public
 }
+
 "#,
     )
     .await?;
@@ -577,6 +669,114 @@ record Note {
         .await?;
     assert_eq!(catchup_result.server_revision, Some(2));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn database_epoch_mismatch_returns_explicit_replacement(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let response = SyncServer::new(&db.context)
+        .catchup_protocol(
+            &conn,
+            &SyncCursor::new(),
+            &SyncSession::new(),
+            10,
+            "main",
+            Some("stale-epoch"),
+        )
+        .await?;
+
+    let json = serde_json::to_value(response)?;
+    assert_eq!(json["type"], json!("reset"));
+    assert_eq!(json["operation"], json!("replace"));
+    assert_eq!(json["scope"], json!("database"));
+    assert_eq!(json["reason"], json!("database_epoch_changed"));
+    assert_eq!(json["databaseId"], json!("main"));
+    assert_eq!(json["databaseEpoch"].as_str().map(str::len), Some(32));
+    assert!(json.get("tables").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn matching_database_epoch_returns_sync_page() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let page = SyncServer::new(&db.context)
+        .catchup(&conn, &SyncCursor::new(), &SyncSession::new(), 10, "main")
+        .await?;
+    let response = SyncServer::new(&db.context)
+        .catchup_protocol(
+            &conn,
+            &SyncCursor::new(),
+            &SyncSession::new(),
+            10,
+            "main",
+            Some(&page.database_epoch),
+        )
+        .await?;
+    let json = serde_json::to_value(response)?;
+
+    assert_eq!(json["databaseEpoch"], json!(page.database_epoch));
+    assert!(json.get("tables").is_some());
+    assert!(json.get("type").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotating_database_epoch_resets_the_revision() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute(
+        "update _pyre_sync set server_revision = 42 where id = 1",
+        (),
+    )
+    .await?;
+    let old_epoch = SyncServer::new(&db.context)
+        .catchup(&conn, &SyncCursor::new(), &SyncSession::new(), 10, "main")
+        .await?
+        .database_epoch;
+
+    let new_epoch = pyre::server::sync::rotate_database_epoch(&conn).await?;
+    let mut rows = conn
+        .query(
+            "select database_epoch, server_revision from _pyre_sync where id = 1",
+            (),
+        )
+        .await?;
+    let row = rows.next().await?.expect("sync singleton");
+
+    assert_ne!(new_epoch, old_epoch);
+    assert_eq!(row.get::<String>(0)?, new_epoch);
+    assert_eq!(row.get::<i64>(1)?, 0);
     Ok(())
 }
 
@@ -1325,7 +1525,7 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     conn.execute(
-        "update _pyre_schema set schema = ?",
+        "update _pyre_migrations set schema = ? where schema is not null",
         libsql::params_from_iter(vec![libsql::Value::Text("record {".to_string())]),
     )
     .await?;
@@ -1355,7 +1555,7 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     conn.execute(
-        "update _pyre_schema set schema = ?",
+        "update _pyre_migrations set schema = ? where schema is not null",
         libsql::params_from_iter(vec![libsql::Value::Text(
             r#"
 record Note {

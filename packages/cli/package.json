@@ -1,6 +1,6 @@
 {
   "name": "pyre",
-  "version": "0.1.8",
+  "version": "0.1.10",
   "description": "Pyre CLI npm wrapper",
   "license": "MIT",
   "type": "module",

@@ -1,0 +1,13 @@
+{
+  "name": "tree-sitter-pyre",
+  "version": "0.1.0",
+  "private": true,
+  "main": "bindings/node",
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.8"
+  }
+}

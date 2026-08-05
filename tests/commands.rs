@@ -547,10 +547,6 @@ query GetGame($id: Game.id) {
     .unwrap();
 }
 
-fn bun_is_available() -> bool {
-    StdCommand::new("bun").arg("--version").output().is_ok()
-}
-
 fn elm_is_available() -> bool {
     StdCommand::new("elm").arg("--version").output().is_ok()
 }
@@ -833,7 +829,7 @@ fn test_generate_command() {
     // Create a sample schema file (Pyre format, not SQL)
     write_basic_schema(&ctx);
 
-    ctx.run_command("generate").assert().success();
+    let assert = ctx.run_command("generate").assert().success();
 
     // Verify generated files were created
     assert!(ctx.workspace_path.join("pyre/generated").exists());
@@ -842,6 +838,107 @@ fn test_generate_command() {
         .unwrap()
         .next()
         .is_some());
+    let generated_count = walkdir::WalkDir::new(ctx.workspace_path.join("pyre/generated"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .count();
+    assert_eq!(
+        String::from_utf8_lossy(&assert.get_output().stdout),
+        format!(
+            "Generated {} files from ./pyre into ./pyre/generated.\n",
+            generated_count
+        )
+    );
+}
+
+#[test]
+fn test_generate_preserves_namespaced_session_id_storage_types() {
+    let ctx = TestContext::new();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Other")).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        r#"
+session {
+    uuidRecordId UuidRecord.id?
+    intRecordId  IntRecord.id?
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
+        r#"
+record UuidRecord {
+    id Id.Uuid @id
+    @public
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Other/schema.pyre"),
+        r#"
+record IntRecord {
+    id Id.Int @id
+    @public
+}
+"#,
+    )
+    .unwrap();
+
+    ctx.run_command("generate").assert().success();
+
+    let decode = std::fs::read_to_string(
+        ctx.workspace_path
+            .join("pyre/generated/typescript/core/decode.ts"),
+    )
+    .unwrap();
+    assert!(decode.contains("uuidRecordId?: string | null;"));
+    assert!(decode.contains("intRecordId?: number | null;"));
+    assert!(decode.contains("uuidRecordId: z.string().nullish(),"));
+    assert!(decode.contains("intRecordId: z.number().int().nullish(),"));
+}
+
+#[test]
+fn test_generate_embeds_namespaced_database_initializers() {
+    let ctx = TestContext::new();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Campaign")).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
+        "record User {\n    id Id.Int @id\n    @public\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Campaign/schema.pyre"),
+        "record Encounter {\n    id Id.Int @id\n    @public\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("generate").assert().success();
+
+    let typescript = std::fs::read_to_string(
+        ctx.workspace_path
+            .join("pyre/generated/typescript/databases.ts"),
+    )
+    .unwrap();
+    assert!(typescript.contains("\"Main\": database(\"Main\""));
+    assert!(typescript.contains("\"Campaign\": database(\"Campaign\""));
+    assert!(typescript.contains("record User"));
+    assert!(typescript.contains("record Encounter"));
+
+    let rust = std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/rust/databases.rs"))
+        .unwrap();
+    assert!(rust.contains("pub mod main"));
+    assert!(rust.contains("pub mod campaign"));
+    assert!(rust.contains("pub async fn ensure_database"));
 }
 
 #[test]
@@ -1060,7 +1157,8 @@ fn test_format_command() {
     ctx.run_command("format")
         .arg("pyre/queries.pyre")
         .assert()
-        .success();
+        .success()
+        .stdout("Formatted 1 Pyre file in ./pyre.\n");
 
     // Verify formatted content (should be properly formatted Pyre query)
     let formatted = std::fs::read_to_string(ctx.workspace_path.join("pyre/queries.pyre")).unwrap();
@@ -1166,9 +1264,7 @@ query GetUsers {
     ctx.run_command("check")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Success: checked 1 schema(s) and 1 query files",
-        ));
+        .stdout("Checked 3 Pyre files in ./pyre.\n");
 }
 
 #[test]
@@ -1289,7 +1385,7 @@ record Task {
 
     let mut schema_rows = conn
         .query(
-            "select schema from _pyre_schema order by created_at desc limit 1",
+            "select schema from _pyre_migrations where schema is not null order by id desc limit 1",
             (),
         )
         .await
@@ -1299,12 +1395,12 @@ record Task {
         .next()
         .await
         .unwrap()
-        .expect("_pyre_schema should contain at least one schema row");
+        .expect("_pyre_migrations should contain a schema-bearing row");
     let schema_source: String = schema_row.get(0).unwrap();
 
     assert!(
         schema_source.contains("status TaskStatus"),
-        "_pyre_schema should store the pushed schema source"
+        "_pyre_migrations should store the pushed schema source"
     );
 }
 
@@ -1601,11 +1697,6 @@ fn test_generated_elm_client_compiles_nested_lenses() {
 
 #[tokio::test]
 async fn test_generated_typescript_runner_decodes_enum_unions_and_dates() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based TypeScript runtime test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     write_ai_session_schema_and_query(&ctx);
 
@@ -1650,11 +1741,6 @@ console.log("decoder-check-passed");
 
 #[tokio::test]
 async fn test_generated_typescript_runner_decodes_payload_unions_and_datetime_strings() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based TypeScript runtime test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     write_union_payload_schema_and_query(&ctx);
 
@@ -1691,11 +1777,6 @@ async fn test_generated_typescript_runner_decodes_payload_unions_and_datetime_st
 
 #[tokio::test]
 async fn test_generated_typescript_runner_roundtrips_json_values() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based TypeScript runtime test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     write_json_schema_and_query(&ctx);
 
@@ -1758,11 +1839,6 @@ console.log("json-roundtrip-check-passed");
 
 #[tokio::test]
 async fn test_generated_typescript_runner_roundtrips_typed_json_values() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based TypeScript runtime test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     write_typed_json_schema_and_query(&ctx);
 
@@ -1816,11 +1892,6 @@ console.log("typed-json-roundtrip-check-passed");
 
 #[tokio::test]
 async fn test_generated_seed_data_decodes_through_generated_query() {
-    if !bun_is_available() {
-        eprintln!("Skipping bun-based seed decode test: bun not available");
-        return;
-    }
-
     let ctx = TestContext::new();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
@@ -1833,6 +1904,16 @@ record Token {
     createdAt DateTime @default(now)
     @public
 }
+
+record Game {
+    id Id.Uuid @id
+    kind GameKind
+    @public
+}
+
+type GameKind
+   = Campaign
+   | Clocktower
 
 type TokenPayload
    = TokenPayload {
@@ -1861,6 +1942,13 @@ query GetTokens {
         placement
     }
 }
+
+query GetGames {
+    game {
+        id
+        kind
+    }
+}
         "#,
     )
     .unwrap();
@@ -1870,11 +1958,21 @@ query GetTokens {
     let verify_script = r#"
 import { createClient } from "@libsql/client";
 import { seed } from "./pyre/generated/typescript/server.ts";
-import { GetTokens } from "./pyre/generated/typescript/run.ts";
+import { GetGames, GetTokens } from "./pyre/generated/typescript/run.ts";
 
 const db = createClient({ url: "file:.yak/yak.db" });
 
 const seeded = await seed(db, {
+  games: [
+    {
+      id: "00000000-0000-4000-8000-000000000001",
+      kind: { _type: "Campaign" },
+    },
+    {
+      id: "00000000-0000-4000-8000-000000000002",
+      kind: "Clocktower",
+    },
+  ],
   tokens: [
     {
       id: 1,
@@ -1891,6 +1989,19 @@ const seeded = await seed(db, {
 
 if (seeded.kind !== "success") {
   throw new Error(`Seed failed: ${JSON.stringify(seeded)}`);
+}
+
+const gamesResult = await GetGames(db, {});
+const games = gamesResult?.game;
+if (!Array.isArray(games) || games.length !== 2) {
+  throw new Error(`Expected two game rows, got: ${JSON.stringify(gamesResult)}`);
+}
+const gameKinds = Object.fromEntries(games.map((game) => [game.id, game.kind]));
+if (gameKinds["00000000-0000-4000-8000-000000000001"] !== "Campaign") {
+  throw new Error(`Expected tagged Campaign seed input to normalize and decode, got: ${JSON.stringify(games)}`);
+}
+if (gameKinds["00000000-0000-4000-8000-000000000002"] !== "Clocktower") {
+  throw new Error(`Expected scalar Clocktower seed input to decode, got: ${JSON.stringify(games)}`);
 }
 
 const result = await GetTokens(db, {});

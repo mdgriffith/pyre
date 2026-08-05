@@ -93,11 +93,25 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
     result.push_str("  return decoded.data;\n");
     result.push_str("}\n\n");
 
+    // Generate custom type definitions (tagged unions) in dependency order
+    let recursive_types = common::recursive_type_names(database);
+    let sorted_types = common::sort_types_by_dependency(database);
+    for (name, parsed_variants) in sorted_types {
+        let variants = match context.types.get(&name) {
+            Some((_, typecheck::Type::OneOf { variants })) => variants,
+            _ => &parsed_variants,
+        };
+        result.push_str(&common::generate_tagged_union(
+            &name,
+            variants,
+            recursive_types.contains(&name),
+        ));
+    }
+
     // Get session definition
-    let session = database
-        .schemas
-        .iter()
-        .find_map(|s| s.session.clone())
+    let session = context
+        .session
+        .clone()
         .unwrap_or_else(|| ast::default_session_details());
 
     // Generate Session type
@@ -105,9 +119,13 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
     result.push_str("export interface Session {\n");
     for field in &session.fields {
         if let ast::Field::Column(col) = field {
-            let type_str = col.type_.to_string();
             let ts_type = match &col.type_ {
-                ast::ColumnType::ForeignKey {
+                ast::ColumnType::String => "string".to_string(),
+                ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
+                    "number".to_string()
+                }
+                ast::ColumnType::IdUuid { .. }
+                | ast::ColumnType::ForeignKey {
                     serialization_type:
                         Some(
                             ast::ConcreteSerializationType::Text
@@ -115,29 +133,25 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                             | ast::ConcreteSerializationType::IdUuid,
                         ),
                     ..
-                } => "string",
+                } => "string".to_string(),
                 ast::ColumnType::ForeignKey {
                     serialization_type: Some(ast::ConcreteSerializationType::DateTime),
                     ..
-                } => "Date | string | number",
-                _ => match type_str.as_str() {
-                    "String" => "string",
-                    "Int" | "Float" => "number",
-                    "Bool" => "boolean",
-                    "DateTime" => "Date | string | number",
-                    _ if type_str == "Id.Int"
-                        || type_str == "Id.Uuid"
-                        || type_str.starts_with("Id.Int<")
-                        || type_str.starts_with("Id.Uuid<")
-                        || type_str.contains('.') =>
-                    {
-                        "number"
-                    }
-                    other => other,
-                },
+                } => "Date | string | number".to_string(),
+                ast::ColumnType::ForeignKey { .. } => "number".to_string(),
+                ast::ColumnType::Bool => "boolean".to_string(),
+                ast::ColumnType::DateTime => "Date | string | number".to_string(),
+                other => other.to_string(),
             };
-            let optional = if col.nullable { "?" } else { "" };
-            result.push_str(&format!("  {}{}: {};\n", col.name, optional, ts_type));
+            let (optional, nullable) = if col.nullable {
+                ("?", " | null")
+            } else {
+                ("", "")
+            };
+            result.push_str(&format!(
+                "  {}{}: {}{};\n",
+                col.name, optional, ts_type, nullable
+            ));
         }
     }
     result.push_str("}\n\n");
@@ -146,10 +160,15 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
     result.push_str("export const SessionValidator = z.object({\n");
     for field in &session.fields {
         if let ast::Field::Column(col) = field {
-            let type_str = col.type_.to_string();
             let validator = match &col.type_ {
                 ast::ColumnType::Custom(name) => session_custom_validator(context, name),
-                ast::ColumnType::ForeignKey {
+                ast::ColumnType::String => "z.string()".to_string(),
+                ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => {
+                    "z.number().int()".to_string()
+                }
+                ast::ColumnType::Float => "z.number()".to_string(),
+                ast::ColumnType::IdUuid { .. }
+                | ast::ColumnType::ForeignKey {
                     serialization_type:
                         Some(
                             ast::ConcreteSerializationType::Text
@@ -162,24 +181,21 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                     serialization_type: Some(ast::ConcreteSerializationType::DateTime),
                     ..
                 } => "CoercedDate".to_string(),
-                _ => match type_str.as_str() {
-                    "String" => "z.string()".to_string(),
-                    "Int" | "Float" => "z.number()".to_string(),
-                    "Bool" => "CoercedBool".to_string(),
-                    "DateTime" => "CoercedDate".to_string(),
-                    _ if type_str == "Id.Int"
-                        || type_str == "Id.Uuid"
-                        || type_str.starts_with("Id.Int<")
-                        || type_str.starts_with("Id.Uuid<")
-                        || type_str.contains('.') =>
-                    {
-                        "z.number()".to_string()
-                    }
-                    other => format!("z.any() /* {} */", other),
-                },
+                ast::ColumnType::ForeignKey {
+                    serialization_type:
+                        Some(
+                            ast::ConcreteSerializationType::Integer
+                            | ast::ConcreteSerializationType::IdInt,
+                        ),
+                    ..
+                } => "z.number().int()".to_string(),
+                ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
+                ast::ColumnType::Bool => "CoercedBool".to_string(),
+                ast::ColumnType::DateTime => "CoercedDate".to_string(),
+                other => format!("z.any() /* {} */", other),
             };
             let validator = if col.nullable {
-                format!("{}.optional()", validator)
+                format!("{}.nullish()", validator)
             } else {
                 validator
             };
@@ -187,12 +203,6 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
         }
     }
     result.push_str("});\n\n");
-
-    // Generate custom type definitions (tagged unions) in dependency order
-    let sorted_types = common::sort_types_by_dependency(database);
-    for (name, variants) in sorted_types {
-        result.push_str(&common::generate_tagged_union(&name, &variants));
-    }
 
     result
 }

@@ -137,6 +137,24 @@ pub fn predicate_operand_is_nullable(
         .unwrap_or(false)
 }
 
+pub fn session_field_is_structured_union(context: &Context, field_name: &str) -> bool {
+    let Some(type_name) = context.session.as_ref().and_then(|session| {
+        session.fields.iter().find_map(|field| match field {
+            ast::Field::Column(column) if column.name == field_name => {
+                column.type_.get_custom_type_name()
+            }
+            _ => None,
+        })
+    }) else {
+        return false;
+    };
+
+    matches!(
+        context.types.get(type_name),
+        Some((_, Type::OneOf { variants })) if variants.iter().any(|variant| variant.fields.is_some())
+    )
+}
+
 pub fn query_value_is_nullable(context: &Context, value: &ast::QueryValue) -> bool {
     match value {
         ast::QueryValue::Null(_) => true,
@@ -984,14 +1002,26 @@ pub fn query_param_type_for_column(table: &ast::RecordDetails, column: &ast::Col
 /// Resolves record field references used in query parameter declarations to the
 /// field's concrete type. Parsed references otherwise retain an integer fallback.
 pub fn resolve_query_param_type(context: &Context, type_: &str) -> String {
-    let ast::ColumnType::ForeignKey { table, field, .. } = ast::ColumnType::from_str(type_) else {
+    let ast::ColumnType::ForeignKey {
+        schema,
+        table,
+        field,
+        ..
+    } = ast::ColumnType::from_str(type_)
+    else {
         return type_.to_string();
     };
 
     context
         .tables
         .values()
-        .find(|candidate| candidate.record.name == table)
+        .find(|candidate| {
+            candidate.record.name == table
+                && schema
+                    .as_ref()
+                    .map(|schema| candidate.schema == *schema)
+                    .unwrap_or(true)
+        })
         .and_then(|candidate| {
             candidate
                 .record
@@ -1256,15 +1286,24 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
 
                                     // Validate foreign key references
                                     if let ast::ColumnType::ForeignKey {
+                                        schema: ref_schema,
                                         table: ref_table,
                                         field: ref_field,
                                         ..
                                     } = &column.type_
                                     {
-                                        // Check if the referenced table exists
-                                        let ref_table_lower =
-                                            crate::ext::string::decapitalize(ref_table);
-                                        match context.tables.get(&ref_table_lower) {
+                                        let target_schema =
+                                            ref_schema.as_ref().unwrap_or(&schema.namespace);
+                                        let referenced_table = ref_schema
+                                            .as_ref()
+                                            .map(|schema| format!("{}.{}", schema, ref_table))
+                                            .unwrap_or_else(|| ref_table.clone());
+                                        let foreign_table = context.tables.values().find(|table| {
+                                            table.schema == *target_schema
+                                                && table.record.name == *ref_table
+                                        });
+
+                                        match foreign_table {
                                             Some(foreign_table) => {
                                                 // Check if the referenced field exists
                                                 let ref_column =
@@ -1290,8 +1329,9 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                                                         field_name: column
                                                                             .name
                                                                             .clone(),
-                                                                        referenced_table: ref_table
-                                                                            .clone(),
+                                                                        referenced_table:
+                                                                            referenced_table
+                                                                                .clone(),
                                                                         referenced_field: ref_field
                                                                             .clone(),
                                                                         referenced_field_type: ref_col
@@ -1327,8 +1367,8 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                                             error_type:
                                                                 ErrorType::ForeignKeyToUnknownField {
                                                                     field_name: column.name.clone(),
-                                                                    referenced_table: ref_table
-                                                                        .clone(),
+                                                                    referenced_table:
+                                                                        referenced_table.clone(),
                                                                     referenced_field: ref_field
                                                                         .clone(),
                                                                     existing_fields,
@@ -1346,14 +1386,18 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                             }
                                             None => {
                                                 // Table doesn't exist
-                                                let existing_tables: Vec<String> =
-                                                    context.tables.keys().cloned().collect();
+                                                let existing_tables: Vec<String> = context
+                                                    .tables
+                                                    .values()
+                                                    .filter(|table| table.schema == *target_schema)
+                                                    .map(|table| table.record.name.clone())
+                                                    .collect();
                                                 errors.push(Error {
                                                     filepath: file.path.clone(),
                                                     error_type:
                                                         ErrorType::ForeignKeyToUnknownTable {
                                                             field_name: column.name.clone(),
-                                                            referenced_table: ref_table.clone(),
+                                                            referenced_table,
                                                             existing_tables,
                                                         },
                                                     locations: vec![Location {
@@ -1668,47 +1712,63 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
 }
 
 fn resolve_foreign_key_serialization_types(context: &mut Context) {
-    let foreign_key_types: HashMap<String, HashMap<String, ast::ConcreteSerializationType>> =
-        context
-            .tables
-            .iter()
-            .map(|(table_name, table)| {
-                let columns = table
-                    .record
-                    .fields
-                    .iter()
-                    .filter_map(|field| match field {
-                        ast::Field::Column(column) => column
-                            .type_
-                            .to_serialization_type()
-                            .into_concrete()
-                            .map(|type_| (column.name.clone(), type_)),
-                        _ => None,
-                    })
-                    .collect();
-                (table_name.clone(), columns)
-            })
-            .collect();
+    let foreign_key_types: HashMap<
+        (String, String),
+        HashMap<String, ast::ConcreteSerializationType>,
+    > = context
+        .tables
+        .iter()
+        .map(|(_, table)| {
+            let columns = table
+                .record
+                .fields
+                .iter()
+                .filter_map(|field| match field {
+                    ast::Field::Column(column) => column
+                        .type_
+                        .to_serialization_type()
+                        .into_concrete()
+                        .map(|type_| (column.name.clone(), type_)),
+                    _ => None,
+                })
+                .collect();
+            ((table.schema.clone(), table.record.name.clone()), columns)
+        })
+        .collect();
 
     fn resolve_type(
         type_: &mut ast::ColumnType,
-        foreign_key_types: &HashMap<String, HashMap<String, ast::ConcreteSerializationType>>,
+        current_schema: Option<&str>,
+        foreign_key_types: &HashMap<
+            (String, String),
+            HashMap<String, ast::ConcreteSerializationType>,
+        >,
     ) {
         match type_ {
             ast::ColumnType::ForeignKey {
+                schema,
                 table,
                 field,
                 serialization_type,
             } => {
-                *serialization_type = foreign_key_types
-                    .get(&crate::ext::string::decapitalize(table))
-                    .and_then(|columns| columns.get(field))
-                    .cloned();
+                let columns = match schema.as_deref().or(current_schema) {
+                    Some(target_schema) => {
+                        foreign_key_types.get(&(target_schema.to_string(), table.clone()))
+                    }
+                    None => foreign_key_types
+                        .iter()
+                        .find_map(|((_, candidate), columns)| {
+                            (candidate == table).then_some(columns)
+                        }),
+                };
+                *serialization_type = columns.and_then(|columns| columns.get(field)).cloned();
             }
             ast::ColumnType::JsonTyped(inner)
             | ast::ColumnType::List(inner)
             | ast::ColumnType::Dict(inner)
-            | ast::ColumnType::Nullable(inner) => resolve_type(inner, foreign_key_types),
+            | ast::ColumnType::Nullable(inner) => {
+                resolve_type(inner, current_schema, foreign_key_types)
+            }
             _ => {}
         }
     }
@@ -1716,7 +1776,31 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
     for table in context.tables.values_mut() {
         for field in &mut table.record.fields {
             if let ast::Field::Column(column) = field {
-                resolve_type(&mut column.type_, &foreign_key_types);
+                resolve_type(&mut column.type_, Some(&table.schema), &foreign_key_types);
+            }
+        }
+    }
+
+    if let Some(session) = &mut context.session {
+        for field in &mut session.fields {
+            if let ast::Field::Column(column) = field {
+                resolve_type(&mut column.type_, None, &foreign_key_types);
+            }
+        }
+    }
+
+    for (_, type_) in context.types.values_mut() {
+        let Type::OneOf { variants } = type_ else {
+            continue;
+        };
+        for variant in variants {
+            let Some(fields) = &mut variant.fields else {
+                continue;
+            };
+            for field in fields {
+                if let ast::Field::Column(column) = field {
+                    resolve_type(&mut column.type_, None, &foreign_key_types);
+                }
             }
         }
     }
@@ -2547,6 +2631,7 @@ fn check_where_args(
                         &table.name,
                         &column_type_string,
                         is_nullable,
+                        true,
                     );
                 }
             }
@@ -2791,6 +2876,7 @@ fn check_permissions_where_args(
                         &table.name,
                         &query_param_type_for_column(table, &column),
                         column.nullable,
+                        true,
                     );
                     for error in &mut errors[first_new_error..] {
                         error.filepath = filepath.clone();
@@ -3329,6 +3415,7 @@ fn check_value(
     table_name: &str,
     table_type_string: &str,
     is_nullable: bool,
+    allow_nullable_value: bool,
 ) {
     if let ast::ColumnType::JsonTyped(inner) = ast::ColumnType::from_str(table_type_string) {
         match value {
@@ -3345,6 +3432,7 @@ fn check_value(
                     table_name,
                     &inner.to_string(),
                     false,
+                    allow_nullable_value,
                 );
                 return;
             }
@@ -3486,6 +3574,7 @@ fn check_value(
                                 table_name,
                                 arg_type,
                                 false,
+                                false,
                             );
                         }
                         if !are_query_types_compatible(
@@ -3582,9 +3671,15 @@ fn check_value(
                                             filepath: context.current_filepath.clone(),
                                             error_type: ErrorType::TypeMismatch {
                                                 table: table_name.to_string(),
-                                                column_defined_as: table_type_string.to_string(),
-                                                variable_name: var.name.clone(),
-                                                variable_defined_as: type_name.clone(),
+                                                column_defined_as: format_query_type(
+                                                    table_type_string,
+                                                    is_nullable,
+                                                ),
+                                                variable_name: ast::to_pyre_variable_name(var),
+                                                variable_defined_as: format_query_type(
+                                                    type_name,
+                                                    *param_nullable,
+                                                ),
                                             },
                                             locations: vec![
                                                 Location {
@@ -3602,23 +3697,16 @@ fn check_value(
                                             ],
                                         })
                                     }
-                                    // 2. Check nullability: nullable params cannot be used with non-nullable columns
-                                    //    Null is not a valid value for non-nullable types, regardless of context
-                                    //    (WHERE clauses, SET operations, etc.)
-                                    if !is_nullable && *param_nullable {
+                                    // Comparisons can safely receive null. Assignments to required
+                                    // fields and other required values cannot.
+                                    if !allow_nullable_value && !is_nullable && *param_nullable {
                                         errors.push(Error {
                                             filepath: context.current_filepath.clone(),
                                             error_type: ErrorType::TypeMismatch {
                                                 table: table_name.to_string(),
-                                                column_defined_as: format!(
-                                                    "{} (non-nullable)",
-                                                    table_type_string
-                                                ),
-                                                variable_name: var.name.clone(),
-                                                variable_defined_as: format!(
-                                                    "{} (nullable)",
-                                                    type_name
-                                                ),
+                                                column_defined_as: table_type_string.to_string(),
+                                                variable_name: ast::to_pyre_variable_name(var),
+                                                variable_defined_as: format!("{}?", type_name),
                                             },
                                             locations: vec![
                                                 Location {
@@ -3701,6 +3789,14 @@ fn check_value(
                 }
             }
         }
+    }
+}
+
+fn format_query_type(type_name: &str, nullable: bool) -> String {
+    if nullable {
+        format!("{}?", type_name)
+    } else {
+        type_name.to_string()
     }
 }
 
@@ -3929,6 +4025,7 @@ fn check_table_query(
                             params,
                             &table.record.name,
                             "Int",
+                            false,
                             false,
                         );
                     }
@@ -4274,6 +4371,7 @@ fn check_field(
                 &column.name,
                 &column_type_str,
                 column.nullable,
+                false,
             );
 
             // If this is a union variant with nested fields (e.g., Success { message = $message }),
@@ -4318,6 +4416,7 @@ fn check_field(
                                                     &variant_col.name,
                                                     &variant_col_type_str,
                                                     variant_col.nullable,
+                                                    false,
                                                 );
                                             }
                                         }
@@ -4412,6 +4511,7 @@ fn check_field(
                                                             &variant_col.name,
                                                             &variant_col_type_str,
                                                             variant_col.nullable,
+                                                            false,
                                                         );
                                                     }
                                                 }

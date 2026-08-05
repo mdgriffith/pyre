@@ -14,6 +14,7 @@ export interface LiveSyncMessage {
   databaseId?: string;
   connectionId?: string;
   serverRevision?: number;
+  databaseEpoch?: string;
   data?: unknown;
   error?: string;
 }

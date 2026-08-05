@@ -171,6 +171,9 @@ enum Commands {
     /// Start the Pyre MCP server over stdio.
     Mcp,
 
+    /// Start the Pyre language server over stdio.
+    Lsp,
+
     /// Print bundled documentation by topic, or list topics.
     Docs {
         /// Documentation topic name.
@@ -278,6 +281,9 @@ async fn main() -> io::Result<()> {
         }
         Commands::Mcp => {
             command::mcp(&options).await?;
+        }
+        Commands::Lsp => {
+            command::lsp(&options).await?;
         }
         Commands::Docs { topic } => {
             command::docs(topic)?;

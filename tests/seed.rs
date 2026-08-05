@@ -66,8 +66,8 @@ impl SeedDatabase {
 
         let schema_string = pyre::generate::to_string::schema_to_string("", &schema);
         migration_sql.push(SqlAndParams::SqlWithParams {
-            sql: migrate::INSERT_SCHEMA.to_string(),
-            args: vec![schema_string],
+            sql: migrate::INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
+            args: vec!["test-init".to_string(), "".to_string(), schema_string],
         });
 
         let conn = db.connect().map_err(TestError::Database)?;

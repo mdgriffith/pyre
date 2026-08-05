@@ -223,6 +223,8 @@ Pyre's TypeScript packages are distributed as versioned GitHub Release artifacts
 
 Then run `bun install`. Generated artifacts currently consume the packages as TypeScript source, so use Bun or a build tool that transpiles TypeScript dependencies. Commit the resulting lockfile and keep all `@pyre/*` packages on the same release version.
 
+Generated TypeScript and `@pyre/server` support Zod 4. Zod 3 is not supported because generated decoders use Zod 4's distinct input and output schema types.
+
 ### Option 1: Use The Built-In Server
 
 If you want a working HTTP server quickly:

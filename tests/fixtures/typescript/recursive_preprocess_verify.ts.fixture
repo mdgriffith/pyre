@@ -1,0 +1,75 @@
+import { Attribute } from "./decode";
+import type { Attribute as AttributeType } from "./decode";
+import { z } from "zod";
+
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+  (<Value>() => Value extends Right ? 1 : 2) ? true : false;
+type Expect<Value extends true> = Value;
+type AttributeInputIsUnknown = Expect<Equal<z.input<typeof Attribute>, unknown>>;
+type AttributeOutputIsStrong = Expect<Equal<z.output<typeof Attribute>, AttributeType>>;
+
+const decoded: AttributeType = Attribute.parse({
+  _type: "AttributeCustom",
+  query__variant: "Example",
+  query__fields: {
+    value: { _type: "AttributeInt", query__value: 42 },
+  },
+});
+
+if (decoded._type !== "AttributeCustom" || decoded.variant !== "Example") {
+  throw new Error("prefixed fields were not normalized");
+}
+
+const bool = Attribute.parse({ _type: "AttributeBool", value: 1 });
+if (bool._type !== "AttributeBool" || bool.value !== true) {
+  throw new Error("boolean input was not coerced");
+}
+
+const timestamp = Attribute.parse({
+  _type: "AttributeTimestamp",
+  value: "2026-08-04T12:00:00Z",
+});
+if (timestamp._type !== "AttributeTimestamp" || !(timestamp.value instanceof Date)) {
+  throw new Error("DateTime input was not coerced");
+}
+
+const nullable = Attribute.parse({ _type: "AttributeInt", value: 1, fallback: null });
+if (nullable._type !== "AttributeInt" || nullable.fallback !== null) {
+  throw new Error("nullable input was not preserved");
+}
+
+const nested = Attribute.parse({
+  _type: "AttributeNested",
+  items: [{ example: { _type: "AttributeCustomValue", variant: "Nested", fields: {} } }],
+});
+if (nested._type !== "AttributeNested" || nested.items?.[0]?.example.variant !== "Nested") {
+  throw new Error("nested list and dictionary input was not decoded");
+}
+
+const set = Attribute.parse({
+  _type: "AttributeSet",
+  elementType: "Example",
+  items: [{ _type: "AttributeCustomValue", variant: "Set", fields: {} }],
+});
+if (set._type !== "AttributeSet" || set.items?.[0]?.variant !== "Set") {
+  throw new Error("set items were not decoded");
+}
+
+const choices = Attribute.parse({
+  _type: "AttributeChoiceList",
+  choiceType: "Example",
+  items: [{ _type: "AttributeCustomValue", variant: "Choice", fields: {} }],
+});
+if (choices._type !== "AttributeChoiceList" || choices.items?.[0]?.variant !== "Choice") {
+  throw new Error("choice-list items were not decoded");
+}
+
+const pool = Attribute.parse({
+  _type: "AttributePool",
+  keyType: "Example",
+  entries: [{ _type: "AttributePoolEntry", key: "one", max: 2, remaining: 1 }],
+});
+if (pool._type !== "AttributePool" || pool.entries?.[0]?.remaining !== 1) {
+  throw new Error("pool entries were not decoded");
+}

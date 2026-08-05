@@ -51,7 +51,7 @@ pub async fn migrate<'a>(
         Err(error_list) => {
             error::report_and_exit(error_list, &paths, options.enable_color);
         }
-        Ok(_context) => {
+        Ok(context) => {
             let connection_result = db::connect(&database.to_string(), auth).await;
             match connection_result {
                 Ok(conn) => {
@@ -59,6 +59,7 @@ pub async fn migrate<'a>(
                         &conn,
                         db::MigrateOptions {
                             schema,
+                            context: &context,
                             migration_folder: &namespace_migration_dir,
                             migration_root: Path::new(migration_dir),
                             namespace: namespace.as_deref(),
@@ -167,10 +168,11 @@ pub async fn push<'a>(
                                 sql.splice(0..0, pyre::db::migrate::internal_setup_sql());
 
                                 let schema_source =
-                                    pyre::generate::to_string::schema_to_string("", current_schema);
+                                    pyre::db::migrate::schema_to_storage_string(current_schema);
                                 sql.push(SqlAndParams::SqlWithParams {
-                                    sql: pyre::db::migrate::INSERT_SCHEMA.to_string(),
-                                    args: vec![schema_source],
+                                    sql: pyre::db::migrate::INSERT_MIGRATION_SUCCESS_WITH_SCHEMA
+                                        .to_string(),
+                                    args: vec!["push".to_string(), "".to_string(), schema_source],
                                 });
 
                                 match conn.connect() {

@@ -2,7 +2,7 @@ import { expect, mock, test } from "bun:test";
 import type { SchemaMetadata } from "@pyre/core";
 import { z } from "zod";
 import { run, seed } from "./query";
-import { buildArgs } from "./runtime/sql";
+import { buildArgs, toSqlStatements } from "./runtime/sql";
 
 test("sync wraps mutation responses with server revision metadata", async () => {
   const db = {
@@ -157,11 +157,101 @@ test("SQL args bind logical tagged-union sessions to physical paths", () => {
     session_scope__accountId: null,
     session_accountId: 3,
     session_visibleAfter: 1783787812,
-    session_roles: ["admin", "editor"],
-    session_preferences: { theme: "dark", refreshedAt: 1783787812 },
+    session_roles: JSON.stringify(["admin", "editor"]),
+    session_preferences: JSON.stringify({ theme: "dark", refreshedAt: 1783787812 }),
     session_nullableField: null,
     session_account__id: 11,
   });
+});
+
+test("SQL statements bind every declared parameter", () => {
+  expect(toSqlStatements(
+    [{ include: true, params: ["present", "omitted"], sql: "select $present, $omitted" }],
+    { present: 1 },
+  )).toEqual([{
+    sql: "select $present, $omitted",
+    args: { present: 1, omitted: null },
+  }]);
+});
+
+test("nullable session args always receive SQL bindings", async () => {
+  const db = {
+    batch: mock(async () => []),
+  };
+  const query = {
+    findUsers: {
+      id: "findUsers",
+      sql: [{
+        include: true,
+        params: ["session_isAdmin", "session_userId"],
+        sql: "select 1 where $session_userId is not null or $session_isAdmin = 1",
+      }],
+      session_args: ["isAdmin", "userId"],
+      optional_input_args: [],
+      json_input_args: [],
+      InputValidator: z.object({}),
+      SessionValidator: z.object({
+        userId: z.number().nullish(),
+        isAdmin: z.boolean(),
+      }),
+    },
+  };
+
+  for (const [session, expectedUserId] of [
+    [{ isAdmin: true, userId: 42 }, 42],
+    [{ isAdmin: true, userId: null }, null],
+    [{ isAdmin: true }, null],
+  ] as const) {
+    const result = await run(
+      db as any,
+      query,
+      "findUsers",
+      {},
+      session,
+      new Map(),
+      async () => ({}),
+    );
+
+    expect(result.kind).not.toBe("error");
+    const statement = db.batch.mock.calls.at(-1)?.[0][0];
+    expect(statement.args).toEqual({
+      session_isAdmin: true,
+      session_userId: expectedUserId,
+    });
+    expect(Object.keys(statement.args)).toHaveLength(statement.sql.match(/\$session_/g)?.length ?? 0);
+  }
+
+  expect(db.batch).toHaveBeenCalledTimes(3);
+});
+
+test("missing non-nullable session args fail validation before SQL execution", async () => {
+  const db = {
+    batch: mock(async () => []),
+  };
+
+  const result = await run(
+    db as any,
+    {
+      findUsers: {
+        id: "findUsers",
+        sql: [{ include: true, params: ["session_isAdmin"], sql: "select $session_isAdmin" }],
+        session_args: ["isAdmin"],
+        optional_input_args: [],
+        json_input_args: [],
+        InputValidator: z.object({}),
+        SessionValidator: z.object({ isAdmin: z.boolean() }),
+      },
+    },
+    "findUsers",
+    {},
+    {},
+    new Map(),
+    async () => ({}),
+  );
+
+  expect(result.kind).toBe("error");
+  expect(result.error?.errorType).toBe("InvalidSession");
+  expect(db.batch).not.toHaveBeenCalled();
 });
 
 test("sync does not fan out when no affected rows are returned", async () => {

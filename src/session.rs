@@ -13,11 +13,10 @@ pub fn prepare_session(
         .as_object()
         .ok_or_else(|| "Session must be an object".to_string())?;
     let Some(session) = context.session.as_ref() else {
-        return if object.is_empty() {
-            Ok(HashMap::new())
-        } else {
-            Err("Schema does not define a Session".to_string())
-        };
+        return Ok(object
+            .iter()
+            .map(|(name, value)| (name.clone(), untyped_session_value(value)))
+            .collect());
     };
     if session.fields.is_empty() && session.start.is_none() {
         return Ok(object
@@ -71,8 +70,10 @@ fn flatten_column(
     let type_ = unwrap_nullable(&column.type_);
     if let Some(type_name) = type_.get_custom_type_name() {
         if let Some((_, Type::OneOf { variants })) = context.types.get(type_name) {
+            let accepts_string_tag = variants.iter().all(|variant| variant.fields.is_none());
             let tag = value
                 .as_str()
+                .filter(|_| accepts_string_tag)
                 .or_else(|| value.get("_type").and_then(JsonValue::as_str))
                 .ok_or_else(|| {
                     format!(
@@ -150,7 +151,12 @@ fn scalar_session_value(type_: &ast::ColumnType, value: &JsonValue) -> Option<Se
         ast::ColumnType::Bool => value
             .as_bool()
             .map(|value| SessionValue::Integer(if value { 1 } else { 0 }))
-            .or_else(|| value.as_i64().map(SessionValue::Integer)),
+            .or_else(|| {
+                value
+                    .as_i64()
+                    .filter(|value| matches!(value, 0 | 1))
+                    .map(SessionValue::Integer)
+            }),
         ast::ColumnType::DateTime => value.as_i64().map(SessionValue::Integer).or_else(|| {
             value
                 .as_str()
@@ -322,6 +328,41 @@ mod tests {
         assert_eq!(
             prepare_session(&context, &serde_json::json!({})),
             Ok(HashMap::new())
+        );
+    }
+
+    #[test]
+    fn legacy_flat_session_is_preserved_without_a_session_schema() {
+        let mut schema = ast::Schema::default();
+        crate::parser::run(
+            "schema.pyre",
+            "record Item {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n}",
+            &mut schema,
+        )
+        .unwrap();
+        let context = typecheck::check_schema(&ast::Database {
+            schemas: vec![schema],
+        })
+        .unwrap();
+
+        assert_eq!(
+            prepare_session(&context, &serde_json::json!({ "userId": 7 })),
+            Ok(HashMap::from([(
+                "userId".to_string(),
+                SessionValue::Integer(7)
+            )]))
+        );
+    }
+
+    #[test]
+    fn boolean_session_numbers_are_limited_to_sql_boolean_values() {
+        assert_eq!(
+            scalar_session_value(&ast::ColumnType::Bool, &serde_json::json!(1)),
+            Some(SessionValue::Integer(1))
+        );
+        assert_eq!(
+            scalar_session_value(&ast::ColumnType::Bool, &serde_json::json!(2)),
+            None
         );
     }
 

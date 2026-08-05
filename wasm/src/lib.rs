@@ -33,6 +33,15 @@ pub fn migrate(name: String, schema_source: String) -> JsValue {
 }
 
 #[wasm_bindgen]
+pub fn migrate_with_introspection(
+    name: String,
+    schema_source: String,
+    introspection: JsValue,
+) -> Result<JsValue, JsValue> {
+    migrate::migrate_with_introspection_wasm(name, schema_source, introspection)
+}
+
+#[wasm_bindgen]
 pub fn query_to_sql(query_source: String) -> JsValue {
     let result = query::query_to_sql_wasm(query_source);
     serde_wasm_bindgen::to_value(&result).unwrap()

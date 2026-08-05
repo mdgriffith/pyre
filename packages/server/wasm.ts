@@ -1,5 +1,6 @@
 export { init } from "./init";
-export { loadSchemaFromDatabase, getIntrospectionJson, getPyreSchemaSource } from "./schema";
+export { ensureDatabase, loadSchemaFromDatabase, getIntrospectionJson, getPyreSchemaSource } from "./schema";
+export type { EnsureDatabaseOutcome } from "./schema";
 export { catchup } from "./sync";
 export { runWithSync } from "./query-sync";
 

@@ -1,6 +1,5 @@
 use crate::ast;
 use nom::ToUsize;
-use std::collections::BTreeMap;
 
 pub fn schema_to_string(namespace: &str, schema: &ast::Schema) -> String {
     let mut result = String::new();
@@ -43,8 +42,13 @@ fn to_string_definition(namespace: &str, definition: &ast::Definition) -> String
             let indent_collection: Indentation = collect_indentation(&session.fields, 4);
 
             let mut result = "session {\n".to_string();
-            for field in &session.fields {
-                result.push_str(&to_string_field(namespace, &indent_collection, &field));
+            for (index, field) in session.fields.iter().enumerate() {
+                result.push_str(&to_string_field(
+                    namespace,
+                    &indent_collection,
+                    index,
+                    field,
+                ));
             }
             result.push_str("}\n");
             result
@@ -62,8 +66,13 @@ fn to_string_definition(namespace: &str, definition: &ast::Definition) -> String
             let indent_collection: Indentation = collect_indentation(&fields, 4);
 
             let mut result = format!("record {} {{\n", name);
-            for field in fields {
-                result.push_str(&to_string_field(namespace, &indent_collection, &field));
+            for (index, field) in fields.iter().enumerate() {
+                result.push_str(&to_string_field(
+                    namespace,
+                    &indent_collection,
+                    index,
+                    field,
+                ));
             }
             result.push_str("}\n");
             result
@@ -74,164 +83,72 @@ fn to_string_definition(namespace: &str, definition: &ast::Definition) -> String
 #[derive(Debug)]
 struct Indentation {
     minimum: usize,
-    levels: BTreeMap<usize, FieldIndent>,
+    levels: Vec<Option<FieldIndent>>,
 }
 
 fn collect_indentation(fields: &Vec<ast::Field>, indent_minimum: usize) -> Indentation {
-    let mut indent_collection: BTreeMap<usize, FieldIndent> = BTreeMap::new();
-    let mut previous_linenumber: usize = 0;
-    for field in fields {
-        let maybe_field_indent = get_field_indent(indent_minimum, field);
-        match maybe_field_indent {
-            Some(indent) => match indent_collection.get(&previous_linenumber) {
-                Some(previous_indent) => {
-                    if previous_indent.line_end + 1 == indent.line_start {
-                        let merged = merge_indents(previous_indent, &indent);
+    let mut levels = vec![None; fields.len()];
+    let mut group_start = None;
 
-                        indent_collection.insert(previous_linenumber, merged);
-                    } else {
-                        indent_collection.insert(indent.line_start, indent.clone());
-                        previous_linenumber = indent.line_start.clone();
-                    }
-                }
-                None => {
-                    indent_collection.insert(indent.line_start, indent.clone());
-                    previous_linenumber = indent.line_start.clone();
-                }
-            },
-            None => {
-                previous_linenumber = 0;
+    for index in 0..=fields.len() {
+        let alignable = fields.get(index).is_some_and(|field| {
+            matches!(
+                field,
+                ast::Field::Column(_) | ast::Field::FieldDirective(ast::FieldDirective::Link(_))
+            )
+        });
+
+        if alignable {
+            group_start.get_or_insert(index);
+            continue;
+        }
+
+        if let Some(start) = group_start.take() {
+            let group = &fields[start..index];
+            let indent = FieldIndent {
+                name_width: group
+                    .iter()
+                    .filter_map(field_name)
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0),
+                type_width: group
+                    .iter()
+                    .filter_map(|field| match field {
+                        ast::Field::Column(column) => Some(
+                            schema_type_to_string(&column.type_).len()
+                                + usize::from(column.nullable),
+                        ),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0),
+            };
+
+            for level in &mut levels[start..index] {
+                *level = Some(indent.clone());
             }
         }
-    }
-
-    // Second pass: recalculate directive_column based on actual field lengths at aligned positions
-    let mut updated_collection = BTreeMap::new();
-    for (line_num, mut field_indent) in indent_collection {
-        // Find the maximum directive column by checking actual field lengths in this group
-        let max_directive_col = calculate_directive_column(fields, &field_indent, indent_minimum);
-        field_indent.directive_column = max_directive_col;
-        updated_collection.insert(line_num, field_indent);
     }
 
     Indentation {
         minimum: indent_minimum,
-        levels: updated_collection,
+        levels,
     }
-}
-
-fn merge_indents(previous_indent: &FieldIndent, indent: &FieldIndent) -> FieldIndent {
-    FieldIndent {
-        line_start: previous_indent.line_start,
-        line_end: indent.line_end,
-        name_column: std::cmp::max(previous_indent.name_column, indent.name_column),
-        type_column: std::cmp::max(previous_indent.type_column, indent.type_column),
-        directive_column: std::cmp::max(previous_indent.directive_column, indent.directive_column),
-    }
-}
-
-fn calculate_directive_column(
-    fields: &Vec<ast::Field>,
-    field_indent: &FieldIndent,
-    _indent_minimum: usize,
-) -> usize {
-    let mut max_directive_start = 0;
-
-    // Find all columns in this alignment group (between line_start and line_end)
-    for field in fields {
-        match field {
-            ast::Field::Column(column) => {
-                if let Some(name_loc) = &column.start_name {
-                    let line = name_loc.line.to_usize();
-                    if line >= field_indent.line_start && line <= field_indent.line_end {
-                        // This column is in the current alignment group
-                        // Calculate where its directive would start after alignment
-                        // type_column is where the type starts, add type length, nullable marker, and space
-                        let nullable_space = if column.nullable { 1 } else { 0 };
-                        let directive_start = field_indent.type_column
-                            + column.type_.to_string().len()
-                            + nullable_space
-                            + 1; // space before directive
-                        max_directive_start = std::cmp::max(max_directive_start, directive_start);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    max_directive_start
 }
 
 #[derive(Clone, Debug)]
 struct FieldIndent {
-    line_start: usize,
-    line_end: usize,
-    name_column: usize,
-    type_column: usize,
-    directive_column: usize,
+    name_width: usize,
+    type_width: usize,
 }
 
-fn get_field_indent(indent_minimum: usize, field: &ast::Field) -> Option<FieldIndent> {
+fn field_name(field: &ast::Field) -> Option<&str> {
     match field {
-        ast::Field::Column(column) => {
-            match (&column.start_name, &column.end_name, &column.end_typename) {
-                (Some(name_loc), Some(name_end_loc), Some(end_typename)) => {
-                    let apply_offset = |column: usize| -> usize {
-                        if indent_minimum > name_loc.column {
-                            indent_minimum - name_loc.column
-                        } else {
-                            if column == 0 {
-                                return 0;
-                            } else {
-                                column - 1
-                            }
-                        }
-                    };
-
-                    let nullable_space = if column.nullable { 1 } else { 0 };
-
-                    return Some(FieldIndent {
-                        line_start: name_loc.line.to_usize(),
-                        line_end: end_typename.line.to_usize(),
-                        name_column: apply_offset(name_loc.column),
-                        type_column: apply_offset(name_end_loc.column + 2),
-                        directive_column: apply_offset(end_typename.column + 1 + nullable_space),
-                    });
-                }
-                _ => (),
-            }
-        }
-        ast::Field::FieldDirective(ast::FieldDirective::Link(link)) => {
-            match (&link.start_name, &link.end_name) {
-                (Some(name_loc), Some(name_end_loc)) => {
-                    let apply_offset = |column: usize| -> usize {
-                        if indent_minimum > name_loc.column {
-                            indent_minimum - name_loc.column
-                        } else {
-                            if column == 0 {
-                                return 0;
-                            } else {
-                                column - 1
-                            }
-                        }
-                    };
-
-                    return Some(FieldIndent {
-                        line_start: name_loc.line.to_usize(),
-                        line_end: name_loc.line.to_usize(),
-                        name_column: apply_offset(name_loc.column),
-                        type_column: apply_offset(name_end_loc.column + 2),
-                        directive_column: apply_offset(name_end_loc.column + 2),
-                    });
-                }
-                _ => (),
-            }
-        }
-        _ => (),
+        ast::Field::Column(column) => Some(&column.name),
+        ast::Field::FieldDirective(ast::FieldDirective::Link(link)) => Some(&link.link_name),
+        _ => None,
     }
-
-    None
 }
 
 fn to_string_variant(namespace: &str, is_first: bool, variant: &ast::Variant) -> String {
@@ -246,8 +163,13 @@ fn to_string_variant(namespace: &str, is_first: bool, variant: &ast::Variant) ->
                 // Format as multiline
                 let mut result = format!("  {}{} {{\n", prefix, variant.name);
                 let indent_collection: Indentation = collect_indentation(&fields, 8);
-                for field in fields {
-                    result.push_str(&to_string_field(namespace, &indent_collection, &field));
+                for (index, field) in fields.iter().enumerate() {
+                    result.push_str(&to_string_field(
+                        namespace,
+                        &indent_collection,
+                        index,
+                        field,
+                    ));
                 }
                 result.push_str("     }\n");
                 result
@@ -339,20 +261,25 @@ fn format_variant_inline(
     result
 }
 
-fn to_string_field(namespace: &str, indent: &Indentation, field: &ast::Field) -> String {
+fn to_string_field(
+    namespace: &str,
+    indent: &Indentation,
+    field_index: usize,
+    field: &ast::Field,
+) -> String {
     match field {
         ast::Field::ColumnLines { count } => "\n".repeat((*count).min(2) as usize),
-        ast::Field::Column(column) => to_string_column(indent, column),
+        ast::Field::Column(column) => to_string_column(indent, field_index, column),
         ast::Field::ColumnComment { text } => {
             format!("{}//{}\n", " ".repeat(indent.minimum), text)
         }
         ast::Field::FieldDirective(directive) => {
-            to_string_field_directive(namespace, indent, directive)
+            to_string_field_directive(namespace, indent, field_index, directive)
         }
     }
 }
 
-fn to_string_column(indentation: &Indentation, column: &ast::Column) -> String {
+fn to_string_column(indentation: &Indentation, field_index: usize, column: &ast::Column) -> String {
     let initial_indent = " ".repeat(indentation.minimum);
     let nullable = if column.nullable { "?" } else { "" };
     let schema_type = schema_type_to_string(&column.type_);
@@ -360,29 +287,13 @@ fn to_string_column(indentation: &Indentation, column: &ast::Column) -> String {
     let mut type_indent_len = 1;
     let mut directive_indent_len = 0;
 
-    let line_number: usize = match &column.start_name {
-        Some(loc) => loc.line.to_usize(),
-        None => 0,
-    };
-
-    let maybe_indent = indentation
-        .levels
-        .range(..=line_number)
-        .next_back()
-        .map(|(_, v)| v);
+    let maybe_indent = indentation.levels.get(field_index).and_then(Option::as_ref);
 
     match maybe_indent {
         Some(indent) => {
-            let name_plus_colon = indentation.minimum + 1 + column.name.len();
-
-            if name_plus_colon < indent.type_column {
-                type_indent_len = indent.type_column - name_plus_colon;
-            }
-
-            let name_plus_colon_plus_type =
-                name_plus_colon + type_indent_len + schema_type.len() + nullable.len() + 1;
-            if name_plus_colon_plus_type < indent.directive_column && column.directives.len() > 0 {
-                directive_indent_len = indent.directive_column - name_plus_colon_plus_type;
+            type_indent_len = indent.name_width - column.name.len() + 1;
+            if !column.directives.is_empty() {
+                directive_indent_len = indent.type_width - schema_type.len() - nullable.len();
             }
         }
         None => (),
@@ -421,6 +332,7 @@ fn schema_type_to_string(type_: &ast::ColumnType) -> String {
 fn to_string_field_directive(
     namespace: &str,
     indent: &Indentation,
+    field_index: usize,
     directive: &ast::FieldDirective,
 ) -> String {
     let spaces = " ".repeat(indent.minimum);
@@ -430,7 +342,7 @@ fn to_string_field_directive(
             format!("{}@tablename(\"{}\")\n", spaces, name)
         }
         ast::FieldDirective::Link(details) => {
-            to_string_link_details_shorthand(namespace, indent, details)
+            to_string_link_details_shorthand(namespace, indent, field_index, details)
         }
         ast::FieldDirective::Index(details) => {
             format!("{}@index{}\n", spaces, index_directive_to_string(details))
@@ -497,8 +409,7 @@ fn to_string_permissions_details(
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let where_content =
-                    format_where_for_braces_with_mode(&op.where_, indentation.minimum, true);
+                let where_content = format_where_for_braces(&op.where_, indentation.minimum);
                 result.push_str(&format!("{}@allow({}) {}\n", spaces, ops, where_content));
             }
             result
@@ -507,138 +418,46 @@ fn to_string_permissions_details(
 }
 
 fn format_permissions_where(indent: String, where_arg: &ast::WhereArg) -> String {
-    let content = format_where_for_braces_with_mode(where_arg, indent.len(), true);
+    let content = format_where_for_braces(where_arg, indent.len());
     format!("{}@allow(*) {}\n", indent, content)
 }
 
 fn format_where_for_braces(where_arg: &ast::WhereArg, base_indent: usize) -> String {
-    format_where_for_braces_with_mode(where_arg, base_indent, false)
-}
-
-fn format_where_for_braces_with_mode(
-    where_arg: &ast::WhereArg,
-    base_indent: usize,
-    force_logical_multiline: bool,
-) -> String {
-    let content = format_where_content(where_arg, base_indent, force_logical_multiline);
-    format!("{{{} }}", content)
-}
-
-fn format_where_content(
-    where_arg: &ast::WhereArg,
-    base_indent: usize,
-    force_logical_multiline: bool,
-) -> String {
-    // Check if this is a single expression (Column) or multiple expressions (And/Or)
     match where_arg {
-        ast::WhereArg::Column(..) => {
-            // Single expression: format as  userId = Session.userId  with spaces
-            format!(" {} ", format_where(where_arg))
-        }
-        ast::WhereArg::Exists(path, body) => format!(
-            "\n{}{}\n{}",
-            " ".repeat(base_indent + 4),
-            format_exists(path, body, base_indent + 4),
+        ast::WhereArg::Column(_, _, _, value, _) if value_is_multiline(value) => format!(
+            "{{\n{}\n{}}}",
+            format_where_at(where_arg, base_indent + 4),
             " ".repeat(base_indent)
         ),
+        ast::WhereArg::Column(..) => {
+            format!("{{ {} }}", format_where_leaf(where_arg, base_indent))
+        }
         ast::WhereArg::And(args) => {
-            if args.len() == 1 {
-                // Single item in And - treat as single expression
-                format_where_content(&args[0], base_indent, force_logical_multiline)
-            } else {
-                // Multiple expressions in permission directives: force multi-line with explicit operators.
-                if force_logical_multiline {
-                    let mut result = String::from("\n");
-                    let inner_indent = " ".repeat(base_indent + 4);
-                    for (i, arg) in args.iter().enumerate() {
-                        if i != 0 {
-                            result.push_str(&format!("{}&& ", inner_indent));
-                        } else {
-                            result.push_str(&inner_indent);
-                        }
-                        result.push_str(&format_where_at(arg, base_indent + 4));
-                        result.push_str("\n");
-                    }
-                    result.push_str(&" ".repeat(base_indent));
-                    return result;
-                }
-
-                // Multiple expressions: format as multi-line (newlines act as separators, no commas)
-                let mut result = String::from("\n");
-                let inner_indent = " ".repeat(base_indent + 4);
-                for arg in args {
-                    result.push_str(&format!(
-                        "{}{}\n",
-                        inner_indent,
-                        format_where_at(arg, base_indent + 4)
-                    ));
-                }
-                result.push_str(&format!("{}", " ".repeat(base_indent)));
-                result
+            if let [arg] = args.as_slice() {
+                return format_where_for_braces(arg, base_indent);
             }
-        }
-        ast::WhereArg::Or(args) => {
-            if args.len() == 1 {
-                // Single item in Or - treat as single expression
-                format_where_content(&args[0], base_indent, force_logical_multiline)
-            } else {
-                if force_logical_multiline {
-                    let mut result = String::from("\n");
-                    let inner_indent = " ".repeat(base_indent + 4);
-                    for (i, arg) in args.iter().enumerate() {
-                        if i != 0 {
-                            result.push_str(&format!("{}|| ", inner_indent));
-                        } else {
-                            result.push_str(&inner_indent);
-                        }
-                        result.push_str(&format_where_at(arg, base_indent + 4));
-                        result.push_str("\n");
-                    }
-                    result.push_str(&" ".repeat(base_indent));
-                    return result;
-                }
 
-                // Check if all items are simple (Column or And/Or with only Column items) - if so, format as single-line
-                let all_simple = args.iter().all(|arg| match arg {
-                    ast::WhereArg::Column(..) => true,
-                    ast::WhereArg::And(items) => {
-                        items.len() <= 2
-                            && items.iter().all(|a| matches!(a, ast::WhereArg::Column(..)))
-                    }
-                    ast::WhereArg::Or(items) => {
-                        items.len() <= 2
-                            && items.iter().all(|a| matches!(a, ast::WhereArg::Column(..)))
-                    }
-                    ast::WhereArg::Exists(..) => false,
-                });
-
-                if all_simple {
-                    // Format as single-line using format_where
-                    format!(" {} ", format_where_at(where_arg, base_indent))
-                } else {
-                    // Multiple expressions: format as multi-line with || separator
-                    let mut result = String::from("\n");
-                    let inner_indent = " ".repeat(base_indent + 4);
-                    for (i, arg) in args.iter().enumerate() {
-                        if i != 0 {
-                            result.push_str(&format!("{}|| ", inner_indent));
-                        } else {
-                            result.push_str(&inner_indent);
-                        }
-                        result.push_str(&format_where_at(arg, base_indent + 4));
-                        result.push_str("\n");
-                    }
-                    result.push_str(&format!("{}", " ".repeat(base_indent)));
-                    result
-                }
+            let mut result = String::from("{\n");
+            for arg in args {
+                result.push_str(&format_where_at(arg, base_indent + 4));
+                result.push('\n');
             }
+            result.push_str(&" ".repeat(base_indent));
+            result.push('}');
+            result
         }
+        _ => format!(
+            "{{\n{}\n{}}}",
+            format_where_at(where_arg, base_indent + 4),
+            " ".repeat(base_indent)
+        ),
     }
 }
 
 fn to_string_link_details_shorthand(
     namespace: &str,
     indentation: &Indentation,
+    field_index: usize,
     details: &ast::LinkDetails,
 ) -> String {
     let effective_namespace = if namespace.is_empty() {
@@ -650,31 +469,13 @@ fn to_string_link_details_shorthand(
     let spaces = " ".repeat(indentation.minimum);
     let mut result = format!("{}{}", spaces, details.link_name);
 
-    let line_number: usize = match &details.start_name {
-        Some(loc) => loc.line.to_usize(),
-        None => 0,
-    };
-
-    let mut type_indent_len = 1;
-
-    let maybe_indent = indentation
+    let type_indent_len = indentation
         .levels
-        .range(..=line_number)
-        .next_back()
-        .map(|(_, v)| v);
-
-    match maybe_indent {
-        Some(indent) => {
-            let name_plus_colon = indentation.minimum + 1 + details.link_name.len();
-
-            if name_plus_colon < indent.type_column {
-                type_indent_len = indent.type_column - name_plus_colon;
-            }
-
-            result.push_str(&" ".repeat(type_indent_len));
-        }
-        None => result.push_str(" "),
-    }
+        .get(field_index)
+        .and_then(Option::as_ref)
+        .map(|indent| indent.name_width - details.link_name.len() + 1)
+        .unwrap_or(1);
+    result.push_str(&" ".repeat(type_indent_len));
 
     result.push_str("@link(");
     let mut added = false;
@@ -879,7 +680,7 @@ fn to_string_query_field(indent: usize, field: &ast::QueryField) -> String {
     match &field.set {
         Some(val) => {
             result.push_str(" = ");
-            result.push_str(&value_to_string(val));
+            result.push_str(&value_to_string_at(val, indent));
         }
         None => {}
     }
@@ -905,7 +706,11 @@ fn to_string_param(indent_size: usize, arg: &ast::Arg) -> String {
     let indent = " ".repeat(indent_size);
     match arg {
         ast::Arg::Limit(lim) => {
-            format!("{}@limit({})\n", indent, value_to_string(lim))
+            format!(
+                "{}@limit({})\n",
+                indent,
+                value_to_string_at(lim, indent_size)
+            )
         }
         ast::Arg::OrderBy(direction, column) => {
             format!(
@@ -922,28 +727,28 @@ fn to_string_param(indent_size: usize, arg: &ast::Arg) -> String {
     }
 }
 
-fn format_where(where_arg: &ast::WhereArg) -> String {
-    format_where_at(where_arg, 0)
-}
-
-fn format_exists(
-    path: &[(String, ast::Range)],
-    body: &ast::WhereArg,
-    base_indent: usize,
-) -> String {
-    format!(
-        "exists {} {}",
-        path.iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>()
-            .join("."),
-        format_where_for_braces_with_mode(body, base_indent, true)
-    )
-}
-
 fn format_where_at(where_arg: &ast::WhereArg, base_indent: usize) -> String {
+    let indent = " ".repeat(base_indent);
     match where_arg {
-        ast::WhereArg::Exists(path, body) => format_exists(path, body, base_indent),
+        ast::WhereArg::Exists(path, body) => format!(
+            "{}exists {} {}",
+            indent,
+            path.iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+            format_where_for_braces(body, base_indent)
+        ),
+        ast::WhereArg::Column(..) => {
+            format!("{}{}", indent, format_where_leaf(where_arg, base_indent))
+        }
+        ast::WhereArg::And(args) => format_logical_where("And", args, base_indent),
+        ast::WhereArg::Or(args) => format_logical_where("Or", args, base_indent),
+    }
+}
+
+fn format_where_leaf(where_arg: &ast::WhereArg, base_indent: usize) -> String {
+    match where_arg {
         ast::WhereArg::Column(is_session_var, path, operator, value, _field_name_range) => {
             let column = path.authored();
             let column_name = if *is_session_var {
@@ -952,42 +757,41 @@ fn format_where_at(where_arg: &ast::WhereArg, base_indent: usize) -> String {
                 column
             };
             let operator = operator_to_string(&operator);
-            let value = value_to_string(&value);
+            let value = value_to_string_at(value, base_indent);
             format!("{} {} {}", column_name, operator, value)
         }
-        ast::WhereArg::And(and) => {
-            let mut result = String::new();
-            let last_index = and.len() - 1;
-            for (i, arg) in and.iter().enumerate() {
-                result.push_str(&format_where_at(arg, base_indent));
-                if i != last_index {
-                    result.push_str(" && ");
-                }
-            }
-            result
-        }
-        ast::WhereArg::Or(or) => {
-            let mut result = String::new();
-            let last_index = or.len() - 1;
-            for (i, arg) in or.iter().enumerate() {
-                result.push_str(&format_where_at(arg, base_indent));
-                if i != last_index {
-                    result.push_str(" || ");
-                }
-            }
-            result
-        }
+        _ => unreachable!("compound predicates are formatted recursively"),
     }
 }
 
+fn format_logical_where(name: &str, args: &[ast::WhereArg], base_indent: usize) -> String {
+    if let [arg] = args {
+        return format_where_at(arg, base_indent);
+    }
+
+    let indent = " ".repeat(base_indent);
+    let mut result = format!("{}{}(\n", indent, name);
+    for arg in args {
+        result.push_str(&format_where_at(arg, base_indent + 4));
+        result.push_str(",\n");
+    }
+    result.push_str(&indent);
+    result.push(')');
+    result
+}
+
 fn value_to_string(value: &ast::QueryValue) -> String {
+    value_to_string_at(value, 0)
+}
+
+fn value_to_string_at(value: &ast::QueryValue, base_indent: usize) -> String {
     match value {
         ast::QueryValue::Fn(func) => format!(
             "{}({})",
             func.name,
             func.args
                 .iter()
-                .map(|value| value_to_string(value))
+                .map(|value| value_to_string_at(value, base_indent))
                 .collect::<Vec<String>>()
                 .join(", ")
         ),
@@ -998,7 +802,42 @@ fn value_to_string(value: &ast::QueryValue) -> String {
         ast::QueryValue::Bool((_, true)) => "True".to_string(),
         ast::QueryValue::Bool((_, false)) => "False".to_string(),
         ast::QueryValue::Null(_) => "null".to_string(),
-        ast::QueryValue::LiteralTypeValue((_, details)) => details.name.clone(),
+        ast::QueryValue::LiteralTypeValue((_, details)) => match &details.fields {
+            Some(fields) if fields.len() == 1 && !value_is_multiline(&fields[0].1) => format!(
+                "{} {{ {} = {} }}",
+                details.name,
+                fields[0].0,
+                value_to_string_at(&fields[0].1, base_indent)
+            ),
+            Some(fields) if !fields.is_empty() => {
+                let field_indent = " ".repeat(base_indent + 4);
+                let closing_indent = " ".repeat(base_indent);
+                let mut result = format!("{} {{\n", details.name);
+                for (name, value) in fields {
+                    result.push_str(&field_indent);
+                    result.push_str(name);
+                    result.push_str(" = ");
+                    result.push_str(&value_to_string_at(value, base_indent + 4));
+                    result.push('\n');
+                }
+                result.push_str(&closing_indent);
+                result.push('}');
+                result
+            }
+            _ => details.name.clone(),
+        },
+    }
+}
+
+fn value_is_multiline(value: &ast::QueryValue) -> bool {
+    match value {
+        ast::QueryValue::Fn(func) => func.args.iter().any(value_is_multiline),
+        ast::QueryValue::LiteralTypeValue((_, details)) => {
+            details.fields.as_ref().is_some_and(|fields| {
+                fields.len() > 1 || fields.iter().any(|(_, value)| value_is_multiline(value))
+            })
+        }
+        _ => false,
     }
 }
 

@@ -676,6 +676,7 @@ record Post {
     assert_eq!(
         author_id_column.type_,
         ast::ColumnType::ForeignKey {
+            schema: None,
             table: "User".to_string(),
             field: "id".to_string(),
             serialization_type: Some(ast::ConcreteSerializationType::IdInt),

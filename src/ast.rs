@@ -620,6 +620,7 @@ pub enum ColumnType {
 
     // Foreign key reference (e.g., User.id)
     ForeignKey {
+        schema: Option<String>,
         table: String,
         field: String,
         serialization_type: Option<ConcreteSerializationType>,
@@ -658,7 +659,15 @@ impl ColumnType {
                     format!("Id.Uuid<{}>", table)
                 }
             }
-            ColumnType::ForeignKey { table, field, .. } => format!("{}.{}", table, field),
+            ColumnType::ForeignKey {
+                schema,
+                table,
+                field,
+                ..
+            } => match schema {
+                Some(schema) => format!("{}.{}.{}", schema, table, field),
+                None => format!("{}.{}", table, field),
+            },
             ColumnType::Custom(name) => name.clone(),
         }
     }
@@ -708,6 +717,15 @@ impl ColumnType {
                 serialization_type: Some(ConcreteSerializationType::IdUuid),
                 ..
             } => format!("Id.Uuid<{}>", table),
+            ColumnType::ForeignKey {
+                table,
+                serialization_type: Some(ConcreteSerializationType::IdInt),
+                ..
+            } => format!("Id.Int<{}>", table),
+            ColumnType::ForeignKey {
+                serialization_type: Some(ConcreteSerializationType::Integer),
+                ..
+            } => "Int".to_string(),
             ColumnType::ForeignKey {
                 serialization_type: Some(ConcreteSerializationType::Text),
                 ..
@@ -891,17 +909,23 @@ impl ColumnType {
                     };
                 }
 
-                // Check for foreign key reference (TableName.fieldName pattern)
+                // Check for foreign key references: Table.field or Namespace.Table.field.
                 if type_str.contains('.') && !type_str.starts_with("Id.") {
                     let parts: Vec<&str> = type_str.split('.').collect();
-                    if parts.len() == 2 {
-                        ColumnType::ForeignKey {
-                            table: parts[0].to_string(),
-                            field: parts[1].to_string(),
+                    match parts.as_slice() {
+                        [table, field] => ColumnType::ForeignKey {
+                            schema: None,
+                            table: (*table).to_string(),
+                            field: (*field).to_string(),
                             serialization_type: None,
-                        }
-                    } else {
-                        ColumnType::Custom(type_str.to_string())
+                        },
+                        [schema, table, field] => ColumnType::ForeignKey {
+                            schema: Some((*schema).to_string()),
+                            table: (*table).to_string(),
+                            field: (*field).to_string(),
+                            serialization_type: None,
+                        },
+                        _ => ColumnType::Custom(type_str.to_string()),
                     }
                 } else {
                     ColumnType::Custom(type_str.to_string())
@@ -939,7 +963,15 @@ impl std::fmt::Display for ColumnType {
                     write!(f, "Id.Uuid<{}>", table)
                 }
             }
-            ColumnType::ForeignKey { table, field, .. } => write!(f, "{}.{}", table, field),
+            ColumnType::ForeignKey {
+                schema,
+                table,
+                field,
+                ..
+            } => match schema {
+                Some(schema) => write!(f, "{}.{}.{}", schema, table, field),
+                None => write!(f, "{}.{}", table, field),
+            },
             ColumnType::Custom(name) => write!(f, "{}", name),
         }
     }
@@ -1429,8 +1461,8 @@ pub enum Operator {
 /// 1. Sets the brand on ID columns (IdInt or IdUuid) with no brand to the record name
 /// 2. For foreign key references (type like "User.id"), resolves the brand from the referenced column
 pub fn resolve_id_brands(database: &mut Database) {
-    // Build a lookup table of table name -> record definition
-    let mut table_lookup: std::collections::HashMap<String, RecordDetails> =
+    // Build a lookup table of (namespace, table name) -> record definition.
+    let mut table_lookup: std::collections::HashMap<(String, String), RecordDetails> =
         std::collections::HashMap::new();
 
     for schema in database.schemas.iter() {
@@ -1438,7 +1470,7 @@ pub fn resolve_id_brands(database: &mut Database) {
             for definition in file.definitions.iter() {
                 if let Definition::Record { name, fields, .. } = definition {
                     table_lookup.insert(
-                        name.clone(),
+                        (schema.namespace.clone(), name.clone()),
                         RecordDetails {
                             name: name.clone(),
                             fields: fields.clone(),
@@ -1475,15 +1507,23 @@ pub fn resolve_id_brands(database: &mut Database) {
                                     // Set brand to the record name for ID types
                                     *table = record_name.clone();
                                 }
-                            } else if let ColumnType::ForeignKey { table, field, .. } =
-                                &column.type_
+                            } else if let ColumnType::ForeignKey {
+                                schema: foreign_schema,
+                                table,
+                                field,
+                                ..
+                            } = &column.type_
                             {
                                 // This is a foreign key reference like "User.id"
                                 // The brand should already be set during parsing, but let's resolve any additional info if needed
                                 let ref_table = table.clone();
                                 let ref_field = field.clone();
+                                let ref_schema =
+                                    foreign_schema.as_ref().unwrap_or(&schema.namespace).clone();
 
-                                if let Some(ref_record) = table_lookup_ref.get(&ref_table) {
+                                if let Some(ref_record) =
+                                    table_lookup_ref.get(&(ref_schema, ref_table.clone()))
+                                {
                                     // Look up the referenced column to get its brand
                                     for ref_field_def in ref_record.fields.iter() {
                                         if let Field::Column(ref_col) = ref_field_def {
@@ -1496,6 +1536,7 @@ pub fn resolve_id_brands(database: &mut Database) {
                                                     // Preserve the referenced ID's brand when set and
                                                     // always retain its concrete storage representation.
                                                     column.type_ = ColumnType::ForeignKey {
+                                                        schema: foreign_schema.clone(),
                                                         table: if ref_brand.is_empty() {
                                                             ref_table.clone()
                                                         } else {

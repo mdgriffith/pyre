@@ -55,6 +55,9 @@ pub struct SyncPageResult {
     /// The current server-side sync revision for this page.
     #[serde(rename = "serverRevision", skip_serializing_if = "Option::is_none")]
     pub server_revision: Option<i64>,
+    /// Opaque identity for the current lifetime of the source database.
+    #[serde(rename = "databaseEpoch")]
+    pub database_epoch: String,
     /// Data organized by table name
     pub tables: HashMap<String, TableSyncData>,
     /// Whether there is more data to fetch
@@ -208,6 +211,7 @@ pub struct TableSyncStatus {
 /// Result of sync status check
 pub struct SyncStatusResult {
     pub server_revision: Option<i64>,
+    pub database_epoch: String,
     pub tables: Vec<TableSyncStatus>,
 }
 
@@ -286,6 +290,7 @@ pub fn calculate_permission_hash(
     session: &HashMap<String, SessionValue>,
 ) -> String {
     let mut hasher = Sha256::new();
+    hasher.update("permission_hash_v2");
 
     // Hash the permission AST structure
     if let Some(perm) = permission {
@@ -299,6 +304,7 @@ pub fn calculate_permission_hash(
         let session_fields = extract_session_fields_from_permission(perm);
         for field in session_fields {
             if let Some(value) = session.get(&field) {
+                hasher.update((field.len() as u64).to_le_bytes());
                 hasher.update(&field);
                 hash_session_value(&mut hasher, value);
             }
@@ -410,26 +416,7 @@ fn hash_query_value(hasher: &mut Sha256, value: &ast::QueryValue) {
         }
         ast::QueryValue::Int((_, i)) => {
             hasher.update("int");
-            // Convert integer to string without formatting infrastructure
-            let mut num_str = String::new();
-            let mut n = *i;
-            if n < 0 {
-                num_str.push('-');
-                n = -n;
-            }
-            if n == 0 {
-                num_str.push('0');
-            } else {
-                let mut digits = Vec::new();
-                while n > 0 {
-                    digits.push((b'0' + (n % 10) as u8) as char);
-                    n /= 10;
-                }
-                for d in digits.iter().rev() {
-                    num_str.push(*d);
-                }
-            }
-            hasher.update(&num_str);
+            hasher.update(i.to_le_bytes());
         }
         ast::QueryValue::Float((_, f)) => {
             hasher.update("float");
@@ -458,26 +445,7 @@ fn hash_session_value(hasher: &mut Sha256, value: &SessionValue) {
         SessionValue::Null => hasher.update("null"),
         SessionValue::Integer(i) => {
             hasher.update("int");
-            // Convert integer to string without formatting infrastructure
-            let mut num_str = String::new();
-            let mut n = *i;
-            if n < 0 {
-                num_str.push('-');
-                n = -n;
-            }
-            if n == 0 {
-                num_str.push('0');
-            } else {
-                let mut digits = Vec::new();
-                while n > 0 {
-                    digits.push((b'0' + (n % 10) as u8) as char);
-                    n /= 10;
-                }
-                for d in digits.iter().rev() {
-                    num_str.push(*d);
-                }
-            }
-            hasher.update(&num_str);
+            hasher.update(i.to_le_bytes());
         }
         SessionValue::Real(f) => {
             hasher.update("real");
@@ -488,11 +456,12 @@ fn hash_session_value(hasher: &mut Sha256, value: &SessionValue) {
         }
         SessionValue::Text(s) => {
             hasher.update("text");
+            hasher.update((s.len() as u64).to_le_bytes());
             hasher.update(s);
         }
         SessionValue::Blob(b) => {
             hasher.update("blob");
-            // Hash blob bytes directly instead of Debug formatting
+            hasher.update((b.len() as u64).to_le_bytes());
             hasher.update(b);
         }
     }
@@ -752,7 +721,7 @@ fn get_sync_status_sql_with_params(
         };
 
         let subquery = format!(
-            "SELECT {} AS table_name, {} AS sync_layer, {} AS permission_hash, {} AS last_seen_updated_at, MAX({}.updatedAt) AS max_updated_at, (SELECT value FROM _pyre_sync WHERE key = 'server_revision') AS server_revision FROM {}{}",
+            "SELECT {} AS table_name, {} AS sync_layer, {} AS permission_hash, {} AS last_seen_updated_at, MAX({}.updatedAt) AS max_updated_at, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch FROM {}{}",
             table_name_literal,
             sync_layer_value,
             permission_hash_literal,
@@ -767,7 +736,7 @@ fn get_sync_status_sql_with_params(
 
     if union_parts.is_empty() {
         return Ok(
-            "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, (SELECT value FROM _pyre_sync WHERE key = 'server_revision') AS server_revision"
+            "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch"
                 .to_string(),
         );
     }
@@ -787,6 +756,7 @@ pub fn parse_sync_status(
 ) -> Result<SyncStatusResult, SyncError> {
     let mut result = SyncStatusResult {
         server_revision: None,
+        database_epoch: String::new(),
         tables: Vec::new(),
     };
 
@@ -799,6 +769,16 @@ pub fn parse_sync_status(
                     v.as_i64().or_else(|| v.as_u64().map(|u| u as i64))
                 }
             });
+        }
+        if result.database_epoch.is_empty() {
+            result.database_epoch = row
+                .get("database_epoch")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    SyncError::DatabaseError("missing database_epoch in _pyre_sync".to_string())
+                })?
+                .to_string();
         }
 
         let Some(table_name) = row
@@ -1057,6 +1037,7 @@ pub fn get_sync_page_info(
     let mut result = SyncPageResult {
         database_id: None,
         server_revision: None,
+        database_epoch: String::new(),
         tables: HashMap::new(),
         has_more: false,
     };

@@ -4,6 +4,7 @@ mod helpers;
 use helpers::test_database::TestDatabase;
 use pyre::server::manifest::{Manifest, PyreSession, QueryManifest};
 use pyre::server::query;
+use pyre::{ast, parser, typecheck};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
@@ -2273,4 +2274,49 @@ fn manifest_load_reads_generated_manifest_file() -> Result<(), Box<dyn std::erro
     assert!(loaded.queries.is_empty());
 
     Ok(())
+}
+#[test]
+fn generated_manifest_validates_integer_session_foreign_keys() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+session {
+    userId User.id
+}
+
+record User {
+    @public
+    id Id.Int @id
+}
+
+record Item {
+    id Int @id
+    ownerId User.id
+    @allow(query) { ownerId == Session.userId }
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_schema(&context, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|file| file.path.ends_with("manifest.json"))
+            .expect("generated manifest")
+            .contents,
+    )
+    .unwrap();
+
+    assert!(manifest.session_schema["userId"]
+        .type_
+        .starts_with("Id.Int"));
+    assert!(PyreSession::new(json!({ "userId": 7 }), &manifest.session_schema).is_ok());
+    assert!(PyreSession::new(json!({ "userId": 7.5 }), &manifest.session_schema).is_err());
 }

@@ -6,9 +6,11 @@
  */
 
 export { run, seed } from "./query";
+export { ensureDatabase } from "./schema";
 export { databaseIdFromUrl, requireDatabaseId, withDatabaseId } from "./database-id";
 
 export type { DatabaseId } from "./database-id";
+export type { EnsureDatabaseOutcome } from "./schema";
 
 // Export only the types that are part of the public API for the functions above
 export type {

@@ -156,6 +156,22 @@ query GetUsers {
 }
 
 #[test]
+fn snapshot_select_root_alias() {
+    check_snapshot(
+        "select_root_alias",
+        &schema::full_schema(),
+        r#"
+query GetPeople {
+    people: user {
+        id
+        name
+    }
+}
+"#,
+    );
+}
+
+#[test]
 fn snapshot_select_wildcard() {
     check_snapshot(
         "select_wildcard",

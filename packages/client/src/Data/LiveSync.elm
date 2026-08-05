@@ -41,12 +41,12 @@ type Message
 
 
 type Incoming
-    = DeltaReceived (Maybe String) (Maybe Int) Delta
+    = DeltaReceived (Maybe String) (Maybe String) (Maybe Int) Delta
     | SyncProgressReceived (Maybe String) SyncProgress
-    | LiveSyncConnected (Maybe String) String
+    | LiveSyncConnected (Maybe String) (Maybe String) String
     | LiveSyncError String
     | SyncCompleteReceived (Maybe String)
-    | SyncRequiredReceived (Maybe String) (Maybe Int)
+    | SyncRequiredReceived (Maybe String) (Maybe String) (Maybe Int)
 
 
 port sseOut : Encode.Value -> Cmd msg
@@ -104,8 +104,9 @@ decodeIncoming =
             (\type_ ->
                 case type_ of
                     "delta" ->
-                        Decode.map3 DeltaReceived
+                        Decode.map4 DeltaReceived
                             (Decode.maybe (Decode.field "databaseId" Decode.string))
+                            (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
                             (Decode.maybe (Decode.field "serverRevision" Decode.int))
                             (Decode.field "data" Data.Delta.decodeDelta)
 
@@ -115,8 +116,9 @@ decodeIncoming =
                             (Decode.field "data" decodeSyncProgress)
 
                     "connected" ->
-                        Decode.map2 LiveSyncConnected
+                        Decode.map3 LiveSyncConnected
                             (Decode.maybe (Decode.field "databaseId" Decode.string))
+                            (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
                             (Decode.field "connectionId" Decode.string)
 
                     "error" ->
@@ -128,13 +130,15 @@ decodeIncoming =
                             |> Decode.map SyncCompleteReceived
 
                     "syncRequired" ->
-                        Decode.map2 SyncRequiredReceived
+                        Decode.map3 SyncRequiredReceived
                             (Decode.maybe (Decode.field "databaseId" Decode.string))
+                            (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
                             (Decode.maybe (Decode.field "serverRevision" Decode.int))
 
                     "catchupRequired" ->
-                        Decode.map2 SyncRequiredReceived
+                        Decode.map3 SyncRequiredReceived
                             (Decode.maybe (Decode.field "databaseId" Decode.string))
+                            (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
                             (Decode.maybe (Decode.field "serverRevision" Decode.int))
 
                     _ ->

@@ -261,15 +261,18 @@ record Post {
     @allow(*) { authorId == Session.userId }
     
     // Complex conditions
-    @allow(delete) { 
-        authorId == Session.userId || Session.role == "admin" 
+    @allow(delete) {
+        Or(
+            authorId == Session.userId,
+            Session.role == "admin",
+        )
     }
 }
 ```
 
 **Operations**: `query`, `insert`, `update`, `delete`, or `*` for all.
 
-**Conditions**: Use `Session.fieldName` to reference session variables. Supported operators: `==` (equal), `&&` (and), `||` (or).
+**Conditions**: Use `Session.fieldName` to reference session variables. Compose comparison predicates with `And(...)` and `Or(...)`.
 
 Permissions may test related records through declared links with `exists`:
 
@@ -277,8 +280,13 @@ Permissions may test related records through declared links with `exists`:
 record Document {
     @allow(query) {
         exists workspace.members {
-            userId == Session.userId
-            role == Admin || role == Member
+            And(
+                userId == Session.userId,
+                Or(
+                    role == Admin,
+                    role == Member,
+                ),
+            )
         }
     }
 
@@ -414,7 +422,12 @@ Session fields can be nullable using `?`.
 **Usage in permissions:**
 ```pyre
 @allow(query) { userId = Session.userId }
-@allow(delete) { role = Session.role || Session.role = "admin" }
+@allow(delete) {
+    Or(
+        role == Session.role,
+        Session.role == "admin",
+    )
+}
 ```
 
 **Usage in queries:**

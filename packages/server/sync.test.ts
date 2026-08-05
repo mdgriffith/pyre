@@ -46,6 +46,7 @@ let getSyncStatusSqlMock = () => "select 1";
 let reshapeSyncTableGroupsMock = defaultReshapeSyncTableGroups;
 let introspectionResult = { schema_source: "" };
 let setSchemaCalls: unknown[] = [];
+let migrationResult: any = { Ok: { sql: [], mark_success: "record migration" } };
 
 mock.module("./wasm/pyre_wasm.js", () => ({
   sql_is_initialized: () => "select 1 as is_initialized",
@@ -55,10 +56,12 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   calculate_sync_deltas: () => ({ groups: [] }),
   reshape_sync_table_groups: (groups: any) => reshapeSyncTableGroupsMock(groups),
   set_schema: (introspection: unknown) => setSchemaCalls.push(introspection),
+  migrate_with_introspection: () => migrationResult,
+  sql_introspect_uninitialized: () => "select uninitialized introspection",
 }));
 
-const { catchup } = await import("./sync");
-const { loadSchemaFromDatabase } = await import("./schema");
+const { catchup, rotateDatabaseEpoch } = await import("./sync");
+const { ensureDatabase, loadSchemaFromDatabase } = await import("./schema");
 
 afterEach(() => {
   getSyncSqlMock = defaultSyncSql;
@@ -66,6 +69,87 @@ afterEach(() => {
   reshapeSyncTableGroupsMock = defaultReshapeSyncTableGroups;
   introspectionResult = { schema_source: "" };
   setSchemaCalls = [];
+  migrationResult = { Ok: { sql: [], mark_success: "record migration" } };
+});
+
+function initializationDatabase(initialized: boolean, introspection: any) {
+  const batches: unknown[][] = [];
+  let closed = false;
+  const tx = {
+    execute: mock(async (sql: string) => {
+      if (sql.includes("is_initialized")) {
+        return { rows: [{ is_initialized: initialized ? 1 : 0 }] };
+      }
+      return { rows: [{ result: JSON.stringify(introspection) }] };
+    }),
+    batch: mock(async (statements: unknown[]) => {
+      batches.push(statements);
+      return [];
+    }),
+    commit: mock(async () => { closed = true; }),
+    rollback: mock(async () => { closed = true; }),
+    close: mock(() => { closed = true; }),
+    get closed() { return closed; },
+  };
+  return {
+    db: { transaction: mock(async () => tx) },
+    tx,
+    batches,
+  };
+}
+
+test("ensureDatabase creates a database in one write transaction", async () => {
+  migrationResult = {
+    Ok: {
+      sql: ["create table notes (id integer primary key)"],
+      mark_success: "record migration",
+    },
+  };
+  const database = initializationDatabase(false, {
+    tables: [],
+    migration_state: { NoMigrationTable: null },
+    schema_source: "",
+    links: [],
+  });
+
+  const outcome = await ensureDatabase(database.db as any, "Campaign", "record Note {}");
+
+  expect(outcome).toBe("created");
+  expect(database.db.transaction).toHaveBeenCalledWith("write");
+  expect(database.batches).toEqual([[
+    "create table notes (id integer primary key)",
+    "record migration",
+  ]]);
+  expect(database.tx.commit).toHaveBeenCalledTimes(1);
+});
+
+test("ensureDatabase reuses an unchanged database", async () => {
+  const database = initializationDatabase(true, {
+    tables: [{ name: "notes" }],
+    migration_state: { MigrationTable: { migrations: [] } },
+    schema_source: "record Note {}",
+    links: [],
+  });
+
+  const outcome = await ensureDatabase(database.db as any, "Campaign", "record Note {}");
+
+  expect(outcome).toBe("up-to-date");
+  expect(database.batches).toEqual([]);
+  expect(database.tx.rollback).toHaveBeenCalledTimes(1);
+});
+
+test("ensureDatabase rejects unmanaged tables", async () => {
+  const database = initializationDatabase(false, {
+    tables: [{ name: "legacy" }],
+    migration_state: { NoMigrationTable: null },
+    schema_source: "",
+    links: [],
+  });
+
+  await expect(
+    ensureDatabase(database.db as any, "Campaign", "record Note {}"),
+  ).rejects.toThrow("not managed by Pyre");
+  expect(database.tx.rollback).toHaveBeenCalledTimes(1);
 });
 
 test("catchup activates the schema loaded for its databaseId", async () => {
@@ -82,7 +166,7 @@ test("catchup activates the schema loaded for its databaseId", async () => {
     }),
   };
   const db = {
-    execute: mock(async () => ({ rows: [] })),
+    execute: mock(async () => ({ rows: [{ database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([])),
   };
 
@@ -98,7 +182,7 @@ test("catchup activates the schema loaded for its databaseId", async () => {
 
 test("catchup reshapes flattened custom types before returning sync rows", async () => {
   const db = {
-    execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1 }] })),
+    execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1, database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([
       {
         columns: [
@@ -128,6 +212,7 @@ test("catchup reshapes flattened custom types before returning sync rows", async
   const result = await catchup(db as any, { tables: {} }, {}, 1000);
 
   expect(result).toEqual({
+    databaseEpoch: "test-epoch",
     tables: {
       maps: {
         rows: [
@@ -163,7 +248,7 @@ test("catchup stamps response with databaseId when provided", async () => {
     }),
   };
   const db = {
-    execute: mock(async () => ({ rows: [] })),
+    execute: mock(async () => ({ rows: [{ database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([])),
   };
 
@@ -176,7 +261,7 @@ test("catchup stamps response with databaseId when provided", async () => {
 test("catchup reuses server revision from status query without a second execute", async () => {
   getSyncSqlMock = () => ({ tables: [] });
   const db = {
-    execute: mock(async () => ({ rows: [{ server_revision: 7 }] })),
+    execute: mock(async () => ({ rows: [{ server_revision: 7, database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([])),
   };
 
@@ -187,9 +272,45 @@ test("catchup reuses server revision from status query without a second execute"
   expect(db.batch).toHaveBeenCalledTimes(0);
 });
 
+test("catchup returns an explicit replacement without querying table rows on epoch mismatch", async () => {
+  let syncSqlCalls = 0;
+  getSyncSqlMock = () => {
+    syncSqlCalls += 1;
+    return defaultSyncSql();
+  };
+  const db = {
+    execute: mock(async () => ({ rows: [{ server_revision: 7, database_epoch: "current-epoch" }] })),
+    batch: mock(async () => ([])),
+  };
+
+  const result = await catchup(db as any, { tables: {} }, {}, 1000, "main", "stale-epoch");
+
+  expect(result).toEqual({
+    type: "reset",
+    databaseId: "main",
+    databaseEpoch: "current-epoch",
+    operation: "replace",
+    scope: "database",
+    reason: "database_epoch_changed",
+  });
+  expect(syncSqlCalls).toBe(0);
+  expect(db.batch).toHaveBeenCalledTimes(0);
+});
+
+test("rotateDatabaseEpoch replaces the epoch and resets revision", async () => {
+  const db = {
+    execute: mock(async (sql: string) => {
+      expect(sql).toContain("server_revision = 0");
+      return { rows: [{ database_epoch: "rotated-epoch" }] };
+    }),
+  };
+
+  expect(await rotateDatabaseEpoch(db as any)).toBe("rotated-epoch");
+});
+
 test("catchup normalizes bigint row values before reshaping", async () => {
   const db = {
-    execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1 }] })),
+    execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1, database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([
       {
         columns: [
@@ -247,7 +368,7 @@ test("catchup unwraps double-encoded json objects for json columns", async () =>
   reshapeSyncTableGroupsMock = (groups: any) => groups;
 
   const db = {
-    execute: mock(async () => ({ rows: [{ table_name: "gameEntities", needs_sync: 1 }] })),
+    execute: mock(async () => ({ rows: [{ table_name: "gameEntities", needs_sync: 1, database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([
       {
         columns: ["id", "attrs", "updatedAt"],
@@ -291,7 +412,7 @@ test("catchup expands aggregate sync row payloads", async () => {
   reshapeSyncTableGroupsMock = (groups: any) => groups;
 
   const db = {
-    execute: mock(async () => ({ rows: [{ table_name: "gameEntities", needs_sync: 1 }] })),
+    execute: mock(async () => ({ rows: [{ table_name: "gameEntities", needs_sync: 1, database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([
       {
         columns: ["_pyre_rows"],
@@ -332,7 +453,7 @@ test("catchup executes status and table sync SQL with bound params", async () =>
   });
   reshapeSyncTableGroupsMock = (groups: any) => groups;
   const db = {
-    execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1 }] })),
+    execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1, database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([
       {
         columns: ["id", "name", "updatedAt"],
@@ -366,7 +487,7 @@ test("catchup caps pageSize before requesting sync SQL and slicing rows", async 
     updatedAt: index + 1,
   }));
   const db = {
-    execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1 }] })),
+    execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1, database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([
       {
         columns: ["id", "name", "tiling", "tiling__tileRootKey", "tiling__tileWidth", "tiling__format", "updatedAt"],
@@ -388,7 +509,7 @@ test("catchup rejects oversized sync cursors before wasm work", async () => {
     tables[`table_${index}`] = { last_seen_updated_at: null, permission_hash: "perm" };
   }
   const db = {
-    execute: mock(async () => ({ rows: [] })),
+    execute: mock(async () => ({ rows: [{ database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([])),
   };
 
@@ -398,7 +519,7 @@ test("catchup rejects oversized sync cursors before wasm work", async () => {
 
 test("catchup rejects oversized sync cursor permission hashes", async () => {
   const db = {
-    execute: mock(async () => ({ rows: [] })),
+    execute: mock(async () => ({ rows: [{ database_epoch: "test-epoch" }] })),
     batch: mock(async () => ([])),
   };
 
@@ -413,7 +534,7 @@ test("catchup rejects oversized sync cursor permission hashes", async () => {
 test("catchup rejects non-integer sync cursor timestamps before wasm work", async () => {
   for (const last_seen_updated_at of [1.5, "1700000000", Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
     const db = {
-      execute: mock(async () => ({ rows: [] })),
+      execute: mock(async () => ({ rows: [{ database_epoch: "test-epoch" }] })),
       batch: mock(async () => ([])),
     };
 
@@ -429,7 +550,7 @@ test("catchup rejects non-integer sync cursor timestamps before wasm work", asyn
 test("catchup rejects non-integer database timestamps", async () => {
   for (const updatedAt of [1.5, "1700000000", new Date("2023-11-14T22:13:20Z"), Number.NaN, BigInt(Number.MAX_SAFE_INTEGER) + 1n]) {
     const db = {
-      execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1 }] })),
+      execute: mock(async () => ({ rows: [{ table_name: "maps", needs_sync: 1, database_epoch: "test-epoch" }] })),
       batch: mock(async () => ([
         {
           columns: ["id", "name", "tiling", "tiling__tileRootKey", "tiling__tileWidth", "tiling__format", "updatedAt"],

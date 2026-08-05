@@ -1,5 +1,7 @@
 use crate::ast;
 use crate::db::introspect;
+use crate::db::migrate;
+use crate::generate::sql::to_sql::SqlAndParams;
 use crate::typecheck;
 
 pub struct LoadedSchema {
@@ -37,6 +39,116 @@ pub async fn load_schema_from_database(conn: &libsql::Connection) -> Result<Load
 
 pub async fn load_context_from_database(conn: &libsql::Connection) -> Result<LoadedSchema, Error> {
     load_schema_from_database(conn).await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnsureDatabaseOutcome {
+    Created,
+    Migrated,
+    UpToDate,
+}
+
+/// Create or migrate a database to the supplied generated schema.
+pub async fn ensure_database(
+    conn: &libsql::Connection,
+    schema_name: &str,
+    schema_source: &str,
+) -> Result<EnsureDatabaseOutcome, EnsureDatabaseError> {
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .map_err(EnsureDatabaseError::Database)?;
+    let initialized = is_initialized(&tx)
+        .await
+        .map_err(EnsureDatabaseError::Introspection)?;
+    let introspection = introspect_connection(&tx, initialized)
+        .await
+        .map_err(EnsureDatabaseError::Introspection)?;
+
+    if !initialized && !introspection.tables.is_empty() {
+        return Err(EnsureDatabaseError::UnmanagedDatabase);
+    }
+
+    let migration_name = format!("ensure:{schema_name}");
+    let plan = migrate::migrate_dynamic_for_schema(
+        migration_name,
+        &introspection,
+        schema_source,
+        "generated-schema.pyre",
+        schema_name,
+    )
+    .map_err(EnsureDatabaseError::Migration)?;
+
+    let recorded_schema = if initialized {
+        Some(query_recorded_schema(&tx).await?)
+    } else {
+        None
+    };
+    if initialized && plan.sql.is_empty() && recorded_schema.as_deref() == Some(schema_source) {
+        tx.rollback().await.map_err(EnsureDatabaseError::Database)?;
+        return Ok(EnsureDatabaseOutcome::UpToDate);
+    }
+
+    if !initialized && plan.sql.is_empty() {
+        for statement in migrate::internal_setup_sql() {
+            execute_statement(&tx, statement).await?;
+        }
+    }
+    for statement in plan.sql {
+        execute_statement(&tx, statement).await?;
+    }
+    execute_statement(&tx, plan.mark_success).await?;
+    tx.commit().await.map_err(EnsureDatabaseError::Database)?;
+
+    Ok(if initialized {
+        EnsureDatabaseOutcome::Migrated
+    } else {
+        EnsureDatabaseOutcome::Created
+    })
+}
+
+async fn query_recorded_schema(conn: &libsql::Connection) -> Result<String, EnsureDatabaseError> {
+    let mut rows = conn
+        .query(introspect::GET_SCHEMA, ())
+        .await
+        .map_err(EnsureDatabaseError::Database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(EnsureDatabaseError::Database)?
+        .ok_or_else(|| {
+            EnsureDatabaseError::Introspection(Error::InvalidIntrospection(
+                "initialized database has no recorded schema".to_string(),
+            ))
+        })?;
+    row.get::<String>(0).map_err(EnsureDatabaseError::Database)
+}
+
+async fn introspect_connection(
+    conn: &libsql::Connection,
+    initialized: bool,
+) -> Result<introspect::Introspection, Error> {
+    let sql = if initialized {
+        introspect::INTROSPECT_SQL
+    } else {
+        introspect::INTROSPECT_UNINITIALIZED_SQL
+    };
+    let raw = query_introspection(conn, sql).await?;
+    Ok(introspect::from_raw(raw))
+}
+
+async fn execute_statement(
+    conn: &libsql::Connection,
+    statement: SqlAndParams,
+) -> Result<(), EnsureDatabaseError> {
+    match statement {
+        SqlAndParams::Sql(sql) => conn.execute(&sql, ()).await,
+        SqlAndParams::SqlWithParams { sql, args } => {
+            conn.execute(&sql, libsql::params_from_iter(args)).await
+        }
+    }
+    .map(|_| ())
+    .map_err(EnsureDatabaseError::Database)
 }
 
 async fn is_initialized(conn: &libsql::Connection) -> Result<bool, Error> {
@@ -142,3 +254,29 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[derive(Debug)]
+pub enum EnsureDatabaseError {
+    Database(libsql::Error),
+    Introspection(Error),
+    Migration(Vec<crate::error::Error>),
+    UnmanagedDatabase,
+}
+
+impl std::fmt::Display for EnsureDatabaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(f, "database error: {error}"),
+            Self::Introspection(error) => write!(f, "{error}"),
+            Self::Migration(errors) => {
+                write!(f, "schema migration failed with {} error(s)", errors.len())
+            }
+            Self::UnmanagedDatabase => write!(
+                f,
+                "refusing to initialize a non-empty database that is not managed by Pyre"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EnsureDatabaseError {}

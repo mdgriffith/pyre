@@ -1,7 +1,7 @@
 export { init } from "./init";
 export { databaseIdFromUrl, requireDatabaseId, withDatabaseId } from "./database-id";
 export { activateSchemaForDatabase, loadSchemaFromDatabase } from "./schema";
-export { catchup } from "./sync";
+export { catchup, rotateDatabaseEpoch } from "./sync";
 export { runWithSync as run } from "./query-sync";
 
 export type {
@@ -18,6 +18,8 @@ export type {
 
 export type {
   SyncCursor,
+  CatchupResult,
   SyncPageResult,
+  SyncResetResult,
   SyncSession,
 } from "./sync";

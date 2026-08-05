@@ -731,12 +731,12 @@ fn dynamic_query_plan(
     arguments: &JsonValue,
 ) -> Result<(ast::QueryList, Manifest), String> {
     let query_source = required_string_arg(arguments, "query")?;
-    let (database_schema, context, _paths) = current_schema_context(options, arguments)?;
+    let (_database_schema, context, _paths) = current_schema_context(options, arguments)?;
     let query_list = pyre::parser::parse_query("mcp.pyre", &query_source)
         .map_err(|_| "Failed to parse dynamic Pyre query".to_string())?;
     let query_infos = pyre::typecheck::check_queries(&query_list, &context)
         .map_err(|errors| format!("Dynamic query failed typecheck: {errors:#?}"))?;
-    let manifest = dynamic_manifest(&database_schema, &context, &query_list, &query_infos)?;
+    let manifest = dynamic_manifest(&context, &query_list, &query_infos)?;
     Ok((query_list, manifest))
 }
 
@@ -761,7 +761,6 @@ fn current_schema_context(
 }
 
 fn dynamic_manifest(
-    database: &ast::Database,
     context: &pyre::typecheck::Context,
     query_list: &ast::QueryList,
     query_infos: &HashMap<String, pyre::typecheck::QueryInfo>,
@@ -782,7 +781,7 @@ fn dynamic_manifest(
 
     Ok(Manifest {
         version: 1,
-        session_schema: session_schema(context, database),
+        session_schema: session_schema(context),
         queries,
     })
 }
@@ -814,11 +813,13 @@ fn dynamic_query_manifest(
         }
     }
 
+    let mut attached_dbs: Vec<String> = query_info.attached_dbs.iter().cloned().collect();
+    attached_dbs.sort();
     Ok(QueryManifest {
         id: query.name.clone(),
         operation: format!("{:?}", query.operation).to_lowercase(),
         primary_db: query_info.primary_db.clone(),
-        attached_dbs: query_info.attached_dbs.iter().cloned().collect(),
+        attached_dbs,
         input_schema: input_schema(context, query_info),
         session_args: session_args(query_info),
         optional_input_args: query
@@ -827,7 +828,16 @@ fn dynamic_query_manifest(
             .filter(|arg| arg.omittable)
             .map(|arg| arg.name.clone())
             .collect(),
-        json_input_args: Vec::new(),
+        json_input_args: query
+            .args
+            .iter()
+            .filter(|arg| {
+                arg.type_.as_deref().is_some_and(|type_| {
+                    pyre::typecheck::query_param_requires_json_serialization(context, type_)
+                })
+            })
+            .map(|arg| arg.name.clone())
+            .collect(),
         sql,
         sync_sql: None,
     })
@@ -850,14 +860,16 @@ fn input_schema(
             if *from_session {
                 continue;
             }
+            let resolved_type = type_
+                .as_deref()
+                .map(|type_| pyre::typecheck::resolve_query_param_type(context, type_))
+                .unwrap_or_else(|| "Json".to_string());
             schema.insert(
                 raw_variable_name.clone(),
                 FieldSchema {
-                    type_: type_.clone().unwrap_or_else(|| "Json".to_string()),
-                    is_enum: type_
-                        .as_deref()
-                        .is_some_and(|type_| is_enum_type(context, type_)),
-                    enum_variants: enum_variants(context, type_.as_deref()),
+                    type_: resolved_type.clone(),
+                    is_enum: is_enum_type(context, &resolved_type),
+                    enum_variants: enum_variants(context, Some(&resolved_type)),
                     tagged_union_variants: HashMap::new(),
                     tagged_union_types: HashMap::new(),
                     nullable: *nullable,
@@ -869,14 +881,10 @@ fn input_schema(
     schema
 }
 
-fn session_schema(
-    context: &pyre::typecheck::Context,
-    database: &ast::Database,
-) -> HashMap<String, FieldSchema> {
-    let session = database
-        .schemas
-        .iter()
-        .find_map(|schema| schema.session.clone())
+fn session_schema(context: &pyre::typecheck::Context) -> HashMap<String, FieldSchema> {
+    let session = context
+        .session
+        .clone()
         .unwrap_or_else(ast::default_session_details);
     let mut schema = HashMap::new();
     for field in session.fields {

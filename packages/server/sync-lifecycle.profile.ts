@@ -77,10 +77,11 @@ async function setupDatabase(db: Client, config: ProfileConfig): Promise<void> {
       updatedAt integer not null
     )`,
     `create table if not exists _pyre_sync (
-      key text primary key,
-      value integer not null
+      id integer primary key check (id = 1),
+      database_epoch text not null,
+      server_revision integer not null
     )`,
-    "insert into _pyre_sync (key, value) values ('server_revision', 0) on conflict(key) do nothing",
+    "insert into _pyre_sync (id, database_epoch, server_revision) values (1, lower(hex(randomblob(16))), 0) on conflict(id) do nothing",
   ]);
 
   const chunkSize = 100;
@@ -166,7 +167,7 @@ async function profileCatchup(db: Client, config: ProfileConfig): Promise<PhaseT
       };
     });
 
-    await time(totals, "catchup.revision_read", () => db.execute("select value from _pyre_sync where key = 'server_revision'"));
+    await time(totals, "catchup.revision_read", () => db.execute("select server_revision from _pyre_sync where id = 1"));
     await time(totals, "catchup.serialize_response", () => JSON.stringify(response));
 
     if (cursor.lastSeenUpdatedAt != null && cursor.lastSeenUpdatedAt >= config.rows) {
@@ -221,8 +222,8 @@ async function profileMutationLifecycle(db: Client, config: ProfileConfig): Prom
       }));
     });
 
-    const revisionResult = await time(totals, "delta.revision_allocate", () => db.execute("update _pyre_sync set value = value + 1 where key = 'server_revision' returning value"));
-    const serverRevision = Number(revisionResult.rows[0]?.value ?? 0);
+    const revisionResult = await time(totals, "delta.revision_allocate", () => db.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning server_revision"));
+    const serverRevision = Number(revisionResult.rows[0]?.server_revision ?? 0);
 
     await time(totals, "delta.stamp_messages", () => {
       deltaMessages = deltaMessages.map((entry: any) => ({
@@ -292,14 +293,14 @@ async function profileLiveSyncFanout(db: Client, config: ProfileConfig): Promise
 
   await time(totals, "revision.current_update_returning", async () => {
     for (let iteration = 0; iteration < config.iterations; iteration += 1) {
-      await db.execute("update _pyre_sync set value = value + 1 where key = 'server_revision' returning value");
+      await db.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning server_revision");
     }
   });
   await time(totals, "revision.legacy_lazy_ensure", async () => {
     for (let iteration = 0; iteration < config.iterations; iteration += 1) {
-      await db.execute("create table if not exists _pyre_sync (key text primary key, value integer not null)");
-      await db.execute("insert into _pyre_sync (key, value) values ('server_revision', 0) on conflict(key) do nothing");
-      await db.execute("update _pyre_sync set value = value + 1 where key = 'server_revision' returning value");
+      await db.execute("create table if not exists _pyre_sync (id integer primary key check (id = 1), database_epoch text not null, server_revision integer not null)");
+      await db.execute("insert into _pyre_sync (id, database_epoch, server_revision) values (1, lower(hex(randomblob(16))), 0) on conflict(id) do nothing");
+      await db.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning server_revision");
     }
   });
 

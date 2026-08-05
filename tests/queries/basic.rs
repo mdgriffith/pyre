@@ -36,6 +36,30 @@ async fn test_simple_query() -> Result<(), TestError> {
 }
 
 #[tokio::test]
+async fn test_root_alias_is_used_as_response_key() -> Result<(), TestError> {
+    let db = TestDatabase::new(&schema::full_schema()).await?;
+    db.seed_standard_data().await?;
+
+    let rows = db
+        .execute_query(
+            r#"
+query GetPeople {
+    people: user {
+        id
+        name
+    }
+}
+"#,
+        )
+        .await?;
+    let results = db.parse_query_results(rows).await?;
+
+    assert!(results.contains_key("people"));
+    assert!(!results.contains_key("user"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_query_with_fields() -> Result<(), TestError> {
     let db = TestDatabase::new(&schema::full_schema()).await?;
     db.seed_standard_data().await?;

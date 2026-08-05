@@ -12,8 +12,9 @@
    - `Data.Catchup` receives `InitialDataLoaded` and computes the initial sync cursor from the in-memory DB.
 
 3. **Catchup loop (`Data.Catchup`)**
-   - Once initial data is loaded, `Data.Catchup` requests `/sync`.
-   - Each catchup response is converted to a delta and applied to the in-memory `Db`.
+    - Once initial data is loaded, `Data.Catchup` requests `/sync`.
+    - The request includes the persisted `databaseEpoch` when one is known.
+    - Each catchup response is converted to a delta and applied to the in-memory `Db`.
    - `Data.QueryManager` is notified so queries re-run.
    - The cursor is updated in memory and the loop continues until `has_more = false`.
 
@@ -62,9 +63,17 @@ flowchart TD
    - after each SSE delta.
 - Authoritative catchup/live deltas are applied before local optimistic mutations are replayed.
 - Live sync deltas with `serverRevision <= lastAppliedServerRevision` are stale and are skipped.
+- Revision ordering applies only within the same `databaseEpoch`.
 - The client persists `lastAppliedServerRevision` in IndexedDB metadata and restores it at startup.
+- The client persists the server-issued `databaseEpoch` alongside the revision watermark.
 - Live `syncRequired` / `catchupRequired` messages with stale `serverRevision` values are ignored.
 - Catchup responses include the current `serverRevision` when the server has allocated one, so reconnect catchup advances the same revision watermark as live sync.
+
+## Database replacement
+
+`databaseEpoch` is an opaque identity for one lifetime of a logical database. The server keeps it stable across ordinary writes and migrations and rotates it when cached state must be discarded.
+
+When a catchup request supplies a different epoch, the server returns an explicit `reset` response without a data page. The client immediately clears in-memory data and optimistic state, atomically clears IndexedDB rows/cursors/revision while storing the new epoch, waits for that transaction to complete, and then restarts catchup with an empty cursor. Live messages also carry the epoch so revisions from different database lifetimes are never compared.
 
 ## Mutation Ordering
 

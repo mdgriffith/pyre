@@ -7,7 +7,7 @@ use nom::{
     character::complete::{
         alphanumeric1, char, line_ending, multispace0, multispace1, newline, one_of,
     },
-    combinator::{all_consuming, cut, eof, opt, recognize, value},
+    combinator::{all_consuming, cut, eof, opt, recognize, value, verify},
     error::{VerboseError, VerboseErrorKind},
     multi::{many0, many1, separated_list0, separated_list1},
     sequence::{delimited, preceded, tuple},
@@ -578,7 +578,7 @@ fn parse_table_permission(input: Text) -> ParseResult<ast::Field> {
             // Parse comma or newline-separated list of where conditions (or single condition)
             // Separator: comma or newline (newlines are treated as implicit &&)
             // But || at start of line indicates Or grouping
-            let (input, where_args) = separated_list0(
+            let (input, where_args) = separated_list1(
                 |input| {
                     // Consume spaces/tabs but not newlines (newlines are the separator)
                     let (input, _) = space0(input)?;
@@ -621,7 +621,7 @@ fn parse_table_permission(input: Text) -> ParseResult<ast::Field> {
             // Parse where clause - can be multiline
             // Separator: comma or newline (newlines are treated as implicit &&)
             // But || at start of line indicates Or grouping
-            let (input, where_args) = separated_list0(
+            let (input, where_args) = separated_list1(
                 |input| {
                     // Consume spaces/tabs but not newlines (newlines are the separator)
                     let (input, _) = space0(input)?;
@@ -1689,9 +1689,42 @@ fn parse_where_arg_mode(input: Text, allow_exists: bool) -> ParseResult<ast::Whe
 
 fn parse_where_atom(input: Text, allow_exists: bool) -> ParseResult<ast::WhereArg> {
     if allow_exists {
-        alt((parse_exists, parse_query_where))(input)
+        alt((
+            |input| parse_logical_where(input, allow_exists),
+            parse_exists,
+            parse_query_where,
+        ))(input)
     } else {
-        parse_query_where(input)
+        alt((
+            |input| parse_logical_where(input, allow_exists),
+            parse_query_where,
+        ))(input)
+    }
+}
+
+fn parse_logical_where(input: Text, allow_exists: bool) -> ParseResult<ast::WhereArg> {
+    let (input, is_and) = alt((value(true, tag("And")), value(false, tag("Or"))))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag("(")(input)?;
+    let (input, _) = multispace0(input)?;
+    let separator = |input| {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = tag(",")(input)?;
+        let (input, _) = multispace0(input)?;
+        Ok((input, ()))
+    };
+    let (input, args) = cut(verify(
+        separated_list1(separator, |input| parse_where_arg_mode(input, allow_exists)),
+        |args: &Vec<ast::WhereArg>| args.len() >= 2,
+    ))(input)?;
+    let (input, _) = opt(separator)(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = cut(tag(")"))(input)?;
+
+    if is_and {
+        Ok((input, ast::WhereArg::And(args)))
+    } else {
+        Ok((input, ast::WhereArg::Or(args)))
     }
 }
 

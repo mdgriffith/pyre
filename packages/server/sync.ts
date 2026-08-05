@@ -81,6 +81,7 @@ export interface SyncCursor {
 export interface SyncPageResult {
     databaseId?: DatabaseId;
     serverRevision?: number;
+    databaseEpoch: string;
     tables: Record<
         string,
         {
@@ -90,6 +91,28 @@ export interface SyncPageResult {
         }
     >;
     has_more: boolean;
+}
+
+export interface SyncResetResult {
+    type: "reset";
+    databaseId?: DatabaseId;
+    databaseEpoch: string;
+    operation: "replace";
+    scope: "database";
+    reason: "database_epoch_changed";
+}
+
+export type CatchupResult = SyncPageResult | SyncResetResult;
+
+export async function rotateDatabaseEpoch(db: Client): Promise<string> {
+    const result = await db.execute(
+        "update _pyre_sync set database_epoch = lower(hex(randomblob(16))), server_revision = 0 where id = 1 returning database_epoch",
+    );
+    const databaseEpoch = result.rows[0]?.database_epoch;
+    if (typeof databaseEpoch !== "string" || databaseEpoch.length === 0) {
+        throw new Error("Failed to rotate Pyre database epoch");
+    }
+    return databaseEpoch;
 }
 
 function tryParseNestedJsonContainer(value: unknown): unknown {
@@ -197,13 +220,15 @@ export async function catchup(
     session: SyncSession,
     pageSize: number = DEFAULT_SYNC_PAGE_SIZE,
     databaseId?: DatabaseId,
-): Promise<SyncPageResult> {
+    clientDatabaseEpoch?: string,
+): Promise<CatchupResult> {
     activateSchemaForDatabase(databaseId);
     const effectivePageSize = normalizePageSize(pageSize);
     validateSyncCursor(syncCursor);
+    const wasmSession = normalizeForWasmJson(session);
 
     // Step 1: Get sync status SQL
-    const statusStatement = wasm.get_sync_status_sql(syncCursor, session);
+    const statusStatement = wasm.get_sync_status_sql(syncCursor, wasmSession);
     if (typeof statusStatement === "string" && statusStatement.startsWith("Error:")) {
         throw new Error(statusStatement);
     }
@@ -216,9 +241,24 @@ export async function catchup(
     const serverRevision = typeof rawServerRevision === "number" || typeof rawServerRevision === "bigint"
         ? Number(rawServerRevision)
         : null;
+    const rawDatabaseEpoch = statusResult.rows[0]?.database_epoch;
+    if (typeof rawDatabaseEpoch !== "string" || rawDatabaseEpoch.length === 0) {
+        throw new Error("Missing database_epoch in _pyre_sync");
+    }
+    const databaseEpoch = rawDatabaseEpoch;
+    if (clientDatabaseEpoch !== undefined && clientDatabaseEpoch !== databaseEpoch) {
+        return {
+            type: "reset",
+            ...(databaseId ? { databaseId: requireDatabaseId(databaseId) } : {}),
+            databaseEpoch,
+            operation: "replace",
+            scope: "database",
+            reason: "database_epoch_changed",
+        };
+    }
 
     // Step 3: Get sync SQL for tables that need syncing
-    const syncSqlResult = wasm.get_sync_sql(statusResult.rows, syncCursor, session, effectivePageSize);
+    const syncSqlResult = wasm.get_sync_sql(statusResult.rows, syncCursor, wasmSession, effectivePageSize);
     if (typeof syncSqlResult === "string" && syncSqlResult.startsWith("Error:")) {
         throw new Error(syncSqlResult);
     }
@@ -230,6 +270,7 @@ export async function catchup(
 
     const result: SyncPageResult = {
         ...(databaseId ? { databaseId: requireDatabaseId(databaseId) } : {}),
+        databaseEpoch,
         tables: {},
         has_more: false,
     };

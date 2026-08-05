@@ -263,7 +263,25 @@ pub fn generate_text_file(
     path: impl Into<PathBuf>,
     contents: impl Into<String>,
 ) -> GeneratedFile<String> {
-    GeneratedFile::new(path, contents.into())
+    let contents = contents.into();
+    let contents = contents
+        .split('\n')
+        .map(|line| line.trim_end_matches([' ', '\t']))
+        .collect::<Vec<_>>()
+        .join("\n");
+    GeneratedFile::new(path, contents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_text_file;
+
+    #[test]
+    fn generated_text_files_strip_trailing_horizontal_whitespace() {
+        let file = generate_text_file("generated.ts", "first  \nsecond\t\nthird  ");
+
+        assert_eq!(file.contents, "first\nsecond\nthird");
+    }
 }
 
 // Writing files

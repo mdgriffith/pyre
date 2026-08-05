@@ -39,7 +39,7 @@ async function startSyncedElmApp() {
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseId: 'campaign:123', tables: {}, has_more: false });
+    response = JSON.stringify({ databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -79,6 +79,7 @@ async function startSyncedElmApp() {
         baseUrl: 'http://example.test',
         catchupPath: '/sync',
         databaseId: 'campaign:123',
+        databaseEpoch: 'test-epoch',
       },
       liveSync: {
         transport: 'sse',
@@ -198,6 +199,7 @@ test('Elm live syncRequired starts catchup from the current cursor', async () =>
     expect(requests.at(-1)?.method).toBe('POST');
     expect(JSON.parse(requests.at(-1)?.body ?? '{}')).toEqual({
       databaseId: 'campaign:123',
+      databaseEpoch: 'test-epoch',
       syncCursor: {
         tables: {
           maps: {
@@ -265,6 +267,7 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
     send() {
       this.response = JSON.stringify({
         databaseId: 'campaign:123',
+        databaseEpoch: 'test-epoch',
         serverRevision: 1,
         tables: {
           maps: {
@@ -310,6 +313,7 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
             tables: {},
             cursor: { tables: {} },
             lastAppliedServerRevision: null,
+            databaseEpoch: null,
           },
         });
       }
@@ -367,7 +371,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
 
     send() {
       if (this.responseURL.endsWith('/sync')) {
-        this.response = JSON.stringify({ databaseId: 'campaign:123', serverRevision: 0, tables: {}, has_more: false });
+        this.response = JSON.stringify({ databaseId: 'campaign:123', databaseEpoch: 'test-epoch', serverRevision: 0, tables: {}, has_more: false });
         queueMicrotask(() => (this.listeners.load ?? []).forEach((listener) => listener()));
         return;
       }

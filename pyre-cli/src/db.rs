@@ -133,7 +133,6 @@ pub enum MigrationError {
     MigrationValidationFailed {
         changes: Vec<String>,
     },
-    SchemaTypecheckFailed,
 }
 
 impl MigrationError {
@@ -207,10 +206,6 @@ impl MigrationError {
                         .collect::<Vec<_>>()
                         .join("\n")
                 ),
-            ),
-            MigrationError::SchemaTypecheckFailed => pyre::error::format_custom_error(
-                "Schema Typecheck Failed",
-                "The schema could not be typechecked while validating migrations.",
             ),
         }
     }
@@ -318,6 +313,7 @@ impl MigrateOutcome {
 
 pub struct MigrateOptions<'a> {
     pub schema: &'a ast::Schema,
+    pub context: &'a typecheck::Context,
     pub migration_folder: &'a Path,
     pub migration_root: &'a Path,
     pub namespace: Option<&'a str>,
@@ -382,20 +378,16 @@ async fn preflight_database_compatibility(
     let has_migration_table = table_names
         .iter()
         .any(|name| name == pyre::db::migrate::MIGRATION_TABLE);
-    let has_schema_table = table_names
-        .iter()
-        .any(|name| name == pyre::db::migrate::SCHEMA_TABLE);
-
     let non_pyre_tables: Vec<String> = table_names
         .iter()
         .filter(|name| {
             name.as_str() != pyre::db::migrate::MIGRATION_TABLE
-                && name.as_str() != pyre::db::migrate::SCHEMA_TABLE
+                && name.as_str() != pyre::db::migrate::SYNC_TABLE
         })
         .cloned()
         .collect();
 
-    if !has_migration_table && !has_schema_table {
+    if !has_migration_table {
         if !non_pyre_tables.is_empty() {
             return Err(MigrationError::IncompatibleDatabase {
                 db_path: options.db_path.to_string(),
@@ -403,13 +395,6 @@ async fn preflight_database_compatibility(
             });
         }
         return Ok(());
-    }
-
-    if has_migration_table ^ has_schema_table {
-        return Err(MigrationError::IncompatibleDatabase {
-            db_path: options.db_path.to_string(),
-            tables: table_names,
-        });
     }
 
     if let Some(namespace) = options.namespace {
@@ -507,19 +492,15 @@ pub async fn migrate(
 
     let migrations_applied = migration_plan.migrations_to_run.len();
 
-    let schema_database = ast::Database {
-        schemas: vec![schema.clone()],
-    };
-    let schema_context = typecheck::check_schema(&schema_database)
-        .map_err(|_| MigrationError::SchemaTypecheckFailed)?;
-
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
         .map_err(MigrationError::SqlError)?;
 
     // Execute migrations that need to be run
-    for (migration_filename, migration_contents) in &migration_plan.migrations_to_run {
+    for (index, (migration_filename, migration_contents)) in
+        migration_plan.migrations_to_run.iter().enumerate()
+    {
         tx.execute_batch(migration_contents)
             .await
             .map_err(MigrationError::SqlError)?;
@@ -527,35 +508,41 @@ pub async fn migrate(
         // Record migration using centralized constant
         // INSERT_MIGRATION_SUCCESS requires (name, sql, finished_at)
         // where finished_at is set to unixepoch() automatically
-        let insert_sql = pyre::db::migrate::INSERT_MIGRATION_SUCCESS.replace(
+        let is_last = index + 1 == migration_plan.migrations_to_run.len();
+        let insert_sql = (if is_last {
+            pyre::db::migrate::INSERT_MIGRATION_SUCCESS_WITH_SCHEMA
+        } else {
+            pyre::db::migrate::INSERT_MIGRATION_SUCCESS
+        })
+        .replace(
             pyre::db::migrate::MIGRATION_TABLE,
             &pyre::ext::string::quote(pyre::db::migrate::MIGRATION_TABLE),
         );
-        tx.execute(
-            &insert_sql,
-            libsql::params![migration_filename.clone(), migration_contents.clone()],
-        )
-        .await
-        .map_err(MigrationError::SqlError)?;
+        let params = if is_last {
+            vec![
+                libsql::Value::Text(migration_filename.clone()),
+                libsql::Value::Text(migration_contents.clone()),
+                libsql::Value::Text(migration_plan.schema_string.clone()),
+            ]
+        } else {
+            vec![
+                libsql::Value::Text(migration_filename.clone()),
+                libsql::Value::Text(migration_contents.clone()),
+            ]
+        };
+        tx.execute(&insert_sql, libsql::params_from_iter(params))
+            .await
+            .map_err(MigrationError::SqlError)?;
     }
 
     let introspection = introspect::introspect_connection(&tx)
         .await
         .map_err(MigrationError::SqlError)?;
-    let validation_diff = diff::diff(&schema_context, schema, &introspection);
+    let validation_diff = diff::diff(options.context, schema, &introspection);
     if !diff::is_empty(&validation_diff) {
         let changes = migration_validation_changes(&validation_diff);
         tx.rollback().await.map_err(MigrationError::SqlError)?;
         return Err(MigrationError::MigrationValidationFailed { changes });
-    }
-
-    if migrations_applied > 0 {
-        tx.execute(
-            &migration_plan.insert_schema_sql,
-            libsql::params![migration_plan.schema_string],
-        )
-        .await
-        .map_err(MigrationError::SqlError)?;
     }
 
     tx.commit().await.map_err(MigrationError::SqlError)?;

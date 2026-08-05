@@ -361,6 +361,7 @@ class SingleDatabasePyreClient {
   private pendingLiveState: SyncState | null = null;
   private pendingLiveQueries: Set<string> = new Set();
   private lastAppliedServerRevision: number | null = null;
+  private databaseEpoch: string | null = null;
   private queryManager: QueryManagerService;
   private queryClient: QueryClientService;
   private entityStream: EntityStreamService;
@@ -439,6 +440,10 @@ class SingleDatabasePyreClient {
     this.entityStream = new EntityStreamService();
     this.indexedDbService = new IndexedDbService(this.storage, this.logDebug, (tableGroups, source) => {
       this.entityStream.handleTableDelta(tableGroups, source, this.databaseId);
+    }, () => {
+      this.lastAppliedServerRevision = null;
+    }, (databaseEpoch) => {
+      this.databaseEpoch = databaseEpoch;
     });
     this.sseManager = new SSEManager({
       baseUrl: config.server.baseUrl,
@@ -473,7 +478,14 @@ class SingleDatabasePyreClient {
 
     if (this.elmApp.ports.debugOut) {
       this.elmApp.ports.debugOut.subscribe((message) => {
-        this.logDebug('[PyreClient] port debugOut <-', message);
+        const epochChange = databaseEpochChangeFromDebugMessage(message);
+        if (epochChange) {
+          this.logDebug(
+            `[PyreClient] Database epoch changed: going from epoch ${epochChange.fromEpoch} to epoch ${epochChange.toEpoch}; resetting local state.`,
+          );
+        } else {
+          this.logDebug('[PyreClient] port debugOut <-', message);
+        }
         const eventName = debugOutEventName(message);
         if (eventName) {
           this.emitDevtoolsEvent(`elm:${eventName}`, message);
@@ -529,6 +541,7 @@ class SingleDatabasePyreClient {
   async init(): Promise<void> {
     await this.storage.init();
     this.lastAppliedServerRevision = await this.storage.getServerRevision();
+    this.databaseEpoch = await this.storage.getDatabaseEpoch();
   }
 
   startSync(): void {
@@ -963,6 +976,10 @@ class SingleDatabasePyreClient {
       return false;
     }
 
+    if (this.databaseEpoch !== null && message.databaseEpoch !== undefined && message.databaseEpoch !== this.databaseEpoch) {
+      return false;
+    }
+
     if (this.isStaleServerRevision(message.serverRevision)) {
       return false;
     }
@@ -975,7 +992,10 @@ class SingleDatabasePyreClient {
   }
 
   private shouldAcceptLiveControlMessage(message: LiveSyncMessage): boolean {
-    if (this.isStaleServerRevision(message.serverRevision)) {
+    const epochChanged = this.databaseEpoch !== null
+      && message.databaseEpoch !== undefined
+      && message.databaseEpoch !== this.databaseEpoch;
+    if (!epochChanged && this.isStaleServerRevision(message.serverRevision)) {
       return false;
     }
 
@@ -2617,6 +2637,19 @@ function debugOutEventName(message: unknown): string | null {
   return typeof event === 'string' && event.trim() !== ''
     ? event.trim()
     : null;
+}
+
+function databaseEpochChangeFromDebugMessage(message: unknown): { fromEpoch: string; toEpoch: string } | null {
+  if (!message || typeof message !== 'object') {
+    return null;
+  }
+
+  const event = message as Record<string, unknown>;
+  if (event.event !== 'database-epoch-change' || typeof event.fromEpoch !== 'string' || typeof event.toEpoch !== 'string') {
+    return null;
+  }
+
+  return { fromEpoch: event.fromEpoch, toEpoch: event.toEpoch };
 }
 
 function internalDevtoolsEventType(event: PyreDevtoolsEvent): string {

@@ -13,6 +13,26 @@ pub struct Options<'a> {
     pub enable_color: bool,
 }
 
+pub fn pyre_file_count(paths: &filesystem::Found) -> usize {
+    paths.schema_files.values().map(Vec::len).sum::<usize>()
+        + usize::from(paths.session_file.is_some())
+        + paths.query_files.len()
+}
+
+pub fn display_path(path: &Path) -> String {
+    let relative = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(cwd).ok())
+        .unwrap_or(path);
+    let rendered = relative.display().to_string();
+
+    if relative.is_absolute() || rendered.starts_with('.') {
+        rendered
+    } else {
+        format!("./{}", rendered)
+    }
+}
+
 pub fn id_column() -> ast::Column {
     ast::Column {
         name: "id".to_string(),
@@ -197,7 +217,10 @@ pub fn parse_database_schemas(
                         "{}",
                         parser::render_error(&source.content, err, enable_color)
                     );
-                    std::process::exit(1);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to parse {}", source.path),
+                    ));
                 }
             }
         }

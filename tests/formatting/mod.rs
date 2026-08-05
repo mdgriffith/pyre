@@ -776,6 +776,13 @@ fn round_trip_schema(source: &str) {
 
     // Format again
     format::schema(&mut schema2);
+    let formatted_again = generate::to_string::schema_to_string(&schema2.namespace, &schema2);
+
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent. First format:\n{}\n\nSecond format:\n{}",
+        formatted, formatted_again
+    );
 
     // Compare ASTs (ignoring locations)
     assert!(
@@ -898,6 +905,13 @@ fn round_trip_query(source: &str, database: &ast::Database) {
 
     // Format again
     format::query_list(database, &mut query_list2);
+    let formatted_again = generate::to_string::query(&query_list2);
+
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent. First format:\n{}\n\nSecond format:\n{}",
+        formatted, formatted_again
+    );
 
     // Compare ASTs (ignoring locations)
     assert!(
@@ -1061,10 +1075,54 @@ record Game {
     let formatted = generate::to_string::schema_to_string(&schema.namespace, &schema);
 
     assert!(
-        formatted.contains("@allow(*) {\n        createdByUserId == Session.userId\n        || Session.isAdmin == True\n"),
-        "Expected multi-term @allow OR to format as multi-line. Got:\n{}",
+        formatted.contains(
+            "@allow(*) {\n        Or(\n            createdByUserId == Session.userId,\n            Session.isAdmin == True,\n        )\n    }"
+        ),
+        "Expected multi-term @allow OR to use structural syntax. Got:\n{}",
         formatted
     );
+}
+
+#[test]
+fn test_nested_structural_permissions_format_canonically() {
+    let schema_source = r#"
+record Game {
+    @allow(query) {
+        And(
+            ownerId == Session.userId,
+            Or(status == "active", status == "pending"),
+            published == True
+        )
+    }
+}
+    "#;
+
+    let formatted = format_schema_string(schema_source);
+
+    assert!(formatted.contains(
+        "@allow(query) {\n        ownerId == Session.userId\n        Or(\n            status == \"active\",\n            status == \"pending\",\n        )\n        published == True\n    }"
+    ));
+    assert!(!formatted.contains("@allow(query) {\n        And("));
+    round_trip_schema(schema_source);
+}
+
+#[test]
+fn test_mixed_legacy_and_structural_permissions_format_canonically() {
+    let schema_source = r#"
+record Game {
+    @allow(query) {
+        ownerId == Session.userId && Or(status == "active", status == "pending")
+    }
+}
+    "#;
+
+    let formatted = format_schema_string(schema_source);
+
+    assert!(formatted.contains(
+        "@allow(query) {\n        ownerId == Session.userId\n        Or(\n            status == \"active\",\n            status == \"pending\",\n        )\n    }"
+    ));
+    assert!(!formatted.contains("@allow(query) {\n        And("));
+    round_trip_schema(schema_source);
 }
 
 #[test]
@@ -1269,6 +1327,157 @@ record Task {
     }
 }
 
+fn create_typed_literal_database() -> ast::Database {
+    let schema_source = r#"
+type Dimensions = Dimensions { width Int, height Int }
+
+type Mode
+   = Manual
+   | Automatic { threshold Int }
+
+type Metadata = Metadata {
+    label String
+    scale Float
+    visible Bool
+    note String?
+    capturedAt DateTime?
+    mode Mode
+}
+
+record Asset {
+    @public
+
+    id Int @id
+    dimensions Dimensions
+    metadata Metadata?
+}
+    "#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).unwrap();
+    ast::Database {
+        schemas: vec![schema],
+    }
+}
+
+#[test]
+fn test_query_format_preserves_typed_literal_fields_in_update() {
+    let database = create_typed_literal_database();
+    let source = r#"update UpdateGameAssetDimensions($id: Asset.id, $width: Int, $height: Int) {
+    asset {
+        @where { id == $id }
+
+        dimensions = Dimensions { width = $width, height = $height }
+    }
+}
+
+"#;
+
+    let mut queries = parser::parse_query("query.pyre", source).unwrap();
+    format::query_list(&database, &mut queries);
+    let formatted = generate::to_string::query(&queries);
+
+    assert_eq!(
+        formatted,
+        r#"update UpdateGameAssetDimensions($id: Asset.id, $width: Int, $height: Int) {
+    asset {
+        @where { id == $id }
+
+        dimensions = Dimensions {
+            width = $width
+            height = $height
+        }
+    }
+}
+
+"#
+    );
+    round_trip_query(source, &database);
+}
+
+#[test]
+fn test_query_format_preserves_nested_typed_literals_and_scalar_fields() {
+    let database = create_typed_literal_database();
+    let source = r#"
+insert CreateAsset($id: Asset.id, $width: Int) {
+    asset {
+        id = $id
+        dimensions = Dimensions { width = $width, height = 24 }
+        metadata = Metadata { label = "hero", scale = 1.5, visible = True, note = null, capturedAt = now(), mode = Automatic { threshold = 3 } }
+    }
+}
+"#;
+
+    round_trip_query(source, &database);
+
+    let mut queries = parser::parse_query("query.pyre", source).unwrap();
+    format::query_list(&database, &mut queries);
+    let formatted = generate::to_string::query(&queries);
+    assert!(formatted.contains(
+        "metadata = Metadata {\n            label = \"hero\"\n            scale = 1.5\n            visible = True\n            note = null\n            capturedAt = now()\n            mode = Automatic { threshold = 3 }\n        }"
+    ));
+    assert!(formatted.contains(
+        "dimensions = Dimensions {\n            width = $width\n            height = 24\n        }"
+    ));
+    assert!(formatted.contains("mode = Automatic { threshold = 3 }"));
+}
+
+#[test]
+fn test_query_format_keeps_multiple_typed_literal_fields_multiline() {
+    let database = create_typed_literal_database();
+    let source = r#"
+update UpdateDimensions($id: Asset.id, $width: Int, $height: Int) {
+    asset {
+        @where { id == $id }
+        dimensions = Dimensions {
+            width = $width
+            height = $height
+        }
+    }
+}
+"#;
+
+    let mut queries = parser::parse_query("query.pyre", source).unwrap();
+    format::query_list(&database, &mut queries);
+    let formatted = generate::to_string::query(&queries);
+
+    assert!(formatted.contains(
+        "dimensions = Dimensions {\n            width = $width\n            height = $height\n        }"
+    ));
+    round_trip_query(source, &database);
+}
+
+#[test]
+fn test_query_format_preserves_typed_literals_in_predicates_and_fieldless_variants() {
+    let database = create_typed_literal_database();
+    let source = r#"
+query MatchingAssets($width: Int) {
+    asset {
+        @where { dimensions == Dimensions { width = $width, height = 24 } }
+        id
+    }
+}
+
+update UseManualMode($id: Asset.id) {
+    asset {
+        @where { id == $id }
+        metadata = Metadata { label = "manual", scale = 1, visible = False, note = null, mode = Manual }
+    }
+}
+"#;
+
+    round_trip_query(source, &database);
+
+    let mut queries = parser::parse_query("query.pyre", source).unwrap();
+    format::query_list(&database, &mut queries);
+    let formatted = generate::to_string::query(&queries);
+    assert!(formatted.contains(
+        "@where {\n            dimensions == Dimensions {\n                width = $width\n                height = 24\n            }\n        }"
+    ));
+    assert!(formatted.contains("mode = Manual"));
+    assert!(!formatted.contains("Manual {"));
+}
+
 #[test]
 fn test_query_round_trip_simple_select() {
     let database = create_test_database();
@@ -1450,6 +1659,88 @@ fn test_query_round_trip_complex_where() {
 query GetUsers {
     user {
         @where { id == 1 && name == "test" || email == "test@example.com" }
+        id
+        name
+    }
+}
+    "#;
+
+    round_trip_query(query_source, &database);
+}
+
+#[test]
+fn test_query_format_uses_implicit_top_level_and() {
+    let database = create_test_database();
+    let query_source = r#"
+query GetUser($id: Int, $name: String) {
+    user {
+        @where { id == $id && name == $name }
+        id
+    }
+}
+    "#;
+
+    let mut query_list = parser::parse_query("query.pyre", query_source).unwrap();
+    format::query_list(&database, &mut query_list);
+    let formatted = generate::to_string::query(&query_list);
+
+    assert!(
+        formatted.contains("@where {\n            id == $id\n            name == $name\n        }")
+    );
+    assert!(!formatted.contains("@where {\n            And("));
+    round_trip_query(query_source, &database);
+}
+
+#[test]
+fn test_query_format_keeps_nested_and_inside_or_explicit() {
+    let database = create_test_database();
+    let query_source = r#"
+query GetUsers($id: Int) {
+    user {
+        @where {
+            And(
+                id == $id,
+                Or(
+                    name == "primary",
+                    And(
+                        email == "test@example.com",
+                        age > 18,
+                    ),
+                ),
+            )
+        }
+        id
+    }
+}
+    "#;
+
+    let mut query_list = parser::parse_query("query.pyre", query_source).unwrap();
+    format::query_list(&database, &mut query_list);
+    let formatted = generate::to_string::query(&query_list);
+
+    assert!(formatted.contains("@where {\n            id == $id\n            Or("));
+    assert!(formatted.contains(
+        "name == \"primary\",\n                And(\n                    email == \"test@example.com\",\n                    age > 18,"
+    ));
+    assert!(!formatted.contains("@where {\n            And("));
+    round_trip_query(query_source, &database);
+}
+
+#[test]
+fn test_query_round_trip_structural_where() {
+    let database = create_test_database();
+    let query_source = r#"
+query GetUsers {
+    user {
+        @where {
+            And(
+                id == 1,
+                Or(
+                    name == "test",
+                    email == "test@example.com",
+                ),
+            )
+        }
         id
         name
     }
