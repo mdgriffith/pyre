@@ -54,148 +54,23 @@ record Document {
 
 /// Seed test data for permissions tests
 async fn seed_permissions_data(db: &TestDatabase) -> Result<(), TestError> {
-    // Insert posts for different authors
-    let insert_post = r#"
-        insert CreatePost($title: String, $content: String, $authorId: Int, $published: Bool) {
-            post {
-                title = $title
-                content = $content
-                authorId = $authorId
-                published = $published
-            }
-        }
-    "#;
-
-    let mut params = HashMap::new();
-    params.insert(
-        "title".to_string(),
-        libsql::Value::Text("Post 1".to_string()),
-    );
-    params.insert(
-        "content".to_string(),
-        libsql::Value::Text("Content 1".to_string()),
-    );
-    params.insert("authorId".to_string(), libsql::Value::Integer(1));
-    params.insert("published".to_string(), libsql::Value::Integer(1));
-    db.execute_insert_with_params(insert_post, params).await?;
-
-    let mut params = HashMap::new();
-    params.insert(
-        "title".to_string(),
-        libsql::Value::Text("Post 2".to_string()),
-    );
-    params.insert(
-        "content".to_string(),
-        libsql::Value::Text("Content 2".to_string()),
-    );
-    params.insert("authorId".to_string(), libsql::Value::Integer(2));
-    params.insert("published".to_string(), libsql::Value::Integer(1));
-    db.execute_insert_with_params(insert_post, params).await?;
-
-    let mut params = HashMap::new();
-    params.insert(
-        "title".to_string(),
-        libsql::Value::Text("Post 3".to_string()),
-    );
-    params.insert(
-        "content".to_string(),
-        libsql::Value::Text("Content 3".to_string()),
-    );
-    params.insert("authorId".to_string(), libsql::Value::Integer(1));
-    params.insert("published".to_string(), libsql::Value::Integer(0));
-    db.execute_insert_with_params(insert_post, params).await?;
-
-    // Insert articles
-    let insert_article = r#"
-        insert CreateArticle($title: String, $content: String, $authorId: Int, $status: String) {
-            article {
-                title = $title
-                content = $content
-                authorId = $authorId
-                status = $status
-            }
-        }
-    "#;
-
-    let mut params = HashMap::new();
-    params.insert(
-        "title".to_string(),
-        libsql::Value::Text("Article 1".to_string()),
-    );
-    params.insert(
-        "content".to_string(),
-        libsql::Value::Text("Content 1".to_string()),
-    );
-    params.insert("authorId".to_string(), libsql::Value::Integer(1));
-    params.insert(
-        "status".to_string(),
-        libsql::Value::Text("draft".to_string()),
-    );
-    db.execute_insert_with_params(insert_article, params)
-        .await?;
-
-    let mut params = HashMap::new();
-    params.insert(
-        "title".to_string(),
-        libsql::Value::Text("Article 2".to_string()),
-    );
-    params.insert(
-        "content".to_string(),
-        libsql::Value::Text("Content 2".to_string()),
-    );
-    params.insert("authorId".to_string(), libsql::Value::Integer(2));
-    params.insert(
-        "status".to_string(),
-        libsql::Value::Text("published".to_string()),
-    );
-    db.execute_insert_with_params(insert_article, params)
-        .await?;
-
-    // Insert documents
-    let insert_document = r#"
-        insert CreateDocument($title: String, $content: String, $ownerId: Int, $visibility: String) {
-            document {
-                title = $title
-                content = $content
-                ownerId = $ownerId
-                visibility = $visibility
-            }
-        }
-    "#;
-
-    let mut params = HashMap::new();
-    params.insert(
-        "title".to_string(),
-        libsql::Value::Text("Doc 1".to_string()),
-    );
-    params.insert(
-        "content".to_string(),
-        libsql::Value::Text("Content 1".to_string()),
-    );
-    params.insert("ownerId".to_string(), libsql::Value::Integer(1));
-    params.insert(
-        "visibility".to_string(),
-        libsql::Value::Text("private".to_string()),
-    );
-    db.execute_insert_with_params(insert_document, params)
-        .await?;
-
-    let mut params = HashMap::new();
-    params.insert(
-        "title".to_string(),
-        libsql::Value::Text("Doc 2".to_string()),
-    );
-    params.insert(
-        "content".to_string(),
-        libsql::Value::Text("Content 2".to_string()),
-    );
-    params.insert("ownerId".to_string(), libsql::Value::Integer(2));
-    params.insert(
-        "visibility".to_string(),
-        libsql::Value::Text("public".to_string()),
-    );
-    db.execute_insert_with_params(insert_document, params)
-        .await?;
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    conn.execute_batch(
+        r#"
+insert into posts (title, content, authorId, published) values
+    ('Post 1', 'Content 1', 1, 1),
+    ('Post 2', 'Content 2', 2, 1),
+    ('Post 3', 'Content 3', 1, 0);
+insert into articles (title, content, authorId, status) values
+    ('Article 1', 'Content 1', 1, 'draft'),
+    ('Article 2', 'Content 2', 2, 'published');
+insert into documents (title, content, ownerId, visibility) values
+    ('Doc 1', 'Content 1', 1, 'private'),
+    ('Doc 2', 'Content 2', 2, 'public');
+"#,
+    )
+    .await
+    .map_err(TestError::Database)?;
 
     Ok(())
 }
@@ -265,6 +140,7 @@ record ClocktowerGame {
     id String @id
     name String
     @allow(query) { id in Session.activeClocktowerGameIds }
+    @allow(insert, update, delete) { False }
 }
 "#;
     let db = TestDatabase::new(schema).await?;
@@ -418,7 +294,22 @@ async fn test_insert_permissions() -> Result<(), TestError> {
         while rows.next().await.map_err(TestError::Database)?.is_some() {}
     }
 
-    // Verify the post was created
+    // Verify through the raw database so query visibility cannot hide a bad insert.
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    {
+        let mut count_rows = conn
+            .query("select count(*) from posts", ())
+            .await
+            .map_err(TestError::Database)?;
+        let count_row = count_rows
+            .next()
+            .await
+            .map_err(TestError::Database)?
+            .expect("count row should exist");
+        assert_eq!(count_row.get::<i64>(0).map_err(TestError::Database)?, 4);
+    }
+
+    // Verify the post was visible to its owner.
     let query = r#"
         query GetPosts {
             post {
@@ -456,23 +347,289 @@ async fn test_insert_permissions() -> Result<(), TestError> {
     let mut session = HashMap::new();
     session.insert("userId".to_string(), libsql::Value::Integer(1));
 
-    // The insert will execute but the permission check should prevent it
-    // Note: The insert might succeed at SQL level but return 0 rows due to permission check
-    // We verify by checking the count didn't increase
-    db.execute_insert_with_session(insert_query, params, session.clone())
-        .await
-        .ok(); // Ignore result, we verify by checking count
-    let rows = db
-        .execute_query_with_session(query, HashMap::new(), session, false)
+    let mut result = db
+        .execute_insert_with_session(insert_query, params, session)
         .await?;
-    let results = db.parse_query_results(rows).await?;
-    let posts_after = results.get("post").unwrap();
+    for rows in &mut result {
+        while rows.next().await.map_err(TestError::Database)?.is_some() {}
+    }
+
+    let mut count_rows = conn
+        .query("select count(*) from posts", ())
+        .await
+        .map_err(TestError::Database)?;
+    let count_row = count_rows
+        .next()
+        .await
+        .map_err(TestError::Database)?
+        .expect("count row should exist");
     assert_eq!(
-        posts_after.len(),
-        3,
-        "Post count should remain 3 (unauthorized insert should not create a post)"
+        count_row.get::<i64>(0).map_err(TestError::Database)?,
+        4,
+        "unauthorized insert must not reach the database"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn false_insert_permission_writes_no_row() -> Result<(), TestError> {
+    let db = TestDatabase::new(
+        r#"
+record AuditLog {
+    id Int @id
+    message String
+    @allow(query) { True }
+    @allow(insert, update, delete) { False }
+}
+"#,
+    )
+    .await?;
+    let insert = r#"
+insert CreateAuditLog($message: String) {
+    auditLog { message = $message }
+}
+"#;
+    let mut params = HashMap::new();
+    params.insert(
+        "message".to_string(),
+        libsql::Value::Text("must not persist".to_string()),
+    );
+
+    let mut result = db.execute_insert_with_params(insert, params).await?;
+    for rows in &mut result {
+        while rows.next().await.map_err(TestError::Database)?.is_some() {}
+    }
+
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    let mut rows = conn
+        .query("select count(*) from auditLogs", ())
+        .await
+        .map_err(TestError::Database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(TestError::Database)?
+        .expect("count row should exist");
+    assert_eq!(row.get::<i64>(0).map_err(TestError::Database)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_permission_uses_the_final_generated_integer_id() -> Result<(), TestError> {
+    let db = TestDatabase::new(
+        r#"
+record Gate {
+    id Int @id
+    value String
+    @allow(query) { True }
+    @allow(insert) { id == 1 }
+    @allow(update, delete) { False }
+}
+"#,
+    )
+    .await?;
+    let insert = r#"
+insert CreateFirstOnly($value: String) {
+    gate { value = $value }
+}
+"#;
+
+    for value in ["allowed", "denied"] {
+        let mut params = HashMap::new();
+        params.insert("value".to_string(), libsql::Value::Text(value.to_string()));
+        let mut result = db.execute_insert_with_params(insert, params).await?;
+        for rows in &mut result {
+            while rows.next().await.map_err(TestError::Database)?.is_some() {}
+        }
+    }
+
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    let mut rows = conn
+        .query("select id, value from gates", ())
+        .await
+        .map_err(TestError::Database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(TestError::Database)?
+        .expect("authorized row should exist");
+    assert_eq!(row.get::<i64>(0).map_err(TestError::Database)?, 1);
+    assert_eq!(
+        row.get::<String>(1).map_err(TestError::Database)?,
+        "allowed"
+    );
+    assert!(rows.next().await.map_err(TestError::Database)?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_permission_uses_omitted_column_defaults() -> Result<(), TestError> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    body String
+    visibility String @default("private")
+    @allow(query) { True }
+    @allow(insert) { visibility == "private" }
+    @allow(update, delete) { False }
+}
+"#,
+    )
+    .await?;
+    let insert = r#"
+insert CreateNote($body: String) {
+    note { body = $body }
+}
+"#;
+    let mut params = HashMap::new();
+    params.insert(
+        "body".to_string(),
+        libsql::Value::Text("uses default".to_string()),
+    );
+    let mut result = db.execute_insert_with_params(insert, params).await?;
+    for rows in &mut result {
+        while rows.next().await.map_err(TestError::Database)?.is_some() {}
+    }
+
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    let mut rows = conn
+        .query("select visibility from notes", ())
+        .await
+        .map_err(TestError::Database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(TestError::Database)?
+        .expect("authorized row should exist");
+    assert_eq!(
+        row.get::<String>(0).map_err(TestError::Database)?,
+        "private"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_insert_permission_is_enforced() -> Result<(), TestError> {
+    let db = TestDatabase::new(
+        r#"
+record Project {
+    id Int @id
+    name String
+    tasks @link(Task.projectId)
+    @public
+}
+
+record Task {
+    id Int @id
+    projectId Int
+    title String
+    @allow(query) { True }
+    @allow(insert, update, delete) { False }
+}
+"#,
+    )
+    .await?;
+    let insert = r#"
+insert CreateProject($name: String, $title: String) {
+    project {
+        name = $name
+        tasks { title = $title }
+    }
+}
+"#;
+    let mut params = HashMap::new();
+    params.insert(
+        "name".to_string(),
+        libsql::Value::Text("Secure project".to_string()),
+    );
+    params.insert(
+        "title".to_string(),
+        libsql::Value::Text("Denied task".to_string()),
+    );
+
+    let mut result = db.execute_insert_with_params(insert, params).await?;
+    for rows in &mut result {
+        while rows.next().await.map_err(TestError::Database)?.is_some() {}
+    }
+
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    let mut rows = conn
+        .query("select count(*) from tasks", ())
+        .await
+        .map_err(TestError::Database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(TestError::Database)?
+        .expect("count row should exist");
+    assert_eq!(row.get::<i64>(0).map_err(TestError::Database)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn denied_parent_insert_cannot_attach_children_to_an_existing_row() -> Result<(), TestError> {
+    let db = TestDatabase::new(
+        r#"
+record Project {
+    id Int @id
+    name String
+    tasks @link(Task.projectId)
+    @allow(query) { True }
+    @allow(insert, update, delete) { False }
+}
+
+record Task {
+    id Int @id
+    projectId Int
+    title String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    conn.execute(
+        "insert into projects (name) values ('Existing project')",
+        (),
+    )
+    .await
+    .map_err(TestError::Database)?;
+
+    let insert = r#"
+insert CreateProject($name: String, $title: String) {
+    project {
+        name = $name
+        tasks { title = $title }
+    }
+}
+"#;
+    let mut params = HashMap::new();
+    params.insert(
+        "name".to_string(),
+        libsql::Value::Text("Denied project".to_string()),
+    );
+    params.insert(
+        "title".to_string(),
+        libsql::Value::Text("Must not attach".to_string()),
+    );
+
+    let mut result = db.execute_insert_with_params(insert, params).await?;
+    for rows in &mut result {
+        while rows.next().await.map_err(TestError::Database)?.is_some() {}
+    }
+
+    let mut rows = conn
+        .query("select count(*) from tasks", ())
+        .await
+        .map_err(TestError::Database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(TestError::Database)?
+        .expect("count row should exist");
+    assert_eq!(row.get::<i64>(0).map_err(TestError::Database)?, 0);
     Ok(())
 }
 

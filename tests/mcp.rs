@@ -547,7 +547,7 @@ fn init_accepts_shared_session_source() {
         json!({
             "dir": "app-pyre",
             "session": "session {\n    userId Int\n}\n",
-            "schema": "record User {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n}\n"
+            "schema": "record User {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}\n"
         }),
     );
 

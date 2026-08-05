@@ -34,6 +34,7 @@ record Job {
     state JobState
     updatedAt Int
     @allow(query) { state.Failed.reason.ProviderRejected.code != "blocked" }
+    @allow(insert, update, delete) { False }
 }
 "#;
 
@@ -285,6 +286,7 @@ record Note {
     body String
     updatedAt Int
     @allow(query) { ownerId == Session.userId }
+    @allow(insert, update, delete) { False }
 }
 "#,
     )
@@ -349,6 +351,7 @@ record Note {
     body String
     updatedAt Int
     @allow(query) { tenant == Session.tenant }
+    @allow(insert, update, delete) { False }
 }
 "#,
     )
@@ -395,6 +398,7 @@ record World {
     name String
     updatedAt Int
     @allow(query) { Session.campaignRole == CampaignGM }
+    @allow(insert, update, delete) { False }
 }
 "#,
     )
@@ -775,6 +779,7 @@ record Note {
     body String
     updatedAt Int
     @allow(query) { ownerId == Session.userId }
+    @allow(insert, update, delete) { False }
 }
 "#,
     )
@@ -832,6 +837,7 @@ record Game {
     id String @id
     updatedAt Int
     @allow(query) { id in Session.gameIds }
+    @allow(insert, update, delete) { False }
 }
 "#,
     )
@@ -1189,6 +1195,7 @@ record Note {
     updatedAt Int
     @allow(query) { ownerId == Session.userId }
     @allow(insert, update) { ownerId == 1 }
+    @allow(delete) { False }
 }
 "#,
     )
@@ -1252,6 +1259,7 @@ record Note {
     updatedAt Int
     @allow(query) { ownerId == Session.userId }
     @allow(delete) { ownerId == 1 }
+    @allow(insert, update) { False }
 }
 "#,
     )
@@ -1314,6 +1322,7 @@ record Note {
     body String
     updatedAt Int
     @allow(query) { ownerId == Session.userId }
+    @allow(insert, update, delete) { False }
 }
 "#,
     )
@@ -1633,6 +1642,7 @@ record Feature {
     region String?
     updatedAt Int
     @allow(query) { role == Session.role && enabled == Session.enabled && region == Session.region }
+    @allow(insert, update, delete) { False }
 }
 "#,
     )

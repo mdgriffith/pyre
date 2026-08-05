@@ -895,10 +895,10 @@ record IntRecord {
             .join("pyre/generated/typescript/core/decode.ts"),
     )
     .unwrap();
-    assert!(decode.contains("uuidRecordId?: string;"));
-    assert!(decode.contains("intRecordId?: number;"));
-    assert!(decode.contains("uuidRecordId: z.string().optional(),"));
-    assert!(decode.contains("intRecordId: z.number().optional(),"));
+    assert!(decode.contains("uuidRecordId?: string | null;"));
+    assert!(decode.contains("intRecordId?: number | null;"));
+    assert!(decode.contains("uuidRecordId: z.string().nullish(),"));
+    assert!(decode.contains("intRecordId: z.number().nullish(),"));
 }
 
 #[test]

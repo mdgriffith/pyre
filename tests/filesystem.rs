@@ -108,7 +108,7 @@ fn test_schema_serialization_includes_shared_session() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "record Project {\n    id Int @id\n    @allow(query) { ownerId == Session.userId }\n    ownerId Int\n}\n",
+        "record Project {\n    id Int @id\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n    ownerId Int\n}\n",
         &mut schema,
     )
     .expect("schema should parse");

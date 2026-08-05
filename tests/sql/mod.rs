@@ -27,7 +27,7 @@ record Job {{
 }}
 "#,
         if permission {
-            "@allow(query) { state.Failed.reason.ProviderRejected.code != \"blocked\" }"
+            "@allow(query) { state.Failed.reason.ProviderRejected.code != \"blocked\" }\n    @allow(insert, update, delete) { False }"
         } else {
             "@public"
         }
@@ -48,6 +48,7 @@ record Workspace {
     id Int @id
     accounts @link(Account.workspaceId)
     @allow(query) { exists accounts { state.Failed.code != "blocked" } }
+    @allow(insert, update, delete) { False }
 }
 
 record Account {

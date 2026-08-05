@@ -251,16 +251,11 @@ record Post {
 **`@allow(operations) { conditions }`** - Permission rules
 ```pyre
 record Post {
-    // Single operation
-    @allow(query) { published == True }
-    
-    // Multiple operations
+    // Unrestricted queries
+    @allow(query) { True }
+
+    // Restricted mutations
     @allow(insert, update) { authorId == Session.userId }
-    
-    // All operations
-    @allow(*) { authorId == Session.userId }
-    
-    // Complex conditions
     @allow(delete) {
         Or(
             authorId == Session.userId,
@@ -269,6 +264,12 @@ record Post {
     }
 }
 ```
+
+Fine-grained `@allow` declarations must collectively define all four operations.
+Use `True` for an unrestricted operation and `False` to deny an operation. There
+are no implicit permissions for omitted operations. As alternatives, `@public`
+explicitly allows all operations and `@allow(*) { conditions }` applies one
+condition to all operations. To deny every operation, use `@allow(*) { False }`.
 
 **Operations**: `query`, `insert`, `update`, `delete`, or `*` for all.
 
@@ -289,6 +290,7 @@ record Document {
             )
         }
     }
+    @allow(insert, update, delete) { False }
 
     workspaceId Workspace.id
     workspace @link(workspaceId, Workspace.id)

@@ -293,12 +293,17 @@ Permissions can be defined in three ways:
 2. **`@allow(*) { conditions }`**: Applies to all operations (query, insert, update, delete)
 3. **`@allow(query, insert, update, delete) { conditions }`**: Fine-grained permissions per operation type
 
+Fine-grained declarations must collectively cover all four operations. Use
+`True` for an unrestricted operation and `False` to deny an operation; omitted
+operations are a typecheck error.
+
 ### Permission Conditions
 
 Permission conditions use WHERE clause syntax and can reference:
 - **Table columns**: `authorId == Session.userId`
 - **Session variables**: `Session.role == "admin"`
 - **Literals**: `published == True`
+- **Constant policies**: `True` or `False`
 - **Logical operators**: `And(...)`, `Or(...)`
 - **Comparison operators**: `==`, `!=`, `>`, `<`, `>=`, `<=`
 
@@ -319,6 +324,7 @@ record Post {
             published == True,
         )
     }
+    @allow(insert, update, delete) { False }
 }
 ```
 
@@ -351,6 +357,7 @@ record Post {
     id Int @id
     title String
     authorId Int
+    @allow(query, insert, delete) { False }
     @allow(update) { authorId == Session.userId }
 }
 ```

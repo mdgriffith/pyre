@@ -25,6 +25,7 @@ record Job {
     state JobState
     updatedAt Int
     @allow(query) { state.Failed.reason.ProviderRejected.code != "blocked" }
+    @allow(insert, update, delete) { False }
 }
 "#;
     let mut schema = ast::Schema::default();
@@ -158,6 +159,7 @@ record Job {
     state State
     updatedAt Int
     @allow(query) { state.Failed.code != Session.blockedCode }
+    @allow(insert, update, delete) { False }
 }
 "#,
         &mut schema,
@@ -218,6 +220,7 @@ record Job {
     state State
     updatedAt Int
     @allow(query) { state.Failed.code == Null }
+    @allow(insert, update, delete) { False }
 }
 "#,
         &mut schema,
@@ -326,6 +329,7 @@ record Note {
     workspaceSlug String
     updatedAt Int
     @allow(query) { workspaceSlug == Session.workspaceSlug }
+    @allow(insert, update, delete) { False }
 }
 "#;
 
@@ -360,6 +364,7 @@ record ClocktowerGame {
     id String @id
     updatedAt Int
     @allow(query) { id in Session.activeClocktowerGameIds }
+    @allow(insert, update, delete) { False }
 }
 "#;
 

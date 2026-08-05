@@ -72,6 +72,7 @@ record Workspace {
             role == Admin || role == Member
         }
     }
+    @allow(insert) { False }
     id Int @id
     name String
     memberships @link(Membership.workspaceId)
@@ -152,17 +153,27 @@ fn validates_paths_body_and_sync_gate() {
         ErrorType::SyncedRelationalQueryPermission
     )));
 
-    let star = synced.replace("@allow(query, update, delete)", "@allow(*)");
+    let star = synced
+        .replace("@allow(query, update, delete)", "@allow(*)")
+        .replace("    @allow(insert) { False }\n", "");
     let errors = check_schema(&star).unwrap_err();
     assert!(errors.iter().any(|error| matches!(
         &error.error_type,
         ErrorType::SyncedRelationalQueryPermission
     )));
 
-    let server_only = synced.replace("@allow(query, update, delete)", "@allow(update, delete)");
+    let server_only = synced.replace(
+        "@allow(query, update, delete)",
+        "@allow(query) { False }\n    @allow(update, delete)",
+    );
     assert!(check_schema(&server_only).is_ok());
 
-    let insert = QUERY_ONLY_SCHEMA.replace("@allow(query, update, delete)", "@allow(insert)");
+    let insert = QUERY_ONLY_SCHEMA
+        .replace("@allow(query, update, delete)", "@allow(insert)")
+        .replace(
+            "    @allow(insert) { False }",
+            "    @allow(query, update, delete) { False }",
+        );
     let errors = check_schema(&insert).unwrap_err();
     assert!(errors.iter().any(|error| matches!(
         &error.error_type,

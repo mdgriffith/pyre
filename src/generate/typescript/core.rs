@@ -876,6 +876,7 @@ fn to_query_shape_leaf(field_name: &str, aliased_name: &str) -> String {
 
 fn to_where_clause_ts(where_arg: &ast::WhereArg) -> String {
     match where_arg {
+        ast::WhereArg::Constant(_) => unreachable!("constant predicates are permission-only"),
         ast::WhereArg::Exists(..) => unreachable!("exists is permission-only"),
         ast::WhereArg::Column(is_session_field, path, operator, value, _) => {
             let key = if *is_session_field {

@@ -1625,6 +1625,7 @@ record Note {
     body String
     updatedAt Int
     @allow(query) { ownerId == Session.userId }
+    @allow(insert, update, delete) { False }
 }
 "#,
     )
@@ -1823,6 +1824,44 @@ query GetNotes {
     .await?;
     assert_eq!(remaining.response["note"], json!([]));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn generated_crud_create_enforces_insert_permission() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = TestDatabase::new(
+        r#"
+session {
+    userId Int
+}
+
+record Note {
+    id Int @id
+    ownerId Int
+    body String
+    @allow(query, insert, update, delete) { ownerId == Session.userId }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let session = PyreSession::new(json!({ "userId": 1 }), &manifest.session_schema)?;
+    let create = query_by_operation(&manifest, "insert");
+
+    query::run(
+        &conn,
+        &manifest,
+        &create.id,
+        json!({ "ownerId": 2, "body": "denied" }),
+        &session,
+    )
+    .await?;
+
+    let mut rows = conn.query("select count(*) from notes", ()).await?;
+    let row = rows.next().await?.expect("count row should exist");
+    assert_eq!(row.get::<i64>(0)?, 0);
     Ok(())
 }
 

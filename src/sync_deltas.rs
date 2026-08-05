@@ -48,6 +48,7 @@ fn evaluate_permission(
     session: &HashMap<String, SessionValue>,
 ) -> bool {
     match where_arg {
+        WhereArg::Constant(value) => *value,
         WhereArg::Exists(..) => false,
         WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
             let fieldname = path.root();

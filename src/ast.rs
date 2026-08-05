@@ -116,7 +116,9 @@ pub fn get_permissions(record: &RecordDetails, operation: &QueryOperation) -> Op
             match directive {
                 FieldDirective::Permissions(perm) => match perm {
                     PermissionDetails::Public => return None, // Public allows everything (no restrictions)
-                    PermissionDetails::Star(where_arg) => return Some(where_arg.clone()),
+                    PermissionDetails::Star(where_arg) => {
+                        return effective_permission(where_arg.clone())
+                    }
                     PermissionDetails::OnOperation(ops) => {
                         for op in ops {
                             for op_type in &op.operations {
@@ -133,10 +135,19 @@ pub fn get_permissions(record: &RecordDetails, operation: &QueryOperation) -> Op
         }
     }
 
+    all_matching_wheres.retain(|where_arg| !matches!(where_arg, WhereArg::Constant(true)));
     match all_matching_wheres.as_slice() {
         [] => None,
         [single] => Some(single.clone()),
         _ => Some(WhereArg::And(all_matching_wheres)),
+    }
+}
+
+fn effective_permission(where_arg: WhereArg) -> Option<WhereArg> {
+    if matches!(where_arg, WhereArg::Constant(true)) {
+        None
+    } else {
+        Some(where_arg)
     }
 }
 
@@ -1301,6 +1312,7 @@ pub fn direction_to_string(direction: &Direction) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WhereArg {
+    Constant(bool),
     Column(bool, PredicatePath, Operator, QueryValue, Range), // bool indicates if the path is a Session field
     Exists(Vec<(String, Range)>, Box<WhereArg>),
     And(Vec<WhereArg>),

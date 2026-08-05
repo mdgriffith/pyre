@@ -1388,6 +1388,7 @@ session {
 record ClocktowerGame {
     id Id.Int @id
     @allow(query) { id == Session.currentClocktowerGameId }
+    @allow(insert, update, delete) { False }
 }
 "#;
 
@@ -1410,6 +1411,7 @@ session {
 record ClocktowerGame {
     id Id.Int @id
     @allow(query) { id == Session.currentClocktowerGameId }
+    @allow(insert, update, delete) { False }
 }
 "#;
 
@@ -1990,6 +1992,7 @@ session {
 
 record Post {
     @allow(query) { userId == Session.userId || published == True  }
+    @allow(insert, update, delete) { False }
     @watch
 
     id           Int     @id

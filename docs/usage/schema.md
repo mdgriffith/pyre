@@ -108,13 +108,23 @@ record Post {
             authorId == Session.userId,
         )
     }
-    @allow(update, delete) { authorId == Session.userId }
+    @allow(insert, update, delete) { authorId == Session.userId }
 
     id Post.id @id
     authorId User.id
     published Bool
 }
 ```
+
+Fine-grained permissions must explicitly cover `query`, `insert`, `update`, and
+`delete`. Use `True` to leave an operation unrestricted or `False` to deny it:
+
+```pyre
+@allow(query) { True }
+@allow(insert, update, delete) { False }
+```
+
+Use `@allow(*) { False }` to deny every operation on a record.
 
 Use `exists` to authorize through declared links. The path starts at the
 protected record, and unqualified fields inside the block belong to the final
@@ -138,6 +148,7 @@ record Document {
             )
         }
     }
+    @allow(insert, update, delete) { False }
 
     id Document.id @id
     workspaceId Workspace.id
