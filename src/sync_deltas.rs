@@ -302,11 +302,9 @@ fn query_value_to_json(
     match value {
         ast::QueryValue::String((_, s)) => Some(JsonValue::String(s.clone())),
         ast::QueryValue::Int((_, i)) => Some(JsonValue::Number((*i as i64).into())),
-        ast::QueryValue::Float((_, f)) => {
-            Some(JsonValue::Number(
-                serde_json::Number::from_f64(*f as f64).unwrap_or(0.into()),
-            ))
-        }
+        ast::QueryValue::Float((_, f)) => Some(JsonValue::Number(
+            serde_json::Number::from_f64(*f as f64).unwrap_or(0.into()),
+        )),
         ast::QueryValue::Bool((_, b)) => Some(JsonValue::Bool(*b)),
         ast::QueryValue::Null(_) => Some(JsonValue::Null),
         ast::QueryValue::Variable((_, var)) => {

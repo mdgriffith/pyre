@@ -2332,8 +2332,7 @@ fn register_session_path_params(
                 *param_type = Some(type_);
                 *param_nullable = nullable;
                 *used = true;
-                used_by_top_level_field_alias
-                    .insert(query_context.top_level_field_alias.clone());
+                used_by_top_level_field_alias.insert(query_context.top_level_field_alias.clone());
                 *session_name = Some(physical_name);
                 *session_path = Some(param_path);
                 *session_discriminator = discriminator;
@@ -2346,9 +2345,9 @@ fn register_session_path_params(
                         defined_at: None,
                         type_: Some(type_),
                         nullable,
-                        used_by_top_level_field_alias: HashSet::from([
-                            query_context.top_level_field_alias.clone(),
-                        ]),
+                        used_by_top_level_field_alias: HashSet::from([query_context
+                            .top_level_field_alias
+                            .clone()]),
                         used: true,
                         type_inferred: false,
                         from_session: true,
@@ -2366,13 +2365,10 @@ fn register_session_path_params(
             let discriminator_path = ast::PredicatePath {
                 segments: path.segments[..index].to_vec(),
             };
-            let discriminator_nullable = resolve_predicate_path(
-                context,
-                &session.fields,
-                &discriminator_path,
-            )
-            .map(|resolved| resolved.column.nullable)
-            .unwrap_or(false);
+            let discriminator_nullable =
+                resolve_predicate_path(context, &session.fields, &discriminator_path)
+                    .map(|resolved| resolved.column.nullable)
+                    .unwrap_or(false);
             register(
                 discriminator_path.clone(),
                 discriminator_path.flattened(),
@@ -2683,30 +2679,34 @@ fn check_permissions_where_args(
         }
         ast::WhereArg::Column(is_session_var, path, operator, query_val, field_name_range) => {
             let field_name = path.root();
-            let mut terminal_column = None;
+            let mut terminal_column;
             if *is_session_var {
-                let resolved = context.session.as_ref().and_then(|session| {
-                    resolve_predicate_path(context, &session.fields, path).ok()
-                });
-                terminal_column = resolved.map(|resolved| resolved.column);
-                if terminal_column.is_none() {
-                    let known_fields = context
-                        .session
-                        .as_ref()
-                        .map(|session| get_column_reference(&session.fields))
-                        .unwrap_or_default();
-                    errors.push(Error {
-                        filepath: filepath.clone(),
-                        error_type: ErrorType::UnknownField {
-                            found: format!("Session.{}", path.authored()),
-                            record_name: "Session".to_string(),
-                            known_fields,
-                        },
-                        locations: vec![Location {
-                            contexts: vec![],
-                            primary: vec![convert_range(field_name_range)],
-                        }],
-                    });
+                if let Some(session) = &context.session {
+                    if session.fields.is_empty() && session.start.is_none() {
+                        // Legacy schemas without a Session declaration allow opaque permission fields.
+                        terminal_column = None;
+                    } else {
+                        terminal_column = resolve_predicate_path(context, &session.fields, path)
+                            .ok()
+                            .map(|resolved| resolved.column);
+                        if terminal_column.is_none() {
+                            errors.push(Error {
+                                filepath: filepath.clone(),
+                                error_type: ErrorType::UnknownField {
+                                    found: format!("Session.{}", path.authored()),
+                                    record_name: "Session".to_string(),
+                                    known_fields: get_column_reference(&session.fields),
+                                },
+                                locations: vec![Location {
+                                    contexts: vec![],
+                                    primary: vec![convert_range(field_name_range)],
+                                }],
+                            });
+                        }
+                    }
+                } else {
+                    // Legacy schemas without a Session declaration allow opaque permission fields.
+                    terminal_column = None;
                 }
             } else {
                 // Validate table field exists
@@ -3514,7 +3514,11 @@ fn check_value(
         ast::QueryValue::Variable((var_range, var)) => {
             let var_name = ast::to_pyre_variable_name(var);
 
-            if let Some(path) = var.session_path() {
+            let has_declared_session = context
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.fields.is_empty() || session.start.is_some());
+            if let Some(path) = var.session_path().filter(|_| has_declared_session) {
                 if register_session_path_params(context, query_context, params, &path).is_err() {
                     errors.push(Error {
                         filepath: context.current_filepath.clone(),

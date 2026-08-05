@@ -3,7 +3,7 @@ use crate::filesystem;
 use crate::generate::sql;
 use crate::typecheck;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Serialize)]
@@ -34,6 +34,10 @@ struct FieldSchema {
     type_: String,
     is_enum: bool,
     enum_variants: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    tagged_union_variants: BTreeMap<String, BTreeMap<String, FieldSchema>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    tagged_union_types: BTreeMap<String, BTreeMap<String, BTreeMap<String, FieldSchema>>>,
     nullable: bool,
     omittable: bool,
 }
@@ -153,6 +157,8 @@ fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<St
                 FieldSchema {
                     is_enum: !enum_variants.is_empty(),
                     enum_variants,
+                    tagged_union_variants: BTreeMap::new(),
+                    tagged_union_types: BTreeMap::new(),
                     type_,
                     nullable: arg.nullable,
                     omittable: arg.omittable,
@@ -172,24 +178,166 @@ fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSchema>
                 .iter()
                 .filter_map(|field| match field {
                     ast::Field::Column(column) => {
-                        let type_ = column.type_.to_string();
-                        let enum_variants = enum_variants(context, &type_);
-                        Some((
-                            column.name.clone(),
-                            FieldSchema {
-                                is_enum: !enum_variants.is_empty(),
-                                enum_variants,
-                                type_,
-                                nullable: column.nullable,
-                                omittable: false,
-                            },
-                        ))
+                        Some((column.name.clone(), session_field_schema(context, column)))
                     }
                     _ => None,
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn session_field_schema(context: &typecheck::Context, column: &ast::Column) -> FieldSchema {
+    let mut schema = session_field_schema_inner(context, column, &mut HashSet::new());
+    collect_session_tagged_union_types(
+        context,
+        &column.type_,
+        &mut HashSet::new(),
+        &mut schema.tagged_union_types,
+    );
+    schema
+}
+
+fn session_field_schema_inner(
+    context: &typecheck::Context,
+    column: &ast::Column,
+    visiting: &mut HashSet<String>,
+) -> FieldSchema {
+    let type_ = column.type_.query_type_string();
+    let enum_variants = enum_variants(context, &type_);
+    let tagged_union_variants = column
+        .type_
+        .get_custom_type_name()
+        .and_then(|type_name| {
+            if !visiting.insert(type_name.to_string()) {
+                return None;
+            }
+            let result = context
+                .types
+                .get(type_name)
+                .and_then(|(_, type_)| match type_ {
+                    typecheck::Type::OneOf { variants }
+                        if variants.iter().any(|variant| variant.fields.is_some()) =>
+                    {
+                        Some(
+                            variants
+                                .iter()
+                                .map(|variant| {
+                                    let fields = variant
+                                        .fields
+                                        .as_ref()
+                                        .map(|fields| {
+                                            fields
+                                                .iter()
+                                                .filter_map(|field| match field {
+                                                    ast::Field::Column(column) => Some((
+                                                        column.name.clone(),
+                                                        session_field_schema_inner(
+                                                            context, column, visiting,
+                                                        ),
+                                                    )),
+                                                    _ => None,
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    (variant.name.clone(), fields)
+                                })
+                                .collect(),
+                        )
+                    }
+                    _ => None,
+                });
+            visiting.remove(type_name);
+            result
+        })
+        .unwrap_or_default();
+
+    FieldSchema {
+        is_enum: !enum_variants.is_empty(),
+        enum_variants,
+        tagged_union_variants,
+        tagged_union_types: BTreeMap::new(),
+        type_,
+        nullable: column.nullable,
+        omittable: false,
+    }
+}
+
+fn collect_session_tagged_union_types(
+    context: &typecheck::Context,
+    type_: &ast::ColumnType,
+    visited: &mut HashSet<String>,
+    definitions: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, FieldSchema>>>,
+) {
+    let Some(type_name) = type_.get_custom_type_name() else {
+        return;
+    };
+    if !visited.insert(type_name.to_string()) {
+        return;
+    }
+    let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(type_name) else {
+        return;
+    };
+    if variants.iter().all(|variant| variant.fields.is_none()) {
+        return;
+    }
+
+    let variant_schemas = variants
+        .iter()
+        .map(|variant| {
+            let fields = variant
+                .fields
+                .as_ref()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(|field| match field {
+                            ast::Field::Column(column) => Some((
+                                column.name.clone(),
+                                session_field_schema_reference(context, column),
+                            )),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (variant.name.clone(), fields)
+        })
+        .collect();
+    definitions.insert(type_name.to_string(), variant_schemas);
+
+    for variant in variants {
+        if let Some(fields) = &variant.fields {
+            for field in fields {
+                if let ast::Field::Column(column) = field {
+                    collect_session_tagged_union_types(
+                        context,
+                        &column.type_,
+                        visited,
+                        definitions,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn session_field_schema_reference(
+    context: &typecheck::Context,
+    column: &ast::Column,
+) -> FieldSchema {
+    let type_ = column.type_.query_type_string();
+    let enum_variants = enum_variants(context, &type_);
+    FieldSchema {
+        is_enum: !enum_variants.is_empty(),
+        enum_variants,
+        tagged_union_variants: BTreeMap::new(),
+        tagged_union_types: BTreeMap::new(),
+        type_,
+        nullable: column.nullable,
+        omittable: false,
+    }
 }
 
 fn enum_variants(context: &typecheck::Context, type_: &str) -> Vec<String> {

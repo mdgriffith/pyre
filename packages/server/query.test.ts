@@ -6,16 +6,22 @@ import { buildArgs } from "./runtime/sql";
 
 test("sync wraps mutation responses with server revision metadata", async () => {
   const db = {
-    batch: mock(async () => ([
+    batch: mock(async () => [
       {
         columns: ["createdNote"],
         rows: [{ createdNote: JSON.stringify({ id: 1, body: "one" }) }],
       },
       {
         columns: ["_affectedRows"],
-        rows: [{ _affectedRows: JSON.stringify([{ table_name: "notes", headers: ["id"], rows: [[1]] }]) }],
+        rows: [
+          {
+            _affectedRows: JSON.stringify([
+              { table_name: "notes", headers: ["id"], rows: [[1]] },
+            ]),
+          },
+        ],
       },
-    ])),
+    ]),
   };
 
   const result = await run(
@@ -53,12 +59,18 @@ test("sync wraps mutation responses with server revision metadata", async () => 
 
 test("sync mode omits normal mutation result", async () => {
   const db = {
-    batch: mock(async () => ([
+    batch: mock(async () => [
       {
         columns: ["_affectedRows"],
-        rows: [{ _affectedRows: JSON.stringify([{ table_name: "notes", headers: ["id"], rows: [[1]] }]) }],
+        rows: [
+          {
+            _affectedRows: JSON.stringify([
+              { table_name: "notes", headers: ["id"], rows: [[1]] },
+            ]),
+          },
+        ],
       },
-    ])),
+    ]),
   };
 
   const result = await run(
@@ -66,12 +78,8 @@ test("sync mode omits normal mutation result", async () => {
     {
       createNote: {
         id: "createNote",
-        sql: [
-          { include: true, params: [], sql: "select createdNote" },
-        ],
-        syncSql: [
-          { include: true, params: [], sql: "select _affectedRows" },
-        ],
+        sql: [{ include: true, params: [], sql: "select createdNote" }],
+        syncSql: [{ include: true, params: [], sql: "select _affectedRows" }],
         session_args: [],
         optional_input_args: [],
         json_input_args: [],
@@ -94,33 +102,76 @@ test("sync mode omits normal mutation result", async () => {
     serverRevision: 42,
     sync: { type: "delta" },
   });
-  expect(db.batch).toHaveBeenCalledWith([{ sql: "select _affectedRows", args: {} }]);
+  expect(db.batch).toHaveBeenCalledWith([
+    { sql: "select _affectedRows", args: {} },
+  ]);
 });
 
 test("SQL args serialize Date values as unix seconds", () => {
   const date = new Date("2026-07-11T16:36:52.000Z");
 
-  expect(buildArgs(
-    { startedAt: date, payload: { direct: date, nested: [date] } },
-    { visibleAfter: date },
-    ["visibleAfter"],
-    [],
-    ["payload"],
-  )).toEqual({
+  expect(
+    buildArgs(
+      { startedAt: date, payload: { direct: date, nested: [date] } },
+      { visibleAfter: date },
+      ["visibleAfter"],
+      [],
+      ["payload"],
+    ),
+  ).toEqual({
     startedAt: 1783787812,
     payload: JSON.stringify({ direct: 1783787812, nested: [1783787812] }),
     session_visibleAfter: 1783787812,
   });
 });
 
+test("SQL args bind logical tagged-union sessions to physical paths", () => {
+  const date = new Date("2026-07-11T16:36:52.000Z");
+
+  expect(
+    buildArgs(
+      undefined,
+      {
+        scope: { _type: "Workspace", id: 7, privateData: { hidden: true } },
+        accountId: 3,
+        visibleAfter: date,
+        roles: ["admin", "editor"],
+        preferences: { theme: "dark", refreshedAt: date },
+        account__id: 11,
+      },
+      [
+        "scope",
+        "scope__id",
+        "scope__accountId",
+        "accountId",
+        "visibleAfter",
+        "roles",
+        "preferences",
+        "nullableField",
+        "account__id",
+      ],
+    ),
+  ).toEqual({
+    session_scope: "Workspace",
+    session_scope__id: 7,
+    session_scope__accountId: null,
+    session_accountId: 3,
+    session_visibleAfter: 1783787812,
+    session_roles: ["admin", "editor"],
+    session_preferences: { theme: "dark", refreshedAt: 1783787812 },
+    session_nullableField: null,
+    session_account__id: 11,
+  });
+});
+
 test("sync does not fan out when no affected rows are returned", async () => {
   const db = {
-    batch: mock(async () => ([
+    batch: mock(async () => [
       {
         columns: ["_affectedRows"],
         rows: [{ _affectedRows: JSON.stringify([]) }],
       },
-    ])),
+    ]),
   };
   const syncDeltas = mock(async () => ({ serverRevision: 42 }));
 
@@ -129,9 +180,7 @@ test("sync does not fan out when no affected rows are returned", async () => {
     {
       createNote: {
         id: "createNote",
-        sql: [
-          { include: true, params: [], sql: "select _affectedRows" },
-        ],
+        sql: [{ include: true, params: [], sql: "select _affectedRows" }],
         session_args: [],
         optional_input_args: [],
         json_input_args: [],
@@ -162,8 +211,18 @@ test("seed inserts nested rows through schema links", async () => {
       if (statement === "begin" || statement === "commit") {
         return { rows: [] };
       }
-      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
-        return { rows: [{ name: "id" }, { name: "name" }, { name: "authorId" }, { name: "title" }] };
+      if (
+        typeof statement === "string" &&
+        statement.startsWith("pragma table_info")
+      ) {
+        return {
+          rows: [
+            { name: "id" },
+            { name: "name" },
+            { name: "authorId" },
+            { name: "title" },
+          ],
+        };
       }
       if (statement.sql.includes('"users"')) {
         return { rows: [{ id: 10, name: statement.args.seed_0 }] };
@@ -171,7 +230,9 @@ test("seed inserts nested rows through schema links", async () => {
       if (statement.sql.includes('"posts"')) {
         const values = Object.values(statement.args);
         const authorId = values.find((value) => value === 10);
-        const title = values.find((value) => value === "First" || value === "Second");
+        const title = values.find(
+          (value) => value === "First" || value === "Second",
+        );
         return { rows: [{ id: title === "First" ? 20 : 21, authorId, title }] };
       }
       throw new Error("unexpected statement");
@@ -182,10 +243,7 @@ test("seed inserts nested rows through schema links", async () => {
     users: [
       {
         name: "Fred",
-        posts: [
-          { title: "First" },
-          { title: "Second" },
-        ],
+        posts: [{ title: "First" }, { title: "Second" }],
       },
     ],
   });
@@ -207,7 +265,10 @@ test("seed inserts nested rows through schema links", async () => {
   });
   expect(executed[0]).toBe("begin");
   expect(executed.at(-1)).toBe("commit");
-  const postInserts = executed.filter((statement) => typeof statement !== "string" && statement.sql.includes('"posts"'));
+  const postInserts = executed.filter(
+    (statement) =>
+      typeof statement !== "string" && statement.sql.includes('"posts"'),
+  );
   expect(Object.values(postInserts[0].args)).toContain(10);
   expect(Object.values(postInserts[1].args)).toContain(10);
 });
@@ -218,8 +279,18 @@ test("seed batches sibling inserts when batch is supported", async () => {
   const db = {
     execute: mock(async (statement: any) => {
       executed.push(statement);
-      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
-        return { rows: [{ name: "id" }, { name: "name" }, { name: "authorId" }, { name: "title" }] };
+      if (
+        typeof statement === "string" &&
+        statement.startsWith("pragma table_info")
+      ) {
+        return {
+          rows: [
+            { name: "id" },
+            { name: "name" },
+            { name: "authorId" },
+            { name: "title" },
+          ],
+        };
       }
       throw new Error("unexpected execute");
     }),
@@ -232,7 +303,9 @@ test("seed batches sibling inserts when batch is supported", async () => {
 
         const values = Object.values(statement.args);
         const authorId = values.find((value) => value === 10);
-        const title = values.find((value) => value === "First" || value === "Second");
+        const title = values.find(
+          (value) => value === "First" || value === "Second",
+        );
         return { rows: [{ id: title === "First" ? 20 : 21, authorId, title }] };
       });
     }),
@@ -242,10 +315,7 @@ test("seed batches sibling inserts when batch is supported", async () => {
     users: [
       {
         name: "Fred",
-        posts: [
-          { title: "First" },
-          { title: "Second" },
-        ],
+        posts: [{ title: "First" }, { title: "Second" }],
       },
     ],
   });
@@ -265,7 +335,13 @@ test("seed batches sibling inserts when batch is supported", async () => {
       ],
     },
   });
-  expect(executed.every((statement) => typeof statement === "string" && statement.startsWith("pragma table_info"))).toBe(true);
+  expect(
+    executed.every(
+      (statement) =>
+        typeof statement === "string" &&
+        statement.startsWith("pragma table_info"),
+    ),
+  ).toBe(true);
   expect(executed).not.toContain("begin");
   expect(executed).not.toContain("commit");
   expect(batched).toHaveLength(2);
@@ -279,8 +355,18 @@ test("seed rejects nested foreign key conflicts", async () => {
       if (statement === "begin" || statement === "rollback") {
         return { rows: [] };
       }
-      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
-        return { rows: [{ name: "id" }, { name: "name" }, { name: "authorId" }, { name: "title" }] };
+      if (
+        typeof statement === "string" &&
+        statement.startsWith("pragma table_info")
+      ) {
+        return {
+          rows: [
+            { name: "id" },
+            { name: "name" },
+            { name: "authorId" },
+            { name: "title" },
+          ],
+        };
       }
       return { rows: [{ id: 10, name: "Fred" }] };
     }),
@@ -307,8 +393,18 @@ test("seed rolls back when an insert fails", async () => {
       if (statement === "begin" || statement === "rollback") {
         return { rows: [] };
       }
-      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
-        return { rows: [{ name: "id" }, { name: "name" }, { name: "authorId" }, { name: "title" }] };
+      if (
+        typeof statement === "string" &&
+        statement.startsWith("pragma table_info")
+      ) {
+        return {
+          rows: [
+            { name: "id" },
+            { name: "name" },
+            { name: "authorId" },
+            { name: "title" },
+          ],
+        };
       }
       if (statement === "commit") {
         throw new Error("should not commit");
@@ -337,7 +433,10 @@ test("seed serializes json columns and flattens constructed type columns", async
       if (statement === "begin" || statement === "commit") {
         return { rows: [] };
       }
-      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
+      if (
+        typeof statement === "string" &&
+        statement.startsWith("pragma table_info")
+      ) {
         return {
           rows: [
             { name: "id" },
@@ -368,13 +467,26 @@ test("seed serializes json columns and flattens constructed type columns", async
   const result = await seed(db as any, jsonAndConstructedSchema(), {
     tokens: [
       {
-        state: { groups: [{ _type: "GroupState", id: "party", members: ["a"] }], clocks: [] },
-        placement: { _type: "MapEntityWorldPlacement", x: 10, y: 20, scale: 100 },
+        state: {
+          groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
+          clocks: [],
+        },
+        placement: {
+          _type: "MapEntityWorldPlacement",
+          x: 10,
+          y: 20,
+          scale: 100,
+        },
       },
     ],
   });
 
-  expect(inserts[0].args.seed_0).toBe(JSON.stringify({ groups: [{ _type: "GroupState", id: "party", members: ["a"] }], clocks: [] }));
+  expect(inserts[0].args.seed_0).toBe(
+    JSON.stringify({
+      groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
+      clocks: [],
+    }),
+  );
   expect(inserts[0].args.seed_1).toBe("MapEntityWorldPlacement");
   expect(inserts[0].args.seed_2).toBe(10);
   expect(inserts[0].args.seed_3).toBe(20);
@@ -385,8 +497,16 @@ test("seed serializes json columns and flattens constructed type columns", async
       tokens: [
         {
           id: 1,
-          state: { groups: [{ _type: "GroupState", id: "party", members: ["a"] }], clocks: [] },
-          placement: { _type: "MapEntityWorldPlacement", scale: 100, x: 10, y: 20 },
+          state: {
+            groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
+            clocks: [],
+          },
+          placement: {
+            _type: "MapEntityWorldPlacement",
+            scale: 100,
+            x: 10,
+            y: 20,
+          },
         },
       ],
     },
@@ -404,7 +524,16 @@ test("seed rejects legacy constructed discriminators", async () => {
   };
 
   const result = await seed(db as any, jsonAndConstructedSchema(), {
-    tokens: [{ placement: { type: "MapEntityWorldPlacement", x: 10, y: 20, scale: 100 } as any }],
+    tokens: [
+      {
+        placement: {
+          type: "MapEntityWorldPlacement",
+          x: 10,
+          y: 20,
+          scale: 100,
+        } as any,
+      },
+    ],
   });
 
   expect(result.kind).toBe("error");
@@ -426,11 +555,27 @@ test("seed validates columns with generated validators when provided", async () 
   const result = await seed(
     db as any,
     jsonAndConstructedSchema(),
-    { tokens: [{ placement: { _type: "MapEntityWorldPlacement", x: "bad", y: 20, scale: 100 } as any }] },
+    {
+      tokens: [
+        {
+          placement: {
+            _type: "MapEntityWorldPlacement",
+            x: "bad",
+            y: 20,
+            scale: 100,
+          } as any,
+        },
+      ],
+    },
     {
       tokens: {
         placement: z.discriminatedUnion("_type", [
-          z.object({ _type: z.literal("MapEntityWorldPlacement"), x: z.number(), y: z.number(), scale: z.number() }),
+          z.object({
+            _type: z.literal("MapEntityWorldPlacement"),
+            x: z.number(),
+            y: z.number(),
+            scale: z.number(),
+          }),
         ]),
       },
     },
@@ -450,7 +595,10 @@ test("seed uses transformed validator values", async () => {
       if (statement === "begin" || statement === "commit") {
         return { rows: [] };
       }
-      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
+      if (
+        typeof statement === "string" &&
+        statement.startsWith("pragma table_info")
+      ) {
         return { rows: [{ name: "id" }, { name: "startedAt" }] };
       }
       return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
@@ -461,7 +609,13 @@ test("seed uses transformed validator values", async () => {
     db as any,
     eventSchema(),
     { events: [{ startedAt: "1783787812" }] },
-    { events: { startedAt: z.string().transform((value) => new Date(Number(value) * 1000)) } },
+    {
+      events: {
+        startedAt: z
+          .string()
+          .transform((value) => new Date(Number(value) * 1000)),
+      },
+    },
   );
 
   expect(result.kind).toBe("success");
@@ -479,7 +633,10 @@ test("seed serializes DateTime columns as unix seconds", async () => {
       if (statement === "begin" || statement === "commit") {
         return { rows: [] };
       }
-      if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
+      if (
+        typeof statement === "string" &&
+        statement.startsWith("pragma table_info")
+      ) {
         return { rows: [{ name: "id" }, { name: "startedAt" }] };
       }
       if (statement.sql.includes('"events"')) {
@@ -512,20 +669,34 @@ test("seed accepts canonical DateTime forms and rejects noncanonical values", as
   for (const startedAt of accepted) {
     const db = {
       execute: mock(async (statement: any) => {
-        if (statement === "begin" || statement === "commit") return { rows: [] };
-        if (typeof statement === "string" && statement.startsWith("pragma table_info")) {
+        if (statement === "begin" || statement === "commit")
+          return { rows: [] };
+        if (
+          typeof statement === "string" &&
+          statement.startsWith("pragma table_info")
+        ) {
           return { rows: [{ name: "id" }, { name: "startedAt" }] };
         }
         return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
       }),
     };
-    const result = await seed(db as any, eventSchema(), { events: [{ startedAt }] });
+    const result = await seed(db as any, eventSchema(), {
+      events: [{ startedAt }],
+    });
     expect(result.kind).toBe("success");
   }
 
-  for (const startedAt of [1783787812.5, "1783787812.5", "2026-07-11", "July 11, 2026", "2026-02-30T00:00:00Z"]) {
+  for (const startedAt of [
+    1783787812.5,
+    "1783787812.5",
+    "2026-07-11",
+    "July 11, 2026",
+    "2026-02-30T00:00:00Z",
+  ]) {
     const db = { execute: mock(async () => ({ rows: [] })) };
-    const result = await seed(db as any, eventSchema(), { events: [{ startedAt }] });
+    const result = await seed(db as any, eventSchema(), {
+      events: [{ startedAt }],
+    });
     expect(result.kind).toBe("error");
     expect(result.error?.errorType).toBe("InvalidInput");
   }
@@ -537,8 +708,22 @@ function userPostSchema(): SchemaMetadata {
       users: {
         name: "users",
         columns: [
-          { name: "id", type: "Int", nullable: false, primary: true, unique: true, indexed: true },
-          { name: "name", type: "String", nullable: false, primary: false, unique: false, indexed: false },
+          {
+            name: "id",
+            type: "Int",
+            nullable: false,
+            primary: true,
+            unique: true,
+            indexed: true,
+          },
+          {
+            name: "name",
+            type: "String",
+            nullable: false,
+            primary: false,
+            unique: false,
+            indexed: false,
+          },
         ],
         links: {
           posts: {
@@ -552,9 +737,30 @@ function userPostSchema(): SchemaMetadata {
       posts: {
         name: "posts",
         columns: [
-          { name: "id", type: "Int", nullable: false, primary: true, unique: true, indexed: true },
-          { name: "authorId", type: "Int", nullable: false, primary: false, unique: false, indexed: false },
-          { name: "title", type: "String", nullable: false, primary: false, unique: false, indexed: false },
+          {
+            name: "id",
+            type: "Int",
+            nullable: false,
+            primary: true,
+            unique: true,
+            indexed: true,
+          },
+          {
+            name: "authorId",
+            type: "Int",
+            nullable: false,
+            primary: false,
+            unique: false,
+            indexed: false,
+          },
+          {
+            name: "title",
+            type: "String",
+            nullable: false,
+            primary: false,
+            unique: false,
+            indexed: false,
+          },
         ],
         links: {},
         indices: [],
@@ -570,8 +776,22 @@ function eventSchema(): SchemaMetadata {
       events: {
         name: "events",
         columns: [
-          { name: "id", type: "Int", nullable: false, primary: true, unique: true, indexed: true },
-          { name: "startedAt", type: "DateTime", nullable: false, primary: false, unique: false, indexed: false },
+          {
+            name: "id",
+            type: "Int",
+            nullable: false,
+            primary: true,
+            unique: true,
+            indexed: true,
+          },
+          {
+            name: "startedAt",
+            type: "DateTime",
+            nullable: false,
+            primary: false,
+            unique: false,
+            indexed: false,
+          },
         ],
         links: {},
         indices: [],
@@ -587,9 +807,30 @@ function jsonAndConstructedSchema(): SchemaMetadata {
       tokens: {
         name: "tokens",
         columns: [
-          { name: "id", type: "Int", nullable: false, primary: true, unique: true, indexed: true },
-          { name: "state", type: "Json<GameState>", nullable: false, primary: false, unique: false, indexed: false },
-          { name: "placement", type: "MapEntityPlacement", nullable: false, primary: false, unique: false, indexed: false },
+          {
+            name: "id",
+            type: "Int",
+            nullable: false,
+            primary: true,
+            unique: true,
+            indexed: true,
+          },
+          {
+            name: "state",
+            type: "Json<GameState>",
+            nullable: false,
+            primary: false,
+            unique: false,
+            indexed: false,
+          },
+          {
+            name: "placement",
+            type: "MapEntityPlacement",
+            nullable: false,
+            primary: false,
+            unique: false,
+            indexed: false,
+          },
         ],
         links: {},
         indices: [],

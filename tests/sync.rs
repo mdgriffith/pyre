@@ -169,6 +169,109 @@ record Job {
     .unwrap()
 }
 
+fn tagged_union_session_permission_context(variant: &str) -> typecheck::Context {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        &format!(
+            r#"
+type SessionScope
+    = Workspace {{
+        id Int
+    }}
+    | Account {{
+        id Int
+    }}
+
+session {{
+    scope SessionScope
+}}
+
+record Resource {{
+    id Int @id
+    workspaceId Int
+    updatedAt Int
+    @allow(query) {{ workspaceId == Session.scope.{variant}.id }}
+}}
+"#
+        ),
+        &mut schema,
+    )
+    .unwrap();
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap()
+}
+
+#[test]
+fn tagged_union_session_paths_match_catch_up_and_live_delta_semantics() {
+    let context = tagged_union_session_permission_context("Workspace");
+    let session = pyre::session::prepare_session(
+        &context,
+        &json!({ "scope": { "_type": "Workspace", "id": 7 } }),
+    )
+    .unwrap();
+    let statement =
+        pyre::sync::get_sync_status_statement(&SyncCursor::new(), &context, &session).unwrap();
+    assert!(statement.sql.contains("? = 'Workspace'"));
+    assert!(statement
+        .params
+        .contains(&pyre::sync::SessionValue::Text("Workspace".to_string())));
+    assert!(statement
+        .params
+        .contains(&pyre::sync::SessionValue::Integer(7)));
+
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "resources".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "workspaceId".to_string(),
+            "updatedAt".to_string(),
+        ],
+        rows: vec![
+            vec![json!(1), json!(7), json!(1)],
+            vec![json!(2), json!(8), json!(1)],
+        ],
+    }];
+    let sessions = std::collections::HashMap::from([("session".to_string(), session)]);
+    let result = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &context).unwrap();
+    assert_eq!(result.groups.len(), 1);
+    assert_eq!(
+        result.groups[0].table_groups[0].rows,
+        vec![affected[0].rows[0].clone()]
+    );
+}
+
+#[test]
+fn permission_hash_distinguishes_session_union_variants_on_the_rhs() {
+    let workspace = tagged_union_session_permission_context("Workspace");
+    let account = tagged_union_session_permission_context("Account");
+    let workspace_permission = ast::get_permissions(
+        &workspace.tables["resource"].record,
+        &ast::QueryOperation::Query,
+    );
+    let account_permission = ast::get_permissions(
+        &account.tables["resource"].record,
+        &ast::QueryOperation::Query,
+    );
+    let session = std::collections::HashMap::from([
+        (
+            "scope".to_string(),
+            pyre::sync::SessionValue::Text("Workspace".to_string()),
+        ),
+        (
+            "scope__id".to_string(),
+            pyre::sync::SessionValue::Integer(7),
+        ),
+    ]);
+
+    assert_ne!(
+        pyre::sync::calculate_permission_hash(&workspace_permission, &session),
+        pyre::sync::calculate_permission_hash(&account_permission, &session)
+    );
+}
+
 #[test]
 fn nullable_session_rhs_matches_catch_up_and_live_delta_semantics() {
     let context = nullable_session_union_permission_context();

@@ -3,7 +3,15 @@ import type { LinkInfo, SchemaMetadata, TableMetadata } from "@pyre/core";
 import type { ZodType } from "zod";
 import { buildArgs, formatResultData, toSqlStatements, type SqlInfo } from "./runtime/sql";
 
-export type SessionValue = null | number | string | Uint8Array;
+export type SessionValue =
+    | null
+    | boolean
+    | number
+    | string
+    | Uint8Array
+    | Date
+    | SessionValue[]
+    | { [key: string]: SessionValue };
 
 type Validator<T> = ZodType<T>;
 

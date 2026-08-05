@@ -6,7 +6,7 @@ use crate::generate::sql;
 use crate::generate::typealias;
 use crate::generate::typescript::common;
 use crate::typecheck;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub fn generate_schema(
@@ -17,7 +17,7 @@ pub fn generate_schema(
 ) {
     files.push(generate_text_file(
         base_out_dir.join("decode.ts"),
-        generate_decode_file(database),
+        generate_decode_file(context, database),
     ));
     files.push(generate_text_file(
         base_out_dir.join("schema.ts"),
@@ -75,7 +75,7 @@ fn sql_types_file() -> String {
     result
 }
 
-fn generate_decode_file(database: &ast::Database) -> String {
+fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) -> String {
     let mut result = String::new();
 
     result.push_str("import { z } from 'zod';\n");
@@ -106,45 +106,77 @@ fn generate_decode_file(database: &ast::Database) -> String {
     for field in &session.fields {
         if let ast::Field::Column(col) = field {
             let type_str = col.type_.to_string();
-            let ts_type = match type_str.as_str() {
-                "String" => "string",
-                "Int" | "Float" => "number",
-                "Bool" => "boolean",
-                "DateTime" => "Date | string | number",
-                _ if type_str == "Id.Int"
-                    || type_str == "Id.Uuid"
-                    || type_str.starts_with("Id.Int<")
-                    || type_str.starts_with("Id.Uuid<")
-                    || type_str.contains('.') =>
-                {
-                    "number"
-                }
-                other => other,
+            let ts_type = match &col.type_ {
+                ast::ColumnType::ForeignKey {
+                    serialization_type:
+                        Some(
+                            ast::ConcreteSerializationType::Text
+                            | ast::ConcreteSerializationType::Date
+                            | ast::ConcreteSerializationType::IdUuid,
+                        ),
+                    ..
+                } => "string",
+                ast::ColumnType::ForeignKey {
+                    serialization_type: Some(ast::ConcreteSerializationType::DateTime),
+                    ..
+                } => "Date | string | number",
+                _ => match type_str.as_str() {
+                    "String" => "string",
+                    "Int" | "Float" => "number",
+                    "Bool" => "boolean",
+                    "DateTime" => "Date | string | number",
+                    _ if type_str == "Id.Int"
+                        || type_str == "Id.Uuid"
+                        || type_str.starts_with("Id.Int<")
+                        || type_str.starts_with("Id.Uuid<")
+                        || type_str.contains('.') =>
+                    {
+                        "number"
+                    }
+                    other => other,
+                },
             };
             let optional = if col.nullable { "?" } else { "" };
             result.push_str(&format!("  {}{}: {};\n", col.name, optional, ts_type));
         }
     }
     result.push_str("}\n\n");
+    result.push_str(&session_validation_helpers(context, &session));
 
     result.push_str("export const SessionValidator = z.object({\n");
     for field in &session.fields {
         if let ast::Field::Column(col) = field {
             let type_str = col.type_.to_string();
-            let validator = match type_str.as_str() {
-                "String" => "z.string()".to_string(),
-                "Int" | "Float" => "z.number()".to_string(),
-                "Bool" => "CoercedBool".to_string(),
-                "DateTime" => "CoercedDate".to_string(),
-                _ if type_str == "Id.Int"
-                    || type_str == "Id.Uuid"
-                    || type_str.starts_with("Id.Int<")
-                    || type_str.starts_with("Id.Uuid<")
-                    || type_str.contains('.') =>
-                {
-                    "z.number()".to_string()
-                }
-                other => format!("z.any() /* {} */", other),
+            let validator = match &col.type_ {
+                ast::ColumnType::Custom(name) => session_custom_validator(context, name),
+                ast::ColumnType::ForeignKey {
+                    serialization_type:
+                        Some(
+                            ast::ConcreteSerializationType::Text
+                            | ast::ConcreteSerializationType::Date
+                            | ast::ConcreteSerializationType::IdUuid,
+                        ),
+                    ..
+                } => "z.string()".to_string(),
+                ast::ColumnType::ForeignKey {
+                    serialization_type: Some(ast::ConcreteSerializationType::DateTime),
+                    ..
+                } => "CoercedDate".to_string(),
+                _ => match type_str.as_str() {
+                    "String" => "z.string()".to_string(),
+                    "Int" | "Float" => "z.number()".to_string(),
+                    "Bool" => "CoercedBool".to_string(),
+                    "DateTime" => "CoercedDate".to_string(),
+                    _ if type_str == "Id.Int"
+                        || type_str == "Id.Uuid"
+                        || type_str.starts_with("Id.Int<")
+                        || type_str.starts_with("Id.Uuid<")
+                        || type_str.contains('.') =>
+                    {
+                        "z.number()".to_string()
+                    }
+                    other => format!("z.any() /* {} */", other),
+                },
             };
             let validator = if col.nullable {
                 format!("{}.optional()", validator)
@@ -163,6 +195,102 @@ fn generate_decode_file(database: &ast::Database) -> String {
     }
 
     result
+}
+
+fn session_custom_validator(context: &typecheck::Context, name: &str) -> String {
+    let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(name) else {
+        return format!("z.lazy(() => {})", name);
+    };
+    if variants.iter().all(|variant| variant.fields.is_none()) {
+        format!("z.lazy(() => {})", name)
+    } else {
+        format!(
+            "z.lazy(() => {}).superRefine((value, ctx) => validateSession{}(value, ctx))",
+            name, name
+        )
+    }
+}
+
+fn session_validation_helpers(
+    context: &typecheck::Context,
+    session: &ast::SessionDetails,
+) -> String {
+    let mut type_names = BTreeSet::new();
+    for field in &session.fields {
+        if let ast::Field::Column(column) = field {
+            collect_session_custom_types(context, &column.type_, &mut type_names);
+        }
+    }
+
+    let mut result = String::new();
+    for type_name in type_names {
+        let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(&type_name) else {
+            continue;
+        };
+        if variants.iter().all(|variant| variant.fields.is_none()) {
+            continue;
+        }
+        result.push_str(&format!(
+            "function validateSession{}(value: any, ctx: z.RefinementCtx, path: (string | number)[] = []): void {{\n  switch (value._type) {{\n",
+            type_name
+        ));
+        for variant in variants {
+            result.push_str(&format!("    case '{}':\n", variant.name));
+            if let Some(fields) = &variant.fields {
+                for field in fields {
+                    let ast::Field::Column(column) = field else {
+                        continue;
+                    };
+                    if !column.nullable {
+                        result.push_str(&format!(
+                            "      if (value.{0} == null) ctx.addIssue({{ code: 'custom', path: [...path, '{0}'], message: 'Required' }});\n",
+                            column.name
+                        ));
+                    }
+                    if let Some(nested_type) = column.type_.get_custom_type_name() {
+                        if matches!(
+                            context.types.get(nested_type),
+                            Some((_, typecheck::Type::OneOf { variants }))
+                                if variants.iter().any(|variant| variant.fields.is_some())
+                        ) {
+                            result.push_str(&format!(
+                                "      if (value.{0} != null) validateSession{1}(value.{0}, ctx, [...path, '{0}']);\n",
+                                column.name, nested_type
+                            ));
+                        }
+                    }
+                }
+            }
+            result.push_str("      break;\n");
+        }
+        result.push_str("  }\n}\n\n");
+    }
+    result
+}
+
+fn collect_session_custom_types(
+    context: &typecheck::Context,
+    type_: &ast::ColumnType,
+    type_names: &mut BTreeSet<String>,
+) {
+    let Some(type_name) = type_.get_custom_type_name() else {
+        return;
+    };
+    if !type_names.insert(type_name.to_string()) {
+        return;
+    }
+    let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(type_name) else {
+        return;
+    };
+    for variant in variants {
+        if let Some(fields) = &variant.fields {
+            for field in fields {
+                if let ast::Field::Column(column) = field {
+                    collect_session_custom_types(context, &column.type_, type_names);
+                }
+            }
+        }
+    }
 }
 
 fn to_metadata_formatter() -> typealias::TypeFormatter {

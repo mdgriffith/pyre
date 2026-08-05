@@ -4,7 +4,15 @@ import { normalizeForWasmJson } from "./wasm-json";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
 import { activateSchemaForDatabase } from "./schema";
 
-export type SessionValue = null | number | string | Uint8Array;
+export type SessionValue =
+    | null
+    | boolean
+    | number
+    | string
+    | Uint8Array
+    | Date
+    | SessionValue[]
+    | { [key: string]: SessionValue };
 export const DEFAULT_SYNC_PAGE_SIZE = 1000;
 export const MAX_SYNC_PAGE_SIZE = 5000;
 export const MAX_SYNC_CURSOR_TABLES = 512;

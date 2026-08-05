@@ -148,8 +148,18 @@ type Role
     = Admin
     | Member
 
+type Scope
+    = Workspace {
+        id Int
+    }
+    | Account {
+        id     Int?
+        parent Scope?
+    }
+
 session {
     role Role
+    scope Scope
 }
 
 record User {
@@ -168,6 +178,26 @@ record User {
     assert!(env.contains("import * as Db from './decode';"));
     assert!(env.contains("role: Db.Role"));
     assert!(!env.contains("role: z.any()"));
+
+    let mut files = Vec::new();
+    core::generate_schema(
+        &context,
+        &database,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+    let decode = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "decode.ts"))
+        .expect("generated decode file");
+    assert!(decode.contents.contains("role: z.lazy(() => Role)"));
+    assert!(decode
+        .contents
+        .contains("scope: z.lazy(() => Scope).superRefine"));
+    assert!(decode.contents.contains("value.id == null"));
+    assert!(decode
+        .contents
+        .contains("validateSessionScope(value.parent"));
 }
 
 #[test]

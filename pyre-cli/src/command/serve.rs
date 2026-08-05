@@ -573,6 +573,8 @@ mod tests {
                     type_: "Int".to_string(),
                     is_enum: false,
                     enum_variants: Vec::new(),
+                    tagged_union_variants: HashMap::new(),
+                    tagged_union_types: HashMap::new(),
                     nullable: false,
                     omittable: false,
                 },

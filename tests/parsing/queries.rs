@@ -166,8 +166,7 @@ query Resources {
     };
     assert_eq!(lhs_path.authored(), "scope.Workspace.id");
 
-    let ast::WhereArg::Column(false, _, _, ast::QueryValue::Variable((_, rhs)), _) =
-        &predicates[1]
+    let ast::WhereArg::Column(false, _, _, ast::QueryValue::Variable((_, rhs)), _) = &predicates[1]
     else {
         panic!("expected Session path on the right");
     };

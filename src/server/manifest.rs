@@ -47,6 +47,10 @@ pub struct FieldSchema {
     pub is_enum: bool,
     #[serde(default)]
     pub enum_variants: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tagged_union_variants: HashMap<String, HashMap<String, FieldSchema>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tagged_union_types: HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
     pub nullable: bool,
     pub omittable: bool,
 }
@@ -80,31 +84,23 @@ impl PyreSession {
         let mut sql_args = HashMap::new();
 
         for (name, field_schema) in schema {
-            let Some(value) = object.get(name) else {
-                if field_schema.nullable || field_schema.omittable {
-                    continue;
-                }
-
-                return Err(Error::MissingField(name.clone()));
-            };
-
-            if value.is_null() {
-                if !field_schema.nullable {
-                    return Err(Error::UnexpectedNull(name.clone()));
-                }
-
-                logical.insert(name.clone(), sync::SessionValue::Null);
-                sql_args.insert(format!("session_{}", name), JsonValue::Null);
-                continue;
+            let value = object.get(name).unwrap_or(&JsonValue::Null);
+            if value.is_null() && !field_schema.nullable && !field_schema.omittable {
+                return Err(if object.contains_key(name) {
+                    Error::UnexpectedNull(name.clone())
+                } else {
+                    Error::MissingField(name.clone())
+                });
             }
-
-            validate_value(name, value, field_schema)?;
-            let sql_value = normalize_sql_value(value, field_schema);
-            logical.insert(
-                name.clone(),
-                json_to_session_value(&sql_value, field_schema)?,
-            );
-            sql_args.insert(format!("session_{}", name), sql_value);
+            prepare_field(
+                name,
+                name,
+                value,
+                field_schema,
+                &field_schema.tagged_union_types,
+                &mut logical,
+                &mut sql_args,
+            )?;
         }
 
         Ok(Self { logical, sql_args })
@@ -116,6 +112,173 @@ impl PyreSession {
 
     pub fn sql_args(&self) -> &HashMap<String, JsonValue> {
         &self.sql_args
+    }
+}
+
+fn prepare_field(
+    display_name: &str,
+    physical_name: &str,
+    value: &JsonValue,
+    schema: &FieldSchema,
+    tagged_union_types: &HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
+    logical: &mut HashMap<String, sync::SessionValue>,
+    sql_args: &mut HashMap<String, JsonValue>,
+) -> Result<(), Error> {
+    if value.is_null() {
+        insert_prepared(
+            physical_name,
+            sync::SessionValue::Null,
+            JsonValue::Null,
+            logical,
+            sql_args,
+        );
+        fill_tagged_union_descendants_with_null(
+            physical_name,
+            schema,
+            tagged_union_types,
+            logical,
+            sql_args,
+        );
+        return Ok(());
+    }
+
+    let tagged_union_variants = if schema.tagged_union_variants.is_empty() {
+        tagged_union_types.get(&schema.type_)
+    } else {
+        Some(&schema.tagged_union_variants)
+    };
+    if let Some(tagged_union_variants) = tagged_union_variants {
+        let tag = value
+            .get("_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| Error::InvalidFieldType {
+                field: display_name.to_string(),
+                expected: schema.type_.clone(),
+            })?;
+        let fields = tagged_union_variants
+            .get(tag)
+            .ok_or_else(|| Error::InvalidFieldType {
+                field: display_name.to_string(),
+                expected: schema.type_.clone(),
+            })?;
+        let object = value.as_object().ok_or_else(|| Error::InvalidFieldType {
+            field: display_name.to_string(),
+            expected: schema.type_.clone(),
+        })?;
+
+        insert_prepared(
+            physical_name,
+            sync::SessionValue::Text(tag.to_string()),
+            JsonValue::String(tag.to_string()),
+            logical,
+            sql_args,
+        );
+        fill_tagged_union_descendants_with_null(
+            physical_name,
+            schema,
+            tagged_union_types,
+            logical,
+            sql_args,
+        );
+        for (name, field_schema) in fields {
+            let nested_display_name = format!("{}.{}.{}", display_name, tag, name);
+            let nested_physical_name = format!("{}__{}", physical_name, name);
+            let field_value = object.get(name).unwrap_or(&JsonValue::Null);
+            if field_value.is_null() && !field_schema.nullable && !field_schema.omittable {
+                return Err(if object.contains_key(name) {
+                    Error::UnexpectedNull(nested_display_name)
+                } else {
+                    Error::MissingField(nested_display_name)
+                });
+            }
+            prepare_field(
+                &nested_display_name,
+                &nested_physical_name,
+                field_value,
+                field_schema,
+                tagged_union_types,
+                logical,
+                sql_args,
+            )?;
+        }
+        return Ok(());
+    }
+
+    validate_value(display_name, value, schema)?;
+    let sql_value = normalize_sql_value(value, schema);
+    let logical_value = json_to_session_value(&sql_value, schema)?;
+    insert_prepared(physical_name, logical_value, sql_value, logical, sql_args);
+    Ok(())
+}
+
+fn insert_prepared(
+    physical_name: &str,
+    logical_value: sync::SessionValue,
+    sql_value: JsonValue,
+    logical: &mut HashMap<String, sync::SessionValue>,
+    sql_args: &mut HashMap<String, JsonValue>,
+) {
+    logical.insert(physical_name.to_string(), logical_value);
+    sql_args.insert(format!("session_{}", physical_name), sql_value);
+}
+
+fn fill_tagged_union_descendants_with_null(
+    physical_name: &str,
+    schema: &FieldSchema,
+    tagged_union_types: &HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
+    logical: &mut HashMap<String, sync::SessionValue>,
+    sql_args: &mut HashMap<String, JsonValue>,
+) {
+    fill_tagged_union_descendants_with_null_inner(
+        physical_name,
+        schema,
+        tagged_union_types,
+        logical,
+        sql_args,
+        &mut std::collections::HashSet::new(),
+    );
+}
+
+fn fill_tagged_union_descendants_with_null_inner(
+    physical_name: &str,
+    schema: &FieldSchema,
+    tagged_union_types: &HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
+    logical: &mut HashMap<String, sync::SessionValue>,
+    sql_args: &mut HashMap<String, JsonValue>,
+    visiting: &mut std::collections::HashSet<String>,
+) {
+    let variants = if schema.tagged_union_variants.is_empty() {
+        let Some(variants) = tagged_union_types.get(&schema.type_) else {
+            return;
+        };
+        if !visiting.insert(schema.type_.clone()) {
+            return;
+        }
+        variants
+    } else {
+        &schema.tagged_union_variants
+    };
+    for fields in variants.values() {
+        for (name, field_schema) in fields {
+            let nested_name = format!("{}__{}", physical_name, name);
+            logical
+                .entry(nested_name.clone())
+                .or_insert(sync::SessionValue::Null);
+            sql_args
+                .entry(format!("session_{}", nested_name))
+                .or_insert(JsonValue::Null);
+            fill_tagged_union_descendants_with_null_inner(
+                &nested_name,
+                field_schema,
+                tagged_union_types,
+                logical,
+                sql_args,
+                visiting,
+            );
+        }
+    }
+    if schema.tagged_union_variants.is_empty() {
+        visiting.remove(&schema.type_);
     }
 }
 

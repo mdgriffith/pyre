@@ -189,6 +189,10 @@ fn build_args(
     for session_arg in &query.session_args {
         let sql_arg = format!("session_{}", session_arg);
         let Some(value) = session.sql_args().get(&sql_arg) else {
+            if session_arg.contains("__") {
+                args.insert(sql_arg, JsonValue::Null);
+                continue;
+            }
             return Err(Error::InvalidSession(format!(
                 "missing session field '{}'",
                 session_arg

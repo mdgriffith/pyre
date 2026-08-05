@@ -388,7 +388,21 @@ fn hash_query_value(hasher: &mut Sha256, value: &ast::QueryValue) {
         }
         ast::QueryValue::Variable((_, var)) => {
             hasher.update("var");
-            hasher.update(&var.name);
+            if let Some(path) = var.session_path().filter(|path| !path.is_simple()) {
+                hasher.update("session_predicate_path_v1");
+                hasher.update((path.segments.len() as u64).to_le_bytes());
+                for segment in path.segments {
+                    let (kind, name) = match segment {
+                        ast::PredicatePathSegment::Field(name) => (0_u8, name),
+                        ast::PredicatePathSegment::Variant(name) => (1_u8, name),
+                    };
+                    hasher.update([kind]);
+                    hasher.update((name.len() as u64).to_le_bytes());
+                    hasher.update(name);
+                }
+            } else {
+                hasher.update(&var.name);
+            }
         }
         ast::QueryValue::String((_, s)) => {
             hasher.update("string");
@@ -498,9 +512,7 @@ fn render_permission_value(
         ast::QueryValue::Variable((_, var)) => {
             if let Some(path) = var.session_path() {
                 let session_key = path.flattened();
-                let session_value = session
-                    .get(&session_key)
-                    .expect("Session variable should exist after typechecking");
+                let session_value = session.get(&session_key).unwrap_or(&SessionValue::Null);
                 render_session_param(session_value, params)
             } else {
                 crate::generate::sql::to_sql::render_value(value)
@@ -536,9 +548,7 @@ fn render_permission_where(
                     .as_ref()
                     .map(|path| path.physical_column.as_str())
                     .unwrap_or(fieldname);
-                let session_value = session
-                    .get(physical)
-                    .expect("Session variable should exist after typechecking");
+                let session_value = session.get(physical).unwrap_or(&SessionValue::Null);
                 render_session_param(session_value, params)
             } else {
                 let table_name = crate::ext::string::quote(&ast::get_tablename(
@@ -609,9 +619,7 @@ fn render_permission_where(
             if *is_session_var {
                 if let Some(resolved) = &resolved {
                     guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
-                        let value = session
-                            .get(column)
-                            .expect("Session discriminator should exist after preparation");
+                        let value = session.get(column).unwrap_or(&SessionValue::Null);
                         format!(
                             "{} = '{}'",
                             render_session_param(value, params),
@@ -628,16 +636,16 @@ fn render_permission_where(
                             &session_schema.fields,
                             &session_path,
                         ) {
-                            guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
-                                let value = session.get(column).expect(
-                                    "Session discriminator should exist after preparation",
-                                );
-                                format!(
-                                    "{} = '{}'",
-                                    render_session_param(value, params),
-                                    variant.replace("'", "''")
-                                )
-                            }));
+                            guards.extend(resolved.discriminators.iter().map(
+                                |(column, variant)| {
+                                    let value = session.get(column).unwrap_or(&SessionValue::Null);
+                                    format!(
+                                        "{} = '{}'",
+                                        render_session_param(value, params),
+                                        variant.replace("'", "''")
+                                    )
+                                },
+                            ));
                         }
                     }
                 }

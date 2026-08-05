@@ -6,7 +6,10 @@ export type SqlInfo = {
 
 export type SqlStatement = { sql: string; args: Record<string, any> };
 
-export function toSessionArgs(sessionArgs: string[], session: Record<string, unknown>): Record<string, unknown> {
+export function toSessionArgs(
+  sessionArgs: string[],
+  session: Record<string, unknown>,
+): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
   if (session == null) {
@@ -14,12 +17,35 @@ export function toSessionArgs(sessionArgs: string[], session: Record<string, unk
   }
 
   for (const key of sessionArgs) {
-    if (key in session) {
-      result[`session_${key}`] = normalizeSqlArg(session[key]);
+    const resolved = resolveSessionArg(key, session);
+    if (resolved.found) {
+      result[`session_${key}`] = normalizeSqlArg(resolved.value);
     }
   }
 
   return result;
+}
+
+function resolveSessionArg(
+  key: string,
+  session: Record<string, unknown>,
+): { found: boolean; value?: unknown } {
+  let value: unknown = key in session ? session[key] : session;
+
+  if (!(key in session)) {
+    for (const part of key.split("__")) {
+      if (value === null || typeof value !== "object" || !(part in value)) {
+        return { found: true, value: null };
+      }
+      value = (value as Record<string, unknown>)[part];
+    }
+  }
+
+  if (value !== null && typeof value === "object" && "_type" in value) {
+    value = (value as Record<string, unknown>)._type;
+  }
+
+  return { found: true, value };
 }
 
 function normalizeSqlArg(value: unknown): unknown {
@@ -34,9 +60,16 @@ function normalizeSqlArg(value: unknown): unknown {
     return value.map(normalizeSqlArg);
   }
 
-  if (value !== null && typeof value === "object" && !(value instanceof Uint8Array)) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !(value instanceof Uint8Array)
+  ) {
     return Object.fromEntries(
-      Object.entries(value).map(([key, nested]) => [key, normalizeSqlArg(nested)])
+      Object.entries(value).map(([key, nested]) => [
+        key,
+        normalizeSqlArg(nested),
+      ]),
     );
   }
 
@@ -48,7 +81,7 @@ export function buildArgs(
   session: Record<string, unknown>,
   sessionArgs: string[],
   optionalInputArgs: string[] = [],
-  jsonInputArgs: string[] = []
+  jsonInputArgs: string[] = [],
 ): Record<string, unknown> {
   const args: Record<string, unknown> = {};
   const jsonInputArgSet = new Set(jsonInputArgs);
@@ -60,7 +93,9 @@ export function buildArgs(
   if (input) {
     for (const [key, value] of Object.entries(input)) {
       if (value !== undefined) {
-        args[key] = jsonInputArgSet.has(key) ? JSON.stringify(normalizeSqlArg(value)) : normalizeSqlArg(value);
+        args[key] = jsonInputArgSet.has(key)
+          ? JSON.stringify(normalizeSqlArg(value))
+          : normalizeSqlArg(value);
         if (optionalInputArgs.includes(key)) {
           args[`${key}__is_set`] = true;
         }
@@ -73,7 +108,10 @@ export function buildArgs(
   return args;
 }
 
-export function toSqlStatements(sql: SqlInfo[], args: Record<string, unknown>): SqlStatement[] {
+export function toSqlStatements(
+  sql: SqlInfo[],
+  args: Record<string, unknown>,
+): SqlStatement[] {
   return sql.map(({ sql: statement, params }) => {
     const filtered: Record<string, any> = {};
     for (const key of params) {
@@ -86,7 +124,10 @@ export function toSqlStatements(sql: SqlInfo[], args: Record<string, unknown>): 
   });
 }
 
-export function formatResultData(sql: SqlInfo[], resultSets: unknown[]): Record<string, unknown> {
+export function formatResultData(
+  sql: SqlInfo[],
+  resultSets: unknown[],
+): Record<string, unknown> {
   const formatted: Record<string, unknown> = {};
   const values = resultSets.filter((_, index) => sql[index]?.include) as Array<{
     columns?: string[];
@@ -98,20 +139,22 @@ export function formatResultData(sql: SqlInfo[], resultSets: unknown[]): Record<
       continue;
     }
     for (const colName of resultSet.columns) {
-      if (colName.startsWith('_')) {
+      if (colName.startsWith("_")) {
         continue;
       }
       if (!(colName in formatted)) {
         formatted[colName] = [];
       }
       for (const row of resultSet.rows || []) {
-        if (colName in row && typeof row[colName] === 'string') {
+        if (colName in row && typeof row[colName] === "string") {
           const parsed: unknown = JSON.parse(row[colName]);
           if (Array.isArray(parsed)) {
             formatted[colName] = parsed;
           } else {
             const existing = formatted[colName];
-            formatted[colName] = Array.isArray(existing) ? [...existing, parsed] : [parsed];
+            formatted[colName] = Array.isArray(existing)
+              ? [...existing, parsed]
+              : [parsed];
           }
         }
       }

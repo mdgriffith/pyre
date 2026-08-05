@@ -1747,10 +1747,7 @@ fn parse_query_where(input: Text) -> ParseResult<ast::WhereArg> {
                 start: to_location(&start_pos),
                 end: to_location(&end_pos),
             };
-            Ok((
-                input,
-                (true, path, range),
-            ))
+            Ok((input, (true, path, range)))
         },
         |input| {
             // Fall back to regular fieldname
@@ -1780,8 +1777,7 @@ fn parse_query_where(input: Text) -> ParseResult<ast::WhereArg> {
 
 fn parse_predicate_path(input: Text) -> ParseResult<ast::PredicatePath> {
     let (input, root) = parse_fieldname(input)?;
-    let (input, tail) =
-        many0(preceded(tag("."), alt((parse_typename, parse_fieldname))))(input)?;
+    let (input, tail) = many0(preceded(tag("."), alt((parse_typename, parse_fieldname))))(input)?;
     let segments = std::iter::once(root)
         .chain(tail)
         .enumerate()
