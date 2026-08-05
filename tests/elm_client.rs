@@ -10,6 +10,51 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 }
 
 #[test]
+fn generated_elm_update_groups_list_input_types() {
+    let schema_source = r#"
+record MapEntityTrail {
+    @public
+
+    id    Id.Int @id
+    trail Json<List<Int>>
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let mut query_list = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut query_list, &context);
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    elm::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("client/elm"),
+        &mut files,
+    );
+
+    let generated = files
+        .iter()
+        .find(|f| path_ends_with(&f.path, "Query/MapEntityTrailUpdate.elm"))
+        .expect("generated MapEntityTrailUpdate.elm file");
+
+    assert!(
+        generated
+            .contents
+            .contains("trail : Db.Updates.Update (List Int)"),
+        "Parameterized update input types should be grouped. Generated:\n{}",
+        generated.contents
+    );
+}
+
+#[test]
 fn generated_pyre_elm_uses_query_upserts() {
     let schema_source = r#"
 record Rulebook {

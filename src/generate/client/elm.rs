@@ -2012,7 +2012,11 @@ fn to_param_type_alias(
         let type_string = &arg.type_.clone().unwrap_or("unknown".to_string());
         let base_type = to_elm_typename(lookup, type_string, false);
         let elm_type = if *operation == ast::QueryOperation::Update && arg.omittable {
-            format!("Db.Updates.Update {}", base_type)
+            if base_type.contains(' ') {
+                format!("Db.Updates.Update ({})", base_type)
+            } else {
+                format!("Db.Updates.Update {}", base_type)
+            }
         } else {
             base_type
         };
