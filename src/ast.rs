@@ -1284,12 +1284,12 @@ pub enum WhereArg {
     Or(Vec<WhereArg>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PredicatePath {
     pub segments: Vec<PredicatePathSegment>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PredicatePathSegment {
     Field(String),
     Variant(String),
@@ -1322,6 +1322,33 @@ impl PredicatePath {
             .cloned()
             .collect::<Vec<_>>()
             .join(".")
+    }
+
+    pub fn flattened(&self) -> String {
+        self.segments
+            .iter()
+            .filter_map(|segment| match segment {
+                PredicatePathSegment::Field(name) => Some(name.as_str()),
+                PredicatePathSegment::Variant(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("__")
+    }
+
+    pub fn from_authored(authored: &str) -> Self {
+        Self {
+            segments: authored
+                .split('.')
+                .enumerate()
+                .map(|(index, name)| {
+                    if index % 2 == 0 {
+                        PredicatePathSegment::Field(name.to_string())
+                    } else {
+                        PredicatePathSegment::Variant(name.to_string())
+                    }
+                })
+                .collect(),
+        }
     }
 }
 
@@ -1358,7 +1385,16 @@ pub struct FnDetails {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VariableDetails {
     pub name: String,
+    // Full authored path without the Session prefix.
     pub session_field: Option<String>,
+}
+
+impl VariableDetails {
+    pub fn session_path(&self) -> Option<PredicatePath> {
+        self.session_field
+            .as_deref()
+            .map(PredicatePath::from_authored)
+    }
 }
 
 pub fn to_pyre_variable_name(var: &VariableDetails) -> String {

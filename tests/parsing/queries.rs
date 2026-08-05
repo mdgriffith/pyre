@@ -111,6 +111,141 @@ query Jobs($code: Int) {
     typecheck::check_queries(&queries, &union_predicate_context()).expect("paths typecheck");
 }
 
+fn session_union_predicate_context() -> typecheck::Context {
+    let source = r#"
+type SessionScope
+   = Workspace {
+        id Int?
+     }
+   | Account {
+        id Int?
+     }
+
+session {
+    scope SessionScope
+}
+
+record Resource {
+    id Int @id
+    ownerId Int?
+    label String
+    @public
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).expect("schema parses");
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks")
+}
+
+#[test]
+fn session_tagged_union_paths_parse_typecheck_and_describe_scalar_params() {
+    let source = r#"
+query Resources {
+    resource {
+        @where { Session.scope.Workspace.id == 1 && ownerId == Session.scope.Workspace.id }
+        id
+    }
+}
+"#;
+    let queries = parser::parse_query("query.pyre", source).expect("session paths parse");
+    let ast::QueryDef::Query(query) = &queries.queries[0] else {
+        panic!("expected query");
+    };
+    let ast::TopLevelQueryField::Field(field) = &query.fields[0] else {
+        panic!("expected field");
+    };
+    let wheres = ast::collect_wheres(&field.fields);
+    let ast::WhereArg::And(predicates) = &wheres[0] else {
+        panic!("expected conjunction");
+    };
+    let ast::WhereArg::Column(true, lhs_path, _, _, _) = &predicates[0] else {
+        panic!("expected Session path on the left");
+    };
+    assert_eq!(lhs_path.authored(), "scope.Workspace.id");
+
+    let ast::WhereArg::Column(false, _, _, ast::QueryValue::Variable((_, rhs)), _) =
+        &predicates[1]
+    else {
+        panic!("expected Session path on the right");
+    };
+    assert_eq!(
+        rhs.session_path().expect("session path").authored(),
+        "scope.Workspace.id"
+    );
+    assert_eq!(rhs.name, "session_scope__id");
+    assert_eq!(
+        ast::to_pyre_variable_name(rhs),
+        "Session.scope.Workspace.id"
+    );
+
+    let infos = typecheck::check_queries(&queries, &session_union_predicate_context())
+        .expect("session paths typecheck");
+    let params = &infos["Resources"].variables;
+    let typecheck::ParamInfo::Defined {
+        raw_variable_name,
+        type_,
+        nullable,
+        session_name,
+        session_path,
+        session_discriminator,
+        used,
+        ..
+    } = &params["Session.scope.Workspace.id"]
+    else {
+        panic!("expected terminal session param");
+    };
+    assert_eq!(raw_variable_name, "session_scope__id");
+    assert_eq!(type_.as_deref(), Some("Int"));
+    assert!(*nullable);
+    assert_eq!(session_name.as_deref(), Some("scope__id"));
+    assert_eq!(
+        session_path.as_ref().map(ast::PredicatePath::authored),
+        Some("scope.Workspace.id".to_string())
+    );
+    assert_eq!(session_discriminator, &None);
+    assert!(*used);
+
+    let typecheck::ParamInfo::Defined {
+        raw_variable_name,
+        session_name,
+        session_discriminator,
+        used,
+        ..
+    } = &params["Session.scope"]
+    else {
+        panic!("expected discriminator session param");
+    };
+    assert_eq!(raw_variable_name, "session_scope");
+    assert_eq!(session_name.as_deref(), Some("scope"));
+    assert_eq!(session_discriminator.as_deref(), Some("Workspace"));
+    assert!(*used);
+}
+
+#[test]
+fn session_tagged_union_paths_report_invalid_variants_and_terminal_types() {
+    let context = session_union_predicate_context();
+    for predicate in [
+        "ownerId == Session.scope.Unknown.id",
+        "ownerId == Session.scope.Workspace.missing",
+        "ownerId == Session.scope.Workspace",
+        "label == Session.scope.Workspace.id",
+    ] {
+        let source = format!(
+            "query Resources {{ resource {{ @where {{ {} }} id }} }}",
+            predicate
+        );
+        let queries = parser::parse_query("query.pyre", &source).expect("path syntax parses");
+        assert!(
+            typecheck::check_queries(&queries, &context).is_err(),
+            "session path should fail typechecking: {}",
+            predicate
+        );
+    }
+}
+
 #[test]
 fn tagged_union_predicates_reject_unqualified_unknown_and_mismatched_paths() {
     let context = union_predicate_context();

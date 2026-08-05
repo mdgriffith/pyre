@@ -968,6 +968,31 @@ session {
 }
 
 #[test]
+fn test_session_tagged_union_predicate_paths_round_trip() {
+    round_trip_schema(
+        r#"
+type SessionScope
+    = Workspace {
+        id Int
+    }
+    | Account {
+        id Int
+    }
+
+session {
+    scope SessionScope
+}
+
+record Resource {
+    id Int @id
+    ownerId Int
+    @allow(*) { Session.scope.Workspace.id == 1 || ownerId == Session.scope.Workspace.id }
+}
+"#,
+    );
+}
+
+#[test]
 fn test_schema_round_trip_directives() {
     let schema_source = r#"
 record Test {

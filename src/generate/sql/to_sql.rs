@@ -327,7 +327,9 @@ fn render_where_arg_inner(
         ast::WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
             let fieldname = path.root();
             let resolved = if *is_session_var {
-                None
+                context.session.as_ref().and_then(|session| {
+                    typecheck::resolve_predicate_path(context, &session.fields, path).ok()
+                })
             } else {
                 typecheck::resolve_predicate_path(context, &table.record.fields, path).ok()
             };
@@ -336,7 +338,7 @@ fn render_where_arg_inner(
                 .map(|resolved| resolved.physical_column.as_str())
                 .unwrap_or(fieldname);
             let qualified_column_name = if *is_session_var {
-                render_real_where_field(table, query_info, true, fieldname)
+                render_real_where_field(table, query_info, true, physical_column)
             } else if let Some(table_ref) = table_ref {
                 format!("{}.{}", table_ref, string::quote(physical_column))
             } else {
@@ -359,41 +361,56 @@ fn render_where_arg_inner(
                 operator(op)
             };
 
-            let rendered_value = if *is_session_var {
-                render_value(value)
-            } else {
-                resolved
-                    .as_ref()
-                    .map(|resolved| render_column_value(&resolved.column, value))
-                    .unwrap_or_else(|| render_value(value))
-            };
+            let rendered_value = resolved
+                .as_ref()
+                .map(|resolved| render_column_value(&resolved.column, value))
+                .unwrap_or_else(|| render_value(value));
 
-            let value = if matches!(op, ast::Operator::In | ast::Operator::NotIn)
+            let rendered_rhs = if matches!(op, ast::Operator::In | ast::Operator::NotIn)
                 && matches!(value, ast::QueryValue::Variable((_, var)) if var.session_field.is_some())
             {
                 format!("(select value from json_each({}))", rendered_value)
             } else {
                 rendered_value
             };
-            let comparison = format!("{} {} {}", qualified_column_name, operator, value);
-            let Some(resolved) = resolved else {
-                return comparison;
-            };
-            if resolved.discriminators.is_empty() {
-                return comparison;
-            }
-            let mut guards = resolved
-                .discriminators
-                .iter()
-                .map(|(column, variant)| {
-                    let qualified = if let Some(table_ref) = table_ref {
+            let comparison = format!("{} {} {}", qualified_column_name, operator, rendered_rhs);
+            let mut guards = Vec::new();
+            if let Some(resolved) = &resolved {
+                guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
+                    let qualified = if *is_session_var {
+                        render_real_where_field(table, query_info, true, column)
+                    } else if let Some(table_ref) = table_ref {
                         format!("{}.{}", table_ref, string::quote(column))
                     } else {
                         render_real_where_field(table, query_info, false, column)
                     };
                     format!("{} = '{}'", qualified, variant.replace("'", "''"))
-                })
-                .collect::<Vec<_>>();
+                }));
+            }
+            if let ast::QueryValue::Variable((_, variable)) = value {
+                if let Some(session_path) = variable.session_path() {
+                    if let Some(session) = &context.session {
+                        if let Ok(resolved) = typecheck::resolve_predicate_path(
+                            context,
+                            &session.fields,
+                            &session_path,
+                        ) {
+                            guards.extend(resolved.discriminators.iter().map(
+                                |(column, variant)| {
+                                    format!(
+                                        "{} = '{}'",
+                                        render_real_where_field(table, query_info, true, column),
+                                        variant.replace("'", "''")
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            if guards.is_empty() {
+                return comparison;
+            }
             guards.push(comparison);
             format!("({})", guards.join(" and "))
         }

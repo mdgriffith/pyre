@@ -125,11 +125,11 @@ pub fn predicate_operand_is_nullable(
     path: &ast::PredicatePath,
 ) -> bool {
     if is_session {
-        return context.session.as_ref().is_some_and(|session| {
-            session.fields.iter().any(|field| {
-                matches!(field, ast::Field::Column(column) if column.name == path.root() && column.nullable)
-            })
-        });
+        return context
+            .session
+            .as_ref()
+            .and_then(|session| resolve_predicate_path(context, &session.fields, path).ok())
+            .is_some_and(|resolved| resolved.column.nullable);
     }
 
     resolve_predicate_path(context, fields, path)
@@ -140,15 +140,13 @@ pub fn predicate_operand_is_nullable(
 pub fn query_value_is_nullable(context: &Context, value: &ast::QueryValue) -> bool {
     match value {
         ast::QueryValue::Null(_) => true,
-        ast::QueryValue::Variable((_, variable)) => variable.session_field.as_ref().is_some_and(
-            |session_field| {
-                context.session.as_ref().is_some_and(|session| {
-                    session.fields.iter().any(|field| {
-                        matches!(field, ast::Field::Column(column) if column.name == *session_field && column.nullable)
-                    })
-                })
-            },
-        ),
+        ast::QueryValue::Variable((_, variable)) => variable.session_path().is_some_and(|path| {
+            context
+                .session
+                .as_ref()
+                .and_then(|session| resolve_predicate_path(context, &session.fields, &path).ok())
+                .is_some_and(|resolved| resolved.column.nullable)
+        }),
         _ => false,
     }
 }
@@ -1997,6 +1995,8 @@ pub enum ParamInfo {
         type_inferred: bool,
         from_session: bool,
         session_name: Option<String>,
+        session_path: Option<ast::PredicatePath>,
+        session_discriminator: Option<String>,
     },
     NotDefinedButUsed {
         used_at: Option<Range>,
@@ -2060,6 +2060,8 @@ pub fn check_query(context: &Context, errors: &mut Vec<Error>, query: &ast::Quer
                         type_inferred: false,
                         from_session: false,
                         session_name: None,
+                        session_path: None,
+                        session_discriminator: None,
                     },
                 );
             }
@@ -2091,6 +2093,8 @@ pub fn check_query(context: &Context, errors: &mut Vec<Error>, query: &ast::Quer
                         type_inferred: false,
                         from_session: false,
                         session_name: None,
+                        session_path: None,
+                        session_discriminator: None,
                     },
                 );
             }
@@ -2116,6 +2120,8 @@ pub fn check_query(context: &Context, errors: &mut Vec<Error>, query: &ast::Quer
                                 type_inferred: false,
                                 from_session: true,
                                 session_name: Some(col.name.clone()),
+                                session_path: Some(ast::PredicatePath::field(&col.name)),
+                                session_discriminator: None,
                             },
                         );
                     }
@@ -2294,6 +2300,98 @@ fn get_secondary_dbs(namespaces: &UsedNamespaces, primary_db: &str) -> HashSet<S
     secondary
 }
 
+fn register_session_path_params(
+    context: &Context,
+    query_context: &QueryContext,
+    params: &mut HashMap<String, ParamInfo>,
+    path: &ast::PredicatePath,
+) -> Result<ResolvedPredicatePath, String> {
+    let session = context
+        .session
+        .as_ref()
+        .ok_or_else(|| format!("unknown field 'Session.{}'", path.authored()))?;
+    let resolved = resolve_predicate_path(context, &session.fields, path)?;
+
+    let mut register = |param_path: ast::PredicatePath,
+                        physical_name: String,
+                        type_: String,
+                        nullable: bool,
+                        discriminator: Option<String>| {
+        let key = format!("Session.{}", param_path.authored());
+        match params.get_mut(&key) {
+            Some(ParamInfo::Defined {
+                type_: param_type,
+                nullable: param_nullable,
+                used,
+                used_by_top_level_field_alias,
+                session_name,
+                session_path,
+                session_discriminator,
+                ..
+            }) => {
+                *param_type = Some(type_);
+                *param_nullable = nullable;
+                *used = true;
+                used_by_top_level_field_alias
+                    .insert(query_context.top_level_field_alias.clone());
+                *session_name = Some(physical_name);
+                *session_path = Some(param_path);
+                *session_discriminator = discriminator;
+            }
+            _ => {
+                params.insert(
+                    key,
+                    ParamInfo::Defined {
+                        raw_variable_name: format!("session_{}", physical_name),
+                        defined_at: None,
+                        type_: Some(type_),
+                        nullable,
+                        used_by_top_level_field_alias: HashSet::from([
+                            query_context.top_level_field_alias.clone(),
+                        ]),
+                        used: true,
+                        type_inferred: false,
+                        from_session: true,
+                        session_name: Some(physical_name),
+                        session_path: Some(param_path),
+                        session_discriminator: discriminator,
+                    },
+                );
+            }
+        }
+    };
+
+    for (index, segment) in path.segments.iter().enumerate() {
+        if let ast::PredicatePathSegment::Variant(variant) = segment {
+            let discriminator_path = ast::PredicatePath {
+                segments: path.segments[..index].to_vec(),
+            };
+            let discriminator_nullable = resolve_predicate_path(
+                context,
+                &session.fields,
+                &discriminator_path,
+            )
+            .map(|resolved| resolved.column.nullable)
+            .unwrap_or(false);
+            register(
+                discriminator_path.clone(),
+                discriminator_path.flattened(),
+                "String".to_string(),
+                discriminator_nullable,
+                Some(variant.clone()),
+            );
+        }
+    }
+    register(
+        path.clone(),
+        resolved.physical_column.clone(),
+        resolved.column.type_.query_type_string(),
+        resolved.column.nullable,
+        None,
+    );
+    Ok(resolved)
+}
+
 fn check_where_args(
     context: &Context,
     query_context: &QueryContext,
@@ -2358,38 +2456,12 @@ fn check_where_args(
             let mut is_nullable = false;
 
             if *is_session_var {
-                // Validate against session fields
-                if let Some(session) = &context.session {
-                    for field in &session.fields {
-                        match field {
-                            ast::Field::Column(column) => {
-                                if &column.name == field_name {
-                                    is_known_field = true;
-                                    column_type = Some(query_param_type_for_column(table, column));
-                                    is_nullable = column.nullable;
-                                    // Mark the session variable as used
-                                    let session_param_name = ast::session_field_name(column);
-                                    if let Some(param_info) = params.get_mut(&session_param_name) {
-                                        match param_info {
-                                            ParamInfo::Defined {
-                                                ref mut used,
-                                                ref mut used_by_top_level_field_alias,
-                                                ..
-                                            } => {
-                                                *used = true;
-                                                used_by_top_level_field_alias.insert(
-                                                    query_context.top_level_field_alias.clone(),
-                                                );
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                            _ => (),
-                        }
-                    }
+                if let Ok(resolved) =
+                    register_session_path_params(context, query_context, params, path)
+                {
+                    is_known_field = true;
+                    column_type = Some(resolved.column.type_.query_type_string());
+                    is_nullable = resolved.column.nullable;
                 }
                 if !is_known_field {
                     let known_fields = match &context.session {
@@ -2399,7 +2471,7 @@ fn check_where_args(
                     errors.push(Error {
                         filepath: error_filepath.clone(),
                         error_type: ErrorType::UnknownField {
-                            found: format!("Session.{}", field_name),
+                            found: format!("Session.{}", path.authored()),
                             record_name: "Session".to_string(),
                             known_fields,
                         },
@@ -2613,43 +2685,22 @@ fn check_permissions_where_args(
             let field_name = path.root();
             let mut terminal_column = None;
             if *is_session_var {
-                // Validate session variable exists
-                if let Some(session) = &context.session {
-                    let mut is_known_field = false;
-                    for field in &session.fields {
-                        match field {
-                            ast::Field::Column(column) => {
-                                if &column.name == field_name {
-                                    is_known_field = true;
-                                    terminal_column = Some(column.clone());
-                                    break;
-                                }
-                            }
-                            _ => (),
-                        }
-                    }
-                    if !is_known_field {
-                        let known_fields = get_column_reference(&session.fields);
-                        errors.push(Error {
-                            filepath: filepath.clone(),
-                            error_type: ErrorType::UnknownField {
-                                found: format!("Session.{}", field_name),
-                                record_name: "Session".to_string(),
-                                known_fields,
-                            },
-                            locations: vec![Location {
-                                contexts: vec![],
-                                primary: vec![convert_range(field_name_range)],
-                            }],
-                        });
-                    }
-                } else {
+                let resolved = context.session.as_ref().and_then(|session| {
+                    resolve_predicate_path(context, &session.fields, path).ok()
+                });
+                terminal_column = resolved.map(|resolved| resolved.column);
+                if terminal_column.is_none() {
+                    let known_fields = context
+                        .session
+                        .as_ref()
+                        .map(|session| get_column_reference(&session.fields))
+                        .unwrap_or_default();
                     errors.push(Error {
                         filepath: filepath.clone(),
                         error_type: ErrorType::UnknownField {
-                            found: format!("Session.{}", field_name),
+                            found: format!("Session.{}", path.authored()),
                             record_name: "Session".to_string(),
-                            known_fields: vec![],
+                            known_fields,
                         },
                         locations: vec![Location {
                             contexts: vec![],
@@ -2804,7 +2855,7 @@ fn check_permission_membership_value(
         );
         return;
     };
-    let Some(session_field) = &variable.session_field else {
+    let Some(session_path) = variable.session_path() else {
         invalid(
             "Permission membership predicates require a declared Session list.".to_string(),
             range,
@@ -2813,14 +2864,16 @@ fn check_permission_membership_value(
         return;
     };
     let session_column = context.session.as_ref().and_then(|session| {
-        session.fields.iter().find_map(|field| match field {
-            ast::Field::Column(column) if column.name == *session_field => Some(column),
-            _ => None,
-        })
+        resolve_predicate_path(context, &session.fields, &session_path)
+            .ok()
+            .map(|resolved| resolved.column)
     });
     let Some(session_column) = session_column else {
         invalid(
-            format!("Unknown Session membership list '{}'.", session_field),
+            format!(
+                "Unknown Session membership list '{}'.",
+                session_path.authored()
+            ),
             range,
             errors,
         );
@@ -2830,7 +2883,7 @@ fn check_permission_membership_value(
         invalid(
             format!(
                 "Session.{} must be a Json<List<T>> membership list.",
-                session_field
+                session_path.authored()
             ),
             range,
             errors,
@@ -2842,7 +2895,11 @@ fn check_permission_membership_value(
         invalid(
             format!(
                 "Session.{} contains {}, but {}.{} requires {} values.",
-                session_field, element_type, table.name, terminal_column.name, terminal_type
+                session_path.authored(),
+                element_type,
+                table.name,
+                terminal_column.name,
+                terminal_type
             ),
             range,
             errors,
@@ -2890,6 +2947,8 @@ fn permission_session_params(context: &Context) -> HashMap<String, ParamInfo> {
                         type_inferred: false,
                         from_session: true,
                         session_name: Some(column.name.clone()),
+                        session_path: Some(ast::PredicatePath::field(&column.name)),
+                        session_discriminator: None,
                     },
                 );
             }
@@ -3205,71 +3264,14 @@ fn mark_session_vars_in_where_as_used(
             }
         }
         ast::WhereArg::Column(is_session_var, path, _operator, query_val, _field_name_range) => {
-            let field_name = path.root();
             // Check if the column itself is a session variable (e.g., Session.userId = ...)
             if *is_session_var {
-                if let Some(session) = &context.session {
-                    for field in &session.fields {
-                        match field {
-                            ast::Field::Column(column) => {
-                                if &column.name == field_name {
-                                    let session_param_name = ast::session_field_name(column);
-                                    if let Some(param_info) = params.get_mut(&session_param_name) {
-                                        match param_info {
-                                            ParamInfo::Defined {
-                                                ref mut used,
-                                                ref mut used_by_top_level_field_alias,
-                                                ..
-                                            } => {
-                                                *used = true;
-                                                used_by_top_level_field_alias.insert(
-                                                    query_context.top_level_field_alias.clone(),
-                                                );
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                            _ => (),
-                        }
-                    }
-                }
+                let _ = register_session_path_params(context, query_context, params, path);
             }
             // Also check if the value is a session variable (e.g., authorId = Session.userId)
             if let ast::QueryValue::Variable((_, var_details)) = query_val {
-                if let Some(session_field) = &var_details.session_field {
-                    if let Some(session) = &context.session {
-                        for field in &session.fields {
-                            match field {
-                                ast::Field::Column(column) => {
-                                    if &column.name == session_field {
-                                        let session_param_name = ast::session_field_name(column);
-                                        if let Some(param_info) =
-                                            params.get_mut(&session_param_name)
-                                        {
-                                            match param_info {
-                                                ParamInfo::Defined {
-                                                    ref mut used,
-                                                    ref mut used_by_top_level_field_alias,
-                                                    ..
-                                                } => {
-                                                    *used = true;
-                                                    used_by_top_level_field_alias.insert(
-                                                        query_context.top_level_field_alias.clone(),
-                                                    );
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                                _ => (),
-                            }
-                        }
-                    }
+                if let Some(path) = var_details.session_path() {
+                    let _ = register_session_path_params(context, query_context, params, &path);
                 }
             }
         }
@@ -3511,6 +3513,28 @@ fn check_value(
         }
         ast::QueryValue::Variable((var_range, var)) => {
             let var_name = ast::to_pyre_variable_name(var);
+
+            if let Some(path) = var.session_path() {
+                if register_session_path_params(context, query_context, params, &path).is_err() {
+                    errors.push(Error {
+                        filepath: context.current_filepath.clone(),
+                        error_type: ErrorType::UnknownField {
+                            found: format!("Session.{}", path.authored()),
+                            record_name: "Session".to_string(),
+                            known_fields: context
+                                .session
+                                .as_ref()
+                                .map(|session| get_column_reference(&session.fields))
+                                .unwrap_or_default(),
+                        },
+                        locations: vec![Location {
+                            contexts: vec![],
+                            primary: vec![convert_range(var_range)],
+                        }],
+                    });
+                    return;
+                }
+            }
 
             match params.get_mut(&var_name) {
                 None => {

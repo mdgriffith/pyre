@@ -223,7 +223,7 @@ fn extract_session_fields_recursive(where_arg: &WhereArg, fields: &mut Vec<Strin
         WhereArg::Exists(_, body) => extract_session_fields_recursive(body, fields),
         WhereArg::Column(is_session_var, path, _, value, _field_name_range) => {
             if *is_session_var {
-                fields.push(path.root().to_string());
+                extract_session_path_fields(path, fields);
             }
             extract_session_fields_from_query_value(value, fields);
         }
@@ -238,8 +238,8 @@ fn extract_session_fields_recursive(where_arg: &WhereArg, fields: &mut Vec<Strin
 fn extract_session_fields_from_query_value(value: &ast::QueryValue, fields: &mut Vec<String>) {
     match value {
         ast::QueryValue::Variable((_, var)) => {
-            if let Some(session_field) = &var.session_field {
-                fields.push(session_field.clone());
+            if let Some(path) = var.session_path() {
+                extract_session_path_fields(&path, fields);
             }
         }
         ast::QueryValue::Fn(func) => {
@@ -259,6 +259,24 @@ fn extract_session_fields_from_query_value(value: &ast::QueryValue, fields: &mut
         | ast::QueryValue::Float(_)
         | ast::QueryValue::Bool(_)
         | ast::QueryValue::Null(_) => {}
+    }
+}
+
+fn extract_session_path_fields(path: &ast::PredicatePath, fields: &mut Vec<String>) {
+    for (index, segment) in path.segments.iter().enumerate() {
+        if matches!(segment, ast::PredicatePathSegment::Variant(_)) {
+            let discriminator = ast::PredicatePath {
+                segments: path.segments[..index].to_vec(),
+            }
+            .flattened();
+            if !fields.contains(&discriminator) {
+                fields.push(discriminator);
+            }
+        }
+    }
+    let terminal = path.flattened();
+    if !fields.contains(&terminal) {
+        fields.push(terminal);
     }
 }
 
@@ -478,9 +496,10 @@ fn render_permission_value(
 ) -> String {
     match value {
         ast::QueryValue::Variable((_, var)) => {
-            if let Some(session_key) = &var.session_field {
+            if let Some(path) = var.session_path() {
+                let session_key = path.flattened();
                 let session_value = session
-                    .get(session_key)
+                    .get(&session_key)
                     .expect("Session variable should exist after typechecking");
                 render_session_param(session_value, params)
             } else {
@@ -505,9 +524,20 @@ fn render_permission_where(
         WhereArg::Exists(..) => "0".to_string(),
         WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
             let fieldname = path.root();
+            let resolved = if *is_session_var {
+                context.session.as_ref().and_then(|session| {
+                    typecheck::resolve_predicate_path(context, &session.fields, path).ok()
+                })
+            } else {
+                typecheck::resolve_predicate_path(context, &table.record.fields, path).ok()
+            };
             let qualified_column_name = if *is_session_var {
+                let physical = resolved
+                    .as_ref()
+                    .map(|path| path.physical_column.as_str())
+                    .unwrap_or(fieldname);
                 let session_value = session
-                    .get(fieldname)
+                    .get(physical)
                     .expect("Session variable should exist after typechecking");
                 render_session_param(session_value, params)
             } else {
@@ -515,8 +545,6 @@ fn render_permission_where(
                     &table.record.name,
                     &table.record.fields,
                 ));
-                let resolved =
-                    typecheck::resolve_predicate_path(context, &table.record.fields, path);
                 let physical = resolved
                     .as_ref()
                     .map(|path| path.physical_column.as_str())
@@ -536,7 +564,8 @@ fn render_permission_where(
                 ast::QueryValue::Variable((_, var)) => var
                     .session_field
                     .as_ref()
-                    .and_then(|session_key| session.get(session_key))
+                    .and_then(|_| var.session_path())
+                    .and_then(|path| session.get(&path.flattened()))
                     .map(|value| matches!(value, SessionValue::Null))
                     .unwrap_or(false),
                 _ => matches!(value, ast::QueryValue::Null(_)),
@@ -559,34 +588,63 @@ fn render_permission_where(
                 crate::generate::sql::to_sql::operator(op)
             };
             let comparison = format!("{} {} {}", qualified_column_name, operator_str, value_str);
-            if *is_session_var {
-                return comparison;
+            let mut guards = Vec::new();
+            if !*is_session_var {
+                if let Some(resolved) = &resolved {
+                    let table_name = crate::ext::string::quote(&ast::get_tablename(
+                        &table.record.name,
+                        &table.record.fields,
+                    ));
+                    guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
+                        format!(
+                            "{}.{} = '{}'",
+                            table_name,
+                            crate::ext::string::quote(column),
+                            variant.replace("'", "''")
+                        )
+                    }));
+                }
             }
-            let Ok(resolved) =
-                typecheck::resolve_predicate_path(context, &table.record.fields, path)
-            else {
-                return comparison;
-            };
-            if resolved.discriminators.is_empty() {
-                return comparison;
-            }
-            let table_name = crate::ext::string::quote(&ast::get_tablename(
-                &table.record.name,
-                &table.record.fields,
-            ));
-            let mut guards = resolved
-                .discriminators
-                .iter()
-                .map(|(column, variant)| {
-                    format!(
-                        "{}.{} = '{}'",
-                        table_name,
-                        crate::ext::string::quote(column),
-                        variant.replace("'", "''")
-                    )
-                })
-                .collect::<Vec<_>>();
             guards.push(comparison);
+            if *is_session_var {
+                if let Some(resolved) = &resolved {
+                    guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
+                        let value = session
+                            .get(column)
+                            .expect("Session discriminator should exist after preparation");
+                        format!(
+                            "{} = '{}'",
+                            render_session_param(value, params),
+                            variant.replace("'", "''")
+                        )
+                    }));
+                }
+            }
+            if let ast::QueryValue::Variable((_, variable)) = value {
+                if let Some(session_path) = variable.session_path() {
+                    if let Some(session_schema) = &context.session {
+                        if let Ok(resolved) = typecheck::resolve_predicate_path(
+                            context,
+                            &session_schema.fields,
+                            &session_path,
+                        ) {
+                            guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
+                                let value = session.get(column).expect(
+                                    "Session discriminator should exist after preparation",
+                                );
+                                format!(
+                                    "{} = '{}'",
+                                    render_session_param(value, params),
+                                    variant.replace("'", "''")
+                                )
+                            }));
+                        }
+                    }
+                }
+            }
+            if guards.len() == 1 {
+                return guards.pop().unwrap_or_default();
+            }
             format!("({})", guards.join(" and "))
         }
         WhereArg::And(args) => {
