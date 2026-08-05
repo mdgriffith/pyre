@@ -196,7 +196,8 @@ fn column_type_to_ts_input_type(type_: &ast::ColumnType) -> String {
 pub fn column_type_to_zod_validator(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float => "z.number()".to_string(),
+        ast::ColumnType::Int => "z.number().int()".to_string(),
+        ast::ColumnType::Float => "z.number()".to_string(),
         ast::ColumnType::Bool => "CoercedBool".to_string(),
         ast::ColumnType::DateTime => "CoercedDate".to_string(),
         ast::ColumnType::Date => "z.string()".to_string(),
@@ -214,12 +215,17 @@ pub fn column_type_to_zod_validator(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", column_type_to_zod_validator(inner))
         }
-        ast::ColumnType::IdInt { .. } => "z.number()".to_string(),
+        ast::ColumnType::IdInt { .. } => "z.number().int()".to_string(),
         ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
             ..
         } => "z.string()".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type:
+                Some(ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt),
+            ..
+        } => "z.number().int()".to_string(),
         ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
         ast::ColumnType::Custom(name) => format!("z.lazy(() => {})", name),
     }
@@ -286,7 +292,7 @@ export const CoercedDate = z.union([z.number(), z.string(), z.date()]).transform
 
   return parseRfc3339(trimmed) ?? invalidDate(ctx, 'Expected whole Unix seconds or an RFC 3339 timestamp');
 });
-export const CoercedBool = z.union([z.boolean(), z.number()]).transform((val) => typeof val === 'number' ? val !== 0 : val);
+export const CoercedBool = z.union([z.boolean(), z.literal(0), z.literal(1)]).transform((val) => typeof val === 'number' ? val === 1 : val);
 
 "#
 }

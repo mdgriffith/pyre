@@ -228,7 +228,7 @@ fn extract_session_fields_recursive(where_arg: &WhereArg, fields: &mut Vec<Strin
         WhereArg::Exists(_, body) => extract_session_fields_recursive(body, fields),
         WhereArg::Column(is_session_var, path, _, value, _field_name_range) => {
             if *is_session_var {
-                fields.push(path.root().to_string());
+                extract_session_path_fields(path, fields);
             }
             extract_session_fields_from_query_value(value, fields);
         }
@@ -243,8 +243,8 @@ fn extract_session_fields_recursive(where_arg: &WhereArg, fields: &mut Vec<Strin
 fn extract_session_fields_from_query_value(value: &ast::QueryValue, fields: &mut Vec<String>) {
     match value {
         ast::QueryValue::Variable((_, var)) => {
-            if let Some(session_field) = &var.session_field {
-                fields.push(session_field.clone());
+            if let Some(path) = var.session_path() {
+                extract_session_path_fields(&path, fields);
             }
         }
         ast::QueryValue::Fn(func) => {
@@ -267,12 +267,31 @@ fn extract_session_fields_from_query_value(value: &ast::QueryValue, fields: &mut
     }
 }
 
+fn extract_session_path_fields(path: &ast::PredicatePath, fields: &mut Vec<String>) {
+    for (index, segment) in path.segments.iter().enumerate() {
+        if matches!(segment, ast::PredicatePathSegment::Variant(_)) {
+            let discriminator = ast::PredicatePath {
+                segments: path.segments[..index].to_vec(),
+            }
+            .flattened();
+            if !fields.contains(&discriminator) {
+                fields.push(discriminator);
+            }
+        }
+    }
+    let terminal = path.flattened();
+    if !fields.contains(&terminal) {
+        fields.push(terminal);
+    }
+}
+
 /// Calculate permission hash from permission AST and session values
 pub fn calculate_permission_hash(
     permission: &Option<WhereArg>,
     session: &HashMap<String, SessionValue>,
 ) -> String {
     let mut hasher = Sha256::new();
+    hasher.update("permission_hash_v2");
 
     // Hash the permission AST structure
     if let Some(perm) = permission {
@@ -286,6 +305,7 @@ pub fn calculate_permission_hash(
         let session_fields = extract_session_fields_from_permission(perm);
         for field in session_fields {
             if let Some(value) = session.get(&field) {
+                hasher.update((field.len() as u64).to_le_bytes());
                 hasher.update(&field);
                 hash_session_value(&mut hasher, value);
             }
@@ -382,7 +402,21 @@ fn hash_query_value(hasher: &mut Sha256, value: &ast::QueryValue) {
         }
         ast::QueryValue::Variable((_, var)) => {
             hasher.update("var");
-            hasher.update(&var.name);
+            if let Some(path) = var.session_path().filter(|path| !path.is_simple()) {
+                hasher.update("session_predicate_path_v1");
+                hasher.update((path.segments.len() as u64).to_le_bytes());
+                for segment in path.segments {
+                    let (kind, name) = match segment {
+                        ast::PredicatePathSegment::Field(name) => (0_u8, name),
+                        ast::PredicatePathSegment::Variant(name) => (1_u8, name),
+                    };
+                    hasher.update([kind]);
+                    hasher.update((name.len() as u64).to_le_bytes());
+                    hasher.update(name);
+                }
+            } else {
+                hasher.update(&var.name);
+            }
         }
         ast::QueryValue::String((_, s)) => {
             hasher.update("string");
@@ -390,26 +424,7 @@ fn hash_query_value(hasher: &mut Sha256, value: &ast::QueryValue) {
         }
         ast::QueryValue::Int((_, i)) => {
             hasher.update("int");
-            // Convert integer to string without formatting infrastructure
-            let mut num_str = String::new();
-            let mut n = *i;
-            if n < 0 {
-                num_str.push('-');
-                n = -n;
-            }
-            if n == 0 {
-                num_str.push('0');
-            } else {
-                let mut digits = Vec::new();
-                while n > 0 {
-                    digits.push((b'0' + (n % 10) as u8) as char);
-                    n /= 10;
-                }
-                for d in digits.iter().rev() {
-                    num_str.push(*d);
-                }
-            }
-            hasher.update(&num_str);
+            hasher.update(i.to_le_bytes());
         }
         ast::QueryValue::Float((_, f)) => {
             hasher.update("float");
@@ -438,26 +453,7 @@ fn hash_session_value(hasher: &mut Sha256, value: &SessionValue) {
         SessionValue::Null => hasher.update("null"),
         SessionValue::Integer(i) => {
             hasher.update("int");
-            // Convert integer to string without formatting infrastructure
-            let mut num_str = String::new();
-            let mut n = *i;
-            if n < 0 {
-                num_str.push('-');
-                n = -n;
-            }
-            if n == 0 {
-                num_str.push('0');
-            } else {
-                let mut digits = Vec::new();
-                while n > 0 {
-                    digits.push((b'0' + (n % 10) as u8) as char);
-                    n /= 10;
-                }
-                for d in digits.iter().rev() {
-                    num_str.push(*d);
-                }
-            }
-            hasher.update(&num_str);
+            hasher.update(i.to_le_bytes());
         }
         SessionValue::Real(f) => {
             hasher.update("real");
@@ -468,11 +464,12 @@ fn hash_session_value(hasher: &mut Sha256, value: &SessionValue) {
         }
         SessionValue::Text(s) => {
             hasher.update("text");
+            hasher.update((s.len() as u64).to_le_bytes());
             hasher.update(s);
         }
         SessionValue::Blob(b) => {
             hasher.update("blob");
-            // Hash blob bytes directly instead of Debug formatting
+            hasher.update((b.len() as u64).to_le_bytes());
             hasher.update(b);
         }
     }
@@ -483,17 +480,6 @@ fn render_session_param(value: &SessionValue, params: &mut Vec<SessionValue>) ->
     "?".to_string()
 }
 
-pub(crate) fn structured_union_variant(value: &SessionValue) -> Option<String> {
-    let SessionValue::Text(value) = value else {
-        return None;
-    };
-    serde_json::from_str::<JsonValue>(value)
-        .ok()?
-        .get("_type")?
-        .as_str()
-        .map(str::to_string)
-}
-
 fn render_permission_value(
     value: &ast::QueryValue,
     session: &HashMap<String, SessionValue>,
@@ -501,10 +487,9 @@ fn render_permission_value(
 ) -> String {
     match value {
         ast::QueryValue::Variable((_, var)) => {
-            if let Some(session_key) = &var.session_field {
-                let session_value = session
-                    .get(session_key)
-                    .expect("Session variable should exist after typechecking");
+            if let Some(path) = var.session_path() {
+                let session_key = path.flattened();
+                let session_value = session.get(&session_key).unwrap_or(&SessionValue::Null);
                 render_session_param(session_value, params)
             } else {
                 crate::generate::sql::to_sql::render_value(value)
@@ -529,23 +514,25 @@ fn render_permission_where(
         WhereArg::Exists(..) => "0".to_string(),
         WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
             let fieldname = path.root();
+            let resolved = if *is_session_var {
+                context.session.as_ref().and_then(|session| {
+                    typecheck::resolve_predicate_path(context, &session.fields, path).ok()
+                })
+            } else {
+                typecheck::resolve_predicate_path(context, &table.record.fields, path).ok()
+            };
             let qualified_column_name = if *is_session_var {
-                let session_value = session
-                    .get(fieldname)
-                    .expect("Session variable should exist after typechecking");
-                if typecheck::session_field_is_structured_union(context, fieldname) {
-                    let variant = structured_union_variant(session_value).map(SessionValue::Text);
-                    render_session_param(variant.as_ref().unwrap_or(session_value), params)
-                } else {
-                    render_session_param(session_value, params)
-                }
+                let physical = resolved
+                    .as_ref()
+                    .map(|path| path.physical_column.as_str())
+                    .unwrap_or(fieldname);
+                let session_value = session.get(physical).unwrap_or(&SessionValue::Null);
+                render_session_param(session_value, params)
             } else {
                 let table_name = crate::ext::string::quote(&ast::get_tablename(
                     &table.record.name,
                     &table.record.fields,
                 ));
-                let resolved =
-                    typecheck::resolve_predicate_path(context, &table.record.fields, path);
                 let physical = resolved
                     .as_ref()
                     .map(|path| path.physical_column.as_str())
@@ -565,7 +552,8 @@ fn render_permission_where(
                 ast::QueryValue::Variable((_, var)) => var
                     .session_field
                     .as_ref()
-                    .and_then(|session_key| session.get(session_key))
+                    .and_then(|_| var.session_path())
+                    .and_then(|path| session.get(&path.flattened()))
                     .map(|value| matches!(value, SessionValue::Null))
                     .unwrap_or(false),
                 _ => matches!(value, ast::QueryValue::Null(_)),
@@ -588,34 +576,61 @@ fn render_permission_where(
                 crate::generate::sql::to_sql::operator(op)
             };
             let comparison = format!("{} {} {}", qualified_column_name, operator_str, value_str);
-            if *is_session_var {
-                return comparison;
+            let mut guards = Vec::new();
+            if !*is_session_var {
+                if let Some(resolved) = &resolved {
+                    let table_name = crate::ext::string::quote(&ast::get_tablename(
+                        &table.record.name,
+                        &table.record.fields,
+                    ));
+                    guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
+                        format!(
+                            "{}.{} = '{}'",
+                            table_name,
+                            crate::ext::string::quote(column),
+                            variant.replace("'", "''")
+                        )
+                    }));
+                }
             }
-            let Ok(resolved) =
-                typecheck::resolve_predicate_path(context, &table.record.fields, path)
-            else {
-                return comparison;
-            };
-            if resolved.discriminators.is_empty() {
-                return comparison;
-            }
-            let table_name = crate::ext::string::quote(&ast::get_tablename(
-                &table.record.name,
-                &table.record.fields,
-            ));
-            let mut guards = resolved
-                .discriminators
-                .iter()
-                .map(|(column, variant)| {
-                    format!(
-                        "{}.{} = '{}'",
-                        table_name,
-                        crate::ext::string::quote(column),
-                        variant.replace("'", "''")
-                    )
-                })
-                .collect::<Vec<_>>();
             guards.push(comparison);
+            if *is_session_var {
+                if let Some(resolved) = &resolved {
+                    guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
+                        let value = session.get(column).unwrap_or(&SessionValue::Null);
+                        format!(
+                            "{} = '{}'",
+                            render_session_param(value, params),
+                            variant.replace("'", "''")
+                        )
+                    }));
+                }
+            }
+            if let ast::QueryValue::Variable((_, variable)) = value {
+                if let Some(session_path) = variable.session_path() {
+                    if let Some(session_schema) = &context.session {
+                        if let Ok(resolved) = typecheck::resolve_predicate_path(
+                            context,
+                            &session_schema.fields,
+                            &session_path,
+                        ) {
+                            guards.extend(resolved.discriminators.iter().map(
+                                |(column, variant)| {
+                                    let value = session.get(column).unwrap_or(&SessionValue::Null);
+                                    format!(
+                                        "{} = '{}'",
+                                        render_session_param(value, params),
+                                        variant.replace("'", "''")
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            if guards.len() == 1 {
+                return guards.pop().unwrap_or_default();
+            }
             format!("({})", guards.join(" and "))
         }
         WhereArg::And(args) => {

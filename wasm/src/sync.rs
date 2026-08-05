@@ -31,8 +31,6 @@ pub struct TableSyncDataWasm {
     pub last_seen_updated_at: Option<i64>,
 }
 
-pub type SessionWasm = HashMap<String, SessionValueWasm>;
-
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum SessionValueWasm {
@@ -43,23 +41,13 @@ pub enum SessionValueWasm {
     Blob(Vec<u8>),
 }
 
-impl From<SessionValueWasm> for sync::SessionValue {
-    fn from(value: SessionValueWasm) -> Self {
-        match value {
-            SessionValueWasm::Null => sync::SessionValue::Null,
-            SessionValueWasm::Integer(i) => sync::SessionValue::Integer(i),
-            SessionValueWasm::Real(f) => sync::SessionValue::Real(f),
-            SessionValueWasm::Text(s) => sync::SessionValue::Text(s),
-            SessionValueWasm::Blob(b) => sync::SessionValue::Blob(b),
-        }
-    }
-}
-
-fn convert_session_wasm_to_rust(session: &SessionWasm) -> HashMap<String, sync::SessionValue> {
-    session
-        .iter()
-        .map(|(k, v)| (k.clone(), sync::SessionValue::from((*v).clone())))
-        .collect()
+fn prepare_session_wasm(
+    context: &pyre::typecheck::Context,
+    session: JsValue,
+) -> Result<HashMap<String, sync::SessionValue>, String> {
+    let session: serde_json::Value = serde_wasm_bindgen::from_value(session)
+        .map_err(|_| "Failed to parse session".to_string())?;
+    pyre::session::prepare_session(context, &session)
 }
 
 fn convert_cursor_wasm_to_rust(cursor: &SyncCursorWasm) -> sync::SyncCursor {
@@ -121,12 +109,8 @@ pub fn calculate_permission_hash_wasm(
         None => return Err("No schema found".to_string()),
     };
 
-    let session_wasm: SessionWasm = serde_wasm_bindgen::from_value(session)
-        .map_err(|_e| "Failed to parse session".to_string())?;
-
-    let session_rust = convert_session_wasm_to_rust(&session_wasm);
-
     let context = get_schema_context(&introspection)?;
+    let session_rust = prepare_session_wasm(context, session)?;
     let table = context
         .tables
         .get(&table_name)
@@ -154,13 +138,10 @@ pub fn get_sync_page_info_wasm(
     let cursor_wasm: SyncCursorWasm = serde_wasm_bindgen::from_value(sync_cursor)
         .map_err(|_e| "Failed to parse sync cursor".to_string())?;
 
-    let session_wasm: SessionWasm = serde_wasm_bindgen::from_value(session)
-        .map_err(|_e| "Failed to parse session".to_string())?;
-
-    let session_rust = convert_session_wasm_to_rust(&session_wasm);
     let cursor_rust = convert_cursor_wasm_to_rust(&cursor_wasm);
 
     let context = get_schema_context(&introspection)?;
+    let session_rust = prepare_session_wasm(context, session)?;
     let result = sync::get_sync_page_info(&cursor_rust, context, &session_rust, page_size);
     let wasm_result = convert_result_rust_to_wasm(result);
     Ok(wasm_result)
@@ -214,13 +195,10 @@ pub fn get_sync_status_sql_wasm(
     let cursor_wasm: SyncCursorWasm = serde_wasm_bindgen::from_value(sync_cursor)
         .map_err(|_e| "Failed to parse sync cursor".to_string())?;
 
-    let session_wasm: SessionWasm = serde_wasm_bindgen::from_value(session)
-        .map_err(|_e| "Failed to parse session".to_string())?;
-
-    let session_rust = convert_session_wasm_to_rust(&session_wasm);
     let cursor_rust = convert_cursor_wasm_to_rust(&cursor_wasm);
 
     let context = get_schema_context(&introspection)?;
+    let session_rust = prepare_session_wasm(context, session)?;
 
     let statement = sync::get_sync_status_statement(&cursor_rust, context, &session_rust).map_err(
         |e| match e {
@@ -258,10 +236,6 @@ pub fn get_sync_sql_wasm(
     let cursor_wasm: SyncCursorWasm = serde_wasm_bindgen::from_value(sync_cursor)
         .map_err(|_e| "Failed to parse sync cursor".to_string())?;
 
-    let session_wasm: SessionWasm = serde_wasm_bindgen::from_value(session)
-        .map_err(|_e| "Failed to parse session".to_string())?;
-
-    let session_rust = convert_session_wasm_to_rust(&session_wasm);
     let cursor_rust = convert_cursor_wasm_to_rust(&cursor_wasm);
 
     // Parse rows from JS - expect array of objects
@@ -270,6 +244,7 @@ pub fn get_sync_sql_wasm(
             .map_err(|_e| "Failed to parse status rows".to_string())?;
 
     let context = get_schema_context(&introspection)?;
+    let session_rust = prepare_session_wasm(context, session)?;
 
     // Parse sync status internally
     let status_rust = sync::parse_sync_status(&cursor_rust, context, &session_rust, &rows_vec)

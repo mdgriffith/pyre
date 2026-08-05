@@ -4,7 +4,15 @@ import { normalizeForWasmJson } from "./wasm-json";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
 import { activateSchemaForDatabase } from "./schema";
 
-export type SessionValue = null | number | string | Uint8Array;
+export type SessionValue =
+    | null
+    | boolean
+    | number
+    | string
+    | Uint8Array
+    | Date
+    | SessionValue[]
+    | { [key: string]: SessionValue };
 export const DEFAULT_SYNC_PAGE_SIZE = 1000;
 export const MAX_SYNC_PAGE_SIZE = 5000;
 export const MAX_SYNC_CURSOR_TABLES = 512;
@@ -217,9 +225,10 @@ export async function catchup(
     activateSchemaForDatabase(databaseId);
     const effectivePageSize = normalizePageSize(pageSize);
     validateSyncCursor(syncCursor);
+    const wasmSession = normalizeForWasmJson(session);
 
     // Step 1: Get sync status SQL
-    const statusStatement = wasm.get_sync_status_sql(syncCursor, session);
+    const statusStatement = wasm.get_sync_status_sql(syncCursor, wasmSession);
     if (typeof statusStatement === "string" && statusStatement.startsWith("Error:")) {
         throw new Error(statusStatement);
     }
@@ -249,7 +258,7 @@ export async function catchup(
     }
 
     // Step 3: Get sync SQL for tables that need syncing
-    const syncSqlResult = wasm.get_sync_sql(statusResult.rows, syncCursor, session, effectivePageSize);
+    const syncSqlResult = wasm.get_sync_sql(statusResult.rows, syncCursor, wasmSession, effectivePageSize);
     if (typeof syncSqlResult === "string" && syncSqlResult.startsWith("Error:")) {
         throw new Error(syncSqlResult);
     }

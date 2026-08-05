@@ -96,23 +96,11 @@ fn live_deltas_require_positive_union_guards_for_not_equal() {
 }
 
 #[test]
-fn permission_hash_frames_nested_paths_without_changing_simple_hashes() {
+fn permission_hash_frames_nested_paths() {
     use pyre::ast::{Operator, PredicatePath, PredicatePathSegment, QueryValue, WhereArg};
 
     let range = ast::empty_range();
     let value = QueryValue::String((range.clone(), "x".to_string()));
-    let simple = WhereArg::Column(
-        false,
-        PredicatePath::field("ownerId"),
-        Operator::Equal,
-        value.clone(),
-        range.clone(),
-    );
-    assert_eq!(
-        pyre::sync::calculate_permission_hash(&Some(simple), &Default::default()),
-        "6c2b8e201804e0d21d4560488fdd98074714fe44fccc21a9abc69e931c771673"
-    );
-
     let formerly_colliding = WhereArg::Column(
         false,
         PredicatePath {
@@ -136,6 +124,72 @@ fn permission_hash_frames_nested_paths_without_changing_simple_hashes() {
     assert_ne!(
         pyre::sync::calculate_permission_hash(&Some(formerly_colliding), &Default::default()),
         pyre::sync::calculate_permission_hash(&Some(flat), &Default::default())
+    );
+}
+
+#[test]
+fn permission_hash_frames_session_values_and_signed_integer_minima() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+session {
+    a String
+    b String
+}
+
+record Resource {
+    id Int @id
+    first String
+    second String
+    updatedAt Int
+    @allow(query) { first == Session.a && second == Session.b }
+    @allow(insert, update, delete) { False }
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap();
+    let permission = ast::get_permissions(
+        &context.tables["resource"].record,
+        &ast::QueryOperation::Query,
+    );
+    let first = std::collections::HashMap::from([
+        (
+            "a".to_string(),
+            pyre::sync::SessionValue::Text("x".to_string()),
+        ),
+        (
+            "b".to_string(),
+            pyre::sync::SessionValue::Text("btexty".to_string()),
+        ),
+    ]);
+    let second = std::collections::HashMap::from([
+        (
+            "a".to_string(),
+            pyre::sync::SessionValue::Text("xbtext".to_string()),
+        ),
+        (
+            "b".to_string(),
+            pyre::sync::SessionValue::Text("y".to_string()),
+        ),
+    ]);
+    assert_ne!(
+        pyre::sync::calculate_permission_hash(&permission, &first),
+        pyre::sync::calculate_permission_hash(&permission, &second)
+    );
+
+    let minimum = std::collections::HashMap::from([
+        ("a".to_string(), pyre::sync::SessionValue::Integer(i64::MIN)),
+        ("b".to_string(), pyre::sync::SessionValue::Integer(i64::MIN)),
+    ]);
+    assert_eq!(
+        pyre::sync::calculate_permission_hash(&permission, &minimum).len(),
+        64
     );
 }
 
@@ -169,6 +223,110 @@ record Job {
         schemas: vec![schema],
     })
     .unwrap()
+}
+
+fn tagged_union_session_permission_context(variant: &str) -> typecheck::Context {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        &format!(
+            r#"
+type SessionScope
+    = Workspace {{
+        id Int
+    }}
+    | Account {{
+        id Int
+    }}
+
+session {{
+    scope SessionScope
+}}
+
+record Resource {{
+    id Int @id
+    workspaceId Int
+    updatedAt Int
+    @allow(query) {{ workspaceId == Session.scope.{variant}.id }}
+    @allow(insert, update, delete) {{ False }}
+}}
+"#
+        ),
+        &mut schema,
+    )
+    .unwrap();
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap()
+}
+
+#[test]
+fn tagged_union_session_paths_match_catch_up_and_live_delta_semantics() {
+    let context = tagged_union_session_permission_context("Workspace");
+    let session = pyre::session::prepare_session(
+        &context,
+        &json!({ "scope": { "_type": "Workspace", "id": 7 } }),
+    )
+    .unwrap();
+    let statement =
+        pyre::sync::get_sync_status_statement(&SyncCursor::new(), &context, &session).unwrap();
+    assert!(statement.sql.contains("? = 'Workspace'"));
+    assert!(statement
+        .params
+        .contains(&pyre::sync::SessionValue::Text("Workspace".to_string())));
+    assert!(statement
+        .params
+        .contains(&pyre::sync::SessionValue::Integer(7)));
+
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "resources".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "workspaceId".to_string(),
+            "updatedAt".to_string(),
+        ],
+        rows: vec![
+            vec![json!(1), json!(7), json!(1)],
+            vec![json!(2), json!(8), json!(1)],
+        ],
+    }];
+    let sessions = std::collections::HashMap::from([("session".to_string(), session)]);
+    let result = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &context).unwrap();
+    assert_eq!(result.groups.len(), 1);
+    assert_eq!(
+        result.groups[0].table_groups[0].rows,
+        vec![affected[0].rows[0].clone()]
+    );
+}
+
+#[test]
+fn permission_hash_distinguishes_session_union_variants_on_the_rhs() {
+    let workspace = tagged_union_session_permission_context("Workspace");
+    let account = tagged_union_session_permission_context("Account");
+    let workspace_permission = ast::get_permissions(
+        &workspace.tables["resource"].record,
+        &ast::QueryOperation::Query,
+    );
+    let account_permission = ast::get_permissions(
+        &account.tables["resource"].record,
+        &ast::QueryOperation::Query,
+    );
+    let session = std::collections::HashMap::from([
+        (
+            "scope".to_string(),
+            pyre::sync::SessionValue::Text("Workspace".to_string()),
+        ),
+        (
+            "scope__id".to_string(),
+            pyre::sync::SessionValue::Integer(7),
+        ),
+    ]);
+
+    assert_ne!(
+        pyre::sync::calculate_permission_hash(&workspace_permission, &session),
+        pyre::sync::calculate_permission_hash(&account_permission, &session)
+    );
 }
 
 #[test]

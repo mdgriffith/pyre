@@ -246,8 +246,18 @@ type Role
     = Admin
     | Member
 
+type Scope
+    = Workspace {
+        id Int
+    }
+    | Account {
+        id     Int?
+        parent Scope?
+    }
+
 session {
     role Role
+    scope Scope
 }
 
 record User {
@@ -266,6 +276,26 @@ record User {
     assert!(env.contains("import * as Db from './decode';"));
     assert!(env.contains("role: Db.Role"));
     assert!(!env.contains("role: z.any()"));
+
+    let mut files = Vec::new();
+    core::generate_schema(
+        &context,
+        &database,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+    let decode = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "decode.ts"))
+        .expect("generated decode file");
+    assert!(decode.contents.contains("role: z.lazy(() => Role)"));
+    assert!(decode
+        .contents
+        .contains("scope: z.lazy(() => Scope).superRefine"));
+    assert!(decode.contents.contains("value.id == null"));
+    assert!(decode
+        .contents
+        .contains("validateSessionScope(value.parent"));
 }
 
 #[test]
@@ -277,7 +307,12 @@ type ParticipantStatus
 
 type CampaignRole
     = Owner { campaignId String }
-    | Member { campaignId String }
+    | Member {
+        campaignId String
+        count Int?
+        enabled Bool?
+        ownerId UuidRecord.id?
+      }
 
 session {
     clocktowerParticipantStatus ParticipantStatus?
@@ -287,6 +322,11 @@ session {
 record User {
     @public
     id Id.Int @id
+}
+
+record UuidRecord {
+    @public
+    id Id.Uuid @id
 }
 "#;
     let mut schema = ast::Schema::default();
@@ -310,8 +350,11 @@ record User {
     assert!(decode.contents.contains(
         "clocktowerParticipantStatus?: ParticipantStatus | null;\n  campaignRole?: CampaignRole | null;"
     ));
+    assert!(decode
+        .contents
+        .contains("clocktowerParticipantStatus: z.lazy(() => ParticipantStatus).nullish(),"));
     assert!(decode.contents.contains(
-        "clocktowerParticipantStatus: ParticipantStatus.nullish(),\n  campaignRole: CampaignRole.nullish(),"
+        "campaignRole: z.lazy(() => CampaignRole).superRefine((value, ctx) => validateSessionCampaignRole(value, ctx)).nullish(),"
     ));
     assert!(!decode.contents.contains("z.any() /* ParticipantStatus */"));
     assert!(!decode.contents.contains("z.any() /* CampaignRole */"));
@@ -368,6 +411,16 @@ if (invalid.success) {
 const path = invalid.error.issues[0]?.path;
 if (JSON.stringify(path) !== JSON.stringify(["clocktowerParticipantStatus"])) {
   throw new Error(`Expected precise session field path, got ${JSON.stringify(path)}`);
+}
+if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "campaign-1", count: 7.5 } }).success) {
+  throw new Error("Expected fractional nested session integer to fail");
+}
+if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "campaign-1", enabled: 2 } }).success) {
+  throw new Error("Expected non-canonical nested session boolean to fail");
+}
+SessionValidator.parse({ campaignRole: { _type: "Member", campaignId: "campaign-1", ownerId: "uuid-1" } });
+if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "campaign-1", ownerId: 1 } }).success) {
+  throw new Error("Expected numeric nested UUID session reference to fail");
 }
 "#,
     )
@@ -458,7 +511,7 @@ record IntRecord {
         .contains("uuidRecordId: z.string().nullish(),"));
     assert!(decode
         .contents
-        .contains("intRecordId: z.number().nullish(),"));
+        .contains("intRecordId: z.number().int().nullish(),"));
 
     let env = typescript::to_env(&context, &database).expect("env should generate");
     assert!(env.contains("uuidRecordId: z.string().optional(),"));
@@ -477,6 +530,9 @@ SessionValidator.parse({ intRecordId: 42 });
 
 if (SessionValidator.safeParse({ uuidRecordId: 42 }).success) {
   throw new Error("Expected numeric UUID record ID to fail");
+}
+if (SessionValidator.safeParse({ intRecordId: 7.5 }).success) {
+  throw new Error("Expected fractional integer record ID to fail");
 }
 "#,
     )

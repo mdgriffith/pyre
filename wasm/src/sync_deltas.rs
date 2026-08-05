@@ -1,6 +1,5 @@
 use crate::cache;
 use pyre::db::introspect;
-use pyre::sync::SessionValue as RustSessionValue;
 use pyre::sync_deltas;
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen;
@@ -18,29 +17,7 @@ pub struct AffectedRowTableGroupWasm {
 
 #[derive(Serialize, Deserialize)]
 pub struct SessionDataWasm {
-    pub session: HashMap<String, SessionValueWasm>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(untagged)]
-pub enum SessionValueWasm {
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(String),
-    Blob(Vec<u8>),
-}
-
-impl From<SessionValueWasm> for RustSessionValue {
-    fn from(value: SessionValueWasm) -> Self {
-        match value {
-            SessionValueWasm::Null => RustSessionValue::Null,
-            SessionValueWasm::Integer(i) => RustSessionValue::Integer(i),
-            SessionValueWasm::Real(f) => RustSessionValue::Real(f),
-            SessionValueWasm::Text(s) => RustSessionValue::Text(s),
-            SessionValueWasm::Blob(b) => RustSessionValue::Blob(b),
-        }
-    }
+    pub session: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,20 +98,16 @@ pub fn calculate_sync_deltas_wasm(
                     .map(convert_table_group_wasm_to_rust)
                     .collect();
 
-            // Convert HashMap<String, SessionDataWasm> directly to HashMap<String, HashMap<String, SessionValue>>
-            // Single pass conversion - extract session_id from map key, convert SessionValueWasm to SessionValue
-            let connected_sessions_rust: HashMap<String, HashMap<String, RustSessionValue>> =
-                connected_sessions_map
-                    .into_iter()
-                    .map(|(session_id, data)| {
-                        let session: HashMap<String, RustSessionValue> = data
-                            .session
-                            .into_iter()
-                            .map(|(k, v)| (k, RustSessionValue::from(v)))
-                            .collect();
-                        (session_id, session)
-                    })
-                    .collect();
+            let connected_sessions_rust = connected_sessions_map
+                .into_iter()
+                .map(|(session_id, data)| {
+                    let session = pyre::session::prepare_session(context, &data.session)
+                        .map_err(|error| {
+                            format!("Failed to prepare session '{}': {}", session_id, error)
+                        })?;
+                    Ok::<_, String>((session_id, session))
+                })
+                .collect::<Result<HashMap<_, _>, _>>()?;
 
             // Calculate deltas (now accepts grouped format directly)
             let result = sync_deltas::calculate_sync_deltas(

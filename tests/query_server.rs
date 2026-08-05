@@ -4,6 +4,7 @@ mod helpers;
 use helpers::test_database::TestDatabase;
 use pyre::server::manifest::{Manifest, PyreSession, QueryManifest};
 use pyre::server::query;
+use pyre::{ast, parser, typecheck};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
@@ -1215,6 +1216,165 @@ delete DeleteNote($id: Note.id) {
 }
 
 #[tokio::test]
+async fn run_query_binds_tagged_union_session_paths() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+type SessionScope
+    = Workspace {
+        id Int
+    }
+    | Account {
+        accountId Int
+    }
+
+session {
+    scope SessionScope
+}
+
+record Resource {
+    id Id.Int @id
+    workspaceId Int
+    @allow(query) { workspaceId == Session.scope.Workspace.id }
+    @allow(insert, update, delete) { False }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("insert into resources (id, workspaceId) values (1, 7), (2, 8);")
+        .await?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+query ListResources {
+    resource {
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let query_manifest = only_query(&manifest);
+    assert_eq!(query_manifest.session_args, vec!["scope", "scope__id"]);
+    assert!(manifest.session_schema["scope"]
+        .tagged_union_variants
+        .contains_key("Workspace"));
+
+    let workspace_session = PyreSession::new(
+        json!({ "scope": { "_type": "Workspace", "id": 7 } }),
+        &manifest.session_schema,
+    )?;
+    assert_eq!(
+        workspace_session.sql_args()["session_scope"],
+        json!("Workspace")
+    );
+    assert_eq!(workspace_session.sql_args()["session_scope__id"], json!(7));
+    let result = query::run(
+        &conn,
+        &manifest,
+        &query_manifest.id,
+        json!({}),
+        &workspace_session,
+    )
+    .await?;
+    assert_eq!(result.response["resource"], json!([{ "id": 1 }]));
+
+    let account_session = PyreSession::new(
+        json!({ "scope": { "_type": "Account", "accountId": 7 } }),
+        &manifest.session_schema,
+    )?;
+    assert_eq!(
+        account_session.sql_args()["session_scope"],
+        json!("Account")
+    );
+    assert_eq!(account_session.sql_args()["session_scope__id"], json!(null));
+    let result = query::run(
+        &conn,
+        &manifest,
+        &query_manifest.id,
+        json!({}),
+        &account_session,
+    )
+    .await?;
+    assert_eq!(result.response["resource"], json!([]));
+
+    assert!(PyreSession::new(
+        json!({ "scope": { "_type": "Workspace" } }),
+        &manifest.session_schema,
+    )
+    .is_err());
+    assert!(PyreSession::new(
+        json!({ "scope": { "_type": "Unknown", "id": 7 } }),
+        &manifest.session_schema,
+    )
+    .is_err());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_query_binds_recursive_tagged_union_session_paths(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+type SessionScope
+    = Leaf {
+        id Int
+    }
+    | Next {
+        next SessionScope?
+    }
+
+session {
+    root SessionScope
+}
+
+record Resource {
+    id Id.Int @id
+    workspaceId Int
+    @allow(query) { workspaceId == Session.root.Next.next.Leaf.id }
+    @allow(insert, update, delete) { False }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("insert into resources (id, workspaceId) values (1, 7);")
+        .await?;
+    let manifest = manifest_for(
+        &db.context,
+        "query ListResources { resource { id } }",
+        false,
+    )?;
+    let query_manifest = only_query(&manifest);
+    assert!(manifest.session_schema["root"]
+        .tagged_union_types
+        .contains_key("SessionScope"));
+
+    let session = PyreSession::new(
+        json!({
+            "root": {
+                "_type": "Next",
+                "next": { "_type": "Leaf", "id": 7 }
+            }
+        }),
+        &manifest.session_schema,
+    )?;
+    assert_eq!(session.sql_args()["session_root__next__id"], json!(7));
+    let result = query::run(&conn, &manifest, &query_manifest.id, json!({}), &session).await?;
+    assert_eq!(result.response["resource"], json!([{ "id": 1 }]));
+
+    let inactive = PyreSession::new(
+        json!({ "root": { "_type": "Leaf", "id": 7 } }),
+        &manifest.session_schema,
+    )?;
+    let result = query::run(&conn, &manifest, &query_manifest.id, json!({}), &inactive).await?;
+    assert_eq!(result.response["resource"], json!([]));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn generated_update_roundtrips_omittable_unit_enum_input(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
@@ -2155,4 +2315,50 @@ fn manifest_load_reads_generated_manifest_file() -> Result<(), Box<dyn std::erro
     assert!(loaded.queries.is_empty());
 
     Ok(())
+}
+#[test]
+fn generated_manifest_validates_integer_session_foreign_keys() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+session {
+    userId User.id
+}
+
+record User {
+    @public
+    id Id.Int @id
+}
+
+record Item {
+    id Int @id
+    ownerId User.id
+    @allow(query) { ownerId == Session.userId }
+    @allow(insert, update, delete) { False }
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_schema(&context, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|file| file.path.ends_with("manifest.json"))
+            .expect("generated manifest")
+            .contents,
+    )
+    .unwrap();
+
+    assert!(manifest.session_schema["userId"]
+        .type_
+        .starts_with("Id.Int"));
+    assert!(PyreSession::new(json!({ "userId": 7 }), &manifest.session_schema).is_ok());
+    assert!(PyreSession::new(json!({ "userId": 7.5 }), &manifest.session_schema).is_err());
 }

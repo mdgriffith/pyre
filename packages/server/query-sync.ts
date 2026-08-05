@@ -87,14 +87,36 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
 
     const broadcastSessions = sessionsWithoutOrigin(connectedSessions, originSessionId);
     const originSession = singleOriginSession(connectedSessions, originSessionId);
-    const deltasResult = wasm.calculate_sync_deltas(affectedRowGroups, broadcastSessions);
+    const normalizeSessions = (sessions: typeof broadcastSessions) => new Map(
+      Array.from(sessions, ([id, data]) => [
+        id,
+        { ...data, session: normalizeForWasmJson(data.session) },
+      ]),
+    );
+    const { databaseEpoch, serverRevision } = await nextLiveSyncRevision(db);
+    const deltasResult = wasm.calculate_sync_deltas(
+      affectedRowGroups,
+      normalizeSessions(broadcastSessions),
+    );
 
     if (typeof deltasResult === "string" && deltasResult.startsWith("Error:")) {
       console.error("[SyncDeltas] Failed to calculate sync deltas:", deltasResult);
-      return;
+      const message = {
+        type: "syncRequired",
+        serverRevision,
+        databaseEpoch,
+        ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
+      };
+      for (const sessionId of broadcastSessions.keys()) {
+        sendToSession(sessionId, message);
+      }
+      return {
+        databaseEpoch,
+        serverRevision,
+        ...(originSession ? { originMessage: message } : {}),
+      };
     }
 
-    const { databaseEpoch, serverRevision } = await nextLiveSyncRevision(db);
     const result = typeof deltasResult === "string" ? JSON.parse(deltasResult) : deltasResult;
 
     if ((!Array.isArray(result.groups) || result.groups.length === 0) && !originSession) {
@@ -137,7 +159,10 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
 
     let originMessage: unknown;
     if (originSession) {
-      const originDeltasResult = wasm.calculate_sync_deltas(affectedRowGroups, originSession);
+      const originDeltasResult = wasm.calculate_sync_deltas(
+        affectedRowGroups,
+        normalizeSessions(originSession),
+      );
 
       if (typeof originDeltasResult === "string" && originDeltasResult.startsWith("Error:")) {
         console.error("[SyncDeltas] Failed to calculate origin sync delta:", originDeltasResult);

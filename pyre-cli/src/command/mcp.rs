@@ -1,5 +1,5 @@
 use serde_json::{json, Value as JsonValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
@@ -731,12 +731,12 @@ fn dynamic_query_plan(
     arguments: &JsonValue,
 ) -> Result<(ast::QueryList, Manifest), String> {
     let query_source = required_string_arg(arguments, "query")?;
-    let (database_schema, context, _paths) = current_schema_context(options, arguments)?;
+    let (_database_schema, context, _paths) = current_schema_context(options, arguments)?;
     let query_list = pyre::parser::parse_query("mcp.pyre", &query_source)
         .map_err(|_| "Failed to parse dynamic Pyre query".to_string())?;
     let query_infos = pyre::typecheck::check_queries(&query_list, &context)
         .map_err(|errors| format!("Dynamic query failed typecheck: {errors:#?}"))?;
-    let manifest = dynamic_manifest(&database_schema, &context, &query_list, &query_infos)?;
+    let manifest = dynamic_manifest(&context, &query_list, &query_infos)?;
     Ok((query_list, manifest))
 }
 
@@ -761,7 +761,6 @@ fn current_schema_context(
 }
 
 fn dynamic_manifest(
-    database: &ast::Database,
     context: &pyre::typecheck::Context,
     query_list: &ast::QueryList,
     query_infos: &HashMap<String, pyre::typecheck::QueryInfo>,
@@ -782,7 +781,7 @@ fn dynamic_manifest(
 
     Ok(Manifest {
         version: 1,
-        session_schema: session_schema(context, database),
+        session_schema: session_schema(context),
         queries,
     })
 }
@@ -814,11 +813,13 @@ fn dynamic_query_manifest(
         }
     }
 
+    let mut attached_dbs: Vec<String> = query_info.attached_dbs.iter().cloned().collect();
+    attached_dbs.sort();
     Ok(QueryManifest {
         id: query.name.clone(),
         operation: format!("{:?}", query.operation).to_lowercase(),
         primary_db: query_info.primary_db.clone(),
-        attached_dbs: query_info.attached_dbs.iter().cloned().collect(),
+        attached_dbs,
         input_schema: input_schema(context, query_info),
         session_args: session_args(query_info),
         optional_input_args: query
@@ -827,7 +828,16 @@ fn dynamic_query_manifest(
             .filter(|arg| arg.omittable)
             .map(|arg| arg.name.clone())
             .collect(),
-        json_input_args: Vec::new(),
+        json_input_args: query
+            .args
+            .iter()
+            .filter(|arg| {
+                arg.type_.as_deref().is_some_and(|type_| {
+                    pyre::typecheck::query_param_requires_json_serialization(context, type_)
+                })
+            })
+            .map(|arg| arg.name.clone())
+            .collect(),
         sql,
         sync_sql: None,
     })
@@ -850,14 +860,18 @@ fn input_schema(
             if *from_session {
                 continue;
             }
+            let resolved_type = type_
+                .as_deref()
+                .map(|type_| pyre::typecheck::resolve_query_param_type(context, type_))
+                .unwrap_or_else(|| "Json".to_string());
             schema.insert(
                 raw_variable_name.clone(),
                 FieldSchema {
-                    type_: type_.clone().unwrap_or_else(|| "Json".to_string()),
-                    is_enum: type_
-                        .as_deref()
-                        .is_some_and(|type_| is_enum_type(context, type_)),
-                    enum_variants: enum_variants(context, type_.as_deref()),
+                    type_: resolved_type.clone(),
+                    is_enum: is_enum_type(context, &resolved_type),
+                    enum_variants: enum_variants(context, Some(&resolved_type)),
+                    tagged_union_variants: HashMap::new(),
+                    tagged_union_types: HashMap::new(),
                     nullable: *nullable,
                     omittable: false,
                 },
@@ -867,31 +881,170 @@ fn input_schema(
     schema
 }
 
-fn session_schema(
-    context: &pyre::typecheck::Context,
-    database: &ast::Database,
-) -> HashMap<String, FieldSchema> {
-    let session = database
-        .schemas
-        .iter()
-        .find_map(|schema| schema.session.clone())
+fn session_schema(context: &pyre::typecheck::Context) -> HashMap<String, FieldSchema> {
+    let session = context
+        .session
+        .clone()
         .unwrap_or_else(ast::default_session_details);
     let mut schema = HashMap::new();
     for field in session.fields {
         if let ast::Field::Column(column) = field {
-            schema.insert(
-                column.name,
-                FieldSchema {
-                    type_: column.type_.to_string(),
-                    is_enum: is_enum_type(context, &column.type_.to_string()),
-                    enum_variants: enum_variants(context, Some(&column.type_.to_string())),
-                    nullable: column.nullable,
-                    omittable: false,
-                },
-            );
+            schema.insert(column.name.clone(), session_field_schema(context, &column));
         }
     }
     schema
+}
+
+fn session_field_schema(context: &pyre::typecheck::Context, column: &ast::Column) -> FieldSchema {
+    let mut schema = session_field_schema_inner(context, column, &mut HashSet::new());
+    collect_session_tagged_union_types(
+        context,
+        &column.type_,
+        &mut HashSet::new(),
+        &mut schema.tagged_union_types,
+    );
+    schema
+}
+
+fn session_field_schema_inner(
+    context: &pyre::typecheck::Context,
+    column: &ast::Column,
+    visiting: &mut HashSet<String>,
+) -> FieldSchema {
+    let type_ = column.type_.query_type_string();
+    let tagged_union_variants = column
+        .type_
+        .get_custom_type_name()
+        .and_then(|type_name| {
+            if !visiting.insert(type_name.to_string()) {
+                return None;
+            }
+            let result = context
+                .types
+                .get(type_name)
+                .and_then(|(_, type_)| match type_ {
+                    pyre::typecheck::Type::OneOf { variants }
+                        if variants.iter().any(|variant| variant.fields.is_some()) =>
+                    {
+                        Some(
+                            variants
+                                .iter()
+                                .map(|variant| {
+                                    let fields = variant
+                                        .fields
+                                        .as_ref()
+                                        .map(|fields| {
+                                            fields
+                                                .iter()
+                                                .filter_map(|field| match field {
+                                                    ast::Field::Column(column) => Some((
+                                                        column.name.clone(),
+                                                        session_field_schema_inner(
+                                                            context, column, visiting,
+                                                        ),
+                                                    )),
+                                                    _ => None,
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    (variant.name.clone(), fields)
+                                })
+                                .collect(),
+                        )
+                    }
+                    _ => None,
+                });
+            visiting.remove(type_name);
+            result
+        })
+        .unwrap_or_default();
+
+    FieldSchema {
+        type_: type_.clone(),
+        is_enum: is_enum_type(context, &type_),
+        enum_variants: enum_variants(context, Some(&type_)),
+        tagged_union_variants,
+        tagged_union_types: HashMap::new(),
+        nullable: column.nullable,
+        omittable: false,
+    }
+}
+
+fn collect_session_tagged_union_types(
+    context: &pyre::typecheck::Context,
+    type_: &ast::ColumnType,
+    visited: &mut HashSet<String>,
+    definitions: &mut HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
+) {
+    let Some(type_name) = type_.get_custom_type_name() else {
+        return;
+    };
+    if !visited.insert(type_name.to_string()) {
+        return;
+    }
+    let Some((_, pyre::typecheck::Type::OneOf { variants })) = context.types.get(type_name) else {
+        return;
+    };
+    if variants.iter().all(|variant| variant.fields.is_none()) {
+        return;
+    }
+
+    let variant_schemas = variants
+        .iter()
+        .map(|variant| {
+            let fields = variant
+                .fields
+                .as_ref()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(|field| match field {
+                            ast::Field::Column(column) => Some((
+                                column.name.clone(),
+                                session_field_schema_reference(context, column),
+                            )),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (variant.name.clone(), fields)
+        })
+        .collect();
+    definitions.insert(type_name.to_string(), variant_schemas);
+
+    for variant in variants {
+        if let Some(fields) = &variant.fields {
+            for field in fields {
+                if let ast::Field::Column(column) = field {
+                    collect_session_tagged_union_types(
+                        context,
+                        &column.type_,
+                        visited,
+                        definitions,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn session_field_schema_reference(
+    context: &pyre::typecheck::Context,
+    column: &ast::Column,
+) -> FieldSchema {
+    let type_ = column.type_.query_type_string();
+    let enum_variants = enum_variants(context, Some(&type_));
+    FieldSchema {
+        type_,
+        is_enum: !enum_variants.is_empty(),
+        enum_variants,
+        tagged_union_variants: HashMap::new(),
+        tagged_union_types: HashMap::new(),
+        nullable: column.nullable,
+        omittable: false,
+    }
 }
 
 fn is_enum_type(context: &pyre::typecheck::Context, type_: &str) -> bool {

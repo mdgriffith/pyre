@@ -1782,40 +1782,24 @@ fn parse_query_where(input: Text) -> ParseResult<ast::WhereArg> {
             // Try to parse Session.variableName as a column name
             let (input, start_pos) = position(input)?;
             let (input, _) = tag("Session.")(input)?;
-            let (input, session_field) = parse_fieldname(input)?;
+            let (input, path) = parse_predicate_path(input)?;
             let (input, end_pos) = position(input)?;
             let range = ast::Range {
                 start: to_location(&start_pos),
                 end: to_location(&end_pos),
             };
-            Ok((
-                input,
-                (true, ast::PredicatePath::field(session_field), range),
-            ))
+            Ok((input, (true, path, range)))
         },
         |input| {
             // Fall back to regular fieldname
             let (input, start_pos) = position(input)?;
-            let (input, root) = parse_fieldname(input)?;
-            let (input, tail) =
-                many0(preceded(tag("."), alt((parse_typename, parse_fieldname))))(input)?;
+            let (input, path) = parse_predicate_path(input)?;
             let (input, end_pos) = position(input)?;
             let range = ast::Range {
                 start: to_location(&start_pos),
                 end: to_location(&end_pos),
             };
-            let segments = std::iter::once(root)
-                .chain(tail)
-                .enumerate()
-                .map(|(index, name)| {
-                    if index % 2 == 0 {
-                        ast::PredicatePathSegment::Field(name.to_string())
-                    } else {
-                        ast::PredicatePathSegment::Variant(name.to_string())
-                    }
-                })
-                .collect();
-            Ok((input, (false, ast::PredicatePath { segments }, range)))
+            Ok((input, (false, path, range)))
         },
     ))(input)?;
     let (input, _) = multispace0(input)?;
@@ -1830,6 +1814,23 @@ fn parse_query_where(input: Text) -> ParseResult<ast::WhereArg> {
         input,
         ast::WhereArg::Column(is_session_var, path, operator, value, field_name_range),
     ))
+}
+
+fn parse_predicate_path(input: Text) -> ParseResult<ast::PredicatePath> {
+    let (input, root) = parse_fieldname(input)?;
+    let (input, tail) = many0(preceded(tag("."), alt((parse_typename, parse_fieldname))))(input)?;
+    let segments = std::iter::once(root)
+        .chain(tail)
+        .enumerate()
+        .map(|(index, name)| {
+            if index % 2 == 0 {
+                ast::PredicatePathSegment::Field(name.to_string())
+            } else {
+                ast::PredicatePathSegment::Variant(name.to_string())
+            }
+        })
+        .collect();
+    Ok((input, ast::PredicatePath { segments }))
 }
 
 fn parse_operator(input: Text) -> ParseResult<ast::Operator> {
@@ -1915,7 +1916,7 @@ fn parse_fn(input: Text) -> ParseResult<ast::QueryValue> {
 fn parse_session_variable(input: Text) -> ParseResult<ast::QueryValue> {
     let (input, start_pos) = position(input)?;
     let (input, _) = tag("Session.")(input)?;
-    let (input, name) = parse_fieldname(input)?;
+    let (input, path) = parse_predicate_path(input)?;
     let (input, end_pos) = position(input)?;
     let range = ast::Range {
         start: to_location(&start_pos),
@@ -1926,8 +1927,8 @@ fn parse_session_variable(input: Text) -> ParseResult<ast::QueryValue> {
         ast::QueryValue::Variable((
             range,
             ast::VariableDetails {
-                session_field: Some(name.to_string()),
-                name: format!("session_{}", name.to_string()),
+                session_field: Some(path.authored()),
+                name: format!("session_{}", path.flattened()),
             },
         )),
     ))

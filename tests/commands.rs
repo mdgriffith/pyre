@@ -898,7 +898,7 @@ record IntRecord {
     assert!(decode.contains("uuidRecordId?: string | null;"));
     assert!(decode.contains("intRecordId?: number | null;"));
     assert!(decode.contains("uuidRecordId: z.string().nullish(),"));
-    assert!(decode.contains("intRecordId: z.number().nullish(),"));
+    assert!(decode.contains("intRecordId: z.number().int().nullish(),"));
 }
 
 #[test]
