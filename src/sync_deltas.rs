@@ -1,5 +1,5 @@
 use crate::ast::{self, WhereArg};
-use crate::sync::SessionValue;
+use crate::sync::{structured_union_variant, SessionValue};
 use crate::typecheck;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -59,9 +59,15 @@ fn evaluate_permission(
             // For session variables, conversion to JsonValue is unavoidable but less frequent
             if *is_session_var {
                 // Session variable - convert to JsonValue (unavoidable conversion)
-                let lhs_value = session
-                    .get(fieldname)
-                    .map_or(JsonValue::Null, |v| session_value_to_json(v));
+                let lhs_value = session.get(fieldname).map_or(JsonValue::Null, |value| {
+                    if typecheck::session_field_is_structured_union(context, fieldname) {
+                        structured_union_variant(value)
+                            .map(JsonValue::String)
+                            .unwrap_or_else(|| session_value_to_json(value))
+                    } else {
+                        session_value_to_json(value)
+                    }
+                });
                 evaluate_operator(op, &lhs_value, &rhs_value)
             } else {
                 // Table column - use reference directly from Map (no clone!)

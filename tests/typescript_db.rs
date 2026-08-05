@@ -308,10 +308,10 @@ record User {
         .expect("generated decode file");
 
     assert!(decode.contents.contains(
-        "clocktowerParticipantStatus?: ParticipantStatus;\n  campaignRole?: CampaignRole;"
+        "clocktowerParticipantStatus?: ParticipantStatus | null;\n  campaignRole?: CampaignRole | null;"
     ));
     assert!(decode.contents.contains(
-        "clocktowerParticipantStatus: ParticipantStatus.optional(),\n  campaignRole: CampaignRole.optional(),"
+        "clocktowerParticipantStatus: ParticipantStatus.nullish(),\n  campaignRole: CampaignRole.nullish(),"
     ));
     assert!(!decode.contents.contains("z.any() /* ParticipantStatus */"));
     assert!(!decode.contents.contains("z.any() /* CampaignRole */"));
@@ -339,6 +339,9 @@ const validSession: Session = {
   campaignRole: { _type: "Member", campaignId: "campaign-1" },
 };
 SessionValidator.parse(validSession);
+const nullSession: Session = { clocktowerParticipantStatus: null };
+SessionValidator.parse(nullSession);
+SessionValidator.parse({});
 // @ts-expect-error Invalid variants must not be part of the generated Session type.
 const invalidSession: Session = { clocktowerParticipantStatus: "Observer" };
 
@@ -448,14 +451,14 @@ record IntRecord {
         .iter()
         .find(|file| path_ends_with(&file.path, "typescript/core/decode.ts"))
         .expect("generated decode file");
-    assert!(decode.contents.contains("uuidRecordId?: string;"));
-    assert!(decode.contents.contains("intRecordId?: number;"));
+    assert!(decode.contents.contains("uuidRecordId?: string | null;"));
+    assert!(decode.contents.contains("intRecordId?: number | null;"));
     assert!(decode
         .contents
-        .contains("uuidRecordId: z.string().optional(),"));
+        .contains("uuidRecordId: z.string().nullish(),"));
     assert!(decode
         .contents
-        .contains("intRecordId: z.number().optional(),"));
+        .contains("intRecordId: z.number().nullish(),"));
 
     let env = typescript::to_env(&context, &database).expect("env should generate");
     assert!(env.contains("uuidRecordId: z.string().optional(),"));

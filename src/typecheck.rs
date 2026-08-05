@@ -137,6 +137,24 @@ pub fn predicate_operand_is_nullable(
         .unwrap_or(false)
 }
 
+pub fn session_field_is_structured_union(context: &Context, field_name: &str) -> bool {
+    let Some(type_name) = context.session.as_ref().and_then(|session| {
+        session.fields.iter().find_map(|field| match field {
+            ast::Field::Column(column) if column.name == field_name => {
+                column.type_.get_custom_type_name()
+            }
+            _ => None,
+        })
+    }) else {
+        return false;
+    };
+
+    matches!(
+        context.types.get(type_name),
+        Some((_, Type::OneOf { variants })) if variants.iter().any(|variant| variant.fields.is_some())
+    )
+}
+
 pub fn query_value_is_nullable(context: &Context, value: &ast::QueryValue) -> bool {
     match value {
         ast::QueryValue::Null(_) => true,

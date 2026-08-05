@@ -14,9 +14,7 @@ export function toSessionArgs(sessionArgs: string[], session: Record<string, unk
   }
 
   for (const key of sessionArgs) {
-    if (key in session) {
-      result[`session_${key}`] = normalizeSqlArg(session[key]);
-    }
+    result[`session_${key}`] = key in session ? normalizeSqlArg(session[key]) : null;
   }
 
   return result;
@@ -77,9 +75,7 @@ export function toSqlStatements(sql: SqlInfo[], args: Record<string, unknown>): 
   return sql.map(({ sql: statement, params }) => {
     const filtered: Record<string, any> = {};
     for (const key of params) {
-      if (key in args) {
-        filtered[key] = args[key];
-      }
+      filtered[key] = key in args ? args[key] : null;
     }
 
     return { sql: statement, args: filtered };

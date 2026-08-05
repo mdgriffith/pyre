@@ -378,6 +378,77 @@ insert into notes (id, tenant, body, updatedAt) values (2, 'x'' OR 1=1 --', 'two
 }
 
 #[tokio::test]
+async fn catchup_allows_optional_union_session_variant() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+session {
+    campaignRole CampaignRole?
+}
+
+type CampaignRole
+   = CampaignGM
+   | CampaignPlayer { controlled Json }
+   | CampaignObserver
+
+record World {
+    id Int @id
+    name String
+    updatedAt Int
+    @allow(query) { Session.campaignRole == CampaignGM }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("insert into worlds (id, name, updatedAt) values (1, 'Allowed', 10);")
+        .await?;
+    let session_schema = HashMap::from([(
+        "campaignRole".to_string(),
+        FieldSchema {
+            type_: "CampaignRole".to_string(),
+            is_enum: false,
+            enum_variants: Vec::new(),
+            nullable: true,
+            omittable: false,
+        },
+    )]);
+    let session = PyreSession::new(
+        json!({ "campaignRole": { "_type": "CampaignGM" } }),
+        &session_schema,
+    )?;
+
+    let result = catchup(
+        &conn,
+        &db.context,
+        &SyncCursor::new(),
+        session.logical(),
+        10,
+    )
+    .await?;
+    let worlds = result.tables.get("worlds").expect("worlds should sync");
+
+    assert_eq!(worlds.rows.len(), 1);
+    assert_eq!(worlds.rows[0]["id"], json!(1));
+
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "worlds".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "name".to_string(),
+            "updatedAt".to_string(),
+        ],
+        rows: vec![vec![json!(1), json!("Allowed"), json!(10)]],
+    }];
+    let sessions = HashMap::from([("session".to_string(), session.logical().clone())]);
+    let deltas = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &db.context)
+        .map_err(|error| format!("failed to calculate sync deltas: {:?}", error))?;
+
+    assert_eq!(deltas.groups[0].table_groups[0].rows.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn catchup_shapes_json_and_custom_type_columns() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"

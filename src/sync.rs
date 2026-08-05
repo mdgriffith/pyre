@@ -475,6 +475,17 @@ fn render_session_param(value: &SessionValue, params: &mut Vec<SessionValue>) ->
     "?".to_string()
 }
 
+pub(crate) fn structured_union_variant(value: &SessionValue) -> Option<String> {
+    let SessionValue::Text(value) = value else {
+        return None;
+    };
+    serde_json::from_str::<JsonValue>(value)
+        .ok()?
+        .get("_type")?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn render_permission_value(
     value: &ast::QueryValue,
     session: &HashMap<String, SessionValue>,
@@ -513,7 +524,12 @@ fn render_permission_where(
                 let session_value = session
                     .get(fieldname)
                     .expect("Session variable should exist after typechecking");
-                render_session_param(session_value, params)
+                if typecheck::session_field_is_structured_union(context, fieldname) {
+                    let variant = structured_union_variant(session_value).map(SessionValue::Text);
+                    render_session_param(variant.as_ref().unwrap_or(session_value), params)
+                } else {
+                    render_session_param(session_value, params)
+                }
             } else {
                 let table_name = crate::ext::string::quote(&ast::get_tablename(
                     &table.record.name,

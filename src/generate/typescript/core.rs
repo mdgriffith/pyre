@@ -130,8 +130,15 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 ast::ColumnType::DateTime => "Date | string | number".to_string(),
                 other => other.to_string(),
             };
-            let optional = if col.nullable { "?" } else { "" };
-            result.push_str(&format!("  {}{}: {};\n", col.name, optional, ts_type));
+            let (optional, nullable) = if col.nullable {
+                ("?", " | null")
+            } else {
+                ("", "")
+            };
+            result.push_str(&format!(
+                "  {}{}: {}{};\n",
+                col.name, optional, ts_type, nullable
+            ));
         }
     }
     result.push_str("}\n\n");
@@ -156,7 +163,7 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 other => format!("z.any() /* {} */", other),
             };
             let validator = if col.nullable {
-                format!("{}.optional()", validator)
+                format!("{}.nullish()", validator)
             } else {
                 validator
             };
