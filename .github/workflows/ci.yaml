@@ -25,11 +25,25 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Set up wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: v0.14.0
+
       - name: Install TypeScript test dependencies
         run: bun install --frozen-lockfile
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Build server WASM runtime
+        run: |
+          wasm-pack build --target web wasm
+          mkdir -p packages/server/wasm
+          cp wasm/pkg/pyre_wasm.js packages/server/wasm/
+          cp wasm/pkg/pyre_wasm_bg.wasm packages/server/wasm/
+          cp wasm/pkg/pyre_wasm.d.ts packages/server/wasm/
+          cp wasm/pkg/pyre_wasm_bg.wasm.d.ts packages/server/wasm/
 
       - name: Typecheck TypeScript packages
         run: bun run typecheck
