@@ -2,7 +2,7 @@ use pyre::ast;
 use pyre::parser;
 use pyre::sync::{get_sync_sql, SyncCursor, SyncStatusResult, TableSyncStatus};
 use pyre::sync_deltas::AffectedRowTableGroup;
-use pyre::sync_shape::reshape_table_groups;
+use pyre::sync_shape::{normalize_json_columns, reshape_table_groups};
 use pyre::typecheck;
 use serde_json::json;
 
@@ -751,4 +751,115 @@ record Map {
             json!(1700000000),
         ]
     );
+}
+
+#[test]
+fn sync_shaping_decodes_json_nested_in_constructed_types() {
+    let schema_source = r#"
+type SecretEvent
+   = SetupRecorded { seats List<Int> }
+
+type Inner
+   = Wrapped { values Json<List<Int>> }
+
+type EventPayload
+   = Secret {
+        secretEvent Json<SecretEvent>
+        inner Inner
+     }
+
+record Event {
+    id Int @id
+    payload EventPayload?
+    state Json<SecretEvent>
+    note String
+    updatedAt Int
+    @public
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema should parse");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema should typecheck");
+    let physical = AffectedRowTableGroup {
+        table_name: "events".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "payload".to_string(),
+            "payload__secretEvent".to_string(),
+            "payload__inner".to_string(),
+            "payload__inner__values".to_string(),
+            "state".to_string(),
+            "note".to_string(),
+            "updatedAt".to_string(),
+        ],
+        rows: vec![vec![
+            json!(1),
+            json!("Secret"),
+            json!(r#"{"_type":"SetupRecorded","seats":[]}"#),
+            json!("Wrapped"),
+            json!("[1,2,3]"),
+            json!(r#"{"_type":"SetupRecorded","seats":[4]}"#),
+            json!(r#"{"looks":"like json"}"#),
+            json!(10),
+        ]],
+    };
+
+    let normalized = normalize_json_columns(&[physical], &context).expect("JSON should decode");
+    let reshaped = reshape_table_groups(&normalized, &context);
+
+    assert_eq!(
+        reshaped[0].rows[0],
+        vec![
+            json!(1),
+            json!({
+                "_type": "Secret",
+                "secretEvent": { "_type": "SetupRecorded", "seats": [] },
+                "inner": { "_type": "Wrapped", "values": [1, 2, 3] }
+            }),
+            json!({ "_type": "SetupRecorded", "seats": [4] }),
+            json!(r#"{"looks":"like json"}"#),
+            json!(10),
+        ]
+    );
+}
+
+#[test]
+fn sync_json_normalization_rejects_malformed_json() {
+    let schema_source = r#"
+record Token {
+    id Int @id
+    state Json
+    updatedAt Int
+    @public
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema should parse");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema should typecheck");
+    let affected = [AffectedRowTableGroup {
+        table_name: "tokens".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "state".to_string(),
+            "updatedAt".to_string(),
+        ],
+        rows: vec![vec![json!(1), json!("{malformed"), json!(10)]],
+    }];
+    let error =
+        match pyre::sync_deltas::calculate_sync_deltas(&affected, &Default::default(), &context) {
+            Ok(_) => panic!("malformed JSON should fail"),
+            Err(error) => error,
+        };
+    let pyre::sync_deltas::SyncDeltasError::InvalidRowData(message) = error else {
+        panic!("expected invalid row data");
+    };
+
+    assert!(message.contains("tokens.state"));
+    assert!(message.contains("row 0"));
 }

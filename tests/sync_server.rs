@@ -526,6 +526,102 @@ insert into maps (
 }
 
 #[tokio::test]
+async fn nested_typed_json_has_catchup_live_and_origin_delta_parity(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+type Script
+   = TroubleBrewing
+
+type Started
+   = Started {
+        script Script
+        seats List<Int>
+     }
+
+type SecretEvent
+   = SetupRecorded { setup Started }
+
+type EventPayload
+   = Secret { secretEvent Json<SecretEvent> }
+
+record Event {
+    id Int @id
+    payload EventPayload?
+    createdAt Int
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let secret_event = r#"{"_type":"SetupRecorded","setup":{"_type":"Started","script":{"_type":"TroubleBrewing"},"seats":[]}}"#;
+    conn.execute(
+        "insert into events (id, payload, payload__secretEvent, createdAt, updatedAt) values (1, 'Secret', ?1, 10, 10)",
+        [secret_event],
+    )
+    .await?;
+
+    let catchup_result =
+        catchup(&conn, &db.context, &SyncCursor::new(), &HashMap::new(), 10).await?;
+    let catchup_row = &catchup_result.tables["events"].rows[0];
+    let affected_rows = vec![AffectedRowTableGroup {
+        table_name: "events".to_string(),
+        headers: vec![
+            "id".to_string(),
+            "payload".to_string(),
+            "payload__secretEvent".to_string(),
+            "createdAt".to_string(),
+            "updatedAt".to_string(),
+        ],
+        rows: vec![vec![
+            json!(1),
+            json!("Secret"),
+            json!(secret_event),
+            json!(10),
+            json!(10),
+        ]],
+    }];
+    let connected_sessions = ConnectedSessions::from([
+        ("origin".to_string(), SyncSession::new()),
+        ("recipient".to_string(), SyncSession::new()),
+    ]);
+    let mut result = query_result(affected_rows);
+    let messages = SyncServer::new(&db.context)
+        .calculate_deltas(
+            &conn,
+            &mut result,
+            &connected_sessions,
+            "main",
+            Some("origin"),
+        )
+        .await?;
+
+    let expected_payload = json!({
+        "_type": "Secret",
+        "secretEvent": {
+            "_type": "SetupRecorded",
+            "setup": {
+                "_type": "Started",
+                "script": { "_type": "TroubleBrewing" },
+                "seats": []
+            }
+        }
+    });
+    assert_eq!(catchup_row["payload"], expected_payload);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].session_id, "recipient");
+    assert_eq!(messages[0].message.data[0].rows[0][1], expected_payload);
+    assert_eq!(
+        result.response["sync"]["data"][0]["rows"][0][1],
+        expected_payload
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn catchup_rejects_zero_page_size() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"

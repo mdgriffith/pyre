@@ -1,5 +1,6 @@
 use crate::ast::{self, WhereArg};
 use crate::sync::{structured_union_variant, SessionValue};
+use crate::sync_shape;
 use crate::typecheck;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -382,6 +383,10 @@ pub fn calculate_sync_deltas(
     connected_sessions: &HashMap<String, HashMap<String, SessionValue>>,
     context: &typecheck::Context,
 ) -> Result<SyncDeltasResult, SyncDeltasError> {
+    let normalized_groups = sync_shape::normalize_json_columns(affected_row_groups, context)
+        .map_err(|error| SyncDeltasError::InvalidRowData(error.to_string()))?;
+    let affected_row_groups = normalized_groups.as_slice();
+
     // OPTIMIZATION 1: Build table lookup map once (O(k) instead of O(n*m*k))
     let mut table_map: HashMap<String, (&typecheck::Table, Option<WhereArg>)> = HashMap::new();
     for table in context.tables.values() {
