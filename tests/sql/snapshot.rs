@@ -615,6 +615,7 @@ record ClocktowerGame {
     id String @id
     name String
     @allow(query) { id in Session.activeClocktowerGameIds }
+    @allow(insert, update, delete) { False }
 }
 "#,
         r#"
@@ -623,6 +624,32 @@ query GetClocktowerGames {
         id
         name
     }
+}
+"#,
+    );
+}
+
+#[test]
+fn snapshot_constant_query_permissions() {
+    check_snapshot(
+        "constant_query_permissions",
+        r#"
+record VisiblePost {
+    id Int @id
+    @allow(query) { True }
+    @allow(insert, update, delete) { False }
+}
+
+record HiddenPost {
+    id Int @id
+    @allow(query) { False }
+    @allow(insert, update, delete) { False }
+}
+"#,
+        r#"
+query GetPosts {
+    visiblePost { id }
+    hiddenPost { id }
 }
 "#,
     );

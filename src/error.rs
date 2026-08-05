@@ -89,6 +89,10 @@ pub enum ErrorType {
     MissingPermissions {
         record: String,
     },
+    MissingPermissionOperations {
+        record: String,
+        operations: Vec<ast::QueryOperation>,
+    },
     InvalidRecordIndexField {
         record: String,
         directive: String,
@@ -1090,7 +1094,7 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
             let mut result = "".to_string();
 
             result.push_str(&format!(
-                "{} has multiple {} definitions, let's only have one!",
+                "{} has overlapping or incompatible {} definitions.",
                 cyan_if(in_color, record),
                 yellow_if(in_color, "@allow")
             ));
@@ -1101,13 +1105,25 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
             let mut result = "".to_string();
 
             result.push_str(&format!(
-                "{} must have exactly one permissions directive. Add either {} or {}.",
+                "{} must define permissions. Add either {} or {}.",
                 cyan_if(in_color, record),
                 yellow_if(in_color, "@allow"),
                 yellow_if(in_color, "@public")
             ));
 
             result
+        }
+        ErrorType::MissingPermissionOperations { record, operations } => {
+            let missing = operations
+                .iter()
+                .map(ast::QueryOperation::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{} must explicitly define permissions for every operation. Missing: {}.",
+                cyan_if(in_color, record),
+                yellow_if(in_color, &missing)
+            )
         }
         ErrorType::InvalidRecordIndexField {
             record,
@@ -1611,6 +1627,7 @@ pub fn to_error_title(error_type: &ErrorType) -> String {
         ErrorType::MultipleTableNames { .. } => "Multiple table names",
         ErrorType::MultiplePermissions { .. } => "Multiple Permissions",
         ErrorType::MissingPermissions { .. } => "Missing Permissions",
+        ErrorType::MissingPermissionOperations { .. } => "Missing Permission Operations",
         ErrorType::InvalidRecordIndexField { .. } => "Invalid Record Index Field",
         ErrorType::DuplicateRecordIndexField { .. } => "Duplicate Record Index Field",
         ErrorType::LinkToUnknownTable { .. } => "Link to unknown table",

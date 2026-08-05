@@ -8,7 +8,9 @@ drop table if exists temp_inserted_user
 
 -- statement 3 of 11 (setup)
 create temp table temp_inserted_user as
-  select last_insert_rowid() as id
+  select t.rowid as __pyre_rowid, t.*
+  from "users" t
+  where t.rowid = last_insert_rowid() and changes() > 0
 
 -- statement 4 of 11 (setup)
 insert into posts (authorId, title, content, updatedAt)
@@ -20,9 +22,9 @@ drop table if exists temp_inserted_firstPost
 
 -- statement 6 of 11 (setup)
 create temp table temp_inserted_firstPost as
-  select t.rowid as id
+  select t.rowid as __pyre_rowid, t.*
   from "posts" t
-  join "temp_inserted_user" p on t."authorId" = p."id"
+  where t.rowid = last_insert_rowid() and changes() > 0
 
 -- statement 7 of 11 (setup)
 insert into posts (authorId, title, content, updatedAt)
@@ -34,9 +36,9 @@ drop table if exists temp_inserted_secondPost
 
 -- statement 9 of 11 (setup)
 create temp table temp_inserted_secondPost as
-  select t.rowid as id
+  select t.rowid as __pyre_rowid, t.*
   from "posts" t
-  join "temp_inserted_user" p on t."authorId" = p."id"
+  where t.rowid = last_insert_rowid() and changes() > 0
 
 -- statement 10 of 11 (returns rows)
 select json_group_array(json(affected_row)) as _affectedRows
@@ -47,7 +49,7 @@ from (
     'rows', json_group_array(json_array("users"."id", "users"."name", "users"."status", "users"."status__reason", "users"."updatedAt"))
   ) as affected_row
   from "users"
-  join temp_inserted_user temp_table on "users".rowid = temp_table.id
+  join temp_inserted_user temp_table on "users".rowid = temp_table.__pyre_rowid
   union all
   select json_object(
     'table_name', 'posts',
@@ -55,7 +57,7 @@ from (
     'rows', json_group_array(json_array("posts"."id", "posts"."title", "posts"."content", "posts"."authorId", "posts"."updatedAt"))
   ) as affected_row
   from "posts"
-  join temp_inserted_firstPost temp_table on "posts".rowid = temp_table.id
+  join temp_inserted_firstPost temp_table on "posts".rowid = temp_table.__pyre_rowid
   union all
   select json_object(
     'table_name', 'posts',
@@ -63,7 +65,7 @@ from (
     'rows', json_group_array(json_array("posts"."id", "posts"."title", "posts"."content", "posts"."authorId", "posts"."updatedAt"))
   ) as affected_row
   from "posts"
-  join temp_inserted_secondPost temp_table on "posts".rowid = temp_table.id
+  join temp_inserted_secondPost temp_table on "posts".rowid = temp_table.__pyre_rowid
 )
 
 -- statement 11 of 11 (returns rows)
@@ -84,5 +86,5 @@ select
     )
   ), json('[]')) as user
 from users t
-join temp_inserted_user temp_table on t.rowid = temp_table.id
+join temp_inserted_user temp_table on t.rowid = temp_table.__pyre_rowid
 

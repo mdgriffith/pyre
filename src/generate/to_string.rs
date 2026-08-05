@@ -424,6 +424,9 @@ fn format_permissions_where(indent: String, where_arg: &ast::WhereArg) -> String
 
 fn format_where_for_braces(where_arg: &ast::WhereArg, base_indent: usize) -> String {
     match where_arg {
+        ast::WhereArg::Constant(value) => {
+            format!("{{ {} }}", if *value { "True" } else { "False" })
+        }
         ast::WhereArg::Column(_, _, _, value, _) if value_is_multiline(value) => format!(
             "{{\n{}\n{}}}",
             format_where_at(where_arg, base_indent + 4),
@@ -730,6 +733,9 @@ fn to_string_param(indent_size: usize, arg: &ast::Arg) -> String {
 fn format_where_at(where_arg: &ast::WhereArg, base_indent: usize) -> String {
     let indent = " ".repeat(base_indent);
     match where_arg {
+        ast::WhereArg::Constant(value) => {
+            format!("{}{}", indent, if *value { "True" } else { "False" })
+        }
         ast::WhereArg::Exists(path, body) => format!(
             "{}exists {} {}",
             indent,

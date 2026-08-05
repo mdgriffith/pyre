@@ -53,7 +53,7 @@ pub fn insert_to_string(
     });
 
     if !has_links {
-        let mut statement = initial_select(0, context, query, table, query_table_field);
+        let mut statement = initial_select(0, context, query, query_info, table, query_table_field);
         statement.push_str(&format!(
             " returning {} as {}",
             returning::response_expression(context, table, query_table_field),
@@ -73,6 +73,7 @@ pub fn insert_to_string(
         0,
         context,
         query,
+        query_info,
         table,
         query_table_field,
     )));
@@ -99,9 +100,13 @@ pub fn insert_to_string(
     )));
 
     // Always create temp table - we need it for the typed response query
+    let quoted_table_name = string::quote(&ast::get_tablename(
+        &table.record.name,
+        &table.record.fields,
+    ));
     statements.push(to_sql::ignore(format!(
-        "create temp table {} as\n  select last_insert_rowid() as id",
-        parent_temp_table_name
+        "create temp table {} as\n  select t.rowid as __pyre_rowid, t.*\n  from {} t\n  where t.rowid = last_insert_rowid() and changes() > 0",
+        parent_temp_table_name, quoted_table_name
     )));
 
     for query_field in all_query_fields.iter() {
@@ -135,6 +140,7 @@ pub fn insert_to_string(
                     0,
                     context,
                     query,
+                    query_info,
                     parent_temp_table_name,
                     linked_table,
                     query_field,
@@ -219,7 +225,7 @@ pub fn insert_to_string(
     final_statement.push_str(&primary_table_name);
     final_statement.push_str(" t\n");
     final_statement.push_str(&format!(
-        "join {} temp_table on t.rowid = temp_table.id",
+        "join {} temp_table on t.rowid = temp_table.__pyre_rowid",
         parent_temp_table_name
     ));
 
@@ -248,19 +254,14 @@ pub fn insert_to_string(
 }
 
 fn drop_temp_tables(query_field: &ast::QueryField, statements: &mut Vec<to_sql::Prepared>) {
+    for arg_field in &query_field.fields {
+        if let ast::ArgField::Field(field) = arg_field {
+            if !field.fields.is_empty() {
+                drop_temp_tables(field, statements);
+            }
+        }
+    }
     statements.push(to_sql::ignore(drop_table(query_field)));
-
-    // Only the primary field has a temp table created for it now
-    // for arg_field in query_field.fields.iter() {
-    //     match arg_field {
-    //         ast::ArgField::Field(field) => {
-    //             if !field.fields.is_empty() {
-    //                 drop_temp_tables(field, statements);
-    //             }
-    //         }
-    //         _ => continue,
-    //     }
-    // }
 }
 
 fn drop_table(query_field: &ast::QueryField) -> String {
@@ -275,6 +276,7 @@ pub fn initial_select(
     indent: usize,
     context: &typecheck::Context,
     query: &ast::Query,
+    query_info: &typecheck::QueryInfo,
     table: &typecheck::Table,
     query_table_field: &ast::QueryField,
 ) -> String {
@@ -307,6 +309,11 @@ pub fn initial_select(
         field_names.push("updatedAt".to_string());
     }
 
+    let generated_id = restricted_insert_id(table);
+    if let Some(column) = generated_id {
+        field_names.push(column.name.clone());
+    }
+
     let mut result = format!(
         "{}insert into {} ({})\n",
         indent_str,
@@ -324,12 +331,28 @@ pub fn initial_select(
     if has_legacy_updated_at_field && !updated_at_explicitly_set {
         final_values.push("unixepoch()".to_string());
     }
+    if generated_id.is_some() {
+        final_values.push(next_integer_id_expression(table));
+    }
 
-    result.push_str(&format!(
-        "{}values ({})",
-        indent_str,
-        final_values.join(", ")
-    ));
+    if ast::get_permissions(&table.record, &ast::QueryOperation::Insert).is_some() {
+        result.push_str(&authorized_insert_select(
+            indent,
+            context,
+            query_info,
+            table,
+            query_table_field,
+            &field_names,
+            &final_values,
+            None,
+        ));
+    } else {
+        result.push_str(&format!(
+            "{}values ({})",
+            indent_str,
+            final_values.join(", ")
+        ));
+    }
     result
 }
 
@@ -337,6 +360,7 @@ fn insert_linked(
     indent: usize,
     context: &typecheck::Context,
     query: &ast::Query,
+    query_info: &typecheck::QueryInfo,
     parent_table_name: &String,
     table: &typecheck::Table,
     query_table_field: &ast::QueryField,
@@ -354,7 +378,7 @@ fn insert_linked(
         table,
         &ast::collect_query_fields(&query_table_field.fields),
     );
-    field_names.push(link.foreign.fields.clone().join(", "));
+    field_names.extend(link.foreign.fields.clone());
     field_names.append(&mut new_fieldnames.clone());
 
     let all_query_fields = ast::collect_query_fields(&query_table_field.fields);
@@ -373,6 +397,11 @@ fn insert_linked(
 
     if has_legacy_updated_at_field && !updated_at_explicitly_set {
         field_names.push("updatedAt".to_string());
+    }
+
+    let generated_id = restricted_insert_id(table);
+    if let Some(column) = generated_id {
+        field_names.push(column.name.clone());
     }
 
     let mut insert_values = vec![];
@@ -398,42 +427,44 @@ fn insert_linked(
     if has_legacy_updated_at_field && !updated_at_explicitly_set {
         insert_values.push("unixepoch()".to_string());
     }
+    if generated_id.is_some() {
+        insert_values.push(next_integer_id_expression(table));
+    }
 
-    statements.push(to_sql::ignore(format!(
-        "insert into {} ({})\n  select {}\n  from {}",
-        table_name,
-        field_names.join(", "),
-        insert_values.join(", "),
-        parent_table_name
-    )));
+    let mut statement = format!("insert into {} ({})\n", table_name, field_names.join(", "));
+    if ast::get_permissions(&table.record, &ast::QueryOperation::Insert).is_some() {
+        statement.push_str(&authorized_insert_select(
+            2,
+            context,
+            query_info,
+            table,
+            query_table_field,
+            &field_names,
+            &insert_values,
+            Some(parent_table_name),
+        ));
+    } else {
+        statement.push_str(&format!(
+            "  select {}\n  from {}",
+            insert_values.join(", "),
+            parent_table_name
+        ));
+    }
+    statements.push(to_sql::ignore(statement));
 
     let temp_table_name = &get_temp_table_name(&query_table_field);
 
-    // Create temp table for nested inserts if tracking affected rows
-    // This must happen AFTER the insert to capture the inserted rowids
-    if include_affected_rows {
-        // Drop temp table if it exists (from previous batch) before creating a new one
-        statements.push(to_sql::ignore(format!(
-            "drop table if exists {}",
-            temp_table_name
-        )));
-
-        // Create temp table with rowids of inserted rows by joining on foreign key
-        let foreign_key = &link.foreign.fields[0];
-        let local_key = &link.local_ids[0];
-        let quoted_foreign_key = string::quote(foreign_key);
-        let quoted_local_key = string::quote(local_key);
-        let quoted_table_name_for_temp = string::quote(&table_name);
-        let quoted_parent_table = string::quote(parent_table_name);
-        statements.push(to_sql::ignore(format!(
-            "create temp table {} as\n  select t.rowid as id\n  from {} t\n  join {} p on t.{} = p.{}",
-            temp_table_name,
-            quoted_table_name_for_temp,
-            quoted_parent_table,
-            quoted_foreign_key,
-            quoted_local_key
-        )));
-    }
+    // Capture only the row produced by the immediately preceding insert. This table is also the
+    // source for deeper nested inserts, so it is required even without affected-row tracking.
+    statements.push(to_sql::ignore(format!(
+        "drop table if exists {}",
+        temp_table_name
+    )));
+    statements.push(to_sql::ignore(format!(
+        "create temp table {} as\n  select t.rowid as __pyre_rowid, t.*\n  from {} t\n  where t.rowid = last_insert_rowid() and changes() > 0",
+        temp_table_name,
+        string::quote(&table_name)
+    )));
 
     for query_field in all_query_fields {
         let table_field = &table
@@ -466,6 +497,7 @@ fn insert_linked(
                     indent + 2,
                     context,
                     query,
+                    query_info,
                     &temp_table_name,
                     linked_table,
                     query_field,
@@ -478,6 +510,110 @@ fn insert_linked(
             _ => (),
         }
     }
+}
+
+fn authorized_insert_select(
+    indent: usize,
+    context: &typecheck::Context,
+    query_info: &typecheck::QueryInfo,
+    table: &typecheck::Table,
+    query_table_field: &ast::QueryField,
+    field_names: &[String],
+    values: &[String],
+    source: Option<&str>,
+) -> String {
+    let indent_str = " ".repeat(indent);
+    let proposed_alias = "\"__pyre_proposed\"";
+    let supplied_values = field_names
+        .iter()
+        .zip(values)
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let proposed_columns = typecheck::to_sql_column_info(context, &table.record.fields)
+        .into_iter()
+        .map(|column| {
+            let value = supplied_values
+                .get(column.name.as_str())
+                .copied()
+                .map(str::to_string)
+                .unwrap_or_else(|| proposed_column_fallback(table, &column.name));
+            format!("{} as {}", value, string::quote(&column.name))
+        })
+        .collect::<Vec<_>>();
+    let selected_columns = field_names
+        .iter()
+        .map(|name| format!("{}.{}", proposed_alias, string::quote(name)))
+        .collect::<Vec<_>>();
+    let permission = ast::get_permissions(&table.record, &ast::QueryOperation::Insert)
+        .expect("restricted insert must have an effective permission predicate");
+    let predicate = to_sql::render_where_arg_with_table_ref(
+        context,
+        &permission,
+        table,
+        query_info,
+        query_table_field,
+        Some(proposed_alias),
+    );
+
+    let mut result = format!(
+        "{}select {}\n{}from (\n{}  select {}",
+        indent_str,
+        selected_columns.join(", "),
+        indent_str,
+        indent_str,
+        proposed_columns.join(", ")
+    );
+    if let Some(source) = source {
+        result.push_str(&format!("\n{}  from {}", indent_str, source));
+    }
+    result.push_str(&format!(
+        "\n{}) as {}\n{}where {}",
+        indent_str, proposed_alias, indent_str, predicate
+    ));
+    result
+}
+
+fn proposed_column_fallback(table: &typecheck::Table, physical_name: &str) -> String {
+    table
+        .record
+        .fields
+        .iter()
+        .find_map(|field| match field {
+            ast::Field::Column(column) if column.name == physical_name => {
+                Some(render_column_insert_fallback(column))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn restricted_insert_id(table: &typecheck::Table) -> Option<&ast::Column> {
+    let permission = ast::get_permissions(&table.record, &ast::QueryOperation::Insert)?;
+    let column = table.record.fields.iter().find_map(|field| match field {
+        ast::Field::Column(column) if ast::is_integer_primary_key(column) => Some(column),
+        _ => None,
+    })?;
+    permission_references_column(&permission, &column.name).then_some(column)
+}
+
+fn permission_references_column(permission: &ast::WhereArg, column_name: &str) -> bool {
+    match permission {
+        ast::WhereArg::Constant(_) | ast::WhereArg::Exists(..) => false,
+        ast::WhereArg::Column(is_session, path, ..) => !is_session && path.root() == column_name,
+        ast::WhereArg::And(items) | ast::WhereArg::Or(items) => items
+            .iter()
+            .any(|item| permission_references_column(item, column_name)),
+    }
+}
+
+fn next_integer_id_expression(table: &typecheck::Table) -> String {
+    format!(
+        "(select coalesce(max(rowid), 0) + 1 from {})",
+        string::quote(&ast::get_tablename(
+            &table.record.name,
+            &table.record.fields
+        ))
+    )
 }
 
 fn generate_affected_rows_query_for_inserts(
@@ -507,7 +643,7 @@ fn generate_affected_rows_query_for_inserts(
         // Build the join condition - all tables use their temp table
         // Use table name directly instead of alias to avoid issues with quoted column names
         let join_condition = format!(
-            "join {} temp_table on {}.rowid = temp_table.id",
+            "join {} temp_table on {}.rowid = temp_table.__pyre_rowid",
             affected_table.temp_table_name, quoted_table_name
         );
 
@@ -900,7 +1036,12 @@ mod tests {
             end: None,
         };
 
-        let sql = initial_select(0, &context, &query, &table, &query_table_field);
+        let query_info = typecheck::QueryInfo {
+            variables: std::collections::HashMap::new(),
+            primary_db: String::new(),
+            attached_dbs: std::collections::HashSet::new(),
+        };
+        let sql = initial_select(0, &context, &query, &query_info, &table, &query_table_field);
         assert_eq!(
             sql,
             "insert into users (name, updatedAt)\nvalues ($name, unixepoch())"

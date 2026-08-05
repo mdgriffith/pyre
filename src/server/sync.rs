@@ -268,9 +268,7 @@ pub async fn catchup(
                 &table_sql.headers,
             )?;
 
-            for mut row in rows {
-                decode_json_columns(&mut row, &table_sql.json_columns)?;
-
+            for row in rows {
                 if updated_at_index.is_some() {
                     if let Some(updated_at) = row.get("updatedAt").and_then(json_to_i64) {
                         max_updated_at = Some(match max_updated_at {
@@ -312,7 +310,9 @@ pub async fn catchup(
                 .collect(),
         };
 
-        let reshaped_group = sync_shape::reshape_table_groups(&[raw_group], context)
+        let normalized_groups =
+            sync_shape::normalize_json_columns(&[raw_group], context).map_err(Error::SyncShape)?;
+        let reshaped_group = sync_shape::reshape_table_groups(&normalized_groups, context)
             .into_iter()
             .next();
         let rows = reshaped_group
@@ -593,42 +593,6 @@ fn libsql_value_to_json(value: libsql::Value) -> JsonValue {
     }
 }
 
-fn decode_json_columns(
-    row: &mut HashMap<String, JsonValue>,
-    json_columns: &[String],
-) -> Result<(), Error> {
-    for column in json_columns {
-        if let Some(value) = row.get(column).cloned() {
-            row.insert(column.clone(), parse_json_column_value(value)?);
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_json_column_value(value: JsonValue) -> Result<JsonValue, Error> {
-    match value {
-        JsonValue::String(raw) => {
-            let parsed = serde_json::from_str::<JsonValue>(&raw).map_err(Error::Json)?;
-            Ok(try_parse_nested_json_container(parsed))
-        }
-        value => Ok(value),
-    }
-}
-
-fn try_parse_nested_json_container(value: JsonValue) -> JsonValue {
-    let JsonValue::String(raw) = value else {
-        return value;
-    };
-
-    let trimmed = raw.trim();
-    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
-        return JsonValue::String(raw);
-    }
-
-    serde_json::from_str::<JsonValue>(trimmed).unwrap_or(JsonValue::String(raw))
-}
-
 fn row_array_to_object(headers: &[String], row: Vec<JsonValue>) -> JsonValue {
     let mut object = serde_json::Map::with_capacity(headers.len());
 
@@ -656,6 +620,7 @@ pub enum Error {
     Json(serde_json::Error),
     Sync(sync::SyncError),
     SyncDeltas(sync_deltas::SyncDeltasError),
+    SyncShape(sync_shape::SyncShapeError),
 }
 
 impl std::fmt::Display for Error {
@@ -686,6 +651,7 @@ impl std::fmt::Display for Error {
             Error::SyncDeltas(sync_deltas::SyncDeltasError::InvalidRowData(message)) => {
                 write!(f, "sync delta invalid row data: {}", message)
             }
+            Error::SyncShape(error) => write!(f, "sync shape error: {}", error),
         }
     }
 }

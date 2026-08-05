@@ -1690,6 +1690,7 @@ fn parse_where_arg_mode(input: Text, allow_exists: bool) -> ParseResult<ast::Whe
 fn parse_where_atom(input: Text, allow_exists: bool) -> ParseResult<ast::WhereArg> {
     if allow_exists {
         alt((
+            parse_permission_constant,
             |input| parse_logical_where(input, allow_exists),
             parse_exists,
             parse_query_where,
@@ -1700,6 +1701,13 @@ fn parse_where_atom(input: Text, allow_exists: bool) -> ParseResult<ast::WhereAr
             parse_query_where,
         ))(input)
     }
+}
+
+fn parse_permission_constant(input: Text) -> ParseResult<ast::WhereArg> {
+    alt((
+        value(ast::WhereArg::Constant(true), tag("True")),
+        value(ast::WhereArg::Constant(false), tag("False")),
+    ))(input)
 }
 
 fn parse_logical_where(input: Text, allow_exists: bool) -> ParseResult<ast::WhereArg> {

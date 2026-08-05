@@ -1681,6 +1681,36 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                     }
                                 }
                             }
+
+                            if !has_star && !has_public {
+                                let covered_operations: HashSet<_> = fine_grained_permissions
+                                    .iter()
+                                    .flat_map(|(operations, _)| operations.iter().cloned())
+                                    .collect();
+                                let missing_operations = [
+                                    ast::QueryOperation::Query,
+                                    ast::QueryOperation::Insert,
+                                    ast::QueryOperation::Update,
+                                    ast::QueryOperation::Delete,
+                                ]
+                                .into_iter()
+                                .filter(|operation| !covered_operations.contains(operation))
+                                .collect::<Vec<_>>();
+
+                                if !missing_operations.is_empty() {
+                                    errors.push(Error {
+                                        filepath: file.path.clone(),
+                                        error_type: ErrorType::MissingPermissionOperations {
+                                            record: name.clone(),
+                                            operations: missing_operations,
+                                        },
+                                        locations: vec![Location {
+                                            contexts: to_range(&start, &end),
+                                            primary: to_range(&start_name, &end_name),
+                                        }],
+                                    });
+                                }
+                            }
                         }
 
                         if !has_primary_id {
@@ -2484,6 +2514,7 @@ fn check_where_args(
 ) {
     let error_filepath = context.current_filepath.clone();
     match where_args {
+        ast::WhereArg::Constant(_) => {}
         ast::WhereArg::Exists(path, _) => {
             errors.push(Error {
                 filepath: error_filepath,
@@ -2653,6 +2684,7 @@ fn check_permissions_where_args(
     errors: &mut Vec<Error>,
 ) {
     match where_args {
+        ast::WhereArg::Constant(_) => {}
         ast::WhereArg::Exists(path, body) => {
             let Some((_, first_range)) = path.first() else {
                 errors.push(Error {
@@ -3114,6 +3146,7 @@ fn check_record_index_where(
     errors: &mut Vec<Error>,
 ) {
     match where_arg {
+        ast::WhereArg::Constant(_) => {}
         ast::WhereArg::Exists(path, _) => errors.push(Error {
             filepath: filepath.clone(),
             error_type: ErrorType::InvalidRelationalPermission {
@@ -3181,6 +3214,7 @@ fn check_record_index_where(
 
 fn where_contains_exists(where_arg: &ast::WhereArg) -> bool {
     match where_arg {
+        ast::WhereArg::Constant(_) => false,
         ast::WhereArg::Exists(..) => true,
         ast::WhereArg::And(items) | ast::WhereArg::Or(items) => {
             items.iter().any(where_contains_exists)
@@ -3191,6 +3225,7 @@ fn where_contains_exists(where_arg: &ast::WhereArg) -> bool {
 
 fn first_exists_range(where_arg: &ast::WhereArg) -> Option<&ast::Range> {
     match where_arg {
+        ast::WhereArg::Constant(_) => None,
         ast::WhereArg::Exists(path, _) => path.first().map(|(_, range)| range),
         ast::WhereArg::And(items) | ast::WhereArg::Or(items) => {
             items.iter().find_map(first_exists_range)
@@ -3201,6 +3236,7 @@ fn first_exists_range(where_arg: &ast::WhereArg) -> Option<&ast::Range> {
 
 fn collect_exists_first_links<'a>(where_arg: &'a ast::WhereArg, links: &mut Vec<&'a str>) {
     match where_arg {
+        ast::WhereArg::Constant(_) => {}
         ast::WhereArg::Exists(path, _) => {
             if let Some((link, _)) = path.first() {
                 links.push(link);
@@ -3282,7 +3318,7 @@ fn check_record_permissions(
                 errors.push(Error {
                     filepath: filepath.clone(),
                     error_type: ErrorType::InvalidRelationalPermission {
-                        message: "Relational insert permissions are not supported until insert policies are enforced against the proposed row.".to_string(),
+                        message: "Relational insert permissions are not supported because authorization would depend on both proposed values and existing related rows.".to_string(),
                     },
                     locations: vec![Location {
                         contexts: vec![],
@@ -3336,6 +3372,7 @@ fn mark_session_vars_in_where_as_used(
     params: &mut HashMap<String, ParamInfo>,
 ) {
     match where_args {
+        ast::WhereArg::Constant(_) => {}
         ast::WhereArg::Exists(_, body) => {
             mark_session_vars_in_where_as_used(query_context, context, body, params)
         }

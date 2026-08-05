@@ -336,7 +336,7 @@ mod tests {
         let mut schema = ast::Schema::default();
         crate::parser::run(
             "schema.pyre",
-            "record Item {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n}",
+            "record Item {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}",
             &mut schema,
         )
         .unwrap();

@@ -2459,6 +2459,7 @@ fn to_where_clause_elm(where_arg: &ast::WhereArg, indent_level: usize) -> String
     let indent = "    ".repeat(indent_level);
 
     match where_arg {
+        ast::WhereArg::Constant(_) => unreachable!("constant predicates are permission-only"),
         ast::WhereArg::Exists(..) => unreachable!("exists is permission-only"),
         ast::WhereArg::Column(is_session_field, path, operator, value, _) => {
             let key = if *is_session_field {

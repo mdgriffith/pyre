@@ -324,6 +324,7 @@ fn render_where_arg_inner(
     next_alias: &mut usize,
 ) -> String {
     match arg {
+        ast::WhereArg::Constant(value) => if *value { "1" } else { "0" }.to_string(),
         ast::WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
             let fieldname = path.root();
             let resolved = if *is_session_var {

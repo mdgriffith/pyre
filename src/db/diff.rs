@@ -559,6 +559,7 @@ fn query_value_to_sql(value: &crate::ast::QueryValue) -> String {
 
 fn where_arg_to_sql(where_arg: &crate::ast::WhereArg) -> String {
     match where_arg {
+        crate::ast::WhereArg::Constant(value) => if *value { "1" } else { "0" }.to_string(),
         crate::ast::WhereArg::Exists(..) => "0".to_string(),
         crate::ast::WhereArg::Column(_is_session_var, path, op, value, _) => {
             let quoted = format!("\"{}\"", path.root());

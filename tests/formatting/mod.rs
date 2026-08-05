@@ -402,6 +402,7 @@ fn permission_details_equal_ignoring_locations(
 
 fn where_arg_equal_ignoring_locations(a: &ast::WhereArg, b: &ast::WhereArg) -> bool {
     match (a, b) {
+        (ast::WhereArg::Constant(a), ast::WhereArg::Constant(b)) => a == b,
         (ast::WhereArg::Exists(pa, ba), ast::WhereArg::Exists(pb, bb)) => {
             pa.iter()
                 .map(|(name, _)| name)
@@ -1058,6 +1059,28 @@ record Post {
 }
     "#;
 
+    round_trip_schema(schema_source);
+}
+
+#[test]
+fn test_permission_constants_format_inline() {
+    let schema_source = r#"
+record Post {
+    id Int @id
+    @allow(query) {
+        True
+    }
+    @allow(insert, update, delete) { False }
+}
+    "#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).unwrap();
+    format::schema(&mut schema);
+    let formatted = generate::to_string::schema_to_string(&schema.namespace, &schema);
+
+    assert!(formatted.contains("@allow(query) { True }"));
+    assert!(formatted.contains("@allow(insert, update, delete) { False }"));
     round_trip_schema(schema_source);
 }
 

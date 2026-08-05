@@ -95,6 +95,9 @@ fn hash_arg(hasher: &mut Sha256, arg: &Arg) {
 
 fn hash_where_arg(hasher: &mut Sha256, where_arg: &WhereArg) {
     match where_arg {
+        WhereArg::Constant(value) => {
+            hasher.update(if *value { "where_true" } else { "where_false" });
+        }
         WhereArg::Exists(path, body) => {
             hasher.update("exists");
             hasher.update((path.len() as u64).to_le_bytes());

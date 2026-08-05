@@ -32,6 +32,68 @@ fn permission_predicates_cannot_be_empty() {
 }
 
 #[test]
+fn permission_constants_allow_explicit_unrestricted_and_denied_operations() {
+    let source = r#"
+record Post {
+    id Int @id
+    @allow(query) { True }
+    @allow(insert, update, delete) { False }
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).unwrap();
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema.clone()],
+    })
+    .unwrap();
+
+    let record = schema.files[0]
+        .definitions
+        .iter()
+        .find_map(|definition| match definition {
+            ast::Definition::Record { name, fields, .. } if name == "Post" => {
+                Some(ast::RecordDetails {
+                    name: name.clone(),
+                    fields: fields.clone(),
+                    start: None,
+                    end: None,
+                    start_name: None,
+                    end_name: None,
+                })
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        ast::get_permissions(&record, &ast::QueryOperation::Query),
+        None
+    );
+    for operation in [
+        ast::QueryOperation::Insert,
+        ast::QueryOperation::Update,
+        ast::QueryOperation::Delete,
+    ] {
+        assert_eq!(
+            ast::get_permissions(&record, &operation),
+            Some(ast::WhereArg::Constant(false))
+        );
+    }
+
+    let mut deny_all_schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "record Locked {\n    id Int @id\n    @allow(*) { False }\n}\n",
+        &mut deny_all_schema,
+    )
+    .unwrap();
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![deny_all_schema],
+    })
+    .unwrap();
+}
+
+#[test]
 fn tagged_union_permission_rhs_uses_terminal_field_typechecking() {
     for predicate in [
         r#"state.Failed.code == "wrong""#,
@@ -130,6 +192,7 @@ record Job {
     id Int @id
     code Int
     @allow(query) { code == length("value") }
+    @allow(insert, update, delete) { False }
 }
 "#;
     let mut schema = ast::Schema::default();
@@ -155,6 +218,7 @@ session {{
 record Job {{
     id String @id
     @allow(query) {{ {} }}
+    @allow(insert, update, delete) {{ False }}
 }}
 "#,
         session_type, predicate
@@ -1385,15 +1449,13 @@ record Post {
 }
 
 #[test]
-fn test_partial_operation_coverage_allowed() {
-    // It's allowed to only grant permissions to some operations (others are denied)
+fn test_partial_operation_coverage_fails() {
     let schema_source = r#"
 record Post {
     id Int @id
     title String
     authorId Int
     @allow(query) { authorId == Session.userId }
-    // insert, update, delete are implicitly denied
 }
     "#;
 
@@ -1406,11 +1468,17 @@ record Post {
     };
     let typecheck_result = typecheck::check_schema(&database);
 
-    assert!(
-        typecheck_result.is_ok(),
-        "Typecheck should succeed with partial operation coverage. Errors: {:?}",
-        typecheck_result.err()
-    );
+    let errors = typecheck_result.expect_err("Partial operation coverage should fail");
+    assert!(errors.iter().any(|error| matches!(
+        &error.error_type,
+        ErrorType::MissingPermissionOperations { record, operations }
+            if record == "Post"
+                && operations == &vec![
+                    ast::QueryOperation::Insert,
+                    ast::QueryOperation::Update,
+                    ast::QueryOperation::Delete,
+                ]
+    )));
 }
 
 #[test]
