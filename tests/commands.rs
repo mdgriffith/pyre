@@ -1491,6 +1491,65 @@ record Task {
     );
 }
 
+#[tokio::test]
+async fn test_namespaced_migrate_push_records_standalone_shared_session_types() {
+    let ctx = TestContext::new();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Clocktower")).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n    memberRole MemberRole?\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
+        "type MemberRole\n   = GM\n   | GamePlayer\n   | Observer\n\nrecord Member {\n    @public\n    id Id.Uuid @id\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path
+            .join("pyre/schema/Clocktower/schema.pyre"),
+        "record Game {\n    @allow(query) { Or(Session.memberRole == GM, Session.memberRole == GamePlayer) }\n    @allow(insert, update, delete) { False }\n    id       Id.Int @id\n    memberId Main.Member.id\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .success();
+
+    let db_path = ctx.workspace_path.join(".yak/clocktower.db");
+    let db = libsql::Builder::new_local(db_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "select schema from _pyre_migrations where schema is not null order by id desc limit 1",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("_pyre_migrations should contain a schema-bearing row");
+    let schema_source: String = row.get(0).unwrap();
+
+    assert!(schema_source.contains("type MemberRole\n   = GM\n   | GamePlayer\n   | Observer"));
+    assert!(schema_source.contains("memberId String"));
+    assert!(!schema_source.contains("Main.Member.id"));
+
+    pyre::server::schema::load_schema_from_database(&conn)
+        .await
+        .expect("stored Clocktower schema should reload and typecheck independently");
+}
+
 #[test]
 fn test_migrate_without_migrations_shows_targeted_error() {
     let ctx = TestContext::new();

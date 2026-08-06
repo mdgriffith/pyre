@@ -487,6 +487,7 @@ pub async fn migrate(
     let migration_plan = pyre::db::migrate::plan_file_based_migrations(
         &migration_files.file_contents,
         &migration_state,
+        options.context,
         schema,
     );
 

@@ -167,8 +167,10 @@ pub async fn push<'a>(
 
                                 sql.splice(0..0, pyre::db::migrate::internal_setup_sql());
 
-                                let schema_source =
-                                    pyre::db::migrate::schema_to_storage_string(current_schema);
+                                let schema_source = pyre::db::migrate::schema_to_storage_string(
+                                    &current_context,
+                                    current_schema,
+                                );
                                 sql.push(SqlAndParams::SqlWithParams {
                                     sql: pyre::db::migrate::INSERT_MIGRATION_SUCCESS_WITH_SCHEMA
                                         .to_string(),

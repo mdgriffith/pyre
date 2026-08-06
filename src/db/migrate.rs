@@ -219,7 +219,8 @@ pub struct FileBasedMigrationPlan {
     pub schema_string: String,
 }
 
-pub fn schema_to_storage_string(schema: &ast::Schema) -> String {
+/// Serialize the selected physical schema so it can be reloaded without sibling namespaces.
+pub fn schema_to_storage_string(context: &typecheck::Context, schema: &ast::Schema) -> String {
     let mut stored_schema = schema.clone();
 
     for file in &mut stored_schema.files {
@@ -272,7 +273,7 @@ pub fn schema_to_storage_string(schema: &ast::Schema) -> String {
         }
     }
 
-    crate::generate::to_string::schema_to_string("", &stored_schema)
+    crate::generate::to_string::standalone_schema_to_string(context, &stored_schema)
 }
 
 /// Plan file-based migrations by determining which migration files need to be executed.
@@ -280,6 +281,7 @@ pub fn schema_to_storage_string(schema: &ast::Schema) -> String {
 pub fn plan_file_based_migrations(
     migration_files: &[(String, String)],
     migration_state: &introspect::MigrationState,
+    context: &typecheck::Context,
     schema: &ast::Schema,
 ) -> FileBasedMigrationPlan {
     // Determine which migrations need to be run
@@ -299,7 +301,7 @@ pub fn plan_file_based_migrations(
     };
 
     // Generate schema string
-    let schema_string = schema_to_storage_string(schema);
+    let schema_string = schema_to_storage_string(context, schema);
 
     FileBasedMigrationPlan {
         migrations_to_run,
@@ -339,8 +341,10 @@ mod tests {
             schemas: vec![app, auth],
         };
         ast::resolve_id_brands(&mut database);
+        let context =
+            crate::typecheck::check_schema(&database).expect("project schema should typecheck");
 
-        let source = schema_to_storage_string(&database.schemas[0]);
+        let source = schema_to_storage_string(&context, &database.schemas[0]);
         assert!(source.contains("userId String"), "stored schema: {source}");
         assert!(!source.contains("Auth.User.id"));
 
