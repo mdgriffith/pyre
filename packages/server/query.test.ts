@@ -57,9 +57,13 @@ test("sync wraps mutation responses with server revision metadata", async () => 
   });
 });
 
-test("sync mode omits normal mutation result", async () => {
+test("sync mode includes the mutation result", async () => {
   const db = {
     batch: mock(async () => [
+      {
+        columns: ["createdNote"],
+        rows: [{ createdNote: JSON.stringify({ id: 1, body: "one" }) }],
+      },
       {
         columns: ["_affectedRows"],
         rows: [
@@ -79,7 +83,10 @@ test("sync mode omits normal mutation result", async () => {
       createNote: {
         id: "createNote",
         sql: [{ include: true, params: [], sql: "select createdNote" }],
-        syncSql: [{ include: true, params: [], sql: "select _affectedRows" }],
+        syncSql: [
+          { include: true, params: [], sql: "select createdNote" },
+          { include: true, params: [], sql: "select _affectedRows" },
+        ],
         session_args: [],
         optional_input_args: [],
         json_input_args: [],
@@ -101,8 +108,12 @@ test("sync mode omits normal mutation result", async () => {
   expect(result.response).toEqual({
     serverRevision: 42,
     sync: { type: "delta" },
+    result: {
+      createdNote: [{ id: 1, body: "one" }],
+    },
   });
   expect(db.batch).toHaveBeenCalledWith([
+    { sql: "select createdNote", args: {} },
     { sql: "select _affectedRows", args: {} },
   ]);
 });

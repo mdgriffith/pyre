@@ -389,9 +389,6 @@ fn query_sql(
         };
 
         for prepared in prepared {
-            if sync_mode && prepared.include && !prepared.sql.contains("_affectedRows") {
-                continue;
-            }
             result.push(SqlInfo {
                 include: prepared.include,
                 params: params.clone(),

@@ -485,6 +485,43 @@ insert CreateUser($name: String) {
 }
 
 #[test]
+fn snapshot_insert_nested_zero_field_union() {
+    check_snapshot(
+        "insert_nested_zero_field_union",
+        r#"
+type VoteHandState
+   = HandLowered
+   | HandRaised
+
+type EventPayload
+   = PlayerVoteHandStateChanged {
+        authorParticipantId Participant.id
+        voteId String
+        state VoteHandState
+     }
+
+record Participant {
+    id Id.Int @id
+    @public
+}
+
+record Event {
+    id Id.Int @id
+    payload EventPayload
+    @public
+}
+"#,
+        r#"
+insert CreateEvent($payload: EventPayload) {
+    event {
+        payload = $payload
+    }
+}
+"#,
+    );
+}
+
+#[test]
 fn snapshot_insert_nested() {
     check_snapshot(
         "insert_nested",

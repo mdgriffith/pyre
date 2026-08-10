@@ -270,13 +270,12 @@ export async function run(
     // Prepare SQL statements
     const useSyncMode = options.mode === "sync";
     const activeSql = useSyncMode ? query.syncSql ?? query.sql : query.sql;
-    const includeResult = !useSyncMode;
     const sqlStatements: InStatement[] = toSqlStatements(activeSql, validArgs);
 
     // Execute query
     const resultSets = await db.batch(sqlStatements);
     const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
-    const response = includeResult ? formatResultData(activeSql, resultSets) : {};
+    const response = formatResultData(activeSql, resultSets);
 
     // Always create sync function - it will be a no-op if there's nothing to send
     /**
@@ -317,7 +316,7 @@ export async function run(
                 ...(syncResult.databaseEpoch === undefined ? {} : { databaseEpoch: syncResult.databaseEpoch }),
                 serverRevision: syncResult.serverRevision,
                 ...(syncResult.originMessage === undefined ? {} : { sync: syncResult.originMessage }),
-                ...(includeResult ? { result: queryResult.response } : {}),
+                result: queryResult.response,
             };
         }
 

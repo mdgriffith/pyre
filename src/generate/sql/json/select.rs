@@ -1049,6 +1049,7 @@ fn select_type_with_json_mode(
                 sql.push_str(&format!("{}.{}", base_table_name, query_field_name))
             }
             typecheck::Type::OneOf { variants, .. } => {
+                let json_fn = if use_jsonb { "jsonb" } else { "json" };
                 let object_fn = if use_jsonb {
                     "jsonb_object"
                 } else {
@@ -1058,7 +1059,7 @@ fn select_type_with_json_mode(
                 let when_indent = " ".repeat(indent + 2);
                 let obj_indent = " ".repeat(indent + 4);
                 let obj_field_indent = " ".repeat(indent + 6);
-                sql.push_str(&format!("\n{}case\n", indent_str));
+                sql.push_str(&format!("\n{}{}(case\n", indent_str, json_fn));
                 for var in variants {
                     sql.push_str(&format!(
                         "{}when {}.{} = '{}' then",
@@ -1111,7 +1112,7 @@ fn select_type_with_json_mode(
                         }
                     }
                 }
-                sql.push_str(&format!("{}end", indent_str));
+                sql.push_str(&format!("{}end)", indent_str));
             }
             typecheck::Type::Record(_) => {
                 sql.push_str(&format!("{}.{}", base_table_name, query_field_name))

@@ -74,7 +74,7 @@ select
     json_object(
       'name', t."name",
       'status', 
-      case
+      json(case
         when t.status = 'Active' then json_object('_type', 'Active')
         when t.status = 'Inactive' then json_object('_type', 'Inactive')
         when t.status = 'Special' then
@@ -82,7 +82,7 @@ select
             '_type', 'Special',
             'reason', t.status__reason
           )
-      end
+      end)
     )
   ), json('[]')) as user
 from users t

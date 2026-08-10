@@ -13,7 +13,7 @@ select
     json_object(
       'id', temp_selected_user.id,
       'status', 
-      case
+      json(case
         when temp_selected_user.status = 'Active' then json_object('_type', 'Active')
         when temp_selected_user.status = 'Inactive' then json_object('_type', 'Inactive')
         when temp_selected_user.status = 'Special' then
@@ -21,7 +21,7 @@ select
             '_type', 'Special',
             'reason', temp_selected_user.status__reason
           )
-      end
+      end)
     )
   ), json('[]')) as user
 from temp_selected_user

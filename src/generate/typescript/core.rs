@@ -573,12 +573,6 @@ fn format_sql_entries(
                         };
 
                         for prepped in prepared {
-                            if sync_mode
-                                && prepped.include
-                                && !prepped.sql.contains("_affectedRows")
-                            {
-                                continue;
-                            }
                             if written_field {
                                 result.push_str(",\n");
                             }

@@ -2409,7 +2409,22 @@ function isServerTableGroup(value: unknown): value is ServerTableGroup {
 }
 
 function unwrapMutationResultEnvelope(result: unknown): unknown {
-  if (!result || typeof result !== 'object') {
+  if (!isRecord(result)) {
+    return result;
+  }
+
+  if (result.ok === true && 'value' in result) {
+    return {
+      ...result,
+      value: unwrapMutationResponse(result.value),
+    };
+  }
+
+  return unwrapMutationResponse(result);
+}
+
+function unwrapMutationResponse(result: unknown): unknown {
+  if (!isRecord(result)) {
     return result;
   }
 
@@ -2417,7 +2432,7 @@ function unwrapMutationResultEnvelope(result: unknown): unknown {
     return result;
   }
 
-  return (result as { result?: unknown }).result;
+  return result.result;
 }
 
 function parseSyncStateMessage(message: unknown): SyncState | null {

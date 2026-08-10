@@ -50,6 +50,67 @@ fn only_query(manifest: &Manifest) -> &QueryManifest {
 }
 
 #[tokio::test]
+async fn run_insert_roundtrips_nested_zero_field_union() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+type VoteHandState
+   = HandLowered
+   | HandRaised
+
+type EventPayload
+   = PlayerVoteHandStateChanged {
+        authorParticipantId Participant.id
+        voteId String
+        state VoteHandState
+     }
+
+record Participant {
+    id Id.Int @id
+    @public
+}
+
+record Event {
+    id Id.Int @id
+    payload EventPayload
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+insert CreateEvent($payload: EventPayload) {
+    event {
+        payload = $payload
+    }
+}
+"#,
+        false,
+    )?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let payload = json!({
+        "_type": "PlayerVoteHandStateChanged",
+        "authorParticipantId": 1,
+        "voteId": "vote-1",
+        "state": { "_type": "HandRaised" }
+    });
+
+    let result = query::run(
+        &conn,
+        &manifest,
+        &only_query(&manifest).id,
+        json!({ "payload": payload.clone() }),
+        &session,
+    )
+    .await?;
+
+    assert_eq!(result.response["event"][0]["payload"], payload);
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_query_accepts_uuid_record_id_parameter() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
@@ -1558,7 +1619,7 @@ query GetNotes {
 }
 
 #[tokio::test]
-async fn run_insert_mutation_extracts_affected_rows_in_sync_mode(
+async fn run_insert_mutation_returns_result_and_extracts_affected_rows_in_sync_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
@@ -1595,7 +1656,8 @@ insert CreateNote($body: String) {
     )
     .await?;
 
-    assert_eq!(result.response, json!({}));
+    assert_eq!(result.response["note"][0]["id"], json!(1));
+    assert_eq!(result.response["note"][0]["body"], json!("one"));
     assert_eq!(result.affected_rows.len(), 1);
     assert_eq!(result.affected_rows[0].table_name, "notes");
     assert_eq!(result.affected_rows[0].rows.len(), 1);

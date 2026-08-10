@@ -118,11 +118,7 @@ async fn run_inner(
     }
 
     Ok(QueryResult {
-        response: if sync_mode {
-            JsonValue::Object(serde_json::Map::new())
-        } else {
-            format_response(&included_result_sets)?
-        },
+        response: format_response(&included_result_sets)?,
         affected_rows: extract_affected_rows(&included_result_sets)?,
     })
 }
