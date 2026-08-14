@@ -166,6 +166,16 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
             ),
         )
     })?;
+    if db::is_remote(options.database)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.format_error()))?
+    {
+        pyre::server::query::validate_remote_manifest(&manifest).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot serve generated queries: {error}"),
+            )
+        })?;
+    }
 
     let session_source = session_source(&manifest, &options, loopback)?;
     let state = Arc::new(AppState {

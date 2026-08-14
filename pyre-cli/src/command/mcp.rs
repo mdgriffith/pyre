@@ -602,6 +602,10 @@ async fn dynamic_query(options: &Options<'_>, arguments: &JsonValue) -> Result<J
         .unwrap_or_else(|| json!({}));
 
     let (query_list, manifest) = dynamic_query_plan(options, arguments)?;
+    if db::is_remote(&database).map_err(|error| error.format_error())? {
+        pyre::server::query::validate_remote_manifest(&manifest)
+            .map_err(|error| error.to_string())?;
+    }
     let db = db::connect(&database, &auth)
         .await
         .map_err(|error| error.format_error())?;
@@ -679,6 +683,10 @@ async fn explain_dynamic_query(
         .unwrap_or_else(|| json!({}));
 
     let (query_list, manifest) = dynamic_query_plan(options, arguments)?;
+    if db::is_remote(&database).map_err(|error| error.format_error())? {
+        pyre::server::query::validate_remote_manifest(&manifest)
+            .map_err(|error| error.to_string())?;
+    }
     let db = db::connect(&database, &auth)
         .await
         .map_err(|error| error.format_error())?;

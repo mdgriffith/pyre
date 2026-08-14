@@ -1666,6 +1666,96 @@ insert CreateNote($body: String) {
 }
 
 #[tokio::test]
+async fn run_nested_insert_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(&helpers::schema::full_schema()).await?;
+    let conn = db.db.connect()?;
+    let query_source = r#"
+insert CreateUserWithPost($name: String, $status: Status) {
+    user {
+        name = $name
+        status = $status
+        posts {
+            title = "First Post"
+            content = "Body"
+        }
+    }
+}
+"#;
+    let manifest = manifest_for(&db.context, query_source, false)?;
+    let query_id = only_query(&manifest).id.clone();
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+
+    let result = query::run(
+        &conn,
+        &manifest,
+        &query_id,
+        json!({ "name": "Alice", "status": { "_type": "Active" } }),
+        &session,
+    )
+    .await?;
+
+    assert_eq!(result.response["user"][0]["name"], json!("Alice"));
+    let mut rows = conn
+        .query("select count(*) from posts where title = 'First Post'", ())
+        .await?;
+    assert_eq!(rows.next().await?.expect("count row").get::<i64>(0)?, 1);
+
+    let remote_error = query::validate_remote_manifest(&manifest)
+        .expect_err("nested inserts should be rejected for remote libSQL");
+    assert!(remote_error.to_string().contains(&query_id));
+    assert!(remote_error.to_string().contains("nested inserts"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_nested_insert_rolls_back_parent_after_child_failure(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(&helpers::schema::full_schema()).await?;
+    let conn = db.db.connect()?;
+    let query_source = r#"
+insert CreateUserWithPost($name: String, $status: Status) {
+    user {
+        name = $name
+        status = $status
+        posts {
+            title = "First Post"
+            content = "Body"
+        }
+    }
+}
+"#;
+    let mut manifest = manifest_for(&db.context, query_source, false)?;
+    let query_id = only_query(&manifest).id.clone();
+    let mutation = manifest
+        .queries
+        .get_mut(&query_id)
+        .expect("nested insert manifest");
+    let child_insert = mutation
+        .sql
+        .iter_mut()
+        .find(|statement| statement.sql.trim_start().starts_with("insert into posts"))
+        .expect("generated child insert");
+    child_insert.sql = "insert into missing_nested_insert_table values (1)".to_string();
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+
+    query::run(
+        &conn,
+        &manifest,
+        &query_id,
+        json!({ "name": "Alice", "status": { "_type": "Active" } }),
+        &session,
+    )
+    .await
+    .expect_err("child insert should fail");
+
+    let mut rows = conn.query("select count(*) from users", ()).await?;
+    assert_eq!(rows.next().await?.expect("count row").get::<i64>(0)?, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_query_applies_json_and_session_args() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"

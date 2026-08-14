@@ -84,6 +84,38 @@ pub async fn explain(
     Ok(statements)
 }
 
+/// Reject generated statements that remote libSQL cannot parse or execute.
+pub fn validate_remote_manifest(manifest: &Manifest) -> Result<(), Error> {
+    let mut unsupported_queries = manifest
+        .queries
+        .values()
+        .filter(|query| {
+            query
+                .sql
+                .iter()
+                .chain(query.sync_sql.iter().flatten())
+                .any(|statement| uses_temporary_table(&statement.sql))
+        })
+        .map(|query| query.id.clone())
+        .collect::<Vec<_>>();
+
+    unsupported_queries.sort();
+    unsupported_queries.dedup();
+    if unsupported_queries.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedRuntime(format!(
+            "remote libSQL does not support the temporary tables required by nested inserts (queries: {}). Run these mutations against local SQLite; remote nested inserts require a future result-binding SQL strategy",
+            unsupported_queries.join(", ")
+        )))
+    }
+}
+
+fn uses_temporary_table(sql: &str) -> bool {
+    let normalized = sql.trim_start().to_ascii_uppercase();
+    normalized.starts_with("CREATE TEMP TABLE") || normalized.starts_with("CREATE TEMPORARY TABLE")
+}
+
 async fn run_inner(
     conn: &libsql::Connection,
     manifest: &Manifest,
@@ -102,10 +134,36 @@ async fn run_inner(
     } else {
         &query.sql
     };
+
+    if query.operation == "query" {
+        return execute_generated_sql(conn, sql, &args).await;
+    }
+
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .map_err(Error::Database)?;
+    match execute_generated_sql(&tx, sql, &args).await {
+        Ok(result) => {
+            tx.commit().await.map_err(Error::Database)?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+async fn execute_generated_sql(
+    conn: &libsql::Connection,
+    sql: &[SqlInfo],
+    args: &HashMap<String, JsonValue>,
+) -> Result<QueryResult, Error> {
     let mut included_result_sets = Vec::new();
 
     for statement in sql {
-        let (sql, values) = statement_args(statement, &args)?;
+        let (sql, values) = statement_args(statement, args)?;
 
         if statement.include {
             included_result_sets.push(query_result_set(conn, &sql, values).await?);
@@ -511,6 +569,7 @@ pub enum Error {
     InvalidInput(String),
     InvalidSession(String),
     Json(serde_json::Error),
+    UnsupportedRuntime(String),
     UnknownQuery(String),
 }
 
@@ -521,6 +580,7 @@ impl std::fmt::Display for Error {
             Error::InvalidInput(message) => write!(f, "invalid input: {}", message),
             Error::InvalidSession(message) => write!(f, "invalid session: {}", message),
             Error::Json(error) => write!(f, "json error: {}", error),
+            Error::UnsupportedRuntime(message) => write!(f, "unsupported runtime: {}", message),
             Error::UnknownQuery(query_id) => write!(f, "unknown query: {}", query_id),
         }
     }

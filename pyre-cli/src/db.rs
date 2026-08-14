@@ -76,16 +76,20 @@ fn parse_arg_or_env(arg: &str) -> Result<String, DbError> {
     }
 }
 
+pub fn is_remote(db: &str) -> Result<bool, DbError> {
+    let value = parse_arg_or_env(db)?;
+    Ok(value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("libsql://"))
+}
+
 pub async fn connect(
     db: &String,
     maybe_auth_token: &Option<String>,
 ) -> Result<libsql::Database, DbError> {
     let db_value = parse_arg_or_env(&db)?;
 
-    if db_value.starts_with("http://")
-        || db_value.starts_with("https://")
-        || db_value.starts_with("libsql://")
-    {
+    if is_remote(&db_value)? {
         // Remote database
         match maybe_auth_token {
             None => return Err(DbError::AuthTokenRequired),
