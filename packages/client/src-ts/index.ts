@@ -22,6 +22,14 @@ import {
   registerPyreDevtoolsClient,
   unregisterPyreDevtoolsClient,
 } from './devtools-registry';
+import {
+  describeDebugCall,
+  describePyreEvent,
+  withDatabase,
+  type PyreLogActor,
+  type PyreLogDirection,
+  type PyreLogLevel,
+} from './logging';
 import type {
   ElmApp,
   LiveSyncTransport,
@@ -96,6 +104,11 @@ export interface RegisteredQueryResult {
 export interface PyreDevtoolsEvent {
   id: number;
   timestamp: number;
+  actor: PyreLogActor;
+  direction?: PyreLogDirection;
+  operation: string;
+  level: PyreLogLevel;
+  summary: string;
   type: string;
   payload?: unknown;
 }
@@ -483,12 +496,12 @@ class SingleDatabasePyreClient {
           this.logDebug(
             `[PyreClient] Database epoch changed: going from epoch ${epochChange.fromEpoch} to epoch ${epochChange.toEpoch}; resetting local state.`,
           );
-        } else {
-          this.logDebug('[PyreClient] port debugOut <-', message);
         }
         const eventName = debugOutEventName(message);
         if (eventName) {
           this.emitDevtoolsEvent(`elm:${eventName}`, message);
+        } else if (!epochChange) {
+          this.logDebug('[PyreClient] port debugOut <-', message);
         }
       });
     } else {
@@ -522,9 +535,10 @@ class SingleDatabasePyreClient {
   }
 
   private logDebug = (...args: unknown[]): void => {
-    this.emitDevtoolsEvent('debug', { args });
+    const description = describeDebugCall(args, this.databaseId);
+    this.emitDescribedEvent(description);
     if (this.debug) {
-      console.log(...args);
+      console.log(description.summary);
     }
   };
 
@@ -1443,6 +1457,10 @@ class SingleDatabasePyreClient {
   }
 
   private emitDevtoolsEvent(type: string, payload?: unknown): void {
+    this.emitDescribedEvent(describePyreEvent(type, payload, this.databaseId));
+  }
+
+  private emitDescribedEvent(description: ReturnType<typeof describePyreEvent>): void {
     if (this.devtoolsEventCallbacks.size === 0) {
       return;
     }
@@ -1450,8 +1468,13 @@ class SingleDatabasePyreClient {
     const event = {
       id: this.devtoolsEventCounter,
       timestamp: Date.now(),
-      type,
-      payload,
+      actor: description.actor,
+      direction: description.direction,
+      operation: description.operation,
+      level: description.level,
+      summary: description.summary,
+      type: description.summary,
+      payload: description.payload,
     } satisfies PyreDevtoolsEvent;
     this.devtoolsEventCounter += 1;
 
@@ -2056,10 +2079,10 @@ export class PyreClient {
         return;
       }
 
-      this.emitDevtoolsEvent(internalDevtoolsEventType(event), {
-        databaseId,
-        event,
-      });
+      if (event.level === 'trace' || event.operation.startsWith('sync.')) {
+        return;
+      }
+      this.emitDescribedEvent(withDatabase(event, databaseId));
     });
     this.internalDevtoolsUnsubscribers.set(databaseId, unsubscribeDevtools);
 
@@ -2139,18 +2162,28 @@ export class PyreClient {
   }
 
   private logDebug(...args: unknown[]): void {
-    this.emitDevtoolsEvent('debug', { args });
+    const description = describeDebugCall(args);
+    this.emitDescribedEvent(description);
     if (this.config.debug) {
-      console.log(...args);
+      console.log(description.summary);
     }
   }
 
   private emitDevtoolsEvent(type: string, payload?: unknown): void {
+    this.emitDescribedEvent(describePyreEvent(type, payload));
+  }
+
+  private emitDescribedEvent(description: ReturnType<typeof describePyreEvent>): void {
     const event = {
       id: this.devtoolsEventCounter,
       timestamp: Date.now(),
-      type,
-      payload,
+      actor: description.actor,
+      direction: description.direction,
+      operation: description.operation,
+      level: description.level,
+      summary: description.summary,
+      type: description.summary,
+      payload: description.payload,
     } satisfies PyreDevtoolsEvent;
     this.devtoolsEventCounter += 1;
     this.devtoolsEvents = [event, ...this.devtoolsEvents].slice(0, PyreClient.devtoolsEventLimit);
@@ -2665,30 +2698,6 @@ function databaseEpochChangeFromDebugMessage(message: unknown): { fromEpoch: str
   }
 
   return { fromEpoch: event.fromEpoch, toEpoch: event.toEpoch };
-}
-
-function internalDevtoolsEventType(event: PyreDevtoolsEvent): string {
-  if (event.type !== 'debug') {
-    return `internal.${event.type}`;
-  }
-
-  const args = (event.payload as { args?: unknown[] } | undefined)?.args;
-  const label = Array.isArray(args) && typeof args[0] === 'string'
-    ? args[0]
-    : 'debug';
-
-  return `internal.debug.${slugEventLabel(label)}`;
-}
-
-function slugEventLabel(label: string): string {
-  const withoutPrefix = label.replace(/^\[PyreClient\]\s*/, '');
-  const slug = withoutPrefix
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '.')
-    .replace(/^\.+|\.+$/g, '')
-    .slice(0, 80);
-
-  return slug || 'debug';
 }
 
 function asObject(value: unknown, label: string): Record<string, unknown> {

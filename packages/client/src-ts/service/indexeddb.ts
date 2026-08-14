@@ -538,11 +538,10 @@ export class IndexedDbService {
     try {
       await this.storage.init();
 
-      this.debugLog('[PyreClient] IndexedDB writeDelta table groups received', tableGroups.map((group) => ({
-        tableName: group.table_name,
-        rows: group.rows.length,
-        headers: group.headers,
-      })));
+      this.debugLog('[PyreClient] IndexedDB writeDelta table groups received', {
+        tableGroupCount: tableGroups.length,
+        rowCount: tableGroups.reduce((sum, group) => sum + group.rows.length, 0),
+      });
 
       for (const tableGroup of tableGroups) {
         const tableName = tableGroup.table_name;

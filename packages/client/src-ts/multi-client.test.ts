@@ -782,7 +782,13 @@ test('devtools mutation events include database metadata and retain newest event
 
   const snapshot = await getPyreDevtoolsInstanceSnapshot(instanceId);
   expect(snapshot?.events).toHaveLength(200);
-  expect(snapshot?.events[0].type).toBe('mutation.failed');
+  expect(snapshot?.events[0]).toMatchObject({
+    actor: 'APP',
+    operation: 'mutation.failed',
+    level: 'error',
+    summary: '[pyre] APP mutation.failed secondary mutation=FailMutation duration=0ms error=nope',
+    type: '[pyre] APP mutation.failed secondary mutation=FailMutation duration=0ms error=nope',
+  });
   expect(snapshot?.events[0].payload).toMatchObject({
     instanceId,
     databaseId: 'secondary',
@@ -790,5 +796,5 @@ test('devtools mutation events include database metadata and retain newest event
     input: 'fail',
     error: 'nope',
   });
-  expect(snapshot?.events.some((event) => event.type === 'mutation.started' && (event.payload as any).mutationId === 'Mutation0')).toBe(false);
+  expect(snapshot?.events.some((event) => event.operation === 'mutation.started' && (event.payload as any).mutationId === 'Mutation0')).toBe(false);
 });

@@ -106,7 +106,7 @@ class PyreDevtoolsElement extends HTMLElement {
     }
     this.unsubscribeEvents = subscribePyreDevtoolsInstanceEvents(this.selectedInstanceId, (event) => {
       this.events = [event, ...this.events].slice(0, this.maxEvents);
-      if (event.type === 'debug:value' || event.type.startsWith('sync.') || event.type.startsWith('database.') || event.type.startsWith('mutation.')) {
+      if (event.operation === 'debug-value.updated' || event.operation.startsWith('sync.') || event.operation.startsWith('database.') || event.operation.startsWith('mutation.')) {
         void this.refresh();
         return;
       }
@@ -309,12 +309,12 @@ class PyreDevtoolsElement extends HTMLElement {
           <h2>Events</h2>
           ${this.events.length === 0 ? '<div class="empty">No events captured yet.</div>' : this.events.map((event) => `
             <button class="event-item ${selected?.id === event.id ? 'active' : ''}" data-event="${event.id}">
-              <strong>${escapeHtml(event.type)}</strong>
+              <strong>${escapeHtml(event.summary)}</strong>
               <span>${new Date(event.timestamp).toLocaleTimeString()}</span>
             </button>
           `).join('')}
         </section>
-        <section class="event-detail">${selected ? `<h1>${escapeHtml(selected.type)}</h1><pre>${formatJson(selected)}</pre>` : ''}</section>
+        <section class="event-detail">${selected ? `<h1>${escapeHtml(selected.summary)}</h1><pre>${formatJson(selected.payload)}</pre>` : ''}</section>
       </div>
     `;
   }
