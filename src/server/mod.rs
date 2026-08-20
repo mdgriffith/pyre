@@ -6,4 +6,6 @@ pub mod query;
 #[cfg(feature = "database")]
 pub mod schema;
 #[cfg(feature = "database")]
+pub mod seed;
+#[cfg(feature = "database")]
 pub mod sync;

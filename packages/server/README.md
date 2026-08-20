@@ -7,7 +7,7 @@ Typical usage:
 - import generated `queries` map from `pyre/generated/typescript/server`
 - initialize schema-specific databases through the generated `databases` map
 - execute with `run` from `@pyre/server/query`
-- seed fixture data with the generated `seed` helper from `pyre/generated/typescript/server`
+- seed fixture data with the generated `seed` helper from `pyre/generated/typescript/seed`
 - use sync helpers from `@pyre/server/sync` and `@pyre/server/query-sync`
 
 ## Database Provisioning
@@ -40,7 +40,7 @@ Generated server output includes a schema-bound `seed` helper for server-side fi
 
 ```ts
 import { createClient } from "@libsql/client";
-import { seed } from "./pyre/generated/typescript/server";
+import { seed } from "./pyre/generated/typescript/seed";
 
 const db = createClient({ url: "file:test.db" });
 

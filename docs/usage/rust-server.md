@@ -7,6 +7,7 @@ The app still runs `pyre generate`. Generated output includes:
 - `pyre/generated/manifest.json`, which powers dynamic query and mutation execution in Rust
 - `pyre/generated/rust/server.rs`, which exposes generated query ID constants and typed JSON boundary shapes for server-owned workflows
 - `pyre/generated/rust/databases.rs`, which embeds one initializer per schema namespace
+- `pyre/generated/rust/seed.rs`, which exposes typed schema-shaped fixture and import input
 
 ## Main Modules
 
@@ -15,6 +16,7 @@ pyre::server::manifest
 pyre::server::database_id
 pyre::server::query
 pyre::server::schema
+pyre::server::seed
 pyre::server::sync
 ```
 
@@ -171,6 +173,31 @@ UpdateAssetInput {
 ```
 
 The manifest runtime still validates dynamic input and remains the final fail-loud boundary before SQL execution.
+
+## Initial Data Imports
+
+For fixed-schema ingestion tools, include the generated seed module and construct its typed input:
+
+```rust
+mod pyre_seed {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/pyre/generated/rust/seed.rs"));
+}
+
+let input = pyre_seed::SeedInput {
+    documents: Some(vec![pyre_seed::SeedDocumentsRow {
+        title: Some(title),
+        pages: Some(parsed_pages),
+        ..Default::default()
+    }]),
+    ..Default::default()
+};
+
+let result = pyre_seed::seed(&conn, input).await?;
+```
+
+Call the generated database `ensure_database` helper before seeding. Seed insertion is atomic, derives foreign keys for nested links, and supports SQLite defaults, JSON, custom types, and DateTime values. It intentionally bypasses query permissions and sync metadata, so use it for initial database construction rather than application mutations.
+
+Multi-namespace projects receive one seed module per physical database, matching the module layout in `databases.rs`. For example, use `pyre_seed::main::seed` with the Main connection and `pyre_seed::campaign::seed` with the Campaign connection.
 
 ## Catchup Endpoint
 

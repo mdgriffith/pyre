@@ -189,6 +189,7 @@ pyre/generated/
 └── typescript/
     ├── core/
     ├── run.ts
+    ├── seed.ts
     └── server.ts
 ```
 
@@ -196,6 +197,7 @@ High-level purpose:
 
 - `typescript/core/`: shared schema/query metadata
 - `typescript/run.ts`: typed query functions for direct execution
+- `typescript/seed.ts`: schema-bound fixture and import helper
 - `typescript/server.ts`: query metadata used by `@pyre/server/query` and `@pyre/server/sync`
 - `client/elm/`: generated Elm surfaces for sync-enabled clients
 

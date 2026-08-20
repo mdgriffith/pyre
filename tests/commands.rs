@@ -970,7 +970,7 @@ fn test_generate_embeds_namespaced_database_initializers() {
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Campaign/schema.pyre"),
-        "record Encounter {\n    id Id.Int @id\n    @public\n}\n",
+        "record Encounter {\n    id Id.Int @id\n    userId Main.User.id\n    user @link(userId, Main.User.id)\n    @public\n}\n",
     )
     .unwrap();
 
@@ -991,6 +991,21 @@ fn test_generate_embeds_namespaced_database_initializers() {
     assert!(rust.contains("pub mod main"));
     assert!(rust.contains("pub mod campaign"));
     assert!(rust.contains("pub async fn ensure_database"));
+
+    let seed =
+        std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/rust/seed.rs")).unwrap();
+    let main_start = seed.find("pub mod main").unwrap();
+    let campaign_start = seed.find("pub mod campaign").unwrap();
+    let (main, campaign) = if main_start < campaign_start {
+        (&seed[main_start..campaign_start], &seed[campaign_start..])
+    } else {
+        (&seed[main_start..], &seed[campaign_start..main_start])
+    };
+    assert!(main.contains("pub struct SeedUsersRow"));
+    assert!(!main.contains("SeedEncountersRow"));
+    assert!(campaign.contains("pub struct SeedEncountersRow"));
+    assert!(!campaign.contains("SeedUsersRow"));
+    assert!(!campaign.contains("pub user:"));
 }
 
 #[test]
@@ -1029,7 +1044,7 @@ fn test_generate_embeds_shared_session_type_in_each_standalone_schema() {
 }
 
 #[test]
-fn test_generated_typescript_server_includes_typed_seed_input() {
+fn test_generated_seed_artifacts_include_typed_inputs() {
     let ctx = TestContext::new();
 
     std::fs::write(
@@ -1046,6 +1061,7 @@ record Post {
     id Int @id
     authorId User.id
     title String
+    summary String?
     status Status
     attrs Json<PostAttrs>
     author @link(authorId, User.id)
@@ -1058,6 +1074,16 @@ type Status
 
 type PostAttrs
    = PostAttrs { tags List<String> }
+
+type Attribute
+   = AttributeText { value String }
+   | AttributeGroup { fields Dict<Attribute> }
+
+record Entity {
+    id Id.Int @id
+    attrs Json<Dict<Attribute>>
+    @public
+}
         "#,
     )
     .unwrap();
@@ -1069,22 +1095,103 @@ type PostAttrs
             .join("pyre/generated/typescript/server.ts"),
     )
     .unwrap();
+    let seed_ts =
+        std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/typescript/seed.ts"))
+            .unwrap();
+    let seed_rs =
+        std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/rust/seed.rs")).unwrap();
 
-    assert!(server_ts.contains("import * as Db from './core/decode';"));
-    assert!(server_ts.contains("const seedValidators: SeedValidators ="));
-    assert!(server_ts.contains("type SeedConstructed<T>"));
-    assert!(server_ts.contains("export type SeedUsersRow = {"));
-    assert!(server_ts.contains("\"posts\"?: SeedPostsRow[];"));
-    assert!(server_ts.contains("export type SeedPostsRow = {"));
-    assert!(server_ts.contains("\"status\"?: SeedConstructed<Db.Status>;"));
-    assert!(server_ts.contains("\"attrs\"?: SeedConstructed<Db.PostAttrs>;"));
-    assert!(server_ts.contains("\"users\"?: SeedUsersRow[];"));
-    assert!(server_ts.contains("\"posts\"?: SeedPostsRow[];"));
-    assert!(server_ts
-        .contains("export const seed = (db: Client, input: SeedInput): Promise<SeedResult>"));
-    assert!(server_ts.contains("{ _type: K }"));
-    assert!(!server_ts.contains("type?:"));
-    assert!(!server_ts.contains("$?:"));
+    assert!(server_ts.contains("export * from './seed';"));
+    assert!(!server_ts.contains("seedValidators"));
+    assert!(!server_ts.contains("SeedConstructed"));
+    assert!(seed_ts.contains("import * as Db from './core/decode';"));
+    assert!(seed_ts.contains("const seedValidators: SeedValidators ="));
+    assert!(seed_ts.contains("type SeedConstructed<T>"));
+    assert!(seed_ts.contains("export type SeedUsersRow = {"));
+    assert!(seed_ts.contains("\"posts\"?: SeedPostsRow[];"));
+    assert!(seed_ts.contains("export type SeedPostsRow = {"));
+    assert!(seed_ts.contains("\"status\"?: SeedConstructed<Db.Status>;"));
+    assert!(seed_ts.contains("\"attrs\"?: SeedConstructed<Db.PostAttrs>;"));
+    assert!(seed_ts.contains("\"users\"?: SeedUsersRow[];"));
+    assert!(seed_ts.contains("\"posts\"?: SeedPostsRow[];"));
+    assert!(
+        seed_ts.contains("export const seed = (db: Client, input: SeedInput): Promise<SeedResult>")
+    );
+    assert!(seed_ts.contains("{ _type: K }"));
+    assert!(!seed_ts.contains("type?:"));
+    assert!(!seed_ts.contains("$?:"));
+    assert!(seed_rs.contains("pub struct SeedInput"));
+    assert!(seed_rs.contains("pub struct SeedUsersRow"));
+    assert!(seed_rs.contains("pub posts: Option<Vec<SeedPostsRow>>"));
+    assert!(seed_rs.contains("pub author: Option<Box<SeedUsersRow>>"));
+    assert!(seed_rs.contains("pub enum SeedStatus"));
+    assert!(seed_rs.contains("HashMap<String, SeedAttribute>"));
+    assert!(seed_rs.contains("#[serde(tag = \"_type\")]"));
+    assert!(seed_rs.contains("pub async fn seed("));
+
+    let compile_dir = ctx.workspace_path.join("seed-compile");
+    std::fs::create_dir_all(compile_dir.join("src")).unwrap();
+    std::fs::write(compile_dir.join("src/seed.rs"), seed_rs).unwrap();
+    std::fs::write(
+        compile_dir.join("Cargo.toml"),
+        format!(
+            r#"
+[package]
+name = "generated-seed-check"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+libsql = "0.9.11"
+pyre = {{ path = {:?} }}
+serde = {{ version = "1.0.203", features = ["derive"] }}
+serde_json = "1.0.117"
+"#,
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        compile_dir.join("src/main.rs"),
+        r#"
+mod seed;
+
+fn main() {
+    let input = seed::SeedInput {
+        users: Some(vec![seed::SeedUsersRow {
+            name: Some("Imported".to_string()),
+            posts: Some(vec![seed::SeedPostsRow {
+                status: Some(seed::SeedStatus::Published {
+                    published_at: seed::DateTime::UnixSeconds(1),
+                }),
+                attrs: Some(seed::SeedPostAttrs::PostAttrs {
+                    tags: vec!["pdf".to_string()],
+                }),
+                summary: seed::SeedField::Null,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let value = serde_json::to_value(input).expect("seed input serializes");
+    assert_eq!(value["users"][0]["posts"][0]["status"]["_type"], "Published");
+    assert!(value["users"][0]["posts"][0]["summary"].is_null());
+}
+"#,
+    )
+    .unwrap();
+    let output = StdCommand::new("cargo")
+        .args(["run", "--offline", "--quiet", "--manifest-path"])
+        .arg(compile_dir.join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated Rust seed failed to compile:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -2045,7 +2152,7 @@ async fn test_generated_typescript_runner_matches_nullable_typed_json_null() {
 
     let verify_script = r#"
 import { createClient } from "@libsql/client";
-import { seed } from "./pyre/generated/typescript/server.ts";
+import { seed } from "./pyre/generated/typescript/seed.ts";
 import { EndLifecycle, GetLifecycles, GetNullLifecycles } from "./pyre/generated/typescript/run.ts";
 
 const db = createClient({ url: "file:.yak/yak.db" });

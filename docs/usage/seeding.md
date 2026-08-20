@@ -6,7 +6,7 @@ Seed data is shaped like the database schema. Top-level keys are table names, an
 
 ```ts
 import { createClient } from "@libsql/client";
-import { seed } from "./pyre/generated/typescript/server";
+import { seed } from "./pyre/generated/typescript/seed";
 
 const db = createClient({ url: "file:test.db" });
 
@@ -149,10 +149,12 @@ Pyre writes the discriminator and flattened backing columns behind the scenes, a
 Generated server output exposes the schema-bound helper:
 
 ```ts
-import { seed } from "./pyre/generated/typescript/server";
+import { seed } from "./pyre/generated/typescript/seed";
 
 await seed(db, data);
 ```
+
+`server.ts` also re-exports this helper for compatibility with existing imports.
 
 The lower-level runtime helper is also available if you need to pass schema metadata explicitly:
 
@@ -162,3 +164,39 @@ import { schemaMetadata } from "./pyre/generated/typescript/core/schema";
 
 await seed(db, schemaMetadata, data);
 ```
+
+## Rust API
+
+`pyre generate` emits a fixed-schema Rust helper at `pyre/generated/rust/seed.rs`:
+
+```rust
+mod generated_seed {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/pyre/generated/rust/seed.rs"
+    ));
+}
+
+let input = generated_seed::SeedInput {
+    users: Some(vec![generated_seed::SeedUsersRow {
+        name: Some("Fred".to_string()),
+        posts: Some(vec![generated_seed::SeedPostsRow {
+            title: Some("example post".to_string()),
+            content: Some("My content!".to_string()),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    }]),
+    ..Default::default()
+};
+
+let result = generated_seed::seed(&conn, input).await?;
+```
+
+All columns are omittable so SQLite defaults and generated ids can apply. Nullable columns use `SeedField<T>` to distinguish `Omitted`, `Null`, and `Value(T)`.
+
+The Rust runtime loads the Pyre schema recorded in the database and performs the complete seed call in one immediate transaction. As with the TypeScript API, it bypasses query permissions and does not update sync metadata.
+
+For projects with multiple schema namespaces, `seed.rs` emits one module per physical database, such as `generated_seed::main::seed` and `generated_seed::campaign::seed`. Cross-database links remain available through their foreign-key columns but are not exposed as nested seed fields because one SQLite transaction cannot span separate connections.
+
+Composite links are not currently supported by nested seeding and return an explicit error. Inserts are sequential within the transaction; large imports should be measured against their expected row counts.

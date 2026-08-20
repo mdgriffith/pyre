@@ -100,6 +100,7 @@ pyre/generated/
 │       └── Query/
 └── typescript/
     ├── core/
+    ├── seed.ts
     ├── server.ts
     └── run.ts
 ```
