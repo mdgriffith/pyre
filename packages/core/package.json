@@ -1,6 +1,6 @@
 {
   "name": "@pyre/core",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Shared TypeScript contracts for Pyre packages",
   "license": "MIT",
   "type": "module",
