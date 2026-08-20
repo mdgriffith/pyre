@@ -1151,6 +1151,11 @@ serde_json = "1.0.117"
         ),
     )
     .unwrap();
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+        compile_dir.join("Cargo.lock"),
+    )
+    .unwrap();
     std::fs::write(
         compile_dir.join("src/main.rs"),
         r#"
