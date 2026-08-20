@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { beforeEach, expect, mock, test } from "bun:test";
+import { z } from "zod";
 
 let introspectionResult = { schema_source: "test schema" };
 let sessionIds = ["s1"];
@@ -53,55 +54,6 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   ]),
 }));
 
-mock.module("./query", () => ({
-  run: async (
-    _db: unknown,
-    _queryMap: unknown,
-    _queryId: string,
-    _args: unknown,
-    _executingSession: unknown,
-    connectedSessions: Map<string, { session: Record<string, unknown> }>,
-    syncDeltas: (affectedRowGroups: unknown[], connectedSessions: Map<string, { session: Record<string, unknown> }>, sendToSession: (sessionId: string, message: unknown) => void) => Promise<{ serverRevision?: number; originMessage?: unknown } | void>,
-    originSessionId?: string,
-    options?: { mode?: string },
-  ) => {
-    const queryResult: { kind: "success"; response: unknown; sync: (sendToSession: (sessionId: string, message: unknown) => void) => Promise<unknown> } = {
-      kind: "success",
-      response: {},
-      sync: async (sendToSession: (sessionId: string, message: unknown) => void) => {
-        const syncResult = await syncDeltas(
-          [
-            {
-              table_name: "maps",
-              headers: [
-                "id",
-                "name",
-                "tiling",
-                "tiling__tileRootKey",
-                "tiling__tileWidth",
-                "tiling__format",
-              ],
-              rows: [[1, "World", "Tiling", "tiles/root", 256, "Png"]],
-            },
-          ],
-          connectedSessions,
-          sendToSession,
-          originSessionId,
-        );
-        if (syncResult && typeof syncResult.serverRevision === "number") {
-          queryResult.response = {
-            serverRevision: syncResult.serverRevision,
-            ...(syncResult.originMessage === undefined ? {} : { sync: syncResult.originMessage }),
-            ...(options?.mode === "sync" ? {} : { result: queryResult.response }),
-          };
-        }
-        return syncResult;
-      },
-    };
-    return queryResult;
-  },
-}));
-
 const { runWithSync } = await import("./query-sync");
 const { MAX_LIVE_SYNC_DELTA_ROWS, MAX_LIVE_SYNC_FANOUT_RECIPIENTS, MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES } = await import("./query-sync");
 const { loadSchemaFromDatabase } = await import("./schema");
@@ -126,6 +78,16 @@ function syncDb() {
   let revision = 0;
   const executedSql: string[] = [];
   return {
+    batch: mock(async () => [{
+      columns: ["_affectedRows"],
+      rows: [{
+        _affectedRows: JSON.stringify([{
+          table_name: "maps",
+          headers: ["id", "name", "tiling", "tiling__tileRootKey", "tiling__tileWidth", "tiling__format"],
+          rows: [[1, "World", "Tiling", "tiles/root", 256, "Png"]],
+        }]),
+      }],
+    }]),
     execute: mock(async (sql: string) => {
       executedSql.push(sql);
       if (sql.includes("returning database_epoch, server_revision")) {
@@ -138,6 +100,18 @@ function syncDb() {
     executedSql,
   };
 }
+
+const queryMap = {
+  "query-id": {
+    id: "query-id",
+    sql: [{ include: true, params: [], sql: "select _affectedRows" }],
+    session_args: [],
+    optional_input_args: [],
+    json_input_args: [],
+    InputValidator: z.object({}),
+    SessionValidator: z.object({}),
+  },
+};
 
 const schemaDb = {
   execute: mock(async (sql: string) => {
@@ -154,7 +128,7 @@ test("runWithSync sends reshaped sync deltas", async () => {
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -192,7 +166,7 @@ test("runWithSync stamps sync deltas with databaseId", async () => {
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -215,7 +189,7 @@ test("runWithSync allocates live sync revisions from _pyre_sync", async () => {
 
   const result = await runWithSync(
     db as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -235,7 +209,7 @@ test("runWithSync allocates a revision even with no live recipients", async () =
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -257,7 +231,7 @@ test("runWithSync skips the origin session when provided", async () => {
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -280,7 +254,7 @@ test("runWithSync includes origin authoritative sync in mutation response envelo
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -306,7 +280,7 @@ test("runWithSync builds origin sync from executing session when origin is not l
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -343,7 +317,7 @@ test("runWithSync sends syncRequired when delta row count exceeds cap", async ()
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -367,7 +341,7 @@ test("runWithSync sends syncRequired when fanout recipient count exceeds cap", a
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -389,7 +363,7 @@ test("runWithSync sends syncRequired when payload bytes exceed cap", async () =>
 
   const result = await runWithSync(
     syncDb() as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
@@ -415,7 +389,7 @@ test("runWithSync advances revision and requires catchup when delta calculation 
   const db = syncDb();
   const result = await runWithSync(
     db as any,
-    {} as any,
+    queryMap,
     "query-id",
     {},
     {},
