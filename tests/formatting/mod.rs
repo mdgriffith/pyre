@@ -339,6 +339,8 @@ fn field_directive_equal_ignoring_locations(
         (ast::FieldDirective::Permissions(pa), ast::FieldDirective::Permissions(pb)) => {
             permission_details_equal_ignoring_locations(pa, pb)
         }
+        (ast::FieldDirective::Singleton, ast::FieldDirective::Singleton) => true,
+        (ast::FieldDirective::Timestamps, ast::FieldDirective::Timestamps) => true,
         _ => false,
     }
 }
@@ -865,6 +867,7 @@ fn test_timestamps_grouped_with_table_directives() {
     body String
     @index(body)
     @public
+    @singleton
     @timestamps
     @watch
     @unique(body)
@@ -875,7 +878,7 @@ fn test_timestamps_grouped_with_table_directives() {
 
     assert_eq!(
         formatted,
-        "record Note {\n    @tablename(\"notes\")\n    @watch\n    @public\n    @timestamps\n    @unique(body asc)\n    @index(body asc)\n\n    id   Int    @id\n    body String\n}\n"
+        "record Note {\n    @tablename(\"notes\")\n    @watch\n    @public\n    @singleton\n    @timestamps\n    @unique(body asc)\n    @index(body asc)\n\n    id   Int    @id\n    body String\n}\n"
     );
 }
 

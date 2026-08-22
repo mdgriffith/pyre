@@ -536,11 +536,21 @@ fn parse_table_directive(input: Text) -> ParseResult<ast::Field> {
         parse_table_index_directive(true),
         parse_table_permission,
         parse_public,
+        parse_singleton,
         parse_timestamps,
         parse_watch(),
     )))(input)?;
     let input = expecting(input, crate::error::Expecting::SchemaColumn);
     Ok((input, field_directive))
+}
+
+fn parse_singleton(input: Text) -> ParseResult<ast::Field> {
+    let (input, _) = tag("singleton")(input)?;
+    let (input, _) = multispace0(input)?;
+    Ok((
+        input,
+        ast::Field::FieldDirective(ast::FieldDirective::Singleton),
+    ))
 }
 
 fn parse_timestamps(input: Text) -> ParseResult<ast::Field> {

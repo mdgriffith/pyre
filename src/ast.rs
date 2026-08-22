@@ -348,6 +348,7 @@ pub enum FieldDirective {
     Index(IndexDirective),
     Unique(IndexDirective),
     Permissions(PermissionDetails),
+    Singleton,
     Timestamps,
 }
 
@@ -567,6 +568,12 @@ pub fn collect_indexes(fields: &Vec<Field>) -> Vec<MaterializedIndex> {
     }
 
     indexes
+}
+
+pub fn is_singleton(fields: &[Field]) -> bool {
+    fields
+        .iter()
+        .any(|field| matches!(field, Field::FieldDirective(FieldDirective::Singleton)))
 }
 
 pub fn with_timestamps_fields(fields: &Vec<Field>) -> Vec<Field> {

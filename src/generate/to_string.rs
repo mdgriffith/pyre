@@ -444,6 +444,7 @@ fn to_string_field_directive(
         ast::FieldDirective::Permissions(info) => {
             to_string_permissions_details(namespace, indent, info)
         }
+        ast::FieldDirective::Singleton => format!("{}@singleton\n", spaces),
         ast::FieldDirective::Timestamps => format!("{}@timestamps\n", spaces),
     }
 }

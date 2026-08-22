@@ -1,4 +1,6 @@
-use crate::ast::{Column, ColumnDirective, ColumnType, Definition, Field, SchemaFile};
+use crate::ast::{
+    Column, ColumnDirective, ColumnType, Definition, Field, FieldDirective, SchemaFile,
+};
 use crate::db::introspect::{ColumnInfo, Introspection};
 
 pub fn to_schema(introspection: &Introspection) -> SchemaFile {
@@ -10,6 +12,16 @@ pub fn to_schema(introspection: &Introspection) -> SchemaFile {
         // Convert columns to fields
         for column in &table.columns {
             fields.push(Field::Column(column_info_to_column(column)));
+        }
+
+        if table.indexes.iter().any(|index| {
+            index.name == format!("uniq_{}_singleton", table.name)
+                && index.unique
+                && index.columns.len() == 1
+                && index.columns[0].expression
+                && index.columns[0].name == "1"
+        }) {
+            fields.push(Field::FieldDirective(FieldDirective::Singleton));
         }
 
         // Add the record definition

@@ -457,6 +457,19 @@ fn create_table_from_fields(
         .map(|idx| materialized_index_to_index_info(&table_name, idx))
         .collect();
 
+    if crate::ast::is_singleton(fields) {
+        indexes.push(crate::db::introspect::IndexInfo {
+            name: format!("uniq_{}_singleton", table_name),
+            unique: true,
+            columns: vec![crate::db::introspect::IndexedColumnInfo {
+                name: "1".to_string(),
+                desc: false,
+                expression: true,
+            }],
+            where_clause: None,
+        });
+    }
+
     for field in fields {
         if let crate::ast::Field::Column(column) = field {
             for directive in &column.directives {
@@ -468,6 +481,7 @@ fn create_table_from_fields(
                             columns: vec![crate::db::introspect::IndexedColumnInfo {
                                 name: column.name.clone(),
                                 desc: false,
+                                expression: false,
                             }],
                             where_clause: None,
                         })
@@ -479,6 +493,7 @@ fn create_table_from_fields(
                             columns: vec![crate::db::introspect::IndexedColumnInfo {
                                 name: column.name.clone(),
                                 desc: false,
+                                expression: false,
                             }],
                             where_clause: None,
                         })
@@ -531,6 +546,7 @@ fn materialized_index_to_index_info(
             .map(|c| crate::db::introspect::IndexedColumnInfo {
                 name: c.name.clone(),
                 desc: matches!(c.direction, crate::ast::SortDirection::Desc),
+                expression: false,
             })
             .collect(),
         where_clause: idx.where_.as_ref().map(where_arg_to_sql),
@@ -784,10 +800,15 @@ fn index_signature(index: &crate::db::introspect::IndexInfo) -> String {
         .columns
         .iter()
         .map(|c| {
-            if c.desc {
-                format!("{}:desc", c.name)
+            let name = if c.expression {
+                format!("expr:{}", c.name)
             } else {
-                format!("{}:asc", c.name)
+                c.name.clone()
+            };
+            if c.desc {
+                format!("{}:desc", name)
+            } else {
+                format!("{}:asc", name)
             }
         })
         .collect::<Vec<String>>()

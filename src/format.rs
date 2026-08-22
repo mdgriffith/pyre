@@ -125,6 +125,7 @@ fn reorder_record_fields(fields: &mut Vec<ast::Field>) {
     let mut unique_directives: Vec<ast::Field> = Vec::new();
     let mut index_directives: Vec<ast::Field> = Vec::new();
     let mut permissions: Vec<ast::Field> = Vec::new();
+    let mut singletons: Vec<ast::Field> = Vec::new();
     let mut timestamps: Vec<ast::Field> = Vec::new();
     let mut non_directive_fields: Vec<ast::Field> = Vec::new();
     let mut links: Vec<ast::Field> = Vec::new();
@@ -146,6 +147,9 @@ fn reorder_record_fields(fields: &mut Vec<ast::Field>) {
             }
             ast::Field::FieldDirective(ast::FieldDirective::Permissions(_)) => {
                 permissions.push(field);
+            }
+            ast::Field::FieldDirective(ast::FieldDirective::Singleton) => {
+                singletons.push(field);
             }
             ast::Field::FieldDirective(ast::FieldDirective::Timestamps) => {
                 timestamps.push(field);
@@ -173,6 +177,7 @@ fn reorder_record_fields(fields: &mut Vec<ast::Field>) {
     let has_directives = tablename.is_some()
         || watch.is_some()
         || !permissions.is_empty()
+        || !singletons.is_empty()
         || !unique_directives.is_empty()
         || !index_directives.is_empty()
         || !timestamps.is_empty();
@@ -191,13 +196,16 @@ fn reorder_record_fields(fields: &mut Vec<ast::Field>) {
     // 3. @allowed (or @public)
     fields.extend(permissions);
 
-    // 4. @timestamps
+    // 4. @singleton
+    fields.extend(singletons);
+
+    // 5. @timestamps
     fields.extend(timestamps);
 
-    // 5. @unique
+    // 6. @unique
     fields.extend(unique_directives);
 
-    // 6. @index
+    // 7. @index
     fields.extend(index_directives);
 
     // 7. Empty line (if we have directives and non-directive fields/links)
@@ -376,13 +384,14 @@ fn format_definition(
             // 1. @tablename
             // 2. @watch
             // 3. @allowed (or @public) - ordered: query, update, insert, delete
-            // 4. @timestamps
-            // 5. @unique
-            // 6. @index
-            // 7. Empty line
-            // 8. Columns (in order)
-            // 9. Empty line (if links exist)
-            // 10. Links
+            // 4. @singleton
+            // 5. @timestamps
+            // 6. @unique
+            // 7. @index
+            // 8. Empty line
+            // 9. Columns (in order)
+            // 10. Empty line (if links exist)
+            // 11. Links
             reorder_record_fields(fields);
         }
     }

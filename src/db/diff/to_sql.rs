@@ -139,7 +139,9 @@ fn render_index_sql(table_name: &str, index: &crate::db::introspect::IndexInfo) 
         .columns
         .iter()
         .map(|c| {
-            if c.desc {
+            if c.expression {
+                c.name.clone()
+            } else if c.desc {
                 format!("\"{}\" desc", c.name)
             } else {
                 format!("\"{}\" asc", c.name)
@@ -174,6 +176,7 @@ where
         !index.unique
             && index.where_clause.is_none()
             && index.columns.len() == 1
+            && !index.columns[0].expression
             && index.columns[0].name == column_name
             && !index.columns[0].desc
     })
@@ -237,6 +240,7 @@ mod tests {
                     columns: vec![crate::db::introspect::IndexedColumnInfo {
                         name: "updatedAt".to_string(),
                         desc: false,
+                        expression: false,
                     }],
                     where_clause: None,
                 }],
@@ -265,6 +269,7 @@ mod tests {
             columns: vec![crate::db::introspect::IndexedColumnInfo {
                 name: "updatedAt".to_string(),
                 desc: false,
+                expression: false,
             }],
             where_clause: None,
         };

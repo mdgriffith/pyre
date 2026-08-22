@@ -82,14 +82,21 @@ WITH RECURSIVE
       il.name as index_name,
       il.'unique' as is_unique,
       ix.seqno as seqno,
-      ix.name as column_name,
-      ix.desc as is_desc
+      CASE
+        WHEN ix.name IS NULL AND il.name = 'uniq_' || t.name || '_singleton' THEN '1'
+        ELSE ix.name
+      END as column_name,
+      ix.desc as is_desc,
+      CASE
+        WHEN ix.name IS NULL AND il.name = 'uniq_' || t.name || '_singleton' THEN 1
+        ELSE 0
+      END as is_expression
     FROM all_tables t
     CROSS JOIN pragma_index_list(t.name) il
     CROSS JOIN pragma_index_xinfo(il.name) ix
     WHERE il.origin != 'pk'
       AND ix.key = 1
-      AND ix.name IS NOT NULL
+      AND (ix.name IS NOT NULL OR il.name = 'uniq_' || t.name || '_singleton')
   ),
   -- Group columns for each index
   index_defs AS (
@@ -100,7 +107,8 @@ WITH RECURSIVE
       jsonb_group_array(
         jsonb_object(
           'name', ic.column_name,
-          'desc', CASE WHEN ic.is_desc = 1 THEN jsonb('true') ELSE jsonb('false') END
+          'desc', CASE WHEN ic.is_desc = 1 THEN jsonb('true') ELSE jsonb('false') END,
+          'expression', CASE WHEN ic.is_expression = 1 THEN jsonb('true') ELSE jsonb('false') END
         )
       ) as columns_json
     FROM index_columns ic
@@ -224,14 +232,21 @@ WITH RECURSIVE
       il.name as index_name,
       il.'unique' as is_unique,
       ix.seqno as seqno,
-      ix.name as column_name,
-      ix.desc as is_desc
+      CASE
+        WHEN ix.name IS NULL AND il.name = 'uniq_' || t.name || '_singleton' THEN '1'
+        ELSE ix.name
+      END as column_name,
+      ix.desc as is_desc,
+      CASE
+        WHEN ix.name IS NULL AND il.name = 'uniq_' || t.name || '_singleton' THEN 1
+        ELSE 0
+      END as is_expression
     FROM all_tables t
     CROSS JOIN pragma_index_list(t.name) il
     CROSS JOIN pragma_index_xinfo(il.name) ix
     WHERE il.origin != 'pk'
       AND ix.key = 1
-      AND ix.name IS NOT NULL
+      AND (ix.name IS NOT NULL OR il.name = 'uniq_' || t.name || '_singleton')
   ),
   -- Group columns for each index
   index_defs AS (
@@ -242,7 +257,8 @@ WITH RECURSIVE
       json_group_array(
         json_object(
           'name', ic.column_name,
-          'desc', CASE WHEN ic.is_desc = 1 THEN json('true') ELSE json('false') END
+          'desc', CASE WHEN ic.is_desc = 1 THEN json('true') ELSE json('false') END,
+          'expression', CASE WHEN ic.is_expression = 1 THEN json('true') ELSE json('false') END
         )
       ) as columns_json
     FROM index_columns ic
@@ -365,6 +381,8 @@ pub struct IndexedColumnInfo {
     pub name: String,
     #[serde(default, deserialize_with = "deserialize_boolish")]
     pub desc: bool,
+    #[serde(default, deserialize_with = "deserialize_boolish")]
+    pub expression: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -283,6 +283,88 @@ async fn test_introspection_captures_index_metadata() -> Result<(), TestError> {
     Ok(())
 }
 
+#[tokio::test]
+async fn singleton_record_rejects_a_second_row_and_is_introspected() -> Result<(), TestError> {
+    let db = MigrationDatabase::new(
+        r#"record ApplicationSettings {
+    @singleton
+    @public
+
+    id    Int @id
+    theme String
+}"#,
+    )
+    .await?;
+    let conn = db.db.connect().map_err(TestError::Database)?;
+
+    conn.execute(
+        "insert into applicationSettings (theme) values ('light')",
+        (),
+    )
+    .await
+    .map_err(TestError::Database)?;
+    let second = conn
+        .execute(
+            "insert into applicationSettings (theme) values ('dark')",
+            (),
+        )
+        .await;
+    assert!(
+        second.is_err(),
+        "a singleton table must reject a second row"
+    );
+
+    let introspection = introspect_uninitialized_db(&db.db).await?;
+    let table = introspection
+        .tables
+        .iter()
+        .find(|table| table.name == "applicationSettings")
+        .expect("applicationSettings should be introspected");
+    let singleton_index = table
+        .indexes
+        .iter()
+        .find(|index| index.name == "uniq_applicationSettings_singleton")
+        .expect("singleton index should be introspected");
+    assert!(singleton_index.unique);
+    assert_eq!(singleton_index.columns.len(), 1);
+    assert_eq!(singleton_index.columns[0].name, "1");
+    assert!(singleton_index.columns[0].expression);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn singleton_migrations_add_and_remove_the_constant_unique_index() -> Result<(), TestError> {
+    let regular = r#"record ApplicationSettings {
+    @public
+    id Int @id
+}"#;
+    let singleton = r#"record ApplicationSettings {
+    @singleton
+    @public
+    id Int @id
+}"#;
+
+    let add_sql = diff::to_sql::to_sql(&create_migration_diff(regular, singleton).await?);
+    assert!(add_sql.iter().any(|statement| matches!(
+        statement,
+        pyre::generate::sql::to_sql::SqlAndParams::Sql(sql)
+            if sql == "create unique index if not exists \"uniq_applicationSettings_singleton\" on \"applicationSettings\" (1)"
+    )));
+
+    let remove_sql = diff::to_sql::to_sql(&create_migration_diff(singleton, regular).await?);
+    assert!(remove_sql.iter().any(|statement| matches!(
+        statement,
+        pyre::generate::sql::to_sql::SqlAndParams::Sql(sql)
+            if sql == "drop index if exists \"uniq_applicationSettings_singleton\""
+    )));
+
+    let unchanged = create_migration_diff(singleton, singleton).await?;
+    assert!(unchanged.modified_records.is_empty());
+
+    Ok(())
+}
+
 // ============================================================================
 // Table Migration Tests
 // ============================================================================

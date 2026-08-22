@@ -254,6 +254,36 @@ record Membership {
 }
 
 #[test]
+fn test_valid_singleton_record() {
+    let schema_source = r#"
+record ApplicationSettings {
+    @singleton
+    @public
+
+    id    Id.Uuid @id
+    theme String
+}
+    "#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("singleton should parse");
+
+    let fields = schema
+        .files
+        .iter()
+        .flat_map(|file| &file.definitions)
+        .find_map(|definition| match definition {
+            ast::Definition::Record { name, fields, .. } if name == "ApplicationSettings" => {
+                Some(fields)
+            }
+            _ => None,
+        })
+        .expect("expected ApplicationSettings record");
+
+    assert!(ast::is_singleton(fields));
+}
+
+#[test]
 fn test_invalid_table_level_index_with_unknown_field_fails_typecheck() {
     let schema_source = r#"
 record Membership {

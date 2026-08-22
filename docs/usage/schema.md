@@ -52,7 +52,23 @@ record Membership {
 }
 ```
 
-Useful directives include `@id`, `@default(...)`, `@unique(...)`, `@index(...)`, `@public`, permission directives, `@timestamps`, and `@syncable(false)`.
+Useful directives include `@id`, `@default(...)`, `@unique(...)`, `@index(...)`, `@singleton`, `@public`, permission directives, `@timestamps`, and `@syncable(false)`.
+
+## Singleton Records
+
+Use `@singleton` when a table may contain zero or one row:
+
+```pyre
+record ApplicationSettings {
+    @singleton
+    @public
+
+    id    Id.Uuid @id
+    theme String
+}
+```
+
+Pyre enforces the invariant with a unique SQLite index on a constant expression. The record keeps its normal ID type; `@singleton` does not create or pin an ID. A second row fails with a unique-constraint error, including when it is inserted inside a larger transaction.
 
 ## Types
 
