@@ -254,6 +254,7 @@ fn get_permission_order(field: &ast::Field) -> usize {
                             ast::QueryOperation::Update => 3,
                             ast::QueryOperation::Insert => 4,
                             ast::QueryOperation::Delete => 5,
+                            ast::QueryOperation::Transaction => 6,
                         };
                         min_order = min_order.min(order);
                     }

@@ -73,7 +73,7 @@ interface PyreBridgeClient {
 }
 
 export interface QueryModule<Input = unknown> {
-  operation: 'query' | 'insert' | 'update' | 'delete' | 'mutation';
+  operation: 'query' | 'insert' | 'update' | 'delete' | 'transaction' | 'mutation';
   id?: string;
   source?: unknown;
   queryShape?: unknown;

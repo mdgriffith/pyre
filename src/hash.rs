@@ -48,6 +48,9 @@ fn hash_fields(hasher: &mut Sha256, fields: &[TopLevelQueryField]) {
     for field in fields {
         match field {
             TopLevelQueryField::Field(query_field) => {
+                if let Some(operation) = &query_field.operation {
+                    hasher.update(operation.as_str());
+                }
                 hasher.update(&query_field.name);
                 if let Some(alias) = &query_field.alias {
                     hasher.update(alias);

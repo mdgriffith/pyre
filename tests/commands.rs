@@ -371,6 +371,23 @@ query GetAiSessions {
         updatedAt
     }
 }
+
+transaction ReplaceNode($id: Node.id, $content: Content) {
+    update changedNode: node {
+        @where { id == $id }
+        content = $content
+        id
+    }
+    insert createdNode: node {
+        content = $content
+        id
+    }
+    delete removedNode: node {
+        @where { id == $id }
+        id
+        content
+    }
+}
         "#,
     )
     .unwrap();

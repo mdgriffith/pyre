@@ -4,6 +4,7 @@ mod helpers;
 use helpers::test_database::TestDatabase;
 use pyre::server::manifest::{Manifest, PyreSession, QueryManifest};
 use pyre::server::query;
+use pyre::server::sync::{ConnectedSessions, SyncServer, SyncSession};
 use pyre::{ast, parser, typecheck};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -185,6 +186,24 @@ fn query_by_input_names<'a>(manifest: &'a Manifest, names: &[&str]) -> &'a Query
                     .all(|name| query.input_schema.contains_key(*name))
         })
         .expect("query should have the expected input fields")
+}
+
+fn query_by_operation_and_input_names<'a>(
+    manifest: &'a Manifest,
+    operation: &str,
+    names: &[&str],
+) -> &'a QueryManifest {
+    manifest
+        .queries
+        .values()
+        .find(|query| {
+            query.operation == operation
+                && query.input_schema.len() == names.len()
+                && names
+                    .iter()
+                    .all(|name| query.input_schema.contains_key(*name))
+        })
+        .expect("query should have the expected operation and inputs")
 }
 
 fn query_by_input_signature<'a>(
@@ -459,6 +478,18 @@ fn main() {
         update_game.into_json(),
         serde_json::json!({ "id": 1, "status": { "_type": "ClocktowerStopped" } })
     );
+    let replace_task: server::ReplaceTaskInput = server::replace_task::Input {
+        id: 1,
+        action: server::Action::Create { title: "replacement".to_string() },
+    };
+    assert_eq!(
+        replace_task.into_json(),
+        serde_json::json!({
+            "id": 1,
+            "action": { "_type": "Create", "title": "replacement" }
+        })
+    );
+    assert_eq!(server::query_ids::REPLACE_TASK, server::replace_task::ID);
 
     let responses: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
         &std::fs::read_to_string(std::env::args().nth(1).expect("response path"))
@@ -592,6 +623,21 @@ fn main() {
     let nullable_game = server::create_nullable_game::Output::try_from(response("nullable_game_null"))
         .expect("generated null unit enum output decodes");
     assert!(nullable_game.nullable_game[0].status.is_none());
+    let replaced: server::ReplaceTaskOutput =
+        server::replace_task::Output::try_from(response("task_replaced"))
+            .expect("generated transaction output decodes");
+    assert!(matches!(
+        &replaced.changed_task[0].action,
+        server::Action::Create { title } if title == "replacement"
+    ));
+    assert!(matches!(
+        &replaced.created_task[0].action,
+        server::Action::Create { title } if title == "replacement"
+    ));
+    assert!(matches!(
+        &replaced.removed_task[0].action,
+        server::Action::Create { title } if title == "replacement"
+    ));
 }
 "#,
     )?;
@@ -835,6 +881,23 @@ delete DeleteClocktowerGame($gameId: ClocktowerGame.id) {
 insert CreateNullableGame($status: ClocktowerGameStatus?) {
     nullableGame {
         status = $status
+    }
+}
+
+transaction ReplaceTask($id: Task.id, $action: Action) {
+    update changedTask: task {
+        @where { id == $id }
+        action = $action
+        id
+    }
+    insert createdTask: task {
+        action = $action
+        id
+    }
+    delete removedTask: task {
+        @where { id == $id }
+        id
+        action
     }
 }
 "#;
@@ -1101,7 +1164,7 @@ insert CreateNullableGame($status: ClocktowerGameStatus?) {
     let result = query::run(
         &conn,
         &manifest,
-        &query_by_input_signature(&manifest, &["id", "action"], "action", "Action").id,
+        &query_by_operation_and_input_names(&manifest, "update", &["id", "action"]).id,
         json!({ "id": 1, "action": updated_action.clone() }),
         &session,
     )
@@ -1151,6 +1214,30 @@ insert CreateNullableGame($status: ClocktowerGameStatus?) {
     )
     .await?;
     responses.insert("uuid_game".to_string(), result.response);
+
+    let replacement_action = json!({ "_type": "Create", "title": "replacement" });
+    let transaction = query_by_operation(&manifest, "transaction");
+    let result = query::run(
+        &conn,
+        &manifest,
+        &transaction.id,
+        json!({ "id": 1, "action": replacement_action.clone() }),
+        &session,
+    )
+    .await?;
+    assert_eq!(
+        result.response["changedTask"][0]["action"],
+        replacement_action
+    );
+    assert_eq!(
+        result.response["createdTask"][0]["action"],
+        replacement_action
+    );
+    assert_eq!(
+        result.response["removedTask"][0]["action"],
+        replacement_action
+    );
+    responses.insert("task_replaced".to_string(), result.response);
 
     compile_and_run_generated_rust(
         &generated_rust_server(&db.context, query_source)?,
@@ -1662,6 +1749,318 @@ insert CreateNote($body: String) {
     assert_eq!(result.affected_rows[0].table_name, "notes");
     assert_eq!(result.affected_rows[0].rows.len(), 1);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_transaction_returns_all_steps_and_aggregates_affected_rows(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    body String
+    updatedAt Int
+    @public
+}
+record Counter {
+    id Int @id
+    value Int
+    updatedAt Int
+    @public
+}
+record Pending {
+    id Int @id
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch(
+        "insert into counters (id, value, updatedAt) values (1, 0, 10);\n\
+         insert into pendings (id, updatedAt) values (1, 10);",
+    )
+    .await?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+transaction Apply($body: String, $value: Int) {
+    insert created: note {
+        body = $body
+        updatedAt = 10
+        id
+    }
+    update changed: counter {
+        @where { id == 1 }
+        value = $value
+        id
+    }
+    delete removed: pending {
+        @where { id == 1 }
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let transaction = only_query(&manifest);
+    assert_eq!(transaction.operation, "transaction");
+    query::validate_remote_manifest(&manifest)?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let result = query::run_sync(
+        &conn,
+        &manifest,
+        &transaction.id,
+        json!({ "body": "one", "value": 2 }),
+        &session,
+    )
+    .await?;
+
+    assert_eq!(result.response["created"][0]["body"], json!("one"));
+    assert_eq!(result.response["changed"][0]["value"], json!(2));
+    assert_eq!(result.response["removed"][0]["id"], json!(1));
+    assert_eq!(result.affected_rows.len(), 3);
+    assert_eq!(result.affected_rows[0].table_name, "notes");
+    assert_eq!(result.affected_rows[1].table_name, "counters");
+    assert_eq!(result.affected_rows[2].table_name, "pendings");
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_transaction_preserves_aliases_zero_rows_and_shared_session_permissions(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+session {
+    userId Int
+}
+
+record Note {
+    id Int @id
+    ownerId Int
+    body String
+    updatedAt Int
+    @allow(*) { ownerId == Session.userId }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch(
+        "insert into notes (id, ownerId, body, updatedAt) values (1, 7, 'old', 10);\n\
+         insert into notes (id, ownerId, body, updatedAt) values (2, 8, 'private', 10);",
+    )
+    .await?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+transaction ChangeNotes($body: String) {
+    update changed: note {
+        @where { id == 1 }
+        body = $body
+        id
+    }
+    delete denied: note {
+        @where { id == 2 }
+        id
+    }
+    insert created: note {
+        ownerId = Session.userId
+        body = $body
+        updatedAt = 10
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let transaction = only_query(&manifest);
+    assert_eq!(transaction.session_args, vec!["userId"]);
+    let session = PyreSession::new(json!({ "userId": 7 }), &manifest.session_schema)?;
+    let result = query::run(
+        &conn,
+        &manifest,
+        &transaction.id,
+        json!({ "body": "changed" }),
+        &session,
+    )
+    .await?;
+
+    assert_eq!(result.response["changed"][0]["body"], json!("changed"));
+    assert_eq!(result.response["denied"], json!([]));
+    assert_eq!(result.response["created"][0]["ownerId"], json!(7));
+    let mut rows = conn
+        .query("select body from notes where id = 2", ())
+        .await?;
+    assert_eq!(
+        rows.next()
+            .await?
+            .expect("denied row should remain")
+            .get::<String>(0)?,
+        "private"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_transaction_rolls_back_on_late_unique_constraint_failure(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Int @id
+    body String @unique
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute(
+        "insert into notes (id, body, updatedAt) values (1, 'taken', 10)",
+        (),
+    )
+    .await?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+transaction CreateNotes {
+    insert first: note {
+        body = "one"
+        updatedAt = 10
+        id
+    }
+    insert duplicate: note {
+        body = "taken"
+        updatedAt = 10
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+
+    query::run(
+        &conn,
+        &manifest,
+        &only_query(&manifest).id,
+        json!({}),
+        &session,
+    )
+    .await
+    .expect_err("duplicate insert should fail the transaction");
+    let mut rows = conn.query("select body from notes order by id", ()).await?;
+    let row = rows.next().await?.expect("original row should remain");
+    assert_eq!(row.get::<String>(0)?, "taken");
+    assert!(rows.next().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_nested_transaction_rolls_back_without_sync_publication(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Parent {
+    id Int @id
+    name String
+    updatedAt Int
+    children @link(Child.parentId)
+    @public
+}
+
+record Child {
+    id Int @id
+    parentId Int
+    slug String @unique
+    updatedAt Int
+    parent @link(parentId, Parent.id)
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch(
+        "insert into parents (id, name, updatedAt) values (1, 'baseline', 10);\n\
+         insert into children (id, parentId, slug, updatedAt) values (1, 1, 'taken', 10);",
+    )
+    .await?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+transaction CreateParents {
+    insert first: parent {
+        name = "first"
+        updatedAt = 10
+        children {
+            slug = "ok"
+            updatedAt = 10
+        }
+    }
+    insert second: parent {
+        name = "second"
+        updatedAt = 10
+        children {
+            slug = "taken"
+            updatedAt = 10
+        }
+    }
+}
+"#,
+        false,
+    )?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let connected_sessions = ConnectedSessions::from([("client".to_string(), SyncSession::new())]);
+
+    let messages = match query::run_sync(
+        &conn,
+        &manifest,
+        &only_query(&manifest).id,
+        json!({}),
+        &session,
+    )
+    .await
+    {
+        Ok(mut result) => {
+            SyncServer::new(&db.context)
+                .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
+                .await?
+        }
+        Err(_) => Vec::new(),
+    };
+
+    assert!(messages.is_empty());
+    let mut rows = conn
+        .query("select name from parents order by id", ())
+        .await?;
+    assert_eq!(
+        rows.next()
+            .await?
+            .expect("baseline parent")
+            .get::<String>(0)?,
+        "baseline"
+    );
+    assert!(rows.next().await?.is_none());
+    let mut rows = conn
+        .query("select slug from children order by id", ())
+        .await?;
+    assert_eq!(
+        rows.next()
+            .await?
+            .expect("baseline child")
+            .get::<String>(0)?,
+        "taken"
+    );
+    assert!(rows.next().await?.is_none());
+    let mut rows = conn
+        .query("select server_revision from _pyre_sync where id = 1", ())
+        .await?;
+    assert_eq!(rows.next().await?.expect("sync row").get::<i64>(0)?, 0);
     Ok(())
 }
 

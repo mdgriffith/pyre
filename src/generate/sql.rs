@@ -128,7 +128,8 @@ pub fn to_string_with_affected_rows(
     table_field: &ast::QueryField,
     include_affected_rows: bool,
 ) -> Vec<to_sql::Prepared> {
-    match query.operation {
+    let operation = ast::query_field_operation(query, table_field);
+    match operation {
         ast::QueryOperation::Query => {
             json::select::select_to_string(context, query, query_info, table, table_field)
         }
@@ -166,5 +167,6 @@ pub fn to_string_with_affected_rows(
             table_field,
             include_affected_rows,
         ),
+        ast::QueryOperation::Transaction => unreachable!("transaction fields have an operation"),
     }
 }

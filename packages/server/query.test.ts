@@ -1,8 +1,137 @@
 import { expect, mock, test } from "bun:test";
 import type { SchemaMetadata } from "@pyre/core";
+import { createClient } from "@libsql/client";
 import { z } from "zod";
 import { run, seed } from "./query";
+import { toRunner } from "./runtime/runner";
 import { buildArgs, toSqlStatements } from "./runtime/sql";
+
+test("transaction runner executes every step in exactly one ordered batch", async () => {
+  const db = {
+    batch: mock(async () => [
+      {
+        columns: ["updatedNotes"],
+        rows: [{ updatedNotes: JSON.stringify({ id: 1, body: "updated" }) }],
+      },
+      {
+        columns: ["missingNotes"],
+        rows: [{ missingNotes: JSON.stringify([]) }],
+      },
+      {
+        columns: ["createdNotes"],
+        rows: [{ createdNotes: JSON.stringify({ id: 2, body: "created" }) }],
+      },
+    ]),
+  };
+  const sql = [
+    {
+      include: true,
+      params: ["body", "session_userId"],
+      sql: "update notes returning updatedNotes",
+    },
+    {
+      include: true,
+      params: ["session_userId"],
+      sql: "delete from notes returning missingNotes",
+    },
+    {
+      include: true,
+      params: ["body", "session_userId"],
+      sql: "insert into notes returning createdNotes",
+    },
+  ];
+  const runner = toRunner(
+    {
+      session_args: ["userId"],
+      optional_input_args: [],
+      json_input_args: [],
+      InputValidator: z.object({ body: z.string() }),
+      SessionValidator: z.object({ userId: z.number() }),
+      ReturnData: z.object({
+        updatedNotes: z.array(z.object({ id: z.number(), body: z.string() })),
+        missingNotes: z.array(z.object({ id: z.number(), body: z.string() })),
+        createdNotes: z.array(z.object({ id: z.number(), body: z.string() })),
+      }),
+    },
+    sql,
+  );
+
+  const result = await runner(db as any, { userId: 7 }, { body: "updated" });
+
+  expect(db.batch).toHaveBeenCalledTimes(1);
+  expect(db.batch).toHaveBeenCalledWith([
+    {
+      sql: "update notes returning updatedNotes",
+      args: { body: "updated", session_userId: 7 },
+    },
+    {
+      sql: "delete from notes returning missingNotes",
+      args: { session_userId: 7 },
+    },
+    {
+      sql: "insert into notes returning createdNotes",
+      args: { body: "updated", session_userId: 7 },
+    },
+  ]);
+  expect(result).toEqual({
+    updatedNotes: [{ id: 1, body: "updated" }],
+    missingNotes: [],
+    createdNotes: [{ id: 2, body: "created" }],
+  });
+});
+
+test("failed transaction batch rolls back before sync publication", async () => {
+  const db = createClient({ url: "file::memory:" });
+  const syncDeltas = mock(async () => ({ serverRevision: 1 }));
+
+  try {
+    await db.execute("create table notes (id integer primary key, body text unique not null)");
+    await db.execute({
+      sql: "insert into notes (body) values (?)",
+      args: ["taken"],
+    });
+
+    await expect(run(
+      db,
+      {
+        createNotes: {
+          id: "createNotes",
+          sql: [],
+          syncSql: [
+            {
+              include: false,
+              params: [],
+              sql: "insert into notes (body) values ('first')",
+            },
+            {
+              include: false,
+              params: [],
+              sql: "insert into notes (body) values ('taken')",
+            },
+          ],
+          session_args: [],
+          optional_input_args: [],
+          json_input_args: [],
+          InputValidator: z.object({}),
+          SessionValidator: z.object({}),
+        },
+      },
+      "createNotes",
+      {},
+      {},
+      new Map([["client", { session: {} }]]),
+      syncDeltas,
+      undefined,
+      { mode: "sync" },
+    )).rejects.toThrow();
+
+    const rows = await db.execute("select body from notes order by id");
+    expect(rows.rows).toEqual([{ body: "taken" }]);
+    expect(syncDeltas).not.toHaveBeenCalled();
+  } finally {
+    db.close();
+  }
+});
 
 test("sync wraps mutation responses with server revision metadata", async () => {
   const db = {

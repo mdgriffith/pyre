@@ -4,5 +4,6 @@ mod inserts;
 mod permissions;
 mod queries;
 mod schema;
+mod transactions;
 mod updates;
 mod variant_fields;

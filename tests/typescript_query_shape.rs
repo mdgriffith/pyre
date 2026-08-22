@@ -10,6 +10,59 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 }
 
 #[test]
+fn generated_typescript_transaction_has_shared_input_and_step_results() {
+    let schema_source = r#"
+record Note {
+    id Id.Int @id
+    body String
+    updatedAt Int
+    @public
+}
+"#;
+    let query_source = r#"
+transaction ReplaceNote($id: Note.id, $body: String) {
+    delete removed: note {
+        @where { id == $id }
+        id
+    }
+    insert created: note {
+        body = $body
+        updatedAt = 10
+        id
+    }
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    let query_list = parser::parse_query("query.pyre", query_source).expect("query parses");
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    core::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+    let generated = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "queries/metadata/replaceNote.ts"))
+        .expect("generated transaction metadata");
+
+    assert!(generated.contents.contains("id: z.number()"));
+    assert!(generated.contents.contains("body: z.string()"));
+    assert!(generated.contents.contains("removed: Removed.array()"));
+    assert!(generated.contents.contains("created: Created.array()"));
+    assert!(generated
+        .contents
+        .contains("operation: \"transaction\" as const"));
+}
+
+#[test]
 fn generated_typescript_query_shape_preserves_where_placeholders() {
     let schema_source = r#"
 session {

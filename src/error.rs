@@ -820,6 +820,7 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
                         ast::QueryOperation::Update => "update",
                         ast::QueryOperation::Delete => "delete",
                         ast::QueryOperation::Query => "query",
+                        ast::QueryOperation::Transaction => "transaction",
                     }
                 ),
                 cyan_if(in_color, table)
@@ -1388,6 +1389,7 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
                 ast::QueryOperation::Insert => "inserting a value to",
                 ast::QueryOperation::Update => "updating a value on",
                 ast::QueryOperation::Delete => "deleting from",
+                ast::QueryOperation::Transaction => "running a transaction on",
             };
 
             let schema_words: String = format_yellow_or_list(&other_schemas, in_color);

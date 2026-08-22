@@ -2194,6 +2194,82 @@ query GetPosts {
 }
 
 #[test]
+fn transaction_rejects_writes_to_multiple_namespaces() {
+    let mut app_schema = ast::Schema::default();
+    app_schema.namespace = "App".to_string();
+    parser::run(
+        "pyre/schema/App/schema.pyre",
+        r#"
+record Note {
+    id Int @id
+    body String
+    @public
+}
+"#,
+        &mut app_schema,
+    )
+    .expect("App schema should parse");
+
+    let mut auth_schema = ast::Schema::default();
+    auth_schema.namespace = "Auth".to_string();
+    parser::run(
+        "pyre/schema/Auth/schema.pyre",
+        r#"
+record Account {
+    id Int @id
+    name String
+    @public
+}
+"#,
+        &mut auth_schema,
+    )
+    .expect("Auth schema should parse");
+
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![app_schema, auth_schema],
+    })
+    .expect("Schemas should typecheck");
+    let queries = parser::parse_query(
+        "query.pyre",
+        r#"
+transaction CreateNoteAndAccount {
+    insert note {
+        body = "note"
+        id
+    }
+    insert account {
+        name = "account"
+        id
+    }
+}
+"#,
+    )
+    .expect("Transaction should parse");
+    let errors = match typecheck::check_queries(&queries, &context) {
+        Ok(_) => panic!("Writes to multiple namespaces should fail"),
+        Err(errors) => errors,
+    };
+
+    assert!(
+        errors.iter().any(|error| {
+            matches!(
+                &error.error_type,
+                ErrorType::MultipleSchemaWrites {
+                    field_table,
+                    field_schema,
+                    operation: ast::QueryOperation::Insert,
+                    other_schemas,
+                } if field_table == "Account"
+                    && field_schema == "Auth"
+                    && other_schemas == &["App".to_string()]
+            )
+        }),
+        "Expected a multiple-schema write error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn foreign_key_requires_namespace_to_reference_external_table() {
     let mut app_schema = ast::Schema::default();
     app_schema.namespace = "App".to_string();

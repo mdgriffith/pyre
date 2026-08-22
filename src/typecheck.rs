@@ -2291,7 +2291,7 @@ pub fn check_query(context: &Context, errors: &mut Vec<Error>, query: &ast::Quer
                         context,
                         &query_context,
                         errors,
-                        &query.operation,
+                        ast::query_field_operation(query, query_field),
                         None,
                         table,
                         query_field,
@@ -3931,6 +3931,7 @@ fn add_schema(
         ast::QueryOperation::Query => {
             used_schemas.secondary.insert(table.schema.to_string());
         }
+        ast::QueryOperation::Transaction => unreachable!("transaction fields have an operation"),
     }
 }
 
@@ -4601,6 +4602,7 @@ fn check_field(
                 })
             }
         }
+        ast::QueryOperation::Transaction => unreachable!("transaction fields have an operation"),
     }
 }
 

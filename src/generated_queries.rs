@@ -279,6 +279,7 @@ fn table_root_field(
     fields: Vec<ast::ArgField>,
 ) -> ast::TopLevelQueryField {
     ast::TopLevelQueryField::Field(ast::QueryField {
+        operation: None,
         name: crate::ext::string::decapitalize(&table.record.name),
         alias: None,
         set: None,
@@ -301,6 +302,7 @@ fn selection_field(name: &str) -> ast::QueryField {
 
 fn query_field_with_set(name: &str, set: Option<ast::QueryValue>) -> ast::QueryField {
     ast::QueryField {
+        operation: None,
         name: name.to_string(),
         alias: None,
         set,

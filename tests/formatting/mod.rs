@@ -590,6 +590,7 @@ fn top_level_query_field_equal_ignoring_locations(
 fn query_field_equal_ignoring_locations(a: &ast::QueryField, b: &ast::QueryField) -> bool {
     a.name == b.name
         && a.alias == b.alias
+        && a.operation == b.operation
         && match (&a.set, &b.set) {
             (None, None) => true,
             (Some(sa), Some(sb)) => query_value_equal_ignoring_locations(sa, sb),
@@ -1669,6 +1670,33 @@ fn test_query_round_trip_delete() {
     let query_source = r#"
 delete DeleteUser($id: Int) {
     user {
+        @where { id == $id }
+        id
+    }
+}
+    "#;
+
+    round_trip_query(query_source, &database);
+}
+
+#[test]
+fn test_query_round_trip_transaction() {
+    let database = create_test_database();
+    let query_source = r#"
+transaction ChangeUsers($id: Int, $name: String, $email: String) {
+    update changed: user {
+        @where { id == $id }
+        name = $name
+        id
+    }
+
+    insert created: user {
+        name = $name
+        email = $email
+        id
+    }
+
+    delete removed: user {
         @where { id == $id }
         id
     }

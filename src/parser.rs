@@ -1184,7 +1184,57 @@ fn parse_query_list(input: Text) -> ParseResult<ast::QueryList> {
 }
 
 fn parse_query_def(input: Text) -> ParseResult<ast::QueryDef> {
-    alt((parse_query_comment, parse_query_lines, parse_query_details))(input)
+    alt((
+        parse_query_comment,
+        parse_query_lines,
+        parse_transaction_details,
+        parse_query_details,
+    ))(input)
+}
+
+fn parse_transaction_details(input: Text) -> ParseResult<ast::QueryDef> {
+    let (input, _) = tag("transaction")(input)?;
+    let (input, _) = cut(multispace1)(input)?;
+    let (input, start_pos) = position(input)?;
+    let (input, name) = cut(parse_typename)(input)?;
+    let (input, param_defs_or_nothing) = cut(opt(parse_query_param_definitions))(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, fields) = with_braces(parse_transaction_field)(input)?;
+    let (input, end_pos) = position(input)?;
+    let (input, _) = opt(newline)(input)?;
+
+    let mut query = ast::Query {
+        interface_hash: String::new(),
+        full_hash: String::new(),
+        operation: ast::QueryOperation::Transaction,
+        name: name.to_string(),
+        args: param_defs_or_nothing.unwrap_or_default(),
+        fields,
+        start: Some(to_location(&start_pos)),
+        end: Some(to_location(&end_pos)),
+    };
+    query.interface_hash = crate::hash::hash_query_interface(&query);
+    query.full_hash = crate::hash::hash_query_full(&query);
+    Ok((input, ast::QueryDef::Query(query)))
+}
+
+fn parse_transaction_field(input: Text) -> ParseResult<ast::TopLevelQueryField> {
+    alt((
+        parse_toplevel_query_comment,
+        parse_toplevel_query_lines,
+        |input| {
+            let (input, operation) = alt((
+                parse_token("insert", ast::QueryOperation::Insert),
+                parse_token("update", ast::QueryOperation::Update),
+                parse_token("delete", ast::QueryOperation::Delete),
+            ))(input)?;
+            let (input, _) = cut(multispace1)(input)?;
+            let (input, mut field) = cut(parse_query_field)(input)?;
+            field.operation = Some(operation);
+            let (input, _) = opt(newline)(input)?;
+            Ok((input, ast::TopLevelQueryField::Field(field)))
+        },
+    ))(input)
 }
 
 fn parse_query_comment(input: Text) -> ParseResult<ast::QueryDef> {
@@ -1454,6 +1504,7 @@ fn parse_query_field(input: Text) -> ParseResult<ast::QueryField> {
         ast::QueryField {
             name: name.to_string(),
             alias,
+            operation: None,
             set,
             directives: vec![],
             fields: fields_or_none.unwrap_or_else(Vec::new),

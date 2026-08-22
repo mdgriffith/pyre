@@ -1199,6 +1199,7 @@ pub enum QueryOperation {
     Insert,
     Update,
     Delete,
+    Transaction,
 }
 
 impl QueryOperation {
@@ -1208,6 +1209,7 @@ impl QueryOperation {
             QueryOperation::Insert => "insert",
             QueryOperation::Update => "update",
             QueryOperation::Delete => "delete",
+            QueryOperation::Transaction => "transaction",
         }
     }
 }
@@ -1257,6 +1259,8 @@ pub fn get_aliased_name(field: &QueryField) -> String {
 pub struct QueryField {
     pub name: String,
     pub alias: Option<String>,
+    /// Set only for top-level fields inside a transaction.
+    pub operation: Option<QueryOperation>,
     pub set: Option<QueryValue>,
     pub directives: Vec<String>,
     pub fields: Vec<ArgField>,
@@ -1266,6 +1270,10 @@ pub struct QueryField {
 
     pub start: Option<Location>,
     pub end: Option<Location>,
+}
+
+pub fn query_field_operation<'a>(query: &'a Query, field: &'a QueryField) -> &'a QueryOperation {
+    field.operation.as_ref().unwrap_or(&query.operation)
 }
 
 #[derive(Debug, Clone)]

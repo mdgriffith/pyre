@@ -498,6 +498,7 @@ fn to_string_permissions_details(
                         ast::QueryOperation::Insert => "insert",
                         ast::QueryOperation::Update => "update",
                         ast::QueryOperation::Delete => "delete",
+                        ast::QueryOperation::Transaction => "transaction",
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -698,6 +699,7 @@ fn to_string_query(query: &ast::Query) -> String {
         ast::QueryOperation::Insert => "insert",
         ast::QueryOperation::Delete => "delete",
         ast::QueryOperation::Update => "update",
+        ast::QueryOperation::Transaction => "transaction",
     };
     let mut result = format!("{} {}", operation_name, query.name);
 
@@ -717,10 +719,33 @@ fn to_string_query(query: &ast::Query) -> String {
     result.push_str(" {\n");
 
     for field in &query.fields {
-        result.push_str(&to_string_toplevel_query_field(4, &field));
+        if query.operation == ast::QueryOperation::Transaction {
+            result.push_str(&to_string_transaction_field(4, field));
+        } else {
+            result.push_str(&to_string_toplevel_query_field(4, field));
+        }
     }
     result.push_str("}\n");
     result
+}
+
+fn to_string_transaction_field(indent: usize, field: &ast::TopLevelQueryField) -> String {
+    match field {
+        ast::TopLevelQueryField::Field(query_field) => {
+            let mut result = format!(
+                "{}{} ",
+                " ".repeat(indent),
+                query_field
+                    .operation
+                    .as_ref()
+                    .expect("transaction field operation")
+                    .as_str()
+            );
+            result.push_str(to_string_query_field(0, query_field).trim_start());
+            result
+        }
+        _ => to_string_toplevel_query_field(indent, field),
+    }
 }
 
 fn to_string_toplevel_query_field(indent: usize, field: &ast::TopLevelQueryField) -> String {

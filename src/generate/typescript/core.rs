@@ -481,6 +481,7 @@ fn to_query_metadata_file(
             ast::QueryOperation::Insert => "insert",
             ast::QueryOperation::Update => "update",
             ast::QueryOperation::Delete => "delete",
+            ast::QueryOperation::Transaction => "transaction",
         }
     ));
     meta_block.push_str(&format!("  session_args: {},\n", session_args));

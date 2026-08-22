@@ -10,6 +10,7 @@ pub fn operation_name(operation: &ast::QueryOperation) -> String {
         ast::QueryOperation::Insert => "Added",
         ast::QueryOperation::Update => "Updated",
         ast::QueryOperation::Delete => "Deleted",
+        ast::QueryOperation::Transaction => unreachable!("transactions are not watch operations"),
     }
     .to_string()
 }

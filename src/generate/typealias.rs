@@ -62,7 +62,7 @@ pub fn return_data_aliases(
                             &table.record,
                             "",
                             query_field,
-                            query.operation.clone(),
+                            ast::query_field_operation(query, query_field).clone(),
                             formatter,
                             result,
                         );

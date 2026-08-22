@@ -996,12 +996,14 @@ mod tests {
         };
 
         let query_table_field = ast::QueryField {
+            operation: None,
             name: "user".to_string(),
             alias: None,
             set: None,
             directives: vec![],
             fields: vec![
                 ast::ArgField::Field(ast::QueryField {
+                    operation: None,
                     name: "name".to_string(),
                     alias: None,
                     set: Some(ast::QueryValue::Variable((
@@ -1019,6 +1021,7 @@ mod tests {
                     end: None,
                 }),
                 ast::ArgField::Field(ast::QueryField {
+                    operation: None,
                     name: "updatedAt".to_string(),
                     alias: None,
                     set: None,
@@ -1051,6 +1054,7 @@ mod tests {
     #[test]
     fn select_only_updated_at_is_not_treated_as_explicit_insert() {
         let query_field = ast::QueryField {
+            operation: None,
             name: "updatedAt".to_string(),
             alias: None,
             set: None,

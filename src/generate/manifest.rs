@@ -375,18 +375,19 @@ fn query_sql(
             &query_info.variables,
         );
 
-        let prepared = if query.operation == ast::QueryOperation::Query {
-            sql::to_string(context, query, query_info, table, query_field)
-        } else {
-            sql::to_string_with_affected_rows(
-                context,
-                query,
-                query_info,
-                table,
-                query_field,
-                sync_mode,
-            )
-        };
+        let prepared =
+            if *ast::query_field_operation(query, query_field) == ast::QueryOperation::Query {
+                sql::to_string(context, query, query_info, table, query_field)
+            } else {
+                sql::to_string_with_affected_rows(
+                    context,
+                    query,
+                    query_info,
+                    table,
+                    query_field,
+                    sync_mode,
+                )
+            };
 
         for prepared in prepared {
             result.push(SqlInfo {
@@ -466,6 +467,7 @@ fn operation_to_string(operation: &ast::QueryOperation) -> String {
         ast::QueryOperation::Insert => "insert",
         ast::QueryOperation::Update => "update",
         ast::QueryOperation::Delete => "delete",
+        ast::QueryOperation::Transaction => "transaction",
     }
     .to_string()
 }

@@ -130,6 +130,7 @@ pub fn to_selection(
                         continue;
                     }
                     let wildcard_field = ast::QueryField {
+                        operation: None,
                         name: column.name.clone(),
                         alias: None,
                         set: None,
