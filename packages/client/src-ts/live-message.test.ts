@@ -204,6 +204,7 @@ test('Elm live syncRequired starts catchup from the current cursor', async () =>
         tables: {
           maps: {
             last_seen_updated_at: null,
+            last_seen_primary_key: null,
             permission_hash: '',
           },
         },

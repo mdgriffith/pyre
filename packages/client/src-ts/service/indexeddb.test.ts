@@ -7,7 +7,8 @@ test('IndexedDbService restores persisted sync cursor with initial data', async 
   const persistedCursor: SyncCursor = {
     tables: {
       maps: {
-        last_seen_updated_at: null,
+        last_seen_updated_at: 10,
+        last_seen_primary_key: '00000000-0000-0000-0000-000000000001',
         permission_hash: 'perm-hash',
       },
     },

@@ -43,6 +43,8 @@ pub fn normalize_page_size(page_size: usize) -> Result<usize, SyncError> {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TableCursor {
     pub last_seen_updated_at: Option<i64>, // Unix timestamp
+    #[serde(default)]
+    pub last_seen_primary_key: Option<JsonValue>,
     pub permission_hash: String,
 }
 
@@ -73,6 +75,8 @@ pub struct TableSyncData {
     pub permission_hash: String,
     /// The maximum updated_at timestamp from the returned rows (client should update cursor with this)
     pub last_seen_updated_at: Option<i64>,
+    /// The primary key of the last returned row, used to disambiguate equal timestamps.
+    pub last_seen_primary_key: Option<JsonValue>,
 }
 
 /// SQL statements for syncing a table
@@ -85,6 +89,7 @@ pub struct SyncStatement {
 #[derive(Clone, Debug)]
 pub struct TableSyncSql {
     pub table_name: String,
+    pub primary_key: String,
     pub permission_hash: String,
     pub sql: Vec<String>,
     pub params: Vec<Vec<SessionValue>>,
@@ -144,6 +149,22 @@ pub fn validate_sync_cursor(
                 "sync cursor permission_hash for '{}' is too large",
                 table_name
             )));
+        }
+
+        if cursor.last_seen_updated_at.is_none() && cursor.last_seen_primary_key.is_some() {
+            return Err(SyncError::InvalidSyncCursor(format!(
+                "sync cursor primary key for '{}' requires last_seen_updated_at",
+                table_name
+            )));
+        }
+
+        if let Some(primary_key) = &cursor.last_seen_primary_key {
+            if primary_key.as_i64().is_none() && primary_key.as_str().is_none() {
+                return Err(SyncError::InvalidSyncCursor(format!(
+                    "sync cursor primary key for '{}' must be an integer or string",
+                    table_name
+                )));
+            }
         }
     }
 
@@ -205,6 +226,7 @@ pub struct TableSyncStatus {
     pub sync_layer: usize,
     pub needs_sync: bool,
     pub max_updated_at: Option<i64>,
+    pub max_primary_key: Option<JsonValue>,
     pub permission_hash: String,
 }
 
@@ -291,7 +313,9 @@ pub fn calculate_permission_hash(
     session: &HashMap<String, SessionValue>,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update("permission_hash_v2");
+    // v3 forces timestamp-only cursors to perform one full sync and acquire
+    // the primary-key component required for lossless pagination.
+    hasher.update("permission_hash_v3");
 
     // Hash the permission AST structure
     if let Some(perm) = permission {
@@ -697,6 +721,14 @@ fn get_sync_status_sql_with_params(
         // Get the actual table name from @tablename directive
         let actual_table_name = ast::get_tablename(&table.record.name, &table.record.fields);
         let quoted_table_name = string::quote(&actual_table_name);
+        let primary_key =
+            ast::get_primary_id_field_name(&table.record.fields).ok_or_else(|| {
+                SyncError::SqlGenerationError(format!(
+                    "Table {} has no primary key",
+                    actual_table_name
+                ))
+            })?;
+        let quoted_primary_key = string::quote(&primary_key);
 
         // Get permission for select operation
         let permission = ast::get_permissions(&table.record, &ast::QueryOperation::Query);
@@ -718,9 +750,7 @@ fn get_sync_status_sql_with_params(
             String::new()
         };
 
-        // Build the subquery for this table
-        // We compute MAX(updatedAt) with permissions applied
-        // Also include the sync_layer, table_name, permission_hash, and last_seen_updated_at
+        // Select the final tuple in the same ordering used by catch-up pagination.
         let sync_layer_value = table.sync_layer;
         let table_name_literal = string::single_quote(&actual_table_name);
         let permission_hash_literal = string::single_quote(&current_permission_hash);
@@ -730,14 +760,16 @@ fn get_sync_status_sql_with_params(
         };
 
         let subquery = format!(
-            "SELECT {} AS table_name, {} AS sync_layer, {} AS permission_hash, {} AS last_seen_updated_at, MAX({}.updatedAt) AS max_updated_at, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch FROM {}{}",
+            "SELECT {} AS table_name, {} AS sync_layer, {} AS permission_hash, {} AS last_seen_updated_at, _pyre_latest.updatedAt AS max_updated_at, _pyre_latest.{} AS max_primary_key, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch FROM (SELECT 1) AS _pyre_status LEFT JOIN (SELECT updatedAt, {} FROM {}{} ORDER BY updatedAt DESC, {} DESC LIMIT 1) AS _pyre_latest ON 1 = 1",
             table_name_literal,
             sync_layer_value,
             permission_hash_literal,
             last_seen_literal,
+            quoted_primary_key,
+            quoted_primary_key,
             quoted_table_name,
-            quoted_table_name,
-            permission_where
+            permission_where,
+            quoted_primary_key
         );
 
         union_parts.push(subquery);
@@ -745,7 +777,7 @@ fn get_sync_status_sql_with_params(
 
     if union_parts.is_empty() {
         return Ok(
-            "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch"
+            "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, NULL AS max_primary_key, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch"
                 .to_string(),
         );
     }
@@ -823,6 +855,11 @@ pub fn parse_sync_status(
             }
         });
 
+        let max_primary_key = row
+            .get("max_primary_key")
+            .filter(|value| !value.is_null())
+            .cloned();
+
         let last_seen_updated_at = row.get("last_seen_updated_at").and_then(|v| {
             if v.is_null() {
                 None
@@ -838,9 +875,20 @@ pub fn parse_sync_status(
             None => true, // No cursor means first sync
         };
 
-        // Check if max_updated_at > last_seen_updated_at
+        let last_seen_primary_key =
+            table_cursor.and_then(|cursor| cursor.last_seen_primary_key.as_ref());
+
+        // Timestamp-only cursors retain their legacy behavior until the v3
+        // permission hash forces a full sync and supplies the key component.
         let has_new_data = match (max_updated_at, last_seen_updated_at) {
-            (Some(max), Some(last)) => max > last,
+            (Some(max), Some(last)) if max > last => true,
+            (Some(max), Some(last)) if max == last => {
+                match (max_primary_key.as_ref(), last_seen_primary_key) {
+                    (Some(max_key), Some(last_key)) => primary_key_is_greater(max_key, last_key)?,
+                    _ => false,
+                }
+            }
+            (Some(_), Some(_)) => false,
             (Some(_), None) => true, // Has data but no cursor
             (None, _) => false,      // No data
         };
@@ -852,6 +900,7 @@ pub fn parse_sync_status(
             sync_layer,
             needs_sync,
             max_updated_at,
+            max_primary_key,
             permission_hash,
         });
     }
@@ -903,6 +952,13 @@ pub fn get_sync_sql(
         }
 
         let actual_table_name = &status.table_name;
+        let primary_key =
+            ast::get_primary_id_field_name(&table.record.fields).ok_or_else(|| {
+                SyncError::SqlGenerationError(format!(
+                    "Table {} has no primary key",
+                    actual_table_name
+                ))
+            })?;
 
         // Get permission for select operation
         let permission = ast::get_permissions(&table.record, &ast::QueryOperation::Query);
@@ -924,6 +980,11 @@ pub fn get_sync_sql(
             // Use the last_seen_updated_at from cursor (not max_updated_at from status)
             table_cursor.and_then(|c| c.last_seen_updated_at)
         };
+        let last_seen_primary_key = if needs_full_resync {
+            None
+        } else {
+            table_cursor.and_then(|cursor| cursor.last_seen_primary_key.as_ref())
+        };
 
         // Build WHERE clause combining permissions and updatedAt filter
         let mut where_parts = Vec::new();
@@ -940,18 +1001,26 @@ pub fn get_sync_sql(
             ));
         }
 
-        // Add updatedAt filter if provided
+        // Add the keyset pagination filter. Timestamp-only cursors remain valid
+        // for persisted pre-v3 client state.
         if let Some(updated_at) = last_seen_updated_at {
             let table_name = crate::ext::string::quote(&ast::get_tablename(
                 &table.record.name,
                 &table.record.fields,
             ));
-            params.push(SessionValue::Integer(updated_at));
-            let updated_at_where = format!(
-                "{}.{} > ?",
-                table_name,
-                crate::ext::string::quote("updatedAt")
-            );
+            let updated_at_column = crate::ext::string::quote("updatedAt");
+            let primary_key_column = crate::ext::string::quote(&primary_key);
+            let updated_at_where = if let Some(primary_key_value) = last_seen_primary_key {
+                params.push(SessionValue::Integer(updated_at));
+                params.push(SessionValue::Integer(updated_at));
+                params.push(primary_key_session_value(primary_key_value)?);
+                format!(
+                    "({table_name}.{updated_at_column} > ? OR ({table_name}.{updated_at_column} = ? AND {table_name}.{primary_key_column} > ?))"
+                )
+            } else {
+                params.push(SessionValue::Integer(updated_at));
+                format!("{table_name}.{updated_at_column} > ?")
+            };
             where_parts.push(updated_at_where);
         }
 
@@ -1012,18 +1081,21 @@ pub fn get_sync_sql(
             .collect::<Vec<_>>();
 
         let sql = format!(
-            "SELECT coalesce(json_group_array(json_array({})), json('[]')) AS {} FROM (SELECT {} FROM {}{} ORDER BY {}.updatedAt ASC LIMIT {})",
+            "SELECT coalesce(json_group_array(json_array({})), json('[]')) AS {} FROM (SELECT {} FROM {}{} ORDER BY {}.updatedAt ASC, {}.{} ASC LIMIT {})",
             row_values.join(", "),
             string::quote(SYNC_ROWS_JSON_COLUMN),
             columns.join(", "),
             quoted_table_name,
             where_clause,
             quoted_table_name,
+            quoted_table_name,
+            string::quote(&primary_key),
             effective_page_size + 1 // +1 to check if there's more
         );
 
         result.tables.push(TableSyncSql {
             table_name: actual_table_name.clone(),
+            primary_key,
             permission_hash: current_permission_hash.clone(),
             sql: vec![sql], // Single SQL statement
             params: vec![params],
@@ -1090,11 +1162,38 @@ pub fn get_sync_page_info(
                 rows: Vec::new(), // Will be populated by query execution
                 permission_hash: current_permission_hash,
                 last_seen_updated_at,
+                last_seen_primary_key: if needs_full_resync {
+                    None
+                } else {
+                    table_cursor.and_then(|cursor| cursor.last_seen_primary_key.clone())
+                },
             },
         );
     }
 
     result
+}
+
+fn primary_key_session_value(value: &JsonValue) -> Result<SessionValue, SyncError> {
+    if let Some(value) = value.as_i64() {
+        Ok(SessionValue::Integer(value))
+    } else if let Some(value) = value.as_str() {
+        Ok(SessionValue::Text(value.to_string()))
+    } else {
+        Err(SyncError::InvalidSyncCursor(
+            "sync cursor primary key must be an integer or string".to_string(),
+        ))
+    }
+}
+
+fn primary_key_is_greater(max: &JsonValue, last: &JsonValue) -> Result<bool, SyncError> {
+    match (max.as_i64(), last.as_i64(), max.as_str(), last.as_str()) {
+        (Some(max), Some(last), _, _) => Ok(max > last),
+        (_, _, Some(max), Some(last)) => Ok(max > last),
+        _ => Err(SyncError::InvalidSyncCursor(
+            "sync cursor primary key does not match the database primary key type".to_string(),
+        )),
+    }
 }
 
 #[derive(Debug)]

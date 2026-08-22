@@ -122,6 +122,7 @@ export interface PyreDevtoolsTableSnapshot {
   sync?: TableSyncStatus;
   cursor?: {
     last_seen_updated_at: number | null;
+    last_seen_primary_key?: number | string | null;
     permission_hash: string;
   };
 }
@@ -132,6 +133,7 @@ export interface DevtoolsTableSummary {
   sync?: TableSyncStatus;
   cursor?: {
     last_seen_updated_at: number | null;
+    last_seen_primary_key?: number | string | null;
     permission_hash: string;
   };
 }

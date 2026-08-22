@@ -278,7 +278,7 @@ pub fn has_fieldname(field: &Field, desired_name: &str) -> bool {
     }
 }
 
-/// Ensure that a record has an `updatedAt` DateTime field with a default value of `now` and an index.
+/// Ensure that a record has an `updatedAt` DateTime field with a default value of `now`.
 /// If the field already exists, it's left unchanged. Otherwise, it's added to the fields.
 pub fn ensure_updated_at_field(fields: &mut Vec<Field>) {
     // Check if updatedAt field already exists
@@ -286,20 +286,17 @@ pub fn ensure_updated_at_field(fields: &mut Vec<Field>) {
         return;
     }
 
-    // Create the updatedAt field with @index directive
+    // The database diff adds the managed composite sync index separately.
     let updated_at_field = Field::Column(Column {
         name: "updatedAt".to_string(),
         type_: ColumnType::DateTime,
         nullable: false,
-        directives: vec![
-            ColumnDirective::Default {
-                id: "now".to_string(),
-                value: DefaultValue::Now,
-                start: None,
-                end: None,
-            },
-            ColumnDirective::Index,
-        ],
+        directives: vec![ColumnDirective::Default {
+            id: "now".to_string(),
+            value: DefaultValue::Now,
+            start: None,
+            end: None,
+        }],
         start: None,
         end: None,
         start_name: None,

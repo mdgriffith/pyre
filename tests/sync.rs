@@ -444,6 +444,7 @@ record GameEntity {
             sync_layer: 0,
             needs_sync: true,
             max_updated_at: None,
+            max_primary_key: None,
             permission_hash: "perm".to_string(),
         }],
     };
@@ -571,6 +572,7 @@ record Note {
             sync_layer: 0,
             needs_sync: true,
             max_updated_at: None,
+            max_primary_key: None,
             permission_hash: "perm".to_string(),
         }],
     };
@@ -608,6 +610,7 @@ record Note {
         "not_a_table".to_string(),
         pyre::sync::TableCursor {
             last_seen_updated_at: Some(1),
+            last_seen_primary_key: Some(serde_json::json!(1)),
             permission_hash: "perm".to_string(),
         },
     );
@@ -644,6 +647,7 @@ record Note {
         "notes".to_string(),
         pyre::sync::TableCursor {
             last_seen_updated_at: Some(1),
+            last_seen_primary_key: Some(serde_json::json!(1)),
             permission_hash: "x".repeat(pyre::sync::MAX_SYNC_CURSOR_PERMISSION_HASH_BYTES + 1),
         },
     );
@@ -715,6 +719,7 @@ record Quest {
                 sync_layer: 0,
                 needs_sync: true,
                 max_updated_at: None,
+                max_primary_key: None,
                 permission_hash: "main".to_string(),
             },
             TableSyncStatus {
@@ -722,6 +727,7 @@ record Quest {
                 sync_layer: 0,
                 needs_sync: true,
                 max_updated_at: None,
+                max_primary_key: None,
                 permission_hash: "campaign".to_string(),
             },
         ],
@@ -764,7 +770,7 @@ record Account {
 
     assert_eq!(
         status_sql,
-        "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch"
+        "SELECT NULL AS table_name, NULL AS sync_layer, NULL AS permission_hash, NULL AS last_seen_updated_at, NULL AS max_updated_at, NULL AS max_primary_key, (SELECT server_revision FROM _pyre_sync WHERE id = 1) AS server_revision, (SELECT database_epoch FROM _pyre_sync WHERE id = 1) AS database_epoch"
     );
 }
 
@@ -806,6 +812,7 @@ record Map {
             sync_layer: 0,
             needs_sync: true,
             max_updated_at: None,
+            max_primary_key: None,
             permission_hash: "perm".to_string(),
         }],
     };

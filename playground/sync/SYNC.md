@@ -30,7 +30,8 @@ When a client first connects, it performs a "sync catchup" to fetch all data it 
       [tableName]: {
         rows: JsonValue[],           // Array of row objects
         permission_hash: string,     // Hash of permissions for this table
-        last_seen_updated_at: number | null  // Max updated_at from returned rows
+        last_seen_updated_at: number | null,
+        last_seen_primary_key: number | string | null // Key of the final row at that timestamp
       }
     },
     has_more: boolean
@@ -88,6 +89,7 @@ Each client maintains:
     tables: {
       [tableName]: {
         last_seen_updated_at: number | null,
+        last_seen_primary_key: number | string | null,
         permission_hash: string
       }
     }

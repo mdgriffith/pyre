@@ -31,6 +31,7 @@ type Status
 
 type alias SyncCursorEntry =
     { lastSeenUpdatedAt : Maybe Float
+    , lastSeenPrimaryKey : Maybe Data.Value.Value
     , permissionHash : String
     }
 
@@ -43,6 +44,7 @@ type alias CatchupTableResult =
     { rows : List (Dict String Data.Value.Value)
     , permissionHash : String
     , lastSeenUpdatedAt : Maybe Float
+    , lastSeenPrimaryKey : Maybe Data.Value.Value
     }
 
 
@@ -528,6 +530,7 @@ updateSyncCursor response cursor =
         (\tableName tableResult acc ->
             Dict.insert tableName
                 { lastSeenUpdatedAt = tableResult.lastSeenUpdatedAt
+                , lastSeenPrimaryKey = tableResult.lastSeenPrimaryKey
                 , permissionHash = tableResult.permissionHash
                 }
                 acc
@@ -559,8 +562,8 @@ computeSyncCursor db cursor =
     Dict.foldl
         (\tableName tableData acc ->
             let
-                maxUpdatedAt =
-                    computeMaxUpdatedAt tableData
+                maxCursor =
+                    computeMaxCursor tableData
 
                 existingPermission =
                     Dict.get tableName cursor
@@ -569,14 +572,22 @@ computeSyncCursor db cursor =
 
                 updatedEntry =
                     { lastSeenUpdatedAt =
-                        case maxUpdatedAt of
-                            Just _ ->
-                                maxUpdatedAt
+                        case maxCursor of
+                            Just ( updatedAt, _ ) ->
+                                Just updatedAt
 
                             Nothing ->
                                 Dict.get tableName cursor
                                     |> Maybe.map .lastSeenUpdatedAt
                                     |> Maybe.withDefault Nothing
+                    , lastSeenPrimaryKey =
+                        case maxCursor of
+                            Just ( _, primaryKey ) ->
+                                Just primaryKey
+
+                            Nothing ->
+                                Dict.get tableName cursor
+                                    |> Maybe.andThen .lastSeenPrimaryKey
                     , permissionHash = existingPermission
                     }
             in
@@ -592,6 +603,7 @@ resetCursorIfRowsAreMissing tableName entry cursor =
         Just _ ->
             Dict.insert tableName
                 { lastSeenUpdatedAt = Nothing
+                , lastSeenPrimaryKey = Nothing
                 , permissionHash = ""
                 }
                 cursor
@@ -600,31 +612,48 @@ resetCursorIfRowsAreMissing tableName entry cursor =
             cursor
 
 
-computeMaxUpdatedAt : Dict Int (Dict String Data.Value.Value) -> Maybe Float
-computeMaxUpdatedAt tableData =
-    Dict.values tableData
-        |> List.foldl updateMaxUpdatedAt Nothing
+computeMaxCursor : Dict Int (Dict String Data.Value.Value) -> Maybe ( Float, Data.Value.Value )
+computeMaxCursor tableData =
+    Dict.toList tableData
+        |> List.foldl updateMaxCursor Nothing
 
 
-updateMaxUpdatedAt : Dict String Data.Value.Value -> Maybe Float -> Maybe Float
-updateMaxUpdatedAt row currentMax =
+updateMaxCursor : ( Int, Dict String Data.Value.Value ) -> Maybe ( Float, Data.Value.Value ) -> Maybe ( Float, Data.Value.Value )
+updateMaxCursor ( rowId, row ) currentMax =
     case Dict.get "updatedAt" row of
         Just value ->
             case valueToTimestamp value of
                 Just timestamp ->
-                    Just <|
-                        case currentMax of
-                            Just existing ->
-                                max timestamp existing
+                    let
+                        candidate =
+                            ( timestamp, Data.Value.IntValue rowId )
+                    in
+                    case currentMax of
+                        Just ( existingTimestamp, existingPrimaryKey ) ->
+                            if timestamp > existingTimestamp || (timestamp == existingTimestamp && rowId > primaryKeyToInt existingPrimaryKey) then
+                                Just candidate
 
-                            Nothing ->
-                                timestamp
+                            else
+                                currentMax
+
+                        Nothing ->
+                            Just candidate
 
                 Nothing ->
                     currentMax
 
         Nothing ->
             currentMax
+
+
+primaryKeyToInt : Data.Value.Value -> Int
+primaryKeyToInt value =
+    case value of
+        Data.Value.IntValue primaryKey ->
+            primaryKey
+
+        _ ->
+            -2147483648
 
 
 valueToTimestamp : Data.Value.Value -> Maybe Float
@@ -659,6 +688,11 @@ encodeSyncCursorEntry entry =
 
                 Nothing ->
                     Encode.null
+          )
+        , ( "last_seen_primary_key"
+          , entry.lastSeenPrimaryKey
+                |> Maybe.map Data.Value.encodeValue
+                |> Maybe.withDefault Encode.null
           )
         , ( "permission_hash", Encode.string entry.permissionHash )
         ]
@@ -714,10 +748,26 @@ validateResponseDatabaseId expected actual =
 
 decodeCatchupTable : Decode.Decoder CatchupTableResult
 decodeCatchupTable =
-    Decode.map3 CatchupTableResult
+    Decode.map4 CatchupTableResult
         (Decode.field "rows" (Decode.list (Decode.dict Data.Value.decodeValue)))
         (Decode.field "permission_hash" Decode.string)
         (Decode.field "last_seen_updated_at" decodeMaybeTimestamp)
+        (Decode.maybe (Decode.field "last_seen_primary_key" Data.Value.decodeValue)
+            |> Decode.map (Maybe.andThen valueToPrimaryKey)
+        )
+
+
+valueToPrimaryKey : Data.Value.Value -> Maybe Data.Value.Value
+valueToPrimaryKey value =
+    case value of
+        Data.Value.IntValue _ ->
+            Just value
+
+        Data.Value.StringValue _ ->
+            Just value
+
+        _ ->
+            Nothing
 
 
 decodeMaybeTimestamp : Decode.Decoder (Maybe Float)

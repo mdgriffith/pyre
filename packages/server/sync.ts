@@ -18,6 +18,7 @@ export const MAX_SYNC_PAGE_SIZE = 5000;
 export const MAX_SYNC_CURSOR_TABLES = 512;
 export const MAX_SYNC_CURSOR_PERMISSION_HASH_BYTES = 256;
 const SYNC_ROWS_JSON_COLUMN = "_pyre_rows";
+type SyncPrimaryKey = number | string;
 
 function normalizePageSize(pageSize: number): number {
     if (!Number.isFinite(pageSize) || pageSize <= 0) {
@@ -55,6 +56,16 @@ function validateSyncCursor(syncCursor: SyncCursor): void {
             throw new Error(`syncCursor last_seen_updated_at for ${tableName} must be a safe integer or null`);
         }
 
+        if (entry.last_seen_primary_key !== undefined && entry.last_seen_primary_key !== null
+            && typeof entry.last_seen_primary_key !== "string"
+            && !Number.isSafeInteger(entry.last_seen_primary_key)) {
+            throw new Error(`syncCursor last_seen_primary_key for ${tableName} must be a safe integer, string, or null`);
+        }
+
+        if (entry.last_seen_updated_at === null && entry.last_seen_primary_key != null) {
+            throw new Error(`syncCursor primary key for ${tableName} requires last_seen_updated_at`);
+        }
+
         if (typeof entry.permission_hash !== "string") {
             throw new Error(`syncCursor permission_hash for ${tableName} must be a string`);
         }
@@ -71,6 +82,7 @@ function validateSyncCursor(syncCursor: SyncCursor): void {
 export interface SyncCursor {
     tables: Record<string, {
         last_seen_updated_at: number | null;
+        last_seen_primary_key?: SyncPrimaryKey | null;
         permission_hash: string;
     }>;
 }
@@ -88,6 +100,7 @@ export interface SyncPageResult {
             rows: any[];
             permission_hash: string;
             last_seen_updated_at: number | null;
+            last_seen_primary_key: SyncPrimaryKey | null;
         }
     >;
     has_more: boolean;
@@ -172,6 +185,25 @@ function coerceUnixSeconds(value: unknown): number {
     }
 
     throw new Error("database updatedAt must be a safe integer number or bigint");
+}
+
+function coercePrimaryKey(value: unknown): SyncPrimaryKey {
+    if (typeof value === "string") {
+        return value;
+    }
+
+    if (typeof value === "number" && Number.isSafeInteger(value)) {
+        return value;
+    }
+
+    if (typeof value === "bigint") {
+        const number = Number(value);
+        if (Number.isSafeInteger(number)) {
+            return number;
+        }
+    }
+
+    throw new Error("database primary key must be a string, safe integer number, or bigint");
 }
 
 function rowsFromSyncQueryResult(queryResult: any, headers: string[]): Array<Record<string, any>> {
@@ -333,6 +365,13 @@ export async function catchup(
 
         const hasMoreForTable = tableRows.length > effectivePageSize;
         const finalRows = hasMoreForTable ? tableRows.slice(0, effectivePageSize) : tableRows;
+        const lastRow = finalRows[finalRows.length - 1];
+        let lastSeenPrimaryKey: SyncPrimaryKey | null = null;
+
+        if (lastRow) {
+            maxUpdatedAt = coerceUnixSeconds(lastRow.updatedAt);
+            lastSeenPrimaryKey = coercePrimaryKey(lastRow[tableSql.primary_key]);
+        }
 
         const reshapedGroup = reshapeSyncTableGroups([
             {
@@ -352,19 +391,11 @@ export async function catchup(
             return rowObject;
         });
 
-        if (hasMoreForTable && updatedAtIndex >= 0 && finalRows.length > 0) {
-            const lastRow = finalRows[finalRows.length - 1];
-            const lastUpdatedAt = lastRow.updatedAt;
-            if (lastUpdatedAt !== null && lastUpdatedAt !== undefined) {
-                const updatedAt = coerceUnixSeconds(lastUpdatedAt);
-                maxUpdatedAt = updatedAt;
-            }
-        }
-
         result.tables[tableSql.table_name] = {
             rows: reshapedRows,
             permission_hash: tableSql.permission_hash,
             last_seen_updated_at: maxUpdatedAt,
+            last_seen_primary_key: lastSeenPrimaryKey,
         };
 
         if (hasMoreForTable) {

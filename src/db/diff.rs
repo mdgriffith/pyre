@@ -43,6 +43,7 @@ pub fn diff(
     let mut added = Vec::new();
     let mut removed = Vec::new();
     let mut modified_records = Vec::new();
+    let syncable = schema.sync_mode == crate::ast::SyncMode::Synced;
 
     // Create lookup maps for faster comparison - need to extract tables from all schema files
     let mut schema_tables: std::collections::HashMap<_, _> = HashMap::new();
@@ -83,12 +84,13 @@ pub fn diff(
 
         match intro_tables.get(table_name) {
             None => {
-                let table = create_table_from_fields(context, record_name_to_use, fields_to_use);
+                let table =
+                    create_table_from_fields(context, record_name_to_use, fields_to_use, syncable);
                 added.push(table);
             }
             Some(intro_table) => {
                 let schema_table =
-                    create_table_from_fields(context, record_name_to_use, fields_to_use);
+                    create_table_from_fields(context, record_name_to_use, fields_to_use, syncable);
                 if let Some(record_diff) = compare_record(
                     context,
                     &schema_table,
@@ -439,6 +441,7 @@ fn create_table_from_fields(
     context: &crate::typecheck::Context,
     name: &str,
     fields: &Vec<crate::ast::Field>,
+    syncable: bool,
 ) -> crate::db::introspect::Table {
     let mut columns = Vec::new();
     add_fields(
@@ -456,6 +459,39 @@ fn create_table_from_fields(
         .iter()
         .map(|idx| materialized_index_to_index_info(&table_name, idx))
         .collect();
+
+    if syncable
+        && fields
+            .iter()
+            .any(|field| crate::ast::has_fieldname(field, "updatedAt"))
+    {
+        if let Some(primary_key) = crate::ast::get_primary_id_field_name(fields) {
+            let sync_index = crate::db::introspect::IndexInfo {
+                name: format!("idx_{}_updatedAt_{}", table_name, primary_key),
+                unique: false,
+                columns: vec![
+                    crate::db::introspect::IndexedColumnInfo {
+                        name: "updatedAt".to_string(),
+                        desc: false,
+                        expression: false,
+                    },
+                    crate::db::introspect::IndexedColumnInfo {
+                        name: primary_key,
+                        desc: false,
+                        expression: false,
+                    },
+                ],
+                where_clause: None,
+            };
+            let sync_signature = index_signature(&sync_index);
+            if !indexes
+                .iter()
+                .any(|index| index_signature(index) == sync_signature)
+            {
+                indexes.push(sync_index);
+            }
+        }
+    }
 
     if crate::ast::is_singleton(fields) {
         indexes.push(crate::db::introspect::IndexInfo {

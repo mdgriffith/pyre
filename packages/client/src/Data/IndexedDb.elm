@@ -37,6 +37,7 @@ type alias SyncCursor =
 
 type alias SyncCursorEntry =
     { lastSeenUpdatedAt : Maybe Float
+    , lastSeenPrimaryKey : Maybe Value
     , permissionHash : String
     }
 
@@ -166,8 +167,11 @@ decodeSyncCursor =
 
 decodeSyncCursorEntry : Decode.Decoder SyncCursorEntry
 decodeSyncCursorEntry =
-    Decode.map2 SyncCursorEntry
+    Decode.map3 SyncCursorEntry
         (Decode.field "last_seen_updated_at" decodeMaybeTimestamp)
+        (Decode.maybe (Decode.field "last_seen_primary_key" Data.Value.decodeValue)
+            |> Decode.map (Maybe.andThen valueToPrimaryKey)
+        )
         (Decode.field "permission_hash" Decode.string)
 
 
@@ -197,8 +201,26 @@ encodeSyncCursorEntry entry =
                 Nothing ->
                     Encode.null
           )
+        , ( "last_seen_primary_key"
+          , entry.lastSeenPrimaryKey
+                |> Maybe.map Data.Value.encodeValue
+                |> Maybe.withDefault Encode.null
+          )
         , ( "permission_hash", Encode.string entry.permissionHash )
         ]
+
+
+valueToPrimaryKey : Value -> Maybe Value
+valueToPrimaryKey value =
+    case value of
+        Data.Value.IntValue _ ->
+            Just value
+
+        Data.Value.StringValue _ ->
+            Just value
+
+        _ ->
+            Nothing
 
 
 

@@ -84,6 +84,8 @@ pyre migrate db/app.db --push
 
 For checked-in migration files instead of direct push, see [Migration Guide](./migrations.md).
 
+For each syncable table, Pyre manages an `(updatedAt, @id)` index used by catch-up pagination. Query-only namespaces marked `@syncable(false)` do not receive this index; explicitly declared indexes are preserved.
+
 ## 3. Generate Artifacts
 
 ```bash

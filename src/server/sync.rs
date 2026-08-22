@@ -286,14 +286,20 @@ pub async fn catchup(
         if has_more_for_table {
             table_rows.truncate(page_size);
             result.has_more = true;
-
-            if updated_at_index.is_some() {
-                max_updated_at = table_rows
-                    .last()
-                    .and_then(|row| row.get("updatedAt"))
-                    .and_then(json_to_i64);
-            }
         }
+
+        // The cursor is one ordered tuple; both components must come from the
+        // same final retained row.
+        let last_cursor_row = table_rows.last();
+        if updated_at_index.is_some() {
+            max_updated_at = last_cursor_row
+                .and_then(|row| row.get("updatedAt"))
+                .and_then(json_to_i64);
+        }
+        let last_seen_primary_key = last_cursor_row
+            .and_then(|row| row.get(&table_sql.primary_key))
+            .filter(|value| !value.is_null())
+            .cloned();
 
         let raw_group = AffectedRowTableGroup {
             table_name: table_sql.table_name.clone(),
@@ -331,6 +337,7 @@ pub async fn catchup(
                 rows,
                 permission_hash: table_sql.permission_hash,
                 last_seen_updated_at: max_updated_at,
+                last_seen_primary_key,
             },
         );
     }

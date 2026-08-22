@@ -5,6 +5,7 @@ const defaultSyncSql = () => ({
   tables: [
     {
       table_name: "maps",
+      primary_key: "id",
       permission_hash: "perm",
       sql: ["select 1"],
       headers: [
@@ -230,6 +231,7 @@ test("catchup reshapes flattened custom types before returning sync rows", async
         ],
         permission_hash: "perm",
         last_seen_updated_at: 1700000000,
+        last_seen_primary_key: 1,
       },
     },
     has_more: false,
@@ -358,6 +360,7 @@ test("catchup unwraps double-encoded json objects for json columns", async () =>
     tables: [
       {
         table_name: "gameEntities",
+        primary_key: "id",
         permission_hash: "perm",
         sql: ["select 1"],
         headers: ["id", "attrs", "updatedAt"],
@@ -402,6 +405,7 @@ test("catchup expands aggregate sync row payloads", async () => {
     tables: [
       {
         table_name: "gameEntities",
+        primary_key: "id",
         permission_hash: "perm",
         sql: ["select aggregate rows"],
         headers: ["id", "attrs", "updatedAt"],
@@ -443,6 +447,7 @@ test("catchup executes status and table sync SQL with bound params", async () =>
     tables: [
       {
         table_name: "maps",
+        primary_key: "id",
         permission_hash: "perm",
         sql: ["select ? as id, ? as name, ? as updatedAt"],
         params: [[1, "World", 1700000000]],
@@ -500,6 +505,7 @@ test("catchup caps pageSize before requesting sync SQL and slicing rows", async 
 
   expect(requestedPageSize).toBe(5000);
   expect(result.tables.maps.rows).toHaveLength(5000);
+  expect(result.tables.maps.last_seen_primary_key).toBe(5000);
   expect(result.has_more).toBe(true);
 });
 

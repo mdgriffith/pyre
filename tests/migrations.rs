@@ -284,6 +284,192 @@ async fn test_introspection_captures_index_metadata() -> Result<(), TestError> {
 }
 
 #[tokio::test]
+async fn synced_tables_get_composite_cursor_indexes() -> Result<(), TestError> {
+    let db = MigrationDatabase::new(
+        r#"record Event {
+    @tablename("audit_events")
+    eventId   Id.Uuid @id
+    updatedAt DateTime
+    @public
+}"#,
+    )
+    .await?;
+    let introspection = introspect_uninitialized_db(&db.db).await?;
+    let table = introspection
+        .tables
+        .iter()
+        .find(|table| table.name == "audit_events")
+        .expect("custom table should be introspected");
+
+    assert!(table.indexes.iter().any(|index| {
+        index.name == "idx_audit_events_updatedAt_eventId"
+            && index
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+                == vec!["updatedAt", "eventId"]
+    }));
+    assert!(!table
+        .indexes
+        .iter()
+        .any(|index| { index.columns.len() == 1 && index.columns[0].name == "updatedAt" }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_only_tables_keep_only_explicit_timestamp_indexes() -> Result<(), TestError> {
+    let db = MigrationDatabase::new(
+        r#"@syncable(false)
+
+record Event {
+    id        Int @id
+    updatedAt DateTime @index
+    @public
+}"#,
+    )
+    .await?;
+    let introspection = introspect_uninitialized_db(&db.db).await?;
+    let table = introspection
+        .tables
+        .iter()
+        .find(|table| table.name == "events")
+        .expect("events should be introspected");
+
+    assert!(table
+        .indexes
+        .iter()
+        .any(|index| { index.columns.len() == 1 && index.columns[0].name == "updatedAt" }));
+    assert!(!table.indexes.iter().any(|index| {
+        index
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>()
+            == vec!["updatedAt", "id"]
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_composite_cursor_index_is_not_duplicated() -> Result<(), TestError> {
+    let db = MigrationDatabase::new(
+        r#"record Event {
+    id        Int @id
+    updatedAt DateTime
+    @index(updatedAt, id)
+    @public
+}"#,
+    )
+    .await?;
+    let introspection = introspect_uninitialized_db(&db.db).await?;
+    let table = introspection
+        .tables
+        .iter()
+        .find(|table| table.name == "events")
+        .expect("events should be introspected");
+
+    assert_eq!(
+        table
+            .indexes
+            .iter()
+            .filter(|index| {
+                index
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>()
+                    == vec!["updatedAt", "id"]
+            })
+            .count(),
+        1
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_mode_migrations_add_and_remove_composite_cursor_indexes() -> Result<(), TestError> {
+    let synced = r#"record Event {
+    id Int @id
+    @public
+}"#;
+    let query_only = r#"@syncable(false)
+
+record Event {
+    id Int @id
+    @public
+}"#;
+
+    let add_sql = diff::to_sql::to_sql(&create_migration_diff(query_only, synced).await?);
+    assert!(add_sql.iter().any(|statement| matches!(
+        statement,
+        pyre::generate::sql::to_sql::SqlAndParams::Sql(sql)
+            if sql == "create index if not exists \"idx_events_updatedAt_id\" on \"events\" (\"updatedAt\" asc, \"id\" asc)"
+    )));
+
+    let remove_sql = diff::to_sql::to_sql(&create_migration_diff(synced, query_only).await?);
+    assert!(remove_sql.iter().any(|statement| matches!(
+        statement,
+        pyre::generate::sql::to_sql::SqlAndParams::Sql(sql)
+            if sql == "drop index if exists \"idx_events_updatedAt_id\""
+    )));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_replaces_legacy_timestamp_index_with_composite_cursor_index(
+) -> Result<(), TestError> {
+    let schema_source = r#"record Note {
+    id Int @id
+    @public
+}"#;
+    let db = MigrationDatabase::new(schema_source).await?;
+    let conn = db.db.connect().map_err(TestError::Database)?;
+    conn.execute_batch(
+        r#"
+drop index "idx_notes_updatedAt_id";
+create index "idx_notes_updatedAt" on "notes" ("updatedAt");
+"#,
+    )
+    .await
+    .map_err(TestError::Database)?;
+
+    let introspection_raw = introspect_uninitialized_db(&db.db).await?;
+    let database = ast::Database {
+        schemas: vec![db.schema.clone()],
+    };
+    let context = typecheck::check_schema(&database)
+        .map_err(|errors| TestError::TypecheckError(format!("{:?}", errors)))?;
+    let introspection = introspect::Introspection {
+        tables: introspection_raw.tables,
+        migration_state: introspect::MigrationState::NoMigrationTable,
+        schema: introspect::SchemaResult::Success {
+            schema: db.schema.clone(),
+            context: typecheck::check_schema(&database)
+                .map_err(|errors| TestError::TypecheckError(format!("{:?}", errors)))?,
+        },
+    };
+
+    let sql = diff::to_sql::to_sql(&diff::diff(&context, &db.schema, &introspection));
+    assert!(sql.iter().any(|statement| matches!(
+        statement,
+        pyre::generate::sql::to_sql::SqlAndParams::Sql(sql)
+            if sql == "create index if not exists \"idx_notes_updatedAt_id\" on \"notes\" (\"updatedAt\" asc, \"id\" asc)"
+    )));
+    assert!(sql.iter().any(|statement| matches!(
+        statement,
+        pyre::generate::sql::to_sql::SqlAndParams::Sql(sql)
+            if sql == "drop index if exists \"idx_notes_updatedAt\""
+    )));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn singleton_record_rejects_a_second_row_and_is_introspected() -> Result<(), TestError> {
     let db = MigrationDatabase::new(
         r#"record ApplicationSettings {

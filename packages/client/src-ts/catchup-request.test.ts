@@ -107,6 +107,7 @@ test('Elm catchup request includes restored syncCursor on startup', async () => 
         tables: {
           maps: {
             last_seen_updated_at: null,
+            last_seen_primary_key: null,
             permission_hash: 'perm-hash',
           },
         },
@@ -204,6 +205,7 @@ test('Elm catchup request includes databaseId when configured', async () => {
         tables: {
           maps: {
             last_seen_updated_at: null,
+            last_seen_primary_key: null,
             permission_hash: '',
           },
         },
@@ -644,7 +646,11 @@ test('Elm destructively resets persisted state before retrying a changed databas
     expect(requestBodies).toEqual([
       {
         databaseEpoch: 'old-epoch',
-        syncCursor: { tables: { maps: { last_seen_updated_at: 9, permission_hash: 'old' } } },
+        syncCursor: {
+          tables: {
+            maps: { last_seen_updated_at: 9, last_seen_primary_key: 1, permission_hash: 'old' },
+          },
+        },
       },
       { databaseEpoch: 'new-epoch', syncCursor: { tables: {} } },
     ]);

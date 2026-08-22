@@ -15,6 +15,8 @@ pub struct SyncCursorWasm {
 #[derive(Serialize, Deserialize)]
 pub struct TableCursorWasm {
     pub last_seen_updated_at: Option<i64>,
+    #[serde(default)]
+    pub last_seen_primary_key: Option<serde_json::Value>,
     pub permission_hash: String,
 }
 
@@ -29,6 +31,7 @@ pub struct TableSyncDataWasm {
     pub rows: Vec<serde_json::Value>,
     pub permission_hash: String,
     pub last_seen_updated_at: Option<i64>,
+    pub last_seen_primary_key: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -59,6 +62,7 @@ fn convert_cursor_wasm_to_rust(cursor: &SyncCursorWasm) -> sync::SyncCursor {
                 k.clone(),
                 sync::TableCursor {
                     last_seen_updated_at: v.last_seen_updated_at,
+                    last_seen_primary_key: v.last_seen_primary_key.clone(),
                     permission_hash: v.permission_hash.clone(),
                 },
             )
@@ -78,6 +82,7 @@ fn convert_result_rust_to_wasm(result: sync::SyncPageResult) -> SyncPageResultWa
                         rows: v.rows,
                         permission_hash: v.permission_hash,
                         last_seen_updated_at: v.last_seen_updated_at,
+                        last_seen_primary_key: v.last_seen_primary_key,
                     },
                 )
             })
@@ -163,6 +168,7 @@ pub struct SyncStatementWasm {
 #[derive(Serialize, Deserialize)]
 pub struct TableSyncSqlWasm {
     pub table_name: String,
+    pub primary_key: String,
     pub permission_hash: String,
     pub sql: Vec<String>,
     pub params: Vec<Vec<SessionValueWasm>>,
@@ -278,6 +284,7 @@ pub fn get_sync_sql_wasm(
             .into_iter()
             .map(|t| TableSyncSqlWasm {
                 table_name: t.table_name,
+                primary_key: t.primary_key,
                 permission_hash: t.permission_hash,
                 sql: t.sql,
                 params: t

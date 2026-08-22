@@ -190,7 +190,7 @@ async fn extract_affected_rows(
 }
 
 #[tokio::test]
-async fn catchup_paginates_and_advances_cursor() -> Result<(), Box<dyn std::error::Error>> {
+async fn catchup_paginates_rows_with_equal_timestamps() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
 record Note {
@@ -206,8 +206,8 @@ record Note {
     conn.execute_batch(
         r#"
 insert into notes (id, body, updatedAt) values (1, 'one', 10);
-insert into notes (id, body, updatedAt) values (2, 'two', 20);
-insert into notes (id, body, updatedAt) values (3, 'three', 30);
+insert into notes (id, body, updatedAt) values (2, 'two', 10);
+insert into notes (id, body, updatedAt) values (3, 'three', 10);
 "#,
     )
     .await?;
@@ -220,13 +220,15 @@ insert into notes (id, body, updatedAt) values (3, 'three', 30);
     assert_eq!(notes.rows.len(), 2);
     assert_eq!(notes.rows[0]["id"], json!(1));
     assert_eq!(notes.rows[1]["id"], json!(2));
-    assert_eq!(notes.last_seen_updated_at, Some(20));
+    assert_eq!(notes.last_seen_updated_at, Some(10));
+    assert_eq!(notes.last_seen_primary_key, Some(json!(2)));
 
     let mut cursor = SyncCursor::new();
     cursor.insert(
         "notes".to_string(),
         TableCursor {
             last_seen_updated_at: notes.last_seen_updated_at,
+            last_seen_primary_key: notes.last_seen_primary_key.clone(),
             permission_hash: notes.permission_hash.clone(),
         },
     );
@@ -240,12 +242,14 @@ insert into notes (id, body, updatedAt) values (3, 'three', 30);
     assert!(!second.has_more);
     assert_eq!(notes.rows.len(), 1);
     assert_eq!(notes.rows[0]["id"], json!(3));
-    assert_eq!(notes.last_seen_updated_at, Some(30));
+    assert_eq!(notes.last_seen_updated_at, Some(10));
+    assert_eq!(notes.last_seen_primary_key, Some(json!(3)));
 
     cursor.insert(
         "notes".to_string(),
         TableCursor {
             last_seen_updated_at: notes.last_seen_updated_at,
+            last_seen_primary_key: notes.last_seen_primary_key.clone(),
             permission_hash: notes.permission_hash.clone(),
         },
     );
@@ -257,12 +261,69 @@ insert into notes (id, body, updatedAt) values (3, 'three', 30);
     Ok(())
 }
 
+#[tokio::test]
+async fn catchup_paginates_uuid_primary_keys() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    id Id.Uuid @id
+    body String
+    updatedAt Int
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch(
+        r#"
+insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000001', 'one', 10);
+insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000002', 'two', 10);
+insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000003', 'three', 10);
+"#,
+    )
+    .await?;
+
+    let session = HashMap::new();
+    let first = catchup(&conn, &db.context, &SyncCursor::new(), &session, 2).await?;
+    let notes = first.tables.get("notes").expect("notes should sync");
+    assert!(first.has_more);
+    assert_eq!(notes.rows.len(), 2);
+    assert_eq!(
+        notes.last_seen_primary_key,
+        Some(json!("00000000-0000-0000-0000-000000000002"))
+    );
+
+    let cursor = SyncCursor::from([(
+        "notes".to_string(),
+        TableCursor {
+            last_seen_updated_at: notes.last_seen_updated_at,
+            last_seen_primary_key: notes.last_seen_primary_key.clone(),
+            permission_hash: notes.permission_hash.clone(),
+        },
+    )]);
+    let second = catchup(&conn, &db.context, &cursor, &session, 2).await?;
+    let notes = second
+        .tables
+        .get("notes")
+        .expect("remaining note should sync");
+    assert!(!second.has_more);
+    assert_eq!(notes.rows.len(), 1);
+    assert_eq!(
+        notes.rows[0]["id"],
+        json!("00000000-0000-0000-0000-000000000003")
+    );
+
+    Ok(())
+}
+
 #[test]
 fn table_sync_data_serializes_empty_rows() {
     let data = TableSyncData {
         rows: Vec::new(),
         permission_hash: "permission-hash".to_string(),
         last_seen_updated_at: None,
+        last_seen_primary_key: None,
     };
 
     let serialized = serde_json::to_value(data).expect("table sync data should serialize");
@@ -270,6 +331,7 @@ fn table_sync_data_serializes_empty_rows() {
     assert_eq!(serialized["rows"], json!([]));
     assert_eq!(serialized["permission_hash"], json!("permission-hash"));
     assert_eq!(serialized["last_seen_updated_at"], serde_json::Value::Null);
+    assert_eq!(serialized["last_seen_primary_key"], serde_json::Value::Null);
 }
 
 #[tokio::test]
@@ -1460,6 +1522,7 @@ insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
         "notes".to_string(),
         TableCursor {
             last_seen_updated_at: first_notes.last_seen_updated_at,
+            last_seen_primary_key: first_notes.last_seen_primary_key.clone(),
             permission_hash: first_notes.permission_hash.clone(),
         },
     )]);
