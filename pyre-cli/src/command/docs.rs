@@ -28,7 +28,7 @@ pub const DOC_RESOURCES: &[DocResource] = &[
         uri: "pyre://guides/query",
         name: "Query Guide",
         description:
-            "How to write Pyre queries and mutations: selects, inserts, updates, deletes, params.",
+            "How to write Pyre queries and mutations: selects, inserts, updates, deletes, transactions, params.",
         content: include_str!("../../../docs/usage/query.md"),
     },
     DocResource {

@@ -399,11 +399,31 @@ fn docs_are_exposed_as_resources() {
         .unwrap()
         .contains("exists workspace.members"));
 
+    let query_resource_docs = call_mcp(
+        &ctx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "resources/read",
+            "params": {
+                "uri": "pyre://guides/query"
+            }
+        }),
+    );
+    assert!(query_resource_docs["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("## Transaction Blocks"));
+
     let query_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "query" }));
     assert!(query_docs["content"]
         .as_str()
         .unwrap()
         .contains("Pyre Query Guide"));
+    assert!(query_docs["content"]
+        .as_str()
+        .unwrap()
+        .contains("transaction ReplaceNote"));
 
     let serve_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "serve" }));
     assert!(serve_docs["content"]

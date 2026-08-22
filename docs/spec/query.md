@@ -2,7 +2,7 @@
 
 ## Overview
 
-Pyre query files define database operations: `query` (select), `insert`, `update`, and `delete`. Query files use the `.pyre` extension and are typically named `query.pyre` or `queries.pyre`, or organized in a `queries/` directory.
+Pyre query files define database operations: `query` (select), `insert`, `update`, `delete`, and `transaction`. Query files use the `.pyre` extension and are typically named `query.pyre` or `queries.pyre`, or organized in a `queries/` directory.
 
 Pyre can also provide schema-derived built-in CRUD mutations for writable tables. See the [Generated CRUD Mutations Specification](./generated-crud-mutations.md).
 
@@ -197,6 +197,61 @@ delete DeleteUser($id: Int) {
 ```
 
 **Note**: Delete queries must include at least one field in the selection (typically `id`) for the return value.
+
+### Transaction
+
+Groups ordered mutation steps into one atomic operation.
+
+**Basic Syntax:**
+```pyre
+transaction ReplaceNote($id: Note.id, $body: String) {
+    update changed: note {
+        @where { id == $id }
+        body = $body
+        id
+    }
+
+    insert created: note {
+        body = $body
+        id
+    }
+
+    delete removed: note {
+        @where { id == $id }
+        id
+    }
+}
+```
+
+**Execution Semantics:**
+
+- A top-level step must be an `insert`, `update`, or `delete`. A `query` step is invalid.
+- Steps execute in declaration order within one database transaction.
+- All steps commit if execution succeeds. A constraint, SQL, or connection failure rolls back every step.
+- The enclosing parameter list and session are shared by all steps.
+- Each step is independently typechecked and permission-filtered according to its operation.
+- All writes must target the same schema namespace and database.
+- A step cannot reference values or rows returned by an earlier step.
+
+**Result Shape:**
+
+The result is one object keyed by each top-level step alias. Each value is the normal mutation result array for that step.
+
+```json
+{
+  "changed": [{ "id": 1, "body": "new body" }],
+  "created": [{ "id": 2, "body": "new body" }],
+  "removed": [{ "id": 1 }]
+}
+```
+
+If a step has no alias, its record field name is the result key. Result keys must be unique. An update or delete that matches no permitted rows returns an empty array and is still successful; later steps continue executing.
+
+**Runtime Notes:**
+
+- TypeScript runtimes submit all generated statements in one atomic `db.batch(...)` call.
+- The native Rust runtime executes the statements sequentially inside one immediate database transaction.
+- Nested inserts retain their normal temporary-table behavior. The native remote-libSQL runtime rejects operations requiring those temporary tables; flat transactions are supported.
 
 ## Parameters
 

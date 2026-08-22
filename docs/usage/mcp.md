@@ -103,12 +103,13 @@ Examples:
 
 - `pyre_docs` with topic `getting-started`
 - `pyre_docs` with topic `schema`
-- `pyre_docs` with topic `query`
+- `pyre_docs` with topic `query` for selects, mutations, and transaction blocks
 - `pyre_docs` with topic `migrations`
 - `pyre_docs` with topic `serve`
 - `pyre_docs` with topic `project-structure`
 - `pyre_docs` with topic `troubleshooting`
 - `pyre://project/schema`
+- `pyre://guides/query`
 
 ## When Not To Use MCP
 
