@@ -52,6 +52,8 @@ update RenameUser($id: Int, $name: String) {
 }
 ```
 
+An update cannot assign a record field marked `@immutable`, even when the assignment would write the existing value. Immutable fields may still be selected in the mutation result. The same rule applies to update steps inside `transaction` blocks and to dynamic queries submitted through MCP.
+
 ```pyre
 delete DeleteUser($id: Int) {
     user {
@@ -138,7 +140,9 @@ query MyNotes {
 
 ## Generated CRUD
 
-Pyre can expose schema-derived CRUD mutations for writable tables. Use handwritten queries when you need custom filters, nested writes, business rules, or a response shape that differs from the default generated operation.
+Pyre can expose schema-derived CRUD mutations for writable tables. Generated create inputs retain `@immutable` fields when they are otherwise insertable, while generated update inputs omit them.
+
+Use handwritten queries when you need custom filters, nested writes, business rules, or a response shape that differs from the default generated operation. Handwritten updates remain subject to `@immutable` checking.
 
 ## Validation Flow
 

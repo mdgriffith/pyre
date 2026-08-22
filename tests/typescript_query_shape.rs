@@ -242,3 +242,75 @@ insert CreateEvent($startedAt: DateTime) {
     assert!(content.contains("startedAt: Decode.CoercedDate"));
     assert!(content.contains("export type Input = z.infer<typeof RawInputValidator>;"));
 }
+
+#[test]
+fn generated_typescript_crud_omits_immutable_update_artifacts() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+record Document {
+    @public
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+}
+"#,
+        &mut schema,
+    )
+    .expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    let mut query_list = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut query_list, &context);
+    let query_info = typecheck::check_queries(&query_list, &context).expect("CRUD typechecks");
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    core::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+
+    let file = |suffix: &str| {
+        &files
+            .iter()
+            .find(|file| path_ends_with(&file.path, suffix))
+            .unwrap_or_else(|| panic!("missing generated {suffix}"))
+            .contents
+    };
+    let create_meta = file("queries/metadata/documentCreate.ts");
+    let update_meta = file("queries/metadata/documentUpdate.ts");
+    let update_sql = file("queries/sql/documentUpdate.ts");
+
+    let create_inputs = create_meta
+        .split("export type Input")
+        .next()
+        .expect("create input validators");
+    let update_inputs = update_meta
+        .split("export type Input")
+        .next()
+        .expect("update input validators");
+    assert!(create_inputs.contains("ownerId: z.number()"));
+    assert!(!update_inputs.contains("ownerId:"));
+    assert!(update_meta.contains("ownerId: z.number()"));
+    assert!(update_meta.contains("export type Result = z.infer<typeof ReturnData>;"));
+    let optimistic = update_meta
+        .lines()
+        .find(|line| line.contains("optimistic:"))
+        .expect("update optimistic metadata");
+    assert!(optimistic.contains("{ field: \"title\", input: \"title\" }"));
+    assert!(!optimistic.contains("ownerId"));
+    let params = update_sql
+        .lines()
+        .filter(|line| line.contains("params:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(params.contains("\"title\"") && params.contains("\"title__is_set\""));
+    assert!(!params.contains("ownerId"));
+    assert!(!update_sql.contains("ownerId ="));
+    assert!(!update_sql.contains("ownerId__is_set"));
+}

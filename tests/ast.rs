@@ -37,6 +37,7 @@ record TestRecord {{
             ast::ColumnDirective::PrimaryKey => "@id",
             ast::ColumnDirective::Unique => "@unique",
             ast::ColumnDirective::Index => "@index",
+            ast::ColumnDirective::Immutable => "@immutable",
             ast::ColumnDirective::CreatedAt => "@createdAt",
             ast::ColumnDirective::UpdatedAt => "@updatedAt",
             ast::ColumnDirective::Default { .. } => "",
@@ -174,6 +175,30 @@ fn adding_or_removing_a_default_produces_a_modified_column_error() {
         removed[0].error_type,
         pyre::error::ErrorType::MigrationColumnModified { .. }
     ));
+}
+
+#[test]
+fn adding_or_removing_immutable_produces_no_migration_error() {
+    let mutable = parse_schema(
+        r#"record Document {
+    id      Int @id
+    ownerId Int
+}"#,
+    );
+    let immutable = parse_schema(
+        r#"record Document {
+    id      Int @id
+    ownerId Int @immutable
+}"#,
+    );
+
+    let added = ast::diff::diff_schema(&mutable, &immutable);
+    let removed = ast::diff::diff_schema(&immutable, &mutable);
+
+    assert!(added.modified_records.is_empty());
+    assert!(removed.modified_records.is_empty());
+    assert!(ast::diff::to_errors(added).is_empty());
+    assert!(ast::diff::to_errors(removed).is_empty());
 }
 
 #[test]

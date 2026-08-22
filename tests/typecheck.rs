@@ -172,6 +172,425 @@ record Note {
 }
 
 #[test]
+fn immutable_fields_are_insertable_but_not_updateable() {
+    let context = checked_context(
+        r#"
+record Document {
+    @public
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+}
+"#,
+    );
+    let insert = parser::parse_query(
+        "insert.pyre",
+        r#"
+insert CreateDocument($ownerId: Int, $title: String) {
+    document {
+        ownerId = $ownerId
+        title = $title
+    }
+}
+"#,
+    )
+    .expect("insert parses");
+    typecheck::check_queries(&insert, &context).expect("immutable fields are writable on insert");
+
+    let update_source = r#"
+update TransferDocument($documentId: Int, $ownerId: Int) {
+    document {
+        @where { id == $documentId }
+        ownerId = $ownerId
+    }
+}
+"#;
+    let update = parser::parse_query("update.pyre", update_source).expect("update parses");
+    let errors = match typecheck::check_queries(&update, &context) {
+        Ok(_) => panic!("update should fail"),
+        Err(errors) => errors,
+    };
+    let immutable_error = errors
+        .iter()
+        .find(|error| {
+            matches!(
+                error.error_type,
+                ErrorType::ImmutableColumnCannotBeUpdated { ref field } if field == "ownerId"
+            )
+        })
+        .expect("immutable assignment error");
+
+    assert!(error::format_error(update_source, immutable_error, false)
+        .contains("ownerId is @immutable and cannot be assigned in an update."));
+    assert!(!errors.iter().any(|error| matches!(
+        &error.error_type,
+        ErrorType::UnusedParam { param } if param == "ownerId"
+    )));
+}
+
+#[test]
+fn immutable_fields_can_receive_schema_defaults_on_insert() {
+    let context = checked_context(
+        r#"
+record Document {
+    @public
+    id      Int @id
+    ownerId Int @immutable @default(1)
+    title   String
+}
+"#,
+    );
+    let insert = parser::parse_query(
+        "insert.pyre",
+        r#"
+insert CreateDocument($title: String) {
+    document {
+        title = $title
+        ownerId
+    }
+}
+"#,
+    )
+    .expect("insert parses");
+
+    typecheck::check_queries(&insert, &context)
+        .expect("an omitted immutable field may receive its schema default");
+}
+
+#[test]
+fn immutable_assignments_are_rejected_regardless_of_value() {
+    let context = checked_context(
+        r#"
+record Document {
+    @public
+    id         Int @id
+    ownerId    Int @immutable
+    externalId String? @immutable
+}
+"#,
+    );
+    let update = parser::parse_query(
+        "update.pyre",
+        r#"
+update RewriteDocument($id: Int) {
+    document {
+        @where { id == $id }
+        ownerId = 1
+        externalId = null
+    }
+}
+"#,
+    )
+    .expect("update parses");
+    let errors = match typecheck::check_queries(&update, &context) {
+        Ok(_) => panic!("literal immutable assignments should fail"),
+        Err(errors) => errors,
+    };
+    let fields = errors
+        .iter()
+        .filter_map(|error| match &error.error_type {
+            ErrorType::ImmutableColumnCannotBeUpdated { field } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(fields.contains(&"ownerId"));
+    assert!(fields.contains(&"externalId"));
+}
+
+#[test]
+fn immutable_fields_can_be_selected_from_updates_and_mutable_fields_still_update() {
+    let context = checked_context(
+        r#"
+record Document {
+    @public
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+}
+"#,
+    );
+    let update = parser::parse_query(
+        "update.pyre",
+        r#"
+update RenameDocument($documentId: Int, $title: String) {
+    document {
+        @where { id == $documentId }
+        ownerId
+        title = $title
+    }
+}
+"#,
+    )
+    .expect("update parses");
+
+    typecheck::check_queries(&update, &context)
+        .expect("selection and mutable assignment should remain valid");
+}
+
+#[test]
+fn transaction_update_steps_cannot_assign_immutable_fields() {
+    let context = checked_context(
+        r#"
+record Document {
+    @public
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+}
+"#,
+    );
+    let transaction = parser::parse_query(
+        "transaction.pyre",
+        r#"
+transaction TransferDocument($documentId: Int, $ownerId: Int) {
+    update document {
+        @where { id == $documentId }
+        ownerId = $ownerId
+    }
+}
+"#,
+    )
+    .expect("transaction parses");
+    let errors = match typecheck::check_queries(&transaction, &context) {
+        Ok(_) => panic!("transaction update should fail"),
+        Err(errors) => errors,
+    };
+
+    assert!(errors.iter().any(|error| matches!(
+        error.error_type,
+        ErrorType::ImmutableColumnCannotBeUpdated { ref field } if field == "ownerId"
+    )));
+}
+
+#[test]
+fn structured_immutable_fields_cannot_be_updated() {
+    let context = checked_context(
+        r#"
+type EventPayload
+    = Created { title String }
+    | Renamed { previousTitle String, title String }
+
+record GameEvent {
+    @public
+    id      Int @id
+    payload EventPayload @immutable
+}
+"#,
+    );
+    let update = parser::parse_query(
+        "update.pyre",
+        r#"
+update ReplacePayload($id: Int, $payload: EventPayload) {
+    gameEvent {
+        @where { id == $id }
+        payload = $payload
+    }
+}
+"#,
+    )
+    .expect("structured update parses");
+    let errors = match typecheck::check_queries(&update, &context) {
+        Ok(_) => panic!("structured update should fail"),
+        Err(errors) => errors,
+    };
+
+    assert!(errors.iter().any(|error| matches!(
+        error.error_type,
+        ErrorType::ImmutableColumnCannotBeUpdated { ref field } if field == "payload"
+    )));
+}
+
+#[test]
+fn immutable_inline_structured_assignment_marks_nested_parameters_used() {
+    let context = checked_context(
+        r#"
+type EventPayload
+    = Created { title String }
+    | Renamed { previousTitle String, title String }
+
+record GameEvent {
+    @public
+    id      Int @id
+    payload EventPayload @immutable
+}
+"#,
+    );
+    let source = r#"
+update ReplacePayload($id: Int, $previousTitle: String, $title: String) {
+    gameEvent {
+        @where { id == $id }
+        payload = Renamed { previousTitle = $previousTitle, title = $title }
+    }
+}
+"#;
+    let update = parser::parse_query("update.pyre", source).expect("structured update parses");
+    let errors = match typecheck::check_queries(&update, &context) {
+        Ok(_) => panic!("inline structured immutable assignment should fail"),
+        Err(errors) => errors,
+    };
+
+    let immutable = errors
+        .iter()
+        .find(|error| {
+            matches!(
+                error.error_type,
+                ErrorType::ImmutableColumnCannotBeUpdated { ref field } if field == "payload"
+            )
+        })
+        .expect("diagnostic should identify the logical structured field");
+    assert!(error::format_error(source, immutable, false)
+        .contains("payload is @immutable and cannot be assigned in an update."));
+    assert!(!errors
+        .iter()
+        .any(|error| matches!(error.error_type, ErrorType::UnusedParam { .. })));
+}
+
+#[test]
+fn nested_insert_rejects_explicit_immutable_parent_key_without_unused_param() {
+    let context = checked_context(
+        r#"
+record Parent {
+    @public
+    id       Id.Int @id
+    children @link(Child.parentId)
+}
+
+record Child {
+    @public
+    id       Int @id
+    parentId Parent.id @immutable
+    body     String
+}
+"#,
+    );
+    let insert = parser::parse_query(
+        "insert.pyre",
+        r#"
+insert CreateParent($parentId: Parent.id, $body: String) {
+    parent {
+        children {
+            parentId = $parentId
+            body = $body
+        }
+    }
+}
+"#,
+    )
+    .expect("nested insert parses");
+    let errors = match typecheck::check_queries(&insert, &context) {
+        Ok(_) => panic!("the linked parent key is populated automatically"),
+        Err(errors) => errors,
+    };
+
+    assert!(errors.iter().any(|error| matches!(
+        error.error_type,
+        ErrorType::InsertNestedValueAutomaticallySet { ref field } if field == "parentId"
+    )));
+    assert!(!errors.iter().any(|error| matches!(
+        error.error_type,
+        ErrorType::UnusedParam { ref param } if param == "parentId"
+    )));
+}
+
+#[test]
+fn generated_crud_keeps_immutable_create_inputs_and_omits_update_inputs() {
+    let context = checked_context(
+        r#"
+record Document {
+    @public
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+}
+"#,
+    );
+    let mut query_list = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut query_list, &context);
+
+    let generated = |name: &str| {
+        query_list.queries.iter().find_map(|query| match query {
+            ast::QueryDef::Query(query) if query.name == name => Some(query),
+            _ => None,
+        })
+    };
+    let create = generated("DocumentCreate").expect("generated create exists");
+    let update = generated("DocumentUpdate").expect("generated update exists");
+
+    assert!(create.args.iter().any(|arg| arg.name == "ownerId"));
+    assert!(!update.args.iter().any(|arg| arg.name == "ownerId"));
+    assert!(update.fields.iter().any(|top_level| match top_level {
+        ast::TopLevelQueryField::Field(table) => table.fields.iter().any(|field| match field {
+            ast::ArgField::Field(field) => field.name == "ownerId" && field.set.is_none(),
+            _ => false,
+        }),
+        _ => false,
+    }));
+    typecheck::check_queries(&query_list, &context).expect("generated CRUD should typecheck");
+}
+
+#[test]
+fn generated_crud_update_with_only_immutable_fields_omits_them() {
+    let context = checked_context(
+        r#"
+record DocumentOwner {
+    @public
+    id      Int @id
+    ownerId Int @immutable
+}
+"#,
+    );
+    let mut query_list = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut query_list, &context);
+    let update = query_list
+        .queries
+        .iter()
+        .find_map(|query| match query {
+            ast::QueryDef::Query(query) if query.name == "DocumentOwnerUpdate" => Some(query),
+            _ => None,
+        })
+        .expect("generated update exists");
+
+    assert_eq!(
+        update
+            .args
+            .iter()
+            .map(|arg| arg.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "updatedAt"]
+    );
+    typecheck::check_queries(&query_list, &context).expect("generated CRUD should typecheck");
+}
+
+#[test]
+fn immutable_is_rejected_outside_record_fields() {
+    for schema_source in [
+        r#"
+session {
+    userId Int @immutable
+}
+"#,
+        r#"
+type Payload
+    = Created { ownerId Int @immutable }
+"#,
+    ] {
+        let mut schema = ast::Schema::default();
+        parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+        let errors = typecheck::check_schema(&ast::Database {
+            schemas: vec![schema],
+        })
+        .expect_err("@immutable should be record-only");
+
+        assert!(errors.iter().any(|error| matches!(
+            &error.error_type,
+            ErrorType::InvalidTypeUsage { message }
+                if message == "@immutable can only be used on record fields"
+        )));
+    }
+}
+
+#[test]
 fn uuid_primary_ids_remain_settable_on_insert() {
     let context = checked_context(
         r#"

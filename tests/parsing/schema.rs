@@ -497,6 +497,32 @@ record User {
 }
 
 #[test]
+fn test_immutable_directive_parses() {
+    let schema_source = r#"
+record Document {
+    id      Int @id
+    ownerId Int @immutable
+}
+    "#;
+    let mut schema = ast::Schema::default();
+
+    parser::run("schema.pyre", schema_source, &mut schema).expect("@immutable should parse");
+
+    let owner = schema
+        .files
+        .iter()
+        .flat_map(|file| &file.definitions)
+        .find_map(|definition| match definition {
+            ast::Definition::Record { fields, .. } => ast::collect_columns(fields)
+                .into_iter()
+                .find(|column| column.name == "ownerId"),
+            _ => None,
+        })
+        .expect("ownerId column exists");
+    assert!(ast::is_immutable(&owner));
+}
+
+#[test]
 fn test_invalid_link_syntax() {
     let schema_source = r#"
 record User {

@@ -182,6 +182,8 @@ update UpdatePost($id: Int, $title: String?, $content: String?, $published: Bool
 
 **Note**: Nullable parameters (`String?`) allow omitting fields in updates. Non-nullable parameters require values.
 
+An update assignment to a field marked `@immutable` is invalid regardless of the assigned expression or whether it equals the stored value. Selecting an immutable field without assigning it is valid. Transaction update steps and dynamic query typechecking apply the same rule.
+
 ### Delete
 
 Deletes records.

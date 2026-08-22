@@ -236,6 +236,9 @@ pub enum ErrorType {
         field: String,
         operation: ast::QueryOperation,
     },
+    ImmutableColumnCannotBeUpdated {
+        field: String,
+    },
     MultipleSchemaWrites {
         field_table: String,
         field_schema: String,
@@ -652,10 +655,11 @@ fn render_expecting(expecting: &Expecting, in_color: bool) -> String {
             yellow_if(in_color, "@allow")
         ),
         Expecting::SchemaFieldAtDirective => return format!(
-            "I don't recognize this, did you mean one of these:\n\n        {}\n        {}\n        {}",
+            "I don't recognize this, did you mean one of these:\n\n        {}\n        {}\n        {}\n        {}",
             yellow_if(in_color, "@id"),
             yellow_if(in_color, "@unique"),
-            yellow_if(in_color, "@default")
+            yellow_if(in_color, "@default"),
+            yellow_if(in_color, "@immutable")
         ),
         Expecting::SchemaColumn => return format!(
             "I was expecting a column, like:\n\n        {}",
@@ -1376,6 +1380,10 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
 
             result
         }
+        ErrorType::ImmutableColumnCannotBeUpdated { field } => format!(
+            "{} is @immutable and cannot be assigned in an update.",
+            yellow_if(in_color, field)
+        ),
         ErrorType::MultipleSchemaWrites {
             field_table,
             field_schema,
@@ -1667,6 +1675,7 @@ pub fn to_error_title(error_type: &ErrorType) -> String {
         ErrorType::InsertMissingColumn { .. } => "Insert Missing Column",
         ErrorType::InsertNestedValueAutomaticallySet { .. } => "Can't set automatic field",
         ErrorType::ManagedColumnCannotBeSet { .. } => "Managed Column Cannot Be Set",
+        ErrorType::ImmutableColumnCannotBeUpdated { .. } => "Immutable Column Cannot Be Updated",
         ErrorType::MultipleSchemaWrites { .. } => "Multiple Schema Writes",
         ErrorType::LimitOffsetOnlyInFlatRecord => "Limit Only In Flat Record",
         ErrorType::VariantFieldTypeCollision { .. } => "Variant Field Type Collision",

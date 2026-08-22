@@ -356,6 +356,7 @@ fn writable_update_columns(table: &typecheck::Table) -> Vec<&ast::Column> {
         .into_iter()
         .filter(|column| !ast::is_primary_key(column))
         .filter(|column| !ast::is_managed_timestamp(column))
+        .filter(|column| !ast::is_immutable(column))
         .collect()
 }
 

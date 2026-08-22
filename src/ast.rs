@@ -230,6 +230,12 @@ pub fn is_primary_key(col: &Column) -> bool {
         .any(|d| *d == ColumnDirective::PrimaryKey)
 }
 
+pub fn is_immutable(col: &Column) -> bool {
+    col.directives
+        .iter()
+        .any(|directive| matches!(directive, ColumnDirective::Immutable))
+}
+
 pub fn to_watched_operations(record: &RecordDetails) -> Vec<QueryOperation> {
     let mut ops = Vec::new();
     for field in record.fields.iter() {
@@ -1047,6 +1053,7 @@ pub enum ColumnDirective {
     PrimaryKey,
     Unique,
     Index,
+    Immutable,
     CreatedAt,
     UpdatedAt,
     Default {

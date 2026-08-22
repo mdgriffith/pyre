@@ -418,6 +418,38 @@ fn replace_params_positional(sql: &str, param_names: &[String]) -> String {
 use pyre::seed;
 
 #[tokio::test]
+async fn test_seed_populates_immutable_fields() -> Result<(), TestError> {
+    let schema_source = r#"
+record Document {
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+    @public
+}
+"#;
+    let db = SeedDatabase::new(schema_source).await?;
+    let operations = seed::seed_database(&db.schema, &db.context, None);
+    let conn = db.db.connect().map_err(TestError::Database)?;
+
+    assert!(operations
+        .iter()
+        .any(|operation| operation.sql.contains("ownerId")));
+    for operation in operations {
+        conn.execute(&operation.sql, ())
+            .await
+            .map_err(TestError::Database)?;
+    }
+
+    let mut rows = conn
+        .query("select ownerId from documents limit 1", ())
+        .await
+        .map_err(TestError::Database)?;
+    assert!(rows.next().await.map_err(TestError::Database)?.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_seed_generates_valid_sql() -> Result<(), TestError> {
     let db = SeedDatabase::new(&schema::full_schema()).await?;
 

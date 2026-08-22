@@ -35,6 +35,10 @@ What it does:
 
 Use this when you want the shortest local development loop and do not need checked-in SQL migration files.
 
+### Schema-Only Directives
+
+Adding or removing `@immutable` changes Pyre's write typechecking and generated update inputs, but not the physical SQLite schema. It produces no migration SQL and installs no trigger or constraint. A direct push still stores the latest Pyre schema metadata so later dynamic queries use the current immutability rule.
+
 ## Checked-In Migration Workflow
 
 Use this when you want explicit SQL migration files under `pyre/migrations/`.

@@ -293,6 +293,7 @@ fn column_directive_equal_ignoring_locations(
         (ast::ColumnDirective::PrimaryKey, ast::ColumnDirective::PrimaryKey) => true,
         (ast::ColumnDirective::Unique, ast::ColumnDirective::Unique) => true,
         (ast::ColumnDirective::Index, ast::ColumnDirective::Index) => true,
+        (ast::ColumnDirective::Immutable, ast::ColumnDirective::Immutable) => true,
         (
             ast::ColumnDirective::Default {
                 id: ida, value: va, ..
@@ -1018,6 +1019,7 @@ record Test {
     id Int @id
     uniqueField String @unique
     indexedField String @index
+    immutableField String @immutable
     defaultField String @default("test")
     defaultNow DateTime @default(now)
     nullableField String?

@@ -52,7 +52,26 @@ record Membership {
 }
 ```
 
-Useful directives include `@id`, `@default(...)`, `@unique(...)`, `@index(...)`, `@singleton`, `@public`, permission directives, `@timestamps`, and `@syncable(false)`.
+Useful directives include `@id`, `@default(...)`, `@immutable`, `@unique(...)`, `@index(...)`, `@singleton`, `@public`, permission directives, `@timestamps`, and `@syncable(false)`.
+
+### Immutable Fields
+
+Use `@immutable` for a record field that may be assigned when a row is inserted but must not be assigned by a Pyre update:
+
+```pyre
+record Document {
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+    @public
+}
+```
+
+Immutable fields may use schema defaults and remain selectable in mutation results. The restriction applies to handwritten updates, transaction update steps, dynamic queries, and generated CRUD. Generated create inputs retain immutable fields when they are otherwise writable; generated update inputs omit them.
+
+`@immutable` is valid only on record fields. For a structured record field, such as a tagged union, it protects the complete logical value, including its discriminator and payload columns.
+
+This is a Pyre write-path invariant, not a SQLite constraint. Direct SQL, migrations, triggers, and foreign-key cascades can still change the stored columns.
 
 ## Singleton Records
 

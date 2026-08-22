@@ -311,6 +311,64 @@ fn generated_rust_server(
         .ok_or_else(|| "generated Rust server file is missing".into())
 }
 
+#[test]
+fn generated_rust_crud_omits_immutable_update_input_but_returns_field() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+record Document {
+    @public
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+}
+"#,
+        &mut schema,
+    )
+    .expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    let mut query_list = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut query_list, &context);
+    typecheck::check_queries(&query_list, &context).expect("CRUD typechecks");
+    let mut files = Vec::new();
+    pyre::generate::server::rust::generate_queries(
+        &context,
+        &query_list,
+        Path::new("rust"),
+        &mut files,
+    );
+    let generated = files
+        .into_iter()
+        .find(|file| file.path == Path::new("rust/server.rs"))
+        .expect("generated Rust server")
+        .contents;
+    let create = generated
+        .split("pub mod document_create {")
+        .nth(1)
+        .and_then(|rest| rest.split("pub type DocumentCreateInput").next())
+        .expect("document_create module");
+    let update = generated
+        .split("pub mod document_update {")
+        .nth(1)
+        .and_then(|rest| rest.split("pub type DocumentUpdateInput").next())
+        .expect("document_update module");
+    let update_input = update
+        .split("impl Input")
+        .next()
+        .expect("update Input struct");
+
+    assert!(create.contains("#[serde(rename = \"ownerId\")]"));
+    assert!(create.contains("pub owner_id: i64"));
+    assert!(!update_input.contains("owner_id"));
+    assert!(update.contains("pub owner_id: i64"));
+    assert!(generated.contains("pub type DocumentCreateOutput = document_create::Output;"));
+    assert!(generated.contains("pub type DocumentUpdateOutput = document_update::Output;"));
+}
+
 fn compile_and_run_generated_rust(
     server: &str,
     responses: &serde_json::Map<String, serde_json::Value>,
@@ -2535,6 +2593,179 @@ query GetNotes {
     .await?;
     assert_eq!(remaining.response["note"], json!([]));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn generated_crud_runtime_excludes_immutable_update_inputs(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Document {
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let create = query_by_operation(&manifest, "insert");
+    let update = query_by_operation(&manifest, "update");
+
+    assert!(create.input_schema.contains_key("ownerId"));
+    assert!(!update.input_schema.contains_key("ownerId"));
+    assert!(!update.optional_input_args.contains(&"ownerId".to_string()));
+
+    let created = query::run(
+        &conn,
+        &manifest,
+        &create.id,
+        json!({ "ownerId": 7, "title": "draft" }),
+        &session,
+    )
+    .await?;
+    let id = created.response["document"][0]["id"].clone();
+    assert_eq!(created.response["document"][0]["ownerId"], json!(7));
+
+    let updated = query::run(
+        &conn,
+        &manifest,
+        &update.id,
+        json!({ "id": id, "title": "published" }),
+        &session,
+    )
+    .await?;
+    assert_eq!(updated.response["document"][0]["ownerId"], json!(7));
+    assert_eq!(updated.response["document"][0]["title"], json!("published"));
+
+    let error = query::run(
+        &conn,
+        &manifest,
+        &update.id,
+        json!({ "id": id, "ownerId": 9 }),
+        &session,
+    )
+    .await
+    .expect_err("immutable update input should be unknown");
+    assert!(error.to_string().contains("unknown input field 'ownerId'"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn generated_crud_creates_and_returns_immutable_tagged_union(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+type ActionState
+   = Open { startedAt String }
+   | Completed { completedAt String }
+
+record Action {
+    @public
+    id    Int @id
+    state ActionState @immutable
+    title String
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let create = query_by_operation(&manifest, "insert");
+    let update = query_by_operation(&manifest, "update");
+
+    assert!(create.input_schema.contains_key("state"));
+    assert_eq!(create.json_input_args, vec!["state"]);
+    assert!(!update.input_schema.contains_key("state"));
+    assert!(!update.json_input_args.contains(&"state".to_string()));
+
+    let created = query::run_sync(
+        &conn,
+        &manifest,
+        &create.id,
+        json!({
+            "state": { "_type": "Open", "startedAt": "now" },
+            "title": "first"
+        }),
+        &session,
+    )
+    .await?;
+    assert_eq!(
+        created.response["action"][0]["state"],
+        json!({ "_type": "Open", "startedAt": "now" })
+    );
+
+    let mut rows = conn
+        .query("select state, state__startedAt from actions", ())
+        .await?;
+    let row = rows.next().await?.expect("created action exists");
+    assert_eq!(row.get::<String>(0)?, "Open");
+    assert_eq!(row.get::<String>(1)?, "now");
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_insert_populates_immutable_parent_foreign_key(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Parent {
+    @public
+    id       Id.Int @id
+    name     String
+    children @link(Child.parentId)
+}
+
+record Child {
+    @public
+    id       Int @id
+    parentId Parent.id @immutable
+    body     String
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+insert CreateParent($name: String, $body: String) {
+    parent {
+        name = $name
+        children {
+            body = $body
+        }
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let inserted = query::run_sync(
+        &conn,
+        &manifest,
+        &only_query(&manifest).id,
+        json!({ "name": "parent", "body": "child" }),
+        &session,
+    )
+    .await?;
+    let parent_id = inserted.response["parent"][0]["id"]
+        .as_i64()
+        .expect("parent id is returned");
+
+    let mut rows = conn
+        .query("select parentId, body from children", ())
+        .await?;
+    let row = rows.next().await?.expect("nested child exists");
+    assert_eq!(row.get::<i64>(0)?, parent_id);
+    assert_eq!(row.get::<String>(1)?, "child");
     Ok(())
 }
 

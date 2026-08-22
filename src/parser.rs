@@ -912,6 +912,7 @@ fn parse_column_directive(input: Text) -> ParseResult<ast::ColumnDirective> {
         parse_directive_named("id", ast::ColumnDirective::PrimaryKey),
         parse_directive_named("unique", ast::ColumnDirective::Unique),
         parse_directive_named("index", ast::ColumnDirective::Index),
+        parse_directive_named("immutable", ast::ColumnDirective::Immutable),
         parse_directive_named("createdAt", ast::ColumnDirective::CreatedAt),
         parse_directive_named("updatedAt", ast::ColumnDirective::UpdatedAt),
         parse_default_directive,

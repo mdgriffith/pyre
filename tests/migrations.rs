@@ -370,6 +370,55 @@ async fn singleton_migrations_add_and_remove_the_constant_unique_index() -> Resu
 // ============================================================================
 
 #[tokio::test]
+async fn immutable_changes_produce_no_sql_migration() -> Result<(), TestError> {
+    let mutable = r#"record Document {
+    id      Int @id
+    ownerId Int
+    @public
+}"#;
+    let immutable = r#"record Document {
+    id      Int @id
+    ownerId Int @immutable
+    @public
+}"#;
+
+    for (old, new) in [(mutable, immutable), (immutable, mutable)] {
+        let db_diff = create_migration_diff(old, new).await?;
+        assert!(diff::is_empty(&db_diff));
+        assert!(diff::to_sql::to_sql(&db_diff).is_empty());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn immutable_and_physical_changes_produce_only_physical_sql() -> Result<(), TestError> {
+    let old = r#"record Document {
+    id      Int @id
+    ownerId Int
+    @public
+}"#;
+    let new = r#"record Document {
+    id      Int @id
+    ownerId Int @immutable
+    summary String?
+    @public
+}"#;
+
+    let db_diff = create_migration_diff(old, new).await?;
+    let sql = diff::to_sql::to_sql(&db_diff);
+    assert_eq!(sql.len(), 1);
+    assert!(matches!(
+        &sql[0],
+        pyre::generate::sql::to_sql::SqlAndParams::Sql(statement)
+            if statement.contains("add column")
+                && statement.contains("summary")
+                && !statement.contains("immutable")
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_migration_add_table() -> Result<(), TestError> {
     let old_schema = r#"record User {
     id   Int    @id

@@ -55,6 +55,64 @@ record MapEntityTrail {
 }
 
 #[test]
+fn generated_elm_crud_omits_immutable_update_encoder_but_returns_field() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+record Document {
+    @public
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+}
+"#,
+        &mut schema,
+    )
+    .expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    let mut query_list = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut query_list, &context);
+    let query_info = typecheck::check_queries(&query_list, &context).expect("CRUD typechecks");
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    elm::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("client/elm"),
+        &mut files,
+    );
+    let file = |suffix: &str| {
+        &files
+            .iter()
+            .find(|file| path_ends_with(&file.path, suffix))
+            .unwrap_or_else(|| panic!("missing generated {suffix}"))
+            .contents
+    };
+    let create = file("Query/DocumentCreate.elm");
+    let update = file("Query/DocumentUpdate.elm");
+    let update_input = update
+        .split("type alias Document")
+        .next()
+        .expect("update input and encoder");
+
+    assert!(create.contains("ownerId : Int"));
+    assert!(create.contains("\"ownerId\"") && create.contains("input.ownerId"));
+    assert!(!update_input.contains("ownerId :"));
+    assert!(!update_input.contains("input.ownerId"));
+    assert!(update.contains("ownerId : Int"));
+    assert!(update.contains("type alias MutationResult"));
+    assert!(update.contains("decodeMutationResult : Decode.Decoder MutationResult"));
+    assert!(update.contains(
+        "Encode.object [ ( \"field\", Encode.string \"title\" ), ( \"input\", Encode.string \"title\" ) ]"
+    ));
+    assert!(!update.contains("Encode.string \"ownerId\""));
+}
+
+#[test]
 fn generated_pyre_elm_uses_query_upserts() {
     let schema_source = r#"
 record Rulebook {

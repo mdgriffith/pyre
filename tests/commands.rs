@@ -1621,6 +1621,163 @@ record Task {
 }
 
 #[tokio::test]
+async fn test_migrate_push_records_immutable_only_schema_change() {
+    let ctx = TestContext::new();
+    let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
+    std::fs::write(
+        &schema_path,
+        "record Document {\n    id Int @id\n    ownerId Int\n    title String\n    @public\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("migrate")
+        .arg(".yak/yak.db")
+        .arg("--push")
+        .assert()
+        .success();
+    std::fs::write(
+        &schema_path,
+        "record Document {\n    id Int @id\n    ownerId Int @immutable\n    title String\n    @public\n}\n",
+    )
+    .unwrap();
+    ctx.run_command("migrate")
+        .arg(".yak/yak.db")
+        .arg("--push")
+        .assert()
+        .success();
+
+    let db_path = ctx.workspace_path.join(".yak/yak.db");
+    let db = libsql::Builder::new_local(db_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "select sql, schema from _pyre_migrations where finished_at is not null order by id desc limit 1",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("latest push exists");
+    let sql: String = row.get(0).unwrap();
+    let schema_source: String = row.get(1).unwrap();
+    assert!(sql.is_empty(), "an immutable-only push must emit no DDL");
+    assert!(schema_source.contains("@immutable"));
+
+    let loaded = pyre::server::schema::load_schema_from_database(&conn)
+        .await
+        .expect("stored immutable schema should reload");
+    let owner_id = loaded
+        .context()
+        .unwrap()
+        .tables
+        .values()
+        .find(|table| table.record.name == "Document")
+        .and_then(|table| {
+            pyre::ast::collect_columns(&table.record.fields)
+                .into_iter()
+                .find(|col| col.name == "ownerId")
+        })
+        .expect("Document.ownerId exists");
+    assert!(pyre::ast::is_immutable(&owner_id));
+
+    let update = pyre::parser::parse_query(
+        "update.pyre",
+        "update Transfer($id: Int, $ownerId: Int) { document { @where { id == $id } ownerId = $ownerId } }",
+    )
+    .expect("update parses");
+    let errors = match pyre::typecheck::check_queries(&update, loaded.context().unwrap()) {
+        Ok(_) => panic!("stored metadata should reject immutable updates"),
+        Err(errors) => errors,
+    };
+    assert!(errors.iter().any(|error| matches!(
+        error.error_type,
+        pyre::error::ErrorType::ImmutableColumnCannotBeUpdated { ref field }
+            if field == "ownerId"
+    )));
+}
+
+#[tokio::test]
+async fn test_migrate_push_applies_physical_and_immutable_changes_together() {
+    let ctx = TestContext::new();
+    let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
+    std::fs::write(
+        &schema_path,
+        "record Document {\n    id Int @id\n    ownerId Int\n    @public\n}\n",
+    )
+    .unwrap();
+    ctx.run_command("migrate")
+        .arg(".yak/yak.db")
+        .arg("--push")
+        .assert()
+        .success();
+
+    std::fs::write(
+        &schema_path,
+        "record Document {\n    id Int @id\n    ownerId Int @immutable\n    summary String?\n    @public\n}\n",
+    )
+    .unwrap();
+    ctx.run_command("migrate")
+        .arg(".yak/yak.db")
+        .arg("--push")
+        .assert()
+        .success();
+
+    let db_path = ctx.workspace_path.join(".yak/yak.db");
+    let db = libsql::Builder::new_local(db_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut columns = conn
+        .query("pragma table_info('documents')", ())
+        .await
+        .unwrap();
+    let mut has_summary = false;
+    while let Some(row) = columns.next().await.unwrap() {
+        has_summary |= row.get::<String>(1).unwrap() == "summary";
+    }
+    assert!(has_summary, "the physical column change should be applied");
+
+    let mut rows = conn
+        .query(
+            "select sql, schema from _pyre_migrations where finished_at is not null order by id desc limit 1",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("latest push exists");
+    let sql: String = row.get(0).unwrap();
+    let schema_source: String = row.get(1).unwrap();
+    assert!(
+        sql.is_empty(),
+        "direct pushes store schema metadata separately from executed DDL"
+    );
+    assert!(
+        !sql.contains("immutable"),
+        "immutability has no physical DDL"
+    );
+    assert!(schema_source.contains("@immutable"));
+    let loaded = pyre::server::schema::load_schema_from_database(&conn)
+        .await
+        .expect("mixed-change schema metadata should reload");
+    let owner_id = loaded
+        .context()
+        .unwrap()
+        .tables
+        .values()
+        .find(|table| table.record.name == "Document")
+        .and_then(|table| {
+            pyre::ast::collect_columns(&table.record.fields)
+                .into_iter()
+                .find(|col| col.name == "ownerId")
+        })
+        .expect("Document.ownerId exists");
+    assert!(pyre::ast::is_immutable(&owner_id));
+}
+
+#[tokio::test]
 async fn test_namespaced_migrate_push_records_standalone_shared_session_types() {
     let ctx = TestContext::new();
     std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();

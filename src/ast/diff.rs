@@ -170,10 +170,12 @@ pub fn diff_schema(old_schema: &crate::ast::Schema, new_schema: &crate::ast::Sch
                     }
                     crate::ast::Definition::Record { name, .. } => {
                         let changes = find_record_changes(old_def, new_def);
-                        modified_records.push(DetailedRecordDiff {
-                            name: name.clone(),
-                            changes,
-                        });
+                        if !changes.is_empty() {
+                            modified_records.push(DetailedRecordDiff {
+                                name: name.clone(),
+                                changes,
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -336,23 +338,28 @@ fn diff_column(old: &crate::ast::Column, new: &crate::ast::Column) -> Option<Col
     let mut new_directives = std::collections::HashMap::new();
 
     // Helper function to get directive key
-    let get_key = |directive: &crate::ast::ColumnDirective| -> String {
+    let get_key = |directive: &crate::ast::ColumnDirective| -> Option<&'static str> {
         match directive {
-            crate::ast::ColumnDirective::PrimaryKey => "_key".to_string(),
-            crate::ast::ColumnDirective::Unique => "_uniq".to_string(),
-            crate::ast::ColumnDirective::Index => "_idx".to_string(),
-            crate::ast::ColumnDirective::CreatedAt => "_createdAt".to_string(),
-            crate::ast::ColumnDirective::UpdatedAt => "_updatedAt".to_string(),
-            crate::ast::ColumnDirective::Default { .. } => "_default".to_string(),
+            crate::ast::ColumnDirective::PrimaryKey => Some("_key"),
+            crate::ast::ColumnDirective::Unique => Some("_uniq"),
+            crate::ast::ColumnDirective::Index => Some("_idx"),
+            crate::ast::ColumnDirective::CreatedAt => Some("_createdAt"),
+            crate::ast::ColumnDirective::UpdatedAt => Some("_updatedAt"),
+            crate::ast::ColumnDirective::Default { .. } => Some("_default"),
+            crate::ast::ColumnDirective::Immutable => None,
         }
     };
 
     // Populate HashMaps
     for directive in &old.directives {
-        old_directives.insert(get_key(directive), directive.clone());
+        if let Some(key) = get_key(directive) {
+            old_directives.insert(key, directive.clone());
+        }
     }
     for directive in &new.directives {
-        new_directives.insert(get_key(directive), directive.clone());
+        if let Some(key) = get_key(directive) {
+            new_directives.insert(key, directive.clone());
+        }
     }
 
     // Find added directives

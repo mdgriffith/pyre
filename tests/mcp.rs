@@ -392,6 +392,10 @@ fn docs_are_exposed_as_resources() {
         .as_str()
         .unwrap()
         .contains("exists workspace.members"));
+    assert!(schema_docs["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("### Immutable Fields"));
 
     let schema_tool_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "schema" }));
     assert!(schema_tool_docs["content"]
@@ -424,6 +428,16 @@ fn docs_are_exposed_as_resources() {
         .as_str()
         .unwrap()
         .contains("transaction ReplaceNote"));
+    assert!(query_docs["content"]
+        .as_str()
+        .unwrap()
+        .contains("generated update inputs omit them"));
+
+    let migration_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "migrations" }));
+    assert!(migration_docs["content"]
+        .as_str()
+        .unwrap()
+        .contains("produces no migration SQL"));
 
     let serve_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "serve" }));
     assert!(serve_docs["content"]
@@ -987,6 +1001,36 @@ fn pyre_preview_query_returns_generated_sql_without_database() {
         .as_str()
         .unwrap()
         .contains("$name"));
+}
+
+#[test]
+fn pyre_preview_query_rejects_immutable_updates() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+record Document {
+    id      Int @id
+    ownerId Int @immutable
+    title   String
+    @public
+}
+"#,
+    )
+    .unwrap();
+
+    let response = call_mcp_tool_error(
+        &ctx,
+        "pyre_preview_query",
+        json!({
+            "query": "update TransferDocument($id: Int, $ownerId: Int) { document { @where { id == $id } ownerId = $ownerId } }"
+        }),
+    );
+
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("ImmutableColumnCannotBeUpdated"));
 }
 
 #[test]

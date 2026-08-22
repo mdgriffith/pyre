@@ -158,6 +158,15 @@ createdAt DateTime @index
 
 Column-level `@index` is equivalent to a single-column non-unique index with ascending order.
 
+**`@immutable`** - Insertable but not updateable through Pyre
+```pyre
+ownerId User.id @immutable
+```
+
+`@immutable` is valid only on record fields. The field may be assigned during insertion, receive a schema default, be populated by seed data, and be selected in query or mutation results. Any update assignment is rejected, including transaction update steps and dynamic queries. For a structured logical field, the directive protects its complete discriminator and payload representation.
+
+The directive is enforced by Pyre's write paths and generated APIs. It does not create a SQLite constraint or trigger, and adding or removing it produces no migration SQL. Direct SQL, migrations, triggers, and foreign-key cascades are outside this invariant.
+
 **`@default(value)`** - Default value
 ```pyre
 // String literal

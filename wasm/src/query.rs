@@ -5,8 +5,6 @@ use pyre::error;
 use pyre::generate::sql::to_sql::SqlAndParams;
 use pyre::parser;
 use pyre::typecheck;
-use serde_wasm_bindgen;
-use web_sys::console;
 
 const QUERY_FILE: &str = "query.pyre";
 
@@ -21,8 +19,6 @@ pub fn query_to_sql(
         Ok(query_list) => {
             let query_list: ast::QueryList = query_list;
 
-            console::log_1(&serde_wasm_bindgen::to_value("Parsed").unwrap());
-
             // Find the first query in the list
             // We're only running exactly one query in this context.
             let mut found_query = None;
@@ -30,9 +26,6 @@ pub fn query_to_sql(
                 match query_def {
                     ast::QueryDef::Query(query) => {
                         if found_query.is_some() {
-                            console::log_1(
-                                &serde_wasm_bindgen::to_value("More than one query").unwrap(),
-                            );
                             // Found more than one query
                             return Err(vec![error::Error {
                                 error_type: error::ErrorType::ParsingError(
@@ -129,5 +122,76 @@ pub fn query_to_sql_wasm(query_source: String) -> Result<Vec<SqlAndParams>, Vec<
             }
         }
         _ => Err(vec!["No schema found".to_string()]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> typecheck::Context {
+        let mut schema = ast::Schema::default();
+        parser::run(
+            "schema.pyre",
+            r#"
+type EventPayload
+   = Created { title String }
+   | Deleted
+
+record Event {
+    @public
+    id       Int @id
+    ownerId  Int @immutable
+    code     String @immutable
+    payload  EventPayload @immutable
+    title    String
+}
+"#,
+            &mut schema,
+        )
+        .expect("schema parses");
+        typecheck::check_schema(&ast::Database {
+            schemas: vec![schema],
+        })
+        .expect("schema typechecks")
+    }
+
+    fn assert_immutable_error(source: &str, field: &str) {
+        let errors = match query_to_sql(&context(), source) {
+            Ok(_) => panic!("immutable update must fail"),
+            Err(errors) => errors,
+        };
+        assert!(errors.iter().any(|error| matches!(
+            error.error_type,
+            error::ErrorType::ImmutableColumnCannotBeUpdated { field: ref actual }
+                if actual == field
+        )));
+    }
+
+    #[test]
+    fn query_to_sql_enforces_immutable_assignments_before_generating_sql() {
+        assert_immutable_error(
+            "update SetOwner($id: Int, $ownerId: Int) { event { @where { id == $id } ownerId = $ownerId } }",
+            "ownerId",
+        );
+        assert_immutable_error(
+            "update SetCode($id: Int) { event { @where { id == $id } code = \"fixed\" } }",
+            "code",
+        );
+        assert_immutable_error(
+            "update SetPayload($id: Int, $title: String) { event { @where { id == $id } payload = Created { title = $title } } }",
+            "payload",
+        );
+
+        let sql = query_to_sql(
+            &context(),
+            "update Rename($id: Int, $title: String) { event { @where { id == $id } title = $title ownerId } }",
+        )
+        .expect("mutable update should generate SQL");
+        assert!(!sql.is_empty());
+        assert!(sql.iter().any(|statement| match statement {
+            SqlAndParams::Sql(sql) => sql.contains("title = $title"),
+            SqlAndParams::SqlWithParams { sql, .. } => sql.contains("title = $title"),
+        }));
     }
 }

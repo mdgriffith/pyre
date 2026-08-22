@@ -1897,6 +1897,22 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                         } else {
                             session_found = true;
                         }
+
+                        for column in ast::collect_columns(&session.fields) {
+                            if ast::is_immutable(&column) {
+                                errors.push(Error {
+                                    filepath: file.path.clone(),
+                                    error_type: ErrorType::InvalidTypeUsage {
+                                        message: "@immutable can only be used on record fields"
+                                            .to_string(),
+                                    },
+                                    locations: vec![Location {
+                                        contexts: to_range(&session.start, &session.end),
+                                        primary: to_range(&column.start, &column.end),
+                                    }],
+                                });
+                            }
+                        }
                     }
                     ast::Definition::Record {
                         name,
@@ -2054,13 +2070,28 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                                     validate_type_expr(
                                         context,
                                         &file.path,
-                                        contexts,
+                                        contexts.clone(),
                                         to_range(&field.start_typename, &field.end_typename),
                                         &field.type_,
                                         true,
                                         &mut HashSet::new(),
                                         errors,
                                     );
+
+                                    if ast::is_immutable(&field) {
+                                        errors.push(Error {
+                                            filepath: file.path.clone(),
+                                            error_type: ErrorType::InvalidTypeUsage {
+                                                message:
+                                                    "@immutable can only be used on record fields"
+                                                        .to_string(),
+                                            },
+                                            locations: vec![Location {
+                                                contexts,
+                                                primary: to_range(&field.start, &field.end),
+                                            }],
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -3437,6 +3468,18 @@ fn mark_as_used(
                 }
             }
         }
+        ast::QueryValue::Fn(details) => {
+            for arg in &details.args {
+                mark_as_used(query_context, arg, params);
+            }
+        }
+        ast::QueryValue::LiteralTypeValue((_, details)) => {
+            if let Some(fields) = &details.fields {
+                for (_, value) in fields {
+                    mark_as_used(query_context, value, params);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -4362,6 +4405,21 @@ fn check_field(
     let column_type_str = query_param_type_for_column(table, column);
     match &field.set {
         Some(set) => {
+            if matches!(operation, ast::QueryOperation::Update) && ast::is_immutable(column) {
+                mark_as_used(query_context, set, params);
+                errors.push(Error {
+                    filepath: context.current_filepath.clone(),
+                    error_type: ErrorType::ImmutableColumnCannotBeUpdated {
+                        field: column.name.clone(),
+                    },
+                    locations: vec![Location {
+                        contexts: vec![],
+                        primary: to_range(&field.start_fieldname, &field.end_fieldname),
+                    }],
+                });
+                return;
+            }
+
             if matches!(
                 operation,
                 ast::QueryOperation::Insert | ast::QueryOperation::Update
