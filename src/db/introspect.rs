@@ -334,6 +334,7 @@ pub enum SchemaResult {
         errors: Vec<error::Error>,
     },
     FailedToTypecheck {
+        source: String,
         schema: ast::Schema,
         errors: Vec<error::Error>,
     },
@@ -631,7 +632,11 @@ pub fn from_raw(mut raw: IntrospectionRaw) -> Introspection {
                     raw.links = extract_links(&schema, &raw.tables);
                     SchemaResult::Success { schema, context }
                 }
-                Err(errors) => SchemaResult::FailedToTypecheck { schema, errors },
+                Err(errors) => SchemaResult::FailedToTypecheck {
+                    source: raw.schema_source.clone(),
+                    schema,
+                    errors,
+                },
             }
         }
         Err(err) => {

@@ -192,11 +192,9 @@ fn context_from_introspection(
             source: source.clone(),
             errors: errors.clone(),
         }),
-        introspect::SchemaResult::FailedToTypecheck { schema: _, errors } => {
-            Err(Error::SchemaTypecheck {
-                errors: errors.clone(),
-            })
-        }
+        introspect::SchemaResult::FailedToTypecheck { errors, .. } => Err(Error::SchemaTypecheck {
+            errors: errors.clone(),
+        }),
     }
 }
 
@@ -209,11 +207,9 @@ fn schema_from_introspection(
             source: source.clone(),
             errors: errors.clone(),
         }),
-        introspect::SchemaResult::FailedToTypecheck { schema: _, errors } => {
-            Err(Error::SchemaTypecheck {
-                errors: errors.clone(),
-            })
-        }
+        introspect::SchemaResult::FailedToTypecheck { errors, .. } => Err(Error::SchemaTypecheck {
+            errors: errors.clone(),
+        }),
     }
 }
 

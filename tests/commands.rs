@@ -55,6 +55,31 @@ record User {
     .unwrap();
 }
 
+fn write_clocktower_schema(ctx: &TestContext, source: &str) {
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Clocktower")).unwrap();
+    std::fs::write(
+        ctx.workspace_path
+            .join("pyre/schema/Clocktower/schema.pyre"),
+        source,
+    )
+    .unwrap();
+}
+
+async fn replace_stored_schema(ctx: &TestContext, source: &str) {
+    let db_path = ctx.workspace_path.join(".yak/clocktower.db");
+    let db = libsql::Builder::new_local(db_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "update _pyre_migrations set schema = ? where schema is not null",
+        libsql::params_from_iter(vec![libsql::Value::Text(source.to_string())]),
+    )
+    .await
+    .unwrap();
+}
+
 #[test]
 fn docs_lists_topics() {
     let ctx = TestContext::new();
@@ -1618,6 +1643,134 @@ record Task {
         schema_source.contains("status TaskStatus"),
         "_pyre_migrations should store the pushed schema source"
     );
+}
+
+#[tokio::test]
+async fn test_migrate_push_reports_stored_schema_parse_errors() {
+    let ctx = TestContext::new();
+    write_clocktower_schema(
+        &ctx,
+        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+    );
+
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .success();
+    replace_stored_schema(&ctx, "record {").await;
+
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Stored schema in database '.yak/clocktower.db' for namespace 'Clocktower' failed to parse:",
+        ))
+        .stderr(predicate::str::contains("schema.pyre"))
+        .stderr(predicate::str::contains("record {"))
+        .stderr(predicate::str::contains("No schema found in the database").not());
+}
+
+#[tokio::test]
+async fn test_migrate_push_reports_stored_schema_typecheck_errors() {
+    let ctx = TestContext::new();
+    write_clocktower_schema(
+        &ctx,
+        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+    );
+
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .success();
+    replace_stored_schema(
+        &ctx,
+        "record Note {\n    id Int @id\n    missing MissingType\n    @public\n}\n",
+    )
+    .await;
+
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Stored schema in database '.yak/clocktower.db' for namespace 'Clocktower' failed to typecheck:",
+        ))
+        .stderr(predicate::str::contains("schema.pyre"))
+        .stderr(predicate::str::contains("missing MissingType"))
+        .stderr(predicate::str::contains(
+            "I don't recognize the MissingType type",
+        ))
+        .stderr(predicate::str::contains("No schema found in the database").not());
+}
+
+#[test]
+fn test_migrate_push_preserves_missing_current_source_namespace_error() {
+    let ctx = TestContext::new();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Clocktower")).unwrap();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
+        "record User {\n    id Int @id\n    @public\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Error: No schema found for namespace 'Clocktower'",
+        ))
+        .stderr(predicate::str::contains("Stored schema in database").not());
+}
+
+#[test]
+fn test_migrate_push_with_valid_stored_schema_still_succeeds() {
+    let ctx = TestContext::new();
+    let schema_path = ctx
+        .workspace_path
+        .join("pyre/schema/Clocktower/schema.pyre");
+    write_clocktower_schema(
+        &ctx,
+        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+    );
+
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .success();
+    std::fs::write(
+        schema_path,
+        "record Note {\n    id Int @id\n    body String\n    summary String?\n    @public\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .success();
 }
 
 #[tokio::test]
