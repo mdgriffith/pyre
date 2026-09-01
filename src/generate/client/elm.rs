@@ -2011,14 +2011,24 @@ fn to_param_type_alias(
     for arg in args {
         let type_string = &arg.type_.clone().unwrap_or("unknown".to_string());
         let base_type = to_elm_typename(lookup, type_string, false);
-        let elm_type = if *operation == ast::QueryOperation::Update && arg.omittable {
-            if base_type.contains(' ') {
-                format!("Db.Updates.Update ({})", base_type)
+        let param_type =
+            if arg.nullable && !(*operation == ast::QueryOperation::Update && arg.omittable) {
+                if base_type.contains(' ') {
+                    format!("Maybe ({})", base_type)
+                } else {
+                    format!("Maybe {}", base_type)
+                }
             } else {
-                format!("Db.Updates.Update {}", base_type)
+                base_type
+            };
+        let elm_type = if *operation == ast::QueryOperation::Update && arg.omittable {
+            if param_type.contains(' ') {
+                format!("Db.Updates.Update ({})", param_type)
+            } else {
+                format!("Db.Updates.Update {}", param_type)
             }
         } else {
-            base_type
+            param_type
         };
         if is_first {
             result.push_str(&format!(" {} : {}\n", arg.name, elm_type));
@@ -2056,17 +2066,11 @@ fn to_param_type_encoder(
         let encoded_value = if *operation == ast::QueryOperation::Update && arg.omittable {
             to_update_arg_encoder_str(lookup, type_string, &arg.name)
         } else if *operation == ast::QueryOperation::Update {
-            format!(
-                "Db.Updates.set ({} input.{})",
-                to_type_encoder_str(lookup, &type_string),
-                &arg.name
-            )
+            let encoder = to_param_encoder_str(lookup, type_string, arg.nullable);
+            format!("Db.Updates.set ({} input.{})", encoder, &arg.name)
         } else {
-            format!(
-                "{} input.{}",
-                to_type_encoder_str(lookup, &type_string),
-                &arg.name
-            )
+            let encoder = to_param_encoder_str(lookup, type_string, arg.nullable);
+            format!("{} input.{}", encoder, &arg.name)
         };
         if is_first {
             result.push_str(&format!(
@@ -2085,6 +2089,15 @@ fn to_param_type_encoder(
     }
     result.push_str("        ]\n\n\n");
     result
+}
+
+fn to_param_encoder_str(lookup: &ElmLookup, type_: &str, nullable: bool) -> String {
+    let type_ = ast::ColumnType::from_str(type_);
+    if nullable {
+        to_elm_encoder(lookup, &ast::ColumnType::Nullable(Box::new(type_)))
+    } else {
+        to_elm_encoder(lookup, &type_)
+    }
 }
 
 fn to_update_arg_encoder_str(lookup: &ElmLookup, type_: &str, field_name: &str) -> String {

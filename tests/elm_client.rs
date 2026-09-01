@@ -55,6 +55,71 @@ record MapEntityTrail {
 }
 
 #[test]
+fn generated_elm_nullable_json_input_uses_maybe_and_encodes_null() {
+    let schema_source = r#"
+type ChoiceStorage
+   = Choices {
+        values Json<List<String>>
+     }
+
+record LegacyChoice {
+    @public
+
+    id              Id.Int @id
+    expectedChoices Json<ChoiceStorage>?
+}
+"#;
+
+    let query_source = r#"
+query FindLegacyChoices($expectedChoices: Json<ChoiceStorage>?) {
+    legacyChoice {
+        @where { expectedChoices == $expectedChoices }
+
+        id
+    }
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let query_list = parser::parse_query("query.pyre", query_source).expect("query parses");
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+
+    elm::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("client/elm"),
+        &mut files,
+    );
+
+    let generated = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "Query/FindLegacyChoices.elm"))
+        .expect("generated FindLegacyChoices.elm file");
+
+    assert!(
+        generated
+            .contents
+            .contains("expectedChoices : Maybe Db.ChoiceStorage"),
+        "Nullable JSON input should generate Maybe. Generated:\n{}",
+        generated.contents
+    );
+    assert!(
+        generated.contents.contains(
+            "Maybe.map (Db.Encode.choiceStorage ) maybe__ |> Maybe.withDefault Encode.null"
+        ),
+        "Nothing should encode as JSON null. Generated:\n{}",
+        generated.contents
+    );
+}
+
+#[test]
 fn generated_elm_crud_omits_immutable_update_encoder_but_returns_field() {
     let mut schema = ast::Schema::default();
     parser::run(
