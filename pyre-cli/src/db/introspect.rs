@@ -59,7 +59,7 @@ where
 }
 
 pub async fn introspect(db: &libsql::Database) -> Result<Introspection, libsql::Error> {
-    match db.connect() {
+    match super::ProcessConnection::connect(db) {
         Err(e) => {
             println!("Error: {}", e);
             Err(e)

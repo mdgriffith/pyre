@@ -224,7 +224,7 @@ pub async fn push<'a>(
                                         ],
                                     });
 
-                                    match conn.connect() {
+                                    match db::ProcessConnection::connect(&conn) {
                                         Ok(connected_conn) => {
                                             match connected_conn
                                                 .transaction_with_behavior(

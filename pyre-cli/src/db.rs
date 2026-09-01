@@ -9,6 +9,8 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 pub mod error;
@@ -112,6 +114,28 @@ pub async fn connect(
             Ok(connected) => return Ok(connected),
             Err(e) => return Err(DbError::DatabaseError(e)),
         }
+    }
+}
+
+/// A connection kept alive until this short-lived CLI process exits.
+///
+/// libSQL currently closes local SQLite handles twice when the final connection is dropped,
+/// which can segfault on platforms such as Linux musl. Avoid that destructor in CLI commands;
+/// the operating system reclaims the handle at process exit.
+/// https://github.com/tursodatabase/libsql/issues/2251
+pub struct ProcessConnection(ManuallyDrop<libsql::Connection>);
+
+impl ProcessConnection {
+    pub fn connect(db: &libsql::Database) -> Result<Self, libsql::Error> {
+        db.connect().map(|conn| Self(ManuallyDrop::new(conn)))
+    }
+}
+
+impl Deref for ProcessConnection {
+    type Target = libsql::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -440,7 +464,7 @@ pub async fn migrate(
 ) -> Result<MigrateOutcome, MigrationError> {
     let schema = options.schema;
     let migration_folder = options.migration_folder;
-    let conn = db.connect().map_err(MigrationError::SqlError)?;
+    let conn = ProcessConnection::connect(db).map_err(MigrationError::SqlError)?;
     preflight_database_compatibility(&conn, &options).await?;
 
     let migration_files = match read_migration_folder(migration_folder) {
