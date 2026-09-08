@@ -741,7 +741,7 @@ fn dynamic_query_plan(
     let query_source = required_string_arg(arguments, "query")?;
     let (_database_schema, context, _paths) = current_schema_context(options, arguments)?;
     let query_list = pyre::parser::parse_query("mcp.pyre", &query_source)
-        .map_err(|_| "Failed to parse dynamic Pyre query".to_string())?;
+        .map_err(|error| parser::render_error(&query_source, error, false))?;
     let query_infos = pyre::typecheck::check_queries(&query_list, &context)
         .map_err(|errors| format!("Dynamic query failed typecheck: {errors:#?}"))?;
     let manifest = dynamic_manifest(&context, &query_list, &query_infos)?;

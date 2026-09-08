@@ -978,6 +978,38 @@ record Game {
 }
 
 #[test]
+fn dynamic_query_tools_surface_cli_parse_diagnostics() {
+    let ctx = TestContext::new();
+    write_schema(&ctx);
+
+    for query in [
+        "query GetUsers {\n    user {\n        id\n",
+        "query GetUsers($name: String { user { id } }",
+        "query GetUsers { user { id } }\ninvalid",
+    ] {
+        let error = pyre::parser::parse_query("mcp.pyre", query).unwrap_err();
+        let expected = pyre::parser::render_error(query, error, false);
+        assert!(expected.contains("mcp.pyre"), "{expected}");
+        assert!(!expected.contains('\u{1b}'), "{expected}");
+
+        for tool in ["pyre_query", "pyre_preview_query", "pyre_explain_query"] {
+            let response = call_mcp_tool_error(
+                &ctx,
+                tool,
+                json!({
+                    "database": "unused.db",
+                    "query": query
+                }),
+            );
+
+            assert_eq!(response["error"]["code"], -32603, "{tool}");
+            assert_eq!(response["error"]["message"], expected, "{tool}");
+            assert_eq!(response["error"]["data"]["message"], expected, "{tool}");
+        }
+    }
+}
+
+#[test]
 fn pyre_preview_query_returns_generated_sql_without_database() {
     let ctx = TestContext::new();
     write_schema(&ctx);
