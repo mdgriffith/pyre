@@ -144,6 +144,7 @@ impl Deref for ProcessConnection {
 #[derive(Debug)]
 pub enum MigrationError {
     SqlError(libsql::Error),
+    MigrationSqlError(libsql::Error, PathBuf),
     MigrationReadIoError(std::io::Error, PathBuf),
     NoMigrationsFound(PathBuf),
     IncompatibleDatabase {
@@ -167,6 +168,11 @@ impl MigrationError {
     pub fn format_error(&self) -> String {
         match self {
             MigrationError::SqlError(sql_error) => error::format_libsql_error(sql_error),
+            MigrationError::MigrationSqlError(sql_error, path) => format!(
+                "Failed to execute migration {}:\n{}",
+                path.display(),
+                error::format_libsql_error(sql_error)
+            ),
             MigrationError::MigrationReadIoError(io_error, path) => {
                 pyre::error::format_custom_error(
                     "Migration Read Error",
@@ -530,9 +536,14 @@ pub async fn migrate(
     for (index, (migration_filename, migration_contents)) in
         migration_plan.migrations_to_run.iter().enumerate()
     {
-        tx.execute_batch(migration_contents)
-            .await
-            .map_err(MigrationError::SqlError)?;
+        tx.execute_batch(migration_contents).await.map_err(|err| {
+            MigrationError::MigrationSqlError(
+                err,
+                migration_folder
+                    .join(migration_filename)
+                    .join("migration.sql"),
+            )
+        })?;
 
         // Record migration using centralized constant
         // INSERT_MIGRATION_SUCCESS requires (name, sql, finished_at)

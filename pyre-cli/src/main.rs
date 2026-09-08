@@ -182,7 +182,14 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("{}", error);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> io::Result<()> {
     let cli = Cli::parse();
 
     // Check if stderr is a TTY to determine if we should enable color output.

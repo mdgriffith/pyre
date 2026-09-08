@@ -44,7 +44,12 @@ pub(super) fn format_source(
     let database = parse_database_schemas(&paths, false)?;
     let mut queries = match parser::parse_query(file_path, source) {
         Ok(queries) => queries,
-        Err(_) => return Ok(None),
+        Err(err) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                parser::render_error(source, err, false),
+            ))
+        }
     };
     format::query_list(&database, &mut queries);
     Ok(Some(generate::to_string::query(&queries)))
@@ -292,7 +297,7 @@ fn source_is_schema(paths: &pyre::filesystem::Found, in_dir: &Path, file_path: &
 }
 
 fn format_query_to_std_out(
-    _options: &Options,
+    options: &Options,
     database: &ast::Database,
     query_source_str: &str,
 ) -> io::Result<()> {
@@ -307,9 +312,15 @@ fn format_query_to_std_out(
             println!("{}", formatted);
             return Ok(());
         }
-        Err(_) => {
-            println!("{}", query_source_str);
-            return Ok(());
+        Err(err) => {
+            eprintln!(
+                "{}",
+                parser::render_error(query_source_str, err, options.enable_color)
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to parse query",
+            ));
         }
     }
 }
@@ -341,10 +352,16 @@ fn format_query(
                 .write_all(formatted.as_bytes())
                 .expect("Failed to write to file");
         }
-        Err(err) => eprintln!(
-            "{}",
-            parser::render_error(&query_source_str, err, options.enable_color)
-        ),
+        Err(err) => {
+            eprintln!(
+                "{}",
+                parser::render_error(&query_source_str, err, options.enable_color)
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to parse query",
+            ));
+        }
     }
 
     Ok(())

@@ -44,6 +44,7 @@ pub enum ErrorType {
     },
     MultipleSessionDefinitions,
     MissingType,
+    InvalidSchemaName(String),
     DuplicateDefinition(String),
     DefinitionIsBuiltIn(String),
     GeneratedCrudNameCollision {
@@ -1501,6 +1502,10 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
             result
         }
         ErrorType::InvalidTypeUsage { message } => message.clone(),
+        ErrorType::InvalidSchemaName(name) => format!(
+            "This schema name must be capitalized: {}",
+            yellow_if(in_color, name)
+        ),
 
         ErrorType::UnknownField {
             found,
@@ -1625,6 +1630,7 @@ pub fn to_error_title(error_type: &ErrorType) -> String {
         ErrorType::UnknownFunction { .. } => "Unknown Function",
         ErrorType::MultipleSessionDefinitions => "Multiple Session Definitions",
         ErrorType::MissingType => "Missing Type",
+        ErrorType::InvalidSchemaName(_) => "Schema name formatting",
         ErrorType::DuplicateDefinition(_) => "Duplicate Definition",
         ErrorType::DefinitionIsBuiltIn(_) => "Definition Is Built-in",
         ErrorType::GeneratedCrudNameCollision { .. } => "Generated CRUD Name Collision",

@@ -133,7 +133,28 @@ pub fn collect_filepaths(dir: &Path) -> io::Result<Found> {
     let mut query_files: Vec<String> = vec![];
     let mut namespaces: Vec<String> = vec![];
 
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // Standalone formatting can run without a project directory. Only a
+            // missing root is optional; errors below an existing root are not.
+            Err(error)
+                if error.depth() == 0
+                    && error.io_error().map(|e| e.kind()) == Some(io::ErrorKind::NotFound) =>
+            {
+                break;
+            }
+            Err(error) => {
+                let kind = error.io_error().map_or(io::ErrorKind::Other, |e| e.kind());
+                return Err(io::Error::new(
+                    kind,
+                    format!(
+                        "Failed to traverse '{}': {error}",
+                        error.path().unwrap_or(dir).display()
+                    ),
+                ));
+            }
+        };
         let path = entry.path();
 
         if path.is_dir() {
@@ -161,17 +182,37 @@ pub fn collect_filepaths(dir: &Path) -> io::Result<Found> {
                     None => continue,
                     Some(_) => {
                         if relative_path == Path::new("session.pyre") {
-                            let mut file = fs::File::open(file_str)?;
+                            let mut file = fs::File::open(file_str).map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!("Failed to open '{file_str}': {error}"),
+                                )
+                            })?;
                             let mut session_source = String::new();
-                            file.read_to_string(&mut session_source)?;
+                            file.read_to_string(&mut session_source).map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!("Failed to read '{file_str}': {error}"),
+                                )
+                            })?;
                             session_file = Some(SchemaFile {
                                 path: file_str.to_string(),
                                 content: session_source,
                             });
                         } else if is_schema_file(relative_path.to_str().unwrap()) {
-                            let mut file = fs::File::open(file_str)?;
+                            let mut file = fs::File::open(file_str).map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!("Failed to open '{file_str}': {error}"),
+                                )
+                            })?;
                             let mut schema_source = String::new();
-                            file.read_to_string(&mut schema_source)?;
+                            file.read_to_string(&mut schema_source).map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!("Failed to read '{file_str}': {error}"),
+                                )
+                            })?;
 
                             let schema_file = SchemaFile {
                                 path: file_str.to_string(),
@@ -281,6 +322,76 @@ mod tests {
         let file = generate_text_file("generated.ts", "first  \nsecond\t\nthird  ");
 
         assert_eq!(file.contents, "first\nsecond\nthird");
+    }
+}
+
+#[cfg(all(test, feature = "filesystem"))]
+mod collection_tests {
+    use super::*;
+
+    #[test]
+    fn missing_project_and_empty_project_are_optional() {
+        let temp = tempfile::tempdir().unwrap();
+        for root in [temp.path().to_path_buf(), temp.path().join("missing")] {
+            let found = collect_filepaths(&root).unwrap();
+            assert!(found.schema_files.is_empty());
+            assert!(found.session_file.is_none());
+            assert!(found.query_files.is_empty());
+            assert!(found.namespaces.is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_has_file_context() {
+        for name in ["schema.pyre", "session.pyre"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(name);
+            fs::write(&path, [0xff]).unwrap();
+            let error = collect_filepaths(temp.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("Failed to read"));
+            assert!(error.to_string().contains(path.to_str().unwrap()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_schema_and_session_links_report_open_errors() {
+        for name in ["schema.pyre", "session.pyre"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(name);
+            std::os::unix::fs::symlink(temp.path().join("missing"), &path).unwrap();
+            let error = collect_filepaths(temp.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert!(error.to_string().contains("Failed to open"));
+            assert!(error.to_string().contains(path.to_str().unwrap()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_is_not_silently_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("inaccessible");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Privileged users may still be able to read mode-000 directories.
+        let denied = fs::read_dir(&path).is_err();
+        let result = collect_filepaths(temp.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        if denied {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("Failed to traverse"));
+            assert!(error.to_string().contains(path.to_str().unwrap()));
+            // An unreadable root is not equivalent to a missing root either.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            let result = collect_filepaths(&path);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        }
     }
 }
 

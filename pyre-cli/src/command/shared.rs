@@ -127,16 +127,10 @@ pub fn parse_single_schema(
 
     match parser::run(&schema_file_path, &schema_source, &mut schema) {
         Ok(()) => Ok(schema),
-        Err(err) => {
-            eprintln!(
-                "{}",
-                parser::render_error(&schema_source, err, enable_color)
-            );
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Failed to parse schema",
-            ))
-        }
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            parser::render_error(&schema_source, err, enable_color),
+        )),
     }
 }
 
@@ -154,16 +148,10 @@ pub fn parse_single_schema_from_source(
 
     match parser::run(&schema_file_path, &schema_source, &mut schema) {
         Ok(()) => Ok(schema),
-        Err(err) => {
-            eprintln!(
-                "{}",
-                parser::render_error(&schema_source, err, enable_color)
-            );
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Failed to parse schema",
-            ))
-        }
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            parser::render_error(&schema_source, err, enable_color),
+        )),
     }
 }
 
@@ -213,13 +201,9 @@ pub fn parse_database_schemas(
                     }
                 }
                 Err(err) => {
-                    eprintln!(
-                        "{}",
-                        parser::render_error(&source.content, err, enable_color)
-                    );
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("Failed to parse {}", source.path),
+                        parser::render_error(&source.content, err, enable_color),
                     ));
                 }
             }
@@ -273,13 +257,10 @@ pub fn parse_session_source(
                 )
             })
         }
-        Err(err) => {
-            eprintln!("{}", parser::render_error(source, err, enable_color));
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Failed to parse session",
-            ))
-        }
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            parser::render_error(source, err, enable_color),
+        )),
     }
 }
 

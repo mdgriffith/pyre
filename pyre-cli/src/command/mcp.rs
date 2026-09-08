@@ -123,12 +123,16 @@ async fn call_tool(options: &Options<'_>, params: Option<&JsonValue>) -> Result<
         _ => return Err(format!("Unknown Pyre MCP tool: {name}")),
     };
 
-    Ok(json!({
+    let mut response = json!({
         "content": [{
             "type": "text",
             "text": serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
         }]
-    }))
+    });
+    if value.get("ok").and_then(JsonValue::as_bool) == Some(false) {
+        response["isError"] = json!(true);
+    }
+    Ok(response)
 }
 
 async fn init_project(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonValue, String> {
@@ -228,10 +232,13 @@ async fn init_project(options: &Options<'_>, arguments: &JsonValue) -> Result<Js
     let formatted = generate::to_string::schemafile_to_string(&schema.namespace, schema_file);
 
     if let Some(parent) = schema_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create directory {}: {error}", parent.display()))?;
     }
-    fs::write(&session_path, session_source).map_err(|error| error.to_string())?;
-    fs::write(&schema_path, formatted).map_err(|error| error.to_string())?;
+    fs::write(&session_path, session_source)
+        .map_err(|error| format!("Failed to write {}: {error}", session_path.display()))?;
+    fs::write(&schema_path, formatted)
+        .map_err(|error| format!("Failed to write {}: {error}", schema_path.display()))?;
 
     let mut result = json!({
         "ok": true,
@@ -269,8 +276,25 @@ async fn init_project(options: &Options<'_>, arguments: &JsonValue) -> Result<Js
     Ok(result)
 }
 
+fn validate_project_root(in_dir: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(in_dir).map_err(|error| {
+        format!(
+            "Failed to inspect project directory {}: {error}",
+            in_dir.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Project path is not a directory: {}",
+            in_dir.display()
+        ));
+    }
+    Ok(())
+}
+
 fn project_info(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonValue, String> {
     let in_dir = input_dir(options, arguments)?;
+    validate_project_root(&in_dir)?;
     let found = crate::filesystem::collect_filepaths(&in_dir).map_err(|error| error.to_string())?;
     let generated_dir =
         string_arg(arguments, "generated").unwrap_or_else(|| "pyre/generated".to_string());
@@ -336,6 +360,7 @@ fn schema(arguments: &JsonValue) -> Result<JsonValue, String> {
 }
 
 fn schema_from_dir(in_dir: &Path) -> Result<JsonValue, String> {
+    validate_project_root(in_dir)?;
     let found = crate::filesystem::collect_filepaths(in_dir).map_err(|error| error.to_string())?;
     let mut schemas = Vec::new();
     let mut namespaces = found.schema_files.into_iter().collect::<Vec<_>>();
@@ -531,7 +556,16 @@ async fn db_status(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonV
         .await
         .map_err(|error| error.to_string())?;
 
-    let migration_files = db::read_migration_items(&namespace_migration_dir).unwrap_or_default();
+    let migration_files = match db::read_migration_items(&namespace_migration_dir) {
+        Ok(files) => files,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(format!(
+                "Failed to read migrations in {}: {error}",
+                namespace_migration_dir.display()
+            ))
+        }
+    };
     let applied_migrations = match &introspection.migration_state {
         pyre::db::introspect::MigrationState::NoMigrationTable => Vec::new(),
         pyre::db::introspect::MigrationState::MigrationTable { migrations } => migrations
@@ -546,7 +580,27 @@ async fn db_status(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonV
         .collect::<Vec<_>>();
 
     let mut schema_status = json!({ "checked": false });
-    let status = if !pending_migrations.is_empty() {
+    let stored_schema_error = match &introspection.schema {
+        pyre::db::introspect::SchemaResult::FailedToParse { source, errors } => {
+            Some(("parse", source, errors))
+        }
+        pyre::db::introspect::SchemaResult::FailedToTypecheck { source, errors, .. } => {
+            Some(("typecheck", source, errors))
+        }
+        _ => None,
+    };
+    let status = if let Some((failure, source, errors)) = stored_schema_error {
+        let diagnostics = errors
+            .iter()
+            .map(|error| pyre::error::format_error(source, error, false))
+            .collect::<Vec<_>>()
+            .join("\n");
+        schema_status = json!({
+            "checked": false,
+            "error": format!("Stored schema for namespace '{namespace}' failed to {failure}:\n{diagnostics}")
+        });
+        "unknown"
+    } else if !pending_migrations.is_empty() {
         "pending_migrations"
     } else {
         match current_schema_context(options, arguments) {
@@ -616,10 +670,29 @@ async fn dynamic_query(options: &Options<'_>, arguments: &JsonValue) -> Result<J
     let mut results = Vec::new();
     for query_def in &query_list.queries {
         if let ast::QueryDef::Query(query) = query_def {
-            let result =
-                pyre::server::query::run(&conn, &manifest, &query.name, input.clone(), &session)
-                    .await
-                    .map_err(|error| error.to_string())?;
+            let result = match pyre::server::query::run(
+                &conn,
+                &manifest,
+                &query.name,
+                input.clone(),
+                &session,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let error = format!("query '{}': {}", query.name, error);
+                    if results.is_empty() {
+                        return Err(error);
+                    }
+                    return Ok(json!({
+                        "ok": false,
+                        "results": results,
+                        "failedQuery": query.name,
+                        "error": error
+                    }));
+                }
+            };
             let manifest_query = manifest
                 .queries
                 .get(&query.name)
@@ -739,11 +812,24 @@ fn dynamic_query_plan(
     arguments: &JsonValue,
 ) -> Result<(ast::QueryList, Manifest), String> {
     let query_source = required_string_arg(arguments, "query")?;
-    let (_database_schema, context, _paths) = current_schema_context(options, arguments)?;
+    let (_database_schema, mut context, paths) = current_schema_context(options, arguments)?;
+    context.current_filepath = "mcp.pyre".to_string();
     let query_list = pyre::parser::parse_query("mcp.pyre", &query_source)
         .map_err(|error| parser::render_error(&query_source, error, false))?;
-    let query_infos = pyre::typecheck::check_queries(&query_list, &context)
-        .map_err(|errors| format!("Dynamic query failed typecheck: {errors:#?}"))?;
+    let query_infos = pyre::typecheck::check_queries(&query_list, &context).map_err(|errors| {
+        errors
+            .iter()
+            .map(|error| {
+                let source = if error.filepath == "mcp.pyre" {
+                    query_source.as_str()
+                } else {
+                    pyre::filesystem::get_schema_source(&error.filepath, &paths).unwrap_or("")
+                };
+                pyre::error::format_error(source, error, false)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
     let manifest = dynamic_manifest(&context, &query_list, &query_infos)?;
     Ok((query_list, manifest))
 }
@@ -760,11 +846,21 @@ fn current_schema_context(
     String,
 > {
     let in_dir = input_dir(options, arguments)?;
+    validate_project_root(&in_dir)?;
     let paths = crate::filesystem::collect_filepaths(&in_dir).map_err(|error| error.to_string())?;
     let database_schema =
         super::shared::parse_database_schemas(&paths, false).map_err(|error| error.to_string())?;
-    let context = pyre::typecheck::check_schema(&database_schema)
-        .map_err(|errors| format!("Schema failed typecheck: {errors:#?}"))?;
+    let context = pyre::typecheck::check_schema(&database_schema).map_err(|errors| {
+        errors
+            .iter()
+            .map(|error| {
+                let source =
+                    pyre::filesystem::get_schema_source(&error.filepath, &paths).unwrap_or("");
+                pyre::error::format_error(source, error, false)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
     Ok((database_schema, context, paths))
 }
 

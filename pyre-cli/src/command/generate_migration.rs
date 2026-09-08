@@ -35,14 +35,27 @@ pub async fn generate_migration<'a>(
     let connection_result = db::connect(&db.to_string(), auth).await;
     match connection_result {
         Err(e) => {
-            println!("Failed to connect to database: {:?}", e);
+            eprintln!("{}", e.format_error());
+            return Err(io::Error::other("Failed to connect to database"));
         }
         Ok(conn) => {
             let introspection_result = db::introspect::introspect(&conn).await;
             match introspection_result {
                 Ok(introspection) => {
-                    let existing_migrations =
-                        db::read_migration_items(target_namespace_dir).unwrap_or(vec![]);
+                    let existing_migrations = match db::read_migration_items(target_namespace_dir) {
+                        Ok(items) => items,
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => vec![],
+                        Err(err) => {
+                            return Err(io::Error::new(
+                                err.kind(),
+                                format!(
+                                    "Failed to read migrations in {}: {}",
+                                    target_namespace_dir.display(),
+                                    err
+                                ),
+                            ))
+                        }
+                    };
 
                     let not_applied: Vec<String> = existing_migrations
                         .iter()
@@ -61,7 +74,9 @@ pub async fn generate_migration<'a>(
                             not_applied.join("\n   ")
                         );
                         println!("\nRun `pyre migrate` to apply these migrations before generating a new one.");
-                        return Ok(());
+                        return Err(io::Error::other(
+                            "Unapplied migrations must be applied first",
+                        ));
                     }
 
                     let paths = crate::filesystem::collect_filepaths(&options.in_dir)?;
@@ -73,7 +88,15 @@ pub async fn generate_migration<'a>(
                                 .schemas
                                 .iter()
                                 .find(|s| s.namespace == target_namespace)
-                                .expect("Schema not found");
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::NotFound,
+                                        format!(
+                                            "No schema found for namespace '{}'",
+                                            target_namespace
+                                        ),
+                                    )
+                                })?;
 
                             let db_diff =
                                 pyre::db::diff::diff(&context, &current_schema, &introspection);
@@ -128,7 +151,8 @@ pub async fn generate_migration<'a>(
                     }
                 }
                 Err(err) => {
-                    println!("Failed to introspect database: {:?}", err);
+                    eprintln!("{}", db::error::format_libsql_error(&err));
+                    return Err(io::Error::other("Failed to introspect database"));
                 }
             }
         }

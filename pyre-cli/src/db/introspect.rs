@@ -44,6 +44,119 @@ struct IntrospectionRow {
     result: String,
 }
 
+#[derive(Debug)]
+struct IntrospectionDecodeError(serde_json::Error);
+
+impl std::fmt::Display for IntrospectionDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to decode database introspection JSON: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for IntrospectionDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn decode_introspection(source: &str) -> Result<Introspection, libsql::Error> {
+    let raw = serde_json::from_str(source).map_err(|error| {
+        libsql::Error::ToSqlConversionFailure(Box::new(IntrospectionDecodeError(error)))
+    })?;
+    Ok(pyre::db::introspect::from_raw(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn malformed_json_retains_typed_decode_error() {
+        for source in ["not JSON", "{}"] {
+            let error = decode_introspection(source).unwrap_err();
+            assert!(error.to_string().contains("database introspection JSON"));
+            let libsql::Error::ToSqlConversionFailure(source) = error else {
+                panic!("expected conversion error");
+            };
+            let decode = source.downcast_ref::<IntrospectionDecodeError>().unwrap();
+            assert!(decode.source().unwrap().is::<serde_json::Error>());
+        }
+    }
+
+    #[tokio::test]
+    async fn both_entrypoints_propagate_invalid_introspection_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = libsql::Builder::new_local(temp.path().join("test.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _pyre_migrations (id INTEGER, name, schema, finished_at, error);
+             INSERT INTO _pyre_migrations (name) VALUES (NULL);",
+        )
+        .await
+        .unwrap();
+
+        for result in [introspect(&db).await, introspect_connection(&conn).await] {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("database introspection JSON"));
+            assert!(error.to_string().contains("invalid type: null"));
+            assert!(matches!(error, libsql::Error::ToSqlConversionFailure(_)));
+        }
+
+        conn.execute("UPDATE _pyre_migrations SET name = 'initial'", ())
+            .await
+            .unwrap();
+        for result in [introspect(&db).await, introspect_connection(&conn).await] {
+            let introspection = result.unwrap();
+            let MigrationState::MigrationTable { migrations } = introspection.migration_state
+            else {
+                panic!("expected migration table");
+            };
+            assert_eq!(migrations[0].name, "initial");
+        }
+    }
+
+    #[tokio::test]
+    async fn database_query_errors_keep_their_libsql_variant() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = libsql::Builder::new_local(temp.path().join("test.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE _pyre_migrations (name TEXT)", ())
+            .await
+            .unwrap();
+        for result in [introspect(&db).await, introspect_connection(&conn).await] {
+            assert!(matches!(result, Err(libsql::Error::SqliteFailure(_, _))));
+        }
+    }
+
+    #[tokio::test]
+    async fn uninitialized_database_remains_successful() {
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        for result in [introspect(&db).await, introspect_connection(&conn).await] {
+            let introspection = result.unwrap();
+            assert!(introspection.tables.is_empty());
+            assert!(matches!(
+                introspection.migration_state,
+                MigrationState::NoMigrationTable
+            ));
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct IsInitialized {
     #[serde(deserialize_with = "deserialize_bool_from_int")]
@@ -84,27 +197,7 @@ pub async fn introspect(db: &libsql::Database) -> Result<Introspection, libsql::
                                         let introspection =
                                             libsql::de::from_row::<IntrospectionRow>(&row).unwrap();
 
-                                        let introspection_raw: Result<
-                                            pyre::db::introspect::IntrospectionRaw,
-                                            serde_json::Error,
-                                        > = serde_json::from_str(&introspection.result);
-
-                                        if let Ok(introspection_raw) = introspection_raw {
-                                            return Ok(pyre::db::introspect::from_raw(
-                                                introspection_raw,
-                                            ));
-                                        } else {
-                                            // This is likely not correct
-                                            return Ok(Introspection {
-                                                tables: vec![],
-                                                migration_state: MigrationState::NoMigrationTable,
-                                                schema:
-                                                    pyre::db::introspect::SchemaResult::Success {
-                                                        schema: pyre::ast::Schema::default(),
-                                                        context: pyre::typecheck::empty_context(),
-                                                    },
-                                            });
-                                        }
+                                        return decode_introspection(&introspection.result);
                                     }
                                 }
                                 Err(e) => {
@@ -151,12 +244,7 @@ pub async fn introspect_connection(
 
             if let Some(row) = introspection_rows.next().await? {
                 let introspection = libsql::de::from_row::<IntrospectionRow>(&row).unwrap();
-                let introspection_raw: Result<pyre::db::introspect::IntrospectionRaw, _> =
-                    serde_json::from_str(&introspection.result);
-
-                if let Ok(introspection_raw) = introspection_raw {
-                    return Ok(pyre::db::introspect::from_raw(introspection_raw));
-                }
+                return decode_introspection(&introspection.result);
             }
         }
     }

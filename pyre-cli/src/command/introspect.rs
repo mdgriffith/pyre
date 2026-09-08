@@ -59,11 +59,13 @@ pub async fn introspect<'a>(
                 }
                 Err(libsql_error) => {
                     println!("{}", crate::db::error::format_libsql_error(&libsql_error));
+                    return Err(io::Error::other("Failed to introspect database"));
                 }
             }
         }
         Err(err) => {
             println!("{}", err.format_error());
+            return Err(io::Error::other("Failed to connect to database"));
         }
     }
     Ok(())

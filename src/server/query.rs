@@ -142,10 +142,12 @@ async fn run_inner(
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
-        .map_err(Error::Database)?;
+        .map_err(|error| Error::Database(error).execution("begin transaction", None))?;
     match execute_generated_sql(&tx, sql, &args).await {
         Ok(result) => {
-            tx.commit().await.map_err(Error::Database)?;
+            tx.commit()
+                .await
+                .map_err(|error| Error::Database(error).execution("commit transaction", None))?;
             Ok(result)
         }
         Err(error) => {
@@ -162,17 +164,22 @@ async fn execute_generated_sql(
 ) -> Result<QueryResult, Error> {
     let mut included_result_sets = Vec::new();
 
-    for statement in sql {
-        let (sql, values) = statement_args(statement, args)?;
+    for (index, statement) in sql.iter().enumerate() {
+        async {
+            let (sql, values) = statement_args(statement, args)?;
 
-        if statement.include {
-            included_result_sets.push(query_result_set(conn, &sql, values).await?);
-        } else if sql.to_uppercase().contains("RETURNING") {
-            let mut rows = query_rows(conn, &sql, values).await?;
-            while rows.next().await.map_err(Error::Database)?.is_some() {}
-        } else {
-            execute_statement(conn, &sql, values).await?;
+            if statement.include {
+                included_result_sets.push(query_result_set(conn, &sql, values).await?);
+            } else if sql.to_uppercase().contains("RETURNING") {
+                let mut rows = query_rows(conn, &sql, values).await?;
+                while rows.next().await.map_err(Error::Database)?.is_some() {}
+            } else {
+                execute_statement(conn, &sql, values).await?;
+            }
+            Ok::<_, Error>(())
         }
+        .await
+        .map_err(|error| error.execution("execute", Some(index + 1)))?;
     }
 
     Ok(QueryResult {
@@ -566,6 +573,11 @@ fn libsql_to_json(value: libsql::Value) -> JsonValue {
 #[derive(Debug)]
 pub enum Error {
     Database(libsql::Error),
+    Execution {
+        stage: &'static str,
+        statement_index: Option<usize>,
+        source: Box<Error>,
+    },
     InvalidInput(String),
     InvalidSession(String),
     Json(serde_json::Error),
@@ -573,10 +585,31 @@ pub enum Error {
     UnknownQuery(String),
 }
 
+impl Error {
+    fn execution(self, stage: &'static str, statement_index: Option<usize>) -> Self {
+        Self::Execution {
+            stage,
+            statement_index,
+            source: Box::new(self),
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Database(error) => write!(f, "database error: {}", error),
+            Error::Execution {
+                stage,
+                statement_index,
+                source,
+            } => {
+                write!(f, "{}", stage)?;
+                if let Some(index) = statement_index {
+                    write!(f, " SQL statement {} (1-based)", index)?;
+                }
+                write!(f, ": {}", source)
+            }
             Error::InvalidInput(message) => write!(f, "invalid input: {}", message),
             Error::InvalidSession(message) => write!(f, "invalid session: {}", message),
             Error::Json(error) => write!(f, "json error: {}", error),

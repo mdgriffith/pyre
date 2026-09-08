@@ -32,7 +32,7 @@ fn report_stored_schema_errors(
     source: &str,
     errors: &[error::Error],
     enable_color: bool,
-) -> ! {
+) -> io::Error {
     eprintln!(
         "Stored schema in database '{}' for namespace '{}' failed to {}:",
         display_database_target(database),
@@ -45,7 +45,7 @@ fn report_stored_schema_errors(
             error::format_error(source, &schema_error, enable_color)
         );
     }
-    std::process::exit(1);
+    io::Error::new(io::ErrorKind::InvalidData, "Stored schema is invalid")
 }
 
 pub async fn migrate<'a>(
@@ -111,12 +111,13 @@ pub async fn migrate<'a>(
                         }
                         Err(migration_error) => {
                             println!("{}", migration_error.format_error());
-                            std::process::exit(1);
+                            return Err(io::Error::other("Migration failed"));
                         }
                     }
                 }
                 Err(err) => {
-                    println!("{:?}", err);
+                    eprintln!("{}", err.format_error());
+                    return Err(io::Error::other("Failed to connect to database"));
                 }
             }
         }
@@ -171,7 +172,8 @@ pub async fn push<'a>(
             let connection_result = db::connect(&database.to_string(), auth).await;
             match connection_result {
                 Err(err) => {
-                    println!("{:?}", err);
+                    eprintln!("{}", err.format_error());
+                    return Err(io::Error::other("Failed to connect to database"));
                 }
                 Ok(conn) => {
                     let introspection_result = crate::db::introspect::introspect(&conn).await;
@@ -322,30 +324,35 @@ pub async fn push<'a>(
                                 pyre::db::introspect::SchemaResult::FailedToParse {
                                     source,
                                     errors,
-                                } => report_stored_schema_errors(
-                                    database,
-                                    real_namespace,
-                                    "parse",
-                                    source,
-                                    errors,
-                                    options.enable_color,
-                                ),
+                                } => {
+                                    return Err(report_stored_schema_errors(
+                                        database,
+                                        real_namespace,
+                                        "parse",
+                                        source,
+                                        errors,
+                                        options.enable_color,
+                                    ))
+                                }
                                 pyre::db::introspect::SchemaResult::FailedToTypecheck {
                                     source,
                                     errors,
                                     ..
-                                } => report_stored_schema_errors(
-                                    database,
-                                    real_namespace,
-                                    "typecheck",
-                                    source,
-                                    errors,
-                                    options.enable_color,
-                                ),
+                                } => {
+                                    return Err(report_stored_schema_errors(
+                                        database,
+                                        real_namespace,
+                                        "typecheck",
+                                        source,
+                                        errors,
+                                        options.enable_color,
+                                    ))
+                                }
                             }
                         }
                         Err(err) => {
-                            println!("{:?}", err);
+                            eprintln!("{}", db::error::format_libsql_error(&err));
+                            return Err(io::Error::other("Failed to introspect database"));
                         }
                     }
                 }

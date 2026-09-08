@@ -711,13 +711,15 @@ pub fn check_schema(db: &ast::Database) -> Result<Context, Vec<Error>> {
         if schem.namespace == ast::DEFAULT_SCHEMANAME {
             continue;
         } else if !is_capitalized(&schem.namespace) {
-            let body = format!(
-                "This schema name must be capitalized: {}",
-                &error::yellow_if(true, &schem.namespace)
-            );
-            let error = error::format_custom_error("Schema name formatting", &body);
-            eprintln!("{}", error);
-            std::process::exit(1);
+            errors.push(Error {
+                error_type: ErrorType::InvalidSchemaName(schem.namespace.clone()),
+                filepath: schem
+                    .files
+                    .first()
+                    .map(|file| file.path.clone())
+                    .unwrap_or_default(),
+                locations: Vec::new(),
+            });
         }
     }
 

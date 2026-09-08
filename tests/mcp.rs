@@ -1062,7 +1062,7 @@ record Document {
     assert!(response["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("ImmutableColumnCannotBeUpdated"));
+        .contains("ownerId is @immutable and cannot be assigned in an update."));
 }
 
 #[test]
@@ -1318,7 +1318,11 @@ fn pyre_query_reports_mutation_typecheck_failure() {
     assert!(response["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("typecheck"));
+        .contains("mcp.pyre"));
+    assert!(!response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("error_type:"));
 }
 
 #[test]
