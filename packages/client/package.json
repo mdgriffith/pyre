@@ -36,6 +36,7 @@
     "@pyre/core": "0.1.16"
   },
   "devDependencies": {
+    "fake-indexeddb": "^6.2.5",
     "typescript": "^5.0.0"
   },
   "files": [

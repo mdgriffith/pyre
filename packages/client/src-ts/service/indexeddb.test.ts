@@ -20,6 +20,7 @@ test('IndexedDbService restores persisted sync cursor with initial data', async 
 
   const storage = {
     init: async () => undefined,
+    getInitialSnapshot: async () => ({ tables: { maps: [] }, cursor: persistedCursor, lastAppliedServerRevision: serverRevision, databaseEpoch: 'persisted-epoch' }),
     getAllTables: async () => ({ maps: [] }),
     getSyncCursor: async () => persistedCursor,
     getServerRevision: async () => serverRevision,

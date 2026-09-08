@@ -40,8 +40,10 @@ record Job {
 
 fn query_result(affected_rows: Vec<AffectedRowTableGroup>) -> QueryResult {
     QueryResult {
+        sync_session: None,
         response: json!({}),
         affected_rows,
+        sync_state: None,
     }
 }
 
@@ -227,6 +229,7 @@ insert into notes (id, body, updatedAt) values (3, 'three', 10);
     cursor.insert(
         "notes".to_string(),
         TableCursor {
+            last_seen_delete_sequence: 0,
             last_seen_updated_at: notes.last_seen_updated_at,
             last_seen_primary_key: notes.last_seen_primary_key.clone(),
             permission_hash: notes.permission_hash.clone(),
@@ -248,6 +251,7 @@ insert into notes (id, body, updatedAt) values (3, 'three', 10);
     cursor.insert(
         "notes".to_string(),
         TableCursor {
+            last_seen_delete_sequence: 0,
             last_seen_updated_at: notes.last_seen_updated_at,
             last_seen_primary_key: notes.last_seen_primary_key.clone(),
             permission_hash: notes.permission_hash.clone(),
@@ -297,6 +301,7 @@ insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-0000000
     let cursor = SyncCursor::from([(
         "notes".to_string(),
         TableCursor {
+            last_seen_delete_sequence: 0,
             last_seen_updated_at: notes.last_seen_updated_at,
             last_seen_primary_key: notes.last_seen_primary_key.clone(),
             permission_hash: notes.permission_hash.clone(),
@@ -379,7 +384,7 @@ insert into notes (id, ownerId, body, updatedAt) values (3, 1, 'three', 30);
 
     assert_eq!(ids, vec![json!(1), json!(3)]);
     assert_eq!(result.database_id.as_deref(), Some("main"));
-    assert_eq!(result.server_revision, Some(0));
+    assert_eq!(result.server_revision, Some(3));
     assert_eq!(notes.last_seen_updated_at, Some(30));
 
     session.insert("userId".to_string(), pyre::sync::SessionValue::Integer(2));
@@ -1422,7 +1427,7 @@ update UpdateNote {
 }
 
 #[tokio::test]
-async fn generated_delete_affected_rows_feed_permission_filtered_native_deltas(
+async fn generated_delete_feeds_unfiltered_durable_tombstones(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
@@ -1459,7 +1464,7 @@ delete RemoveNote {
 }
 "#;
     let result_sets = db.execute_query(delete_query).await?;
-    let affected_rows = extract_affected_rows(result_sets).await?;
+    db.parse_query_results(result_sets).await?;
     let connected_sessions = ConnectedSessions::from([
         (
             "user-1".to_string(),
@@ -1471,17 +1476,12 @@ delete RemoveNote {
         ),
     ]);
 
-    let mut result = query_result(affected_rows.clone());
-    let messages = SyncServer::new(&db.context)
-        .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
-        .await?;
-
-    assert_eq!(affected_rows.len(), 1);
-    assert_eq!(affected_rows[0].table_name, "notes");
-    assert_eq!(affected_rows[0].rows.len(), 1);
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].session_id, "user-1");
-    assert_eq!(messages[0].message.data[0].rows[0][0], json!(1));
+    for session in connected_sessions.values() {
+        let page = SyncServer::new(&db.context)
+            .catchup_durable(&conn, &SyncCursor::new(), session, 10, "main", None).await?;
+        assert_eq!(page["tables"]["notes"]["changes"], json!([{ "op": "delete", "id": 1 }]));
+        assert!(!page.to_string().contains("doomed"));
+    }
 
     Ok(())
 }
@@ -1521,6 +1521,7 @@ insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
     let cursor = SyncCursor::from([(
         "notes".to_string(),
         TableCursor {
+            last_seen_delete_sequence: 0,
             last_seen_updated_at: first_notes.last_seen_updated_at,
             last_seen_primary_key: first_notes.last_seen_primary_key.clone(),
             permission_hash: first_notes.permission_hash.clone(),

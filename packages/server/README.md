@@ -61,7 +61,39 @@ Top-level keys are table names. Nested keys must be links declared on the parent
 
 The seed call is atomic: if any row fails validation or insertion, Pyre rolls back the transaction. The returned data contains the full inserted rows, including nested rows.
 
-Seed currently bypasses Pyre query permissions and does not update Pyre sync metadata. Use it for setup/import workflows before synced clients rely on live deltas.
+Seed bypasses Pyre query permissions. Installed SQLite sync triggers maintain
+durable revision metadata, but the host must publish a scoped `syncRequired`
+notification if connected clients should refresh immediately after an import.
+
+## Durable Sync
+
+Install/migrate the database with the current generated schema, rebuild WASM,
+and regenerate clients together. Sync requests require
+`syncCursor: { version: 2, tables: ... }`, plus `databaseEpoch` when resuming a
+persisted cursor. Older clients are rejected rather than silently missing deletes.
+
+Use `run` from `@pyre/server/sync` (or `runWithSync` from
+`@pyre/server/query-sync`) for sync mutations, then call
+`result.sync(sendToSession)`. Authenticate and authorize live connections before
+registering them, and give each entry a server-selected `databaseId`. Broadcasts
+exclude unscoped connections and connections for another physical database.
+
+Ordinary mutations send direct `delta` payloads, including durable deletion IDs
+and permission-filtered upserts. They do not require an HTTP catchup round trip.
+`syncRequired` is reserved for oversized payloads, imports, and explicit refresh.
+Catchup uses `updatedAt`/primary-key pagination and a separate tombstone sequence.
+The client registers its stream before catchup, retains the round-start boundary
+for pending wakes, and replays tombstones to restore absent-key observations.
+Persisted timestamps are capped by a writer-barrier clock fence, separately from
+page cursors. Buffered deltas reconcile against keys each page actually observed.
+No current-row revision table or upsert history is retained.
+
+`rotateDatabaseEpoch(db)` is an explicit admin retention operation. It rotates
+the epoch, clears tombstones, and resets the global revision counter in one
+write transaction. Choose its cadence yourself; Pyre never rotates automatically.
+Broadcast a scoped wake afterward for immediate refresh of connected clients.
+
+See [the protocol and migration notes](../../docs/durable-deletion-sync.md).
 
 ## Install
 

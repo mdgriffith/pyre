@@ -68,12 +68,12 @@ This also handles common server amendments, such as `createdAt`, `updatedAt`, de
 - Network arrival order is not causal order.
 - `requestId`/client mutation id is for idempotency, dedupe, and acknowledgement.
 - Canonical ordering comes from `serverRevision`, a server-assigned monotonic revision on live sync events backed by Pyre internal metadata.
-- Clients must ignore authoritative sync data at or below the last applied server revision.
+- Clients compare authoritative revisions per key, not against a global page watermark. Catchup pages certify only keys they actually return.
 - Clients persist the last applied server revision in local IndexedDB metadata.
 - Mutation response envelopes advance the client's last applied server revision and acknowledge the matching optimistic layer without immediately dropping later acknowledged layers behind older unsettled requests.
 - Clients must tolerate receiving their own mutation through live sync, even if the server normally suppresses it.
 
-Until server revisions are present, the client preserves correctness for in-flight optimistic work by replaying local optimistic deltas after every authoritative live/catchup delta.
+Protocol 2 requires authoritative revisions. Live and mutation-response deltas are buffered during catchup and share its atomic local commit path. Pending optimistic deltas are replayed over separate authoritative memory after each successful commit.
 
 ## Origin Suppression
 

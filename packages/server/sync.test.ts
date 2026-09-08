@@ -1,5 +1,6 @@
 // @ts-nocheck
-import { afterEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { createClient } from "@libsql/client";
 
 const defaultSyncSql = () => ({
   tables: [
@@ -49,7 +50,10 @@ let introspectionResult = { schema_source: "" };
 let setSchemaCalls: unknown[] = [];
 let migrationResult: any = { Ok: { sql: [], mark_success: "record migration" } };
 
-mock.module("./wasm/pyre_wasm.js", () => ({
+const realWasm = { ...await import("./wasm/pyre_wasm.js") };
+let mocking = false;
+beforeEach(() => { mocking = true; });
+const stubs = {
   sql_is_initialized: () => "select 1 as is_initialized",
   sql_introspect: () => "select introspection",
   get_sync_status_sql: () => getSyncStatusSqlMock(),
@@ -59,12 +63,17 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   set_schema: (introspection: unknown) => setSchemaCalls.push(introspection),
   migrate_with_introspection: () => migrationResult,
   sql_introspect_uninitialized: () => "select uninitialized introspection",
+};
+mock.module("./wasm/pyre_wasm.js", () => ({
+  ...realWasm,
+  ...Object.fromEntries(Object.entries(stubs).map(([name, stub]) => [name, (...args: unknown[]) => mocking ? stub(...args) : realWasm[name](...args)])),
 }));
 
-const { catchup, rotateDatabaseEpoch } = await import("./sync");
+const { catchupLegacy: catchup, rotateDatabaseEpoch } = await import("./sync");
 const { ensureDatabase, loadSchemaFromDatabase } = await import("./schema");
 
 afterEach(() => {
+  mocking = false;
   getSyncSqlMock = defaultSyncSql;
   getSyncStatusSqlMock = () => "select 1";
   reshapeSyncTableGroupsMock = defaultReshapeSyncTableGroups;
@@ -136,7 +145,7 @@ test("ensureDatabase reuses an unchanged database", async () => {
 
   expect(outcome).toBe("up-to-date");
   expect(database.batches).toEqual([]);
-  expect(database.tx.rollback).toHaveBeenCalledTimes(1);
+  expect(database.tx.commit).toHaveBeenCalledTimes(1);
 });
 
 test("ensureDatabase rejects unmanaged tables", async () => {
@@ -151,6 +160,25 @@ test("ensureDatabase rejects unmanaged tables", async () => {
     ensureDatabase(database.db as any, "Campaign", "record Note {}"),
   ).rejects.toThrow("not managed by Pyre");
   expect(database.tx.rollback).toHaveBeenCalledTimes(1);
+});
+
+test("ensureDatabase runs internal upgrades even when the user schema is unchanged", async () => {
+  migrationResult = {
+    Ok: {
+      sql: ["install tombstones", "install triggers"],
+      schema_changed: false,
+      mark_success: "record migration",
+    },
+  };
+  const database = initializationDatabase(true, {
+    tables: [],
+    migration_state: { MigrationTable: { migrations: [] } },
+    schema_source: "record Note {}",
+    links: [],
+  });
+  expect(await ensureDatabase(database.db as any, "Campaign", "record Note {}")).toBe("up-to-date");
+  expect(database.batches).toEqual([["install tombstones", "install triggers"]]);
+  expect(database.tx.commit).toHaveBeenCalledTimes(1);
 });
 
 test("catchup activates the schema loaded for its databaseId", async () => {
@@ -301,13 +329,43 @@ test("catchup returns an explicit replacement without querying table rows on epo
 
 test("rotateDatabaseEpoch replaces the epoch and resets revision", async () => {
   const db = {
-    execute: mock(async (sql: string) => {
-      expect(sql).toContain("server_revision = 0");
-      return { rows: [{ database_epoch: "rotated-epoch" }] };
+    batch: mock(async (statements: string[], mode: string) => {
+      expect(mode).toBe("write");
+      expect(statements[0]).toContain("server_revision = 0");
+      expect(statements[1]).toContain("delete from _pyre_sync_tombstones");
+      return [{ rows: [{ database_epoch: "rotated-epoch" }] }, { rows: [] }];
     }),
   };
 
   expect(await rotateDatabaseEpoch(db as any)).toBe("rotated-epoch");
+  expect(db.batch).toHaveBeenCalledTimes(1);
+});
+
+test("rotateDatabaseEpoch atomically clears tombstones in SQLite and rolls back on failure", async () => {
+  const db = createClient({ url: "file::memory:" });
+  try {
+    await db.executeMultiple(`
+      create table _pyre_sync (id integer primary key, database_epoch text, server_revision integer);
+      insert into _pyre_sync values (1, 'before', 23);
+      create table _pyre_sync_tombstones (sequence integer primary key, table_name text, primary_key);
+      insert into _pyre_sync_tombstones values (1, 'notes', 7);
+      create trigger fail_clear before delete on _pyre_sync_tombstones begin select raise(abort, 'clear failed'); end;
+    `);
+    await expect(rotateDatabaseEpoch(db)).rejects.toThrow("clear failed");
+    const unchanged = await db.execute("select database_epoch, server_revision from _pyre_sync");
+    expect(unchanged.rows[0].database_epoch).toBe("before");
+    expect(unchanged.rows[0].server_revision).toBe(23);
+    expect((await db.execute("select count(*) as n from _pyre_sync_tombstones")).rows[0].n).toBe(1);
+    await db.execute("drop trigger fail_clear");
+    expect(await rotateDatabaseEpoch(db)).not.toBe("before");
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(0);
+    expect((await db.execute("select count(*) as n from _pyre_sync_tombstones")).rows[0].n).toBe(0);
+    await db.executeMultiple("insert into _pyre_sync_tombstones values (2, 'notes', 8); delete from _pyre_sync;");
+    await expect(rotateDatabaseEpoch(db)).rejects.toThrow("Failed to rotate");
+    expect((await db.execute("select count(*) as n from _pyre_sync_tombstones")).rows[0].n).toBe(1);
+  } finally {
+    db.close();
+  }
 });
 
 test("catchup normalizes bigint row values before reshaping", async () => {

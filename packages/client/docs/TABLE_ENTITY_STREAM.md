@@ -1,6 +1,9 @@
 # Table Entity Stream Spec
 
-Status: draft proposal.
+Status: historical draft. The implemented API now also supports durable hard
+deletes (`op: 'delete'` with a typed ID). See the package README and
+`docs/durable-deletion-sync.md` at the repository root for the current protocol;
+the original row-only limitations below describe the initial proposal.
 
 Pyre currently exposes live query results through QueryManager. This spec proposes a lower-level sibling API: subscribe directly to incoming server table diffs from selected tables, optionally filtered by a condition.
 

@@ -1880,9 +1880,10 @@ transaction Apply($body: String, $value: Int) {
     assert_eq!(result.response["changed"][0]["value"], json!(2));
     assert_eq!(result.response["removed"][0]["id"], json!(1));
     assert_eq!(result.affected_rows.len(), 3);
-    assert_eq!(result.affected_rows[0].table_name, "notes");
-    assert_eq!(result.affected_rows[1].table_name, "counters");
-    assert_eq!(result.affected_rows[2].table_name, "pendings");
+    assert_eq!(result.affected_rows[0].headers, ["$delete"]);
+    assert_eq!(result.affected_rows[1].table_name, "notes");
+    assert_eq!(result.affected_rows[2].table_name, "counters");
+    assert!(result.sync_state.is_some());
     Ok(())
 }
 
@@ -2118,7 +2119,7 @@ transaction CreateParents {
     let mut rows = conn
         .query("select server_revision from _pyre_sync where id = 1", ())
         .await?;
-    assert_eq!(rows.next().await?.expect("sync row").get::<i64>(0)?, 0);
+    assert_eq!(rows.next().await?.expect("sync row").get::<i64>(0)?, 2);
     Ok(())
 }
 
@@ -2482,7 +2483,7 @@ query GetNote($id: Int, $id2: Int) {
 }
 
 #[tokio::test]
-async fn run_delete_mutation_extracts_affected_rows_in_sync_mode(
+async fn run_delete_mutation_captures_tombstones_not_upsert_rows(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
@@ -2513,7 +2514,7 @@ delete DeleteNote($id: Int) {
         false,
     )?;
     let session = PyreSession::new(json!({}), &manifest.session_schema)?;
-    let result = query::run_sync(
+    let mut result = query::run_sync(
         &conn,
         &manifest,
         &only_query(&manifest).id,
@@ -2522,9 +2523,17 @@ delete DeleteNote($id: Int) {
     )
     .await?;
 
-    assert_eq!(result.affected_rows.len(), 1);
-    assert_eq!(result.affected_rows[0].table_name, "notes");
-    assert_eq!(result.affected_rows[0].rows[0][0], json!(1));
+    assert_eq!(result.affected_rows[0].headers, ["$delete"]);
+    let committed = result.sync_state.clone().expect("transaction stamped");
+    let mut tombstones = conn.query("select primary_key, sequence from _pyre_sync_tombstones where table_name = 'notes'", ()).await?;
+    let tombstone = tombstones.next().await?.unwrap();
+    assert_eq!(tombstone.get::<i64>(0)?, 1);
+    assert_eq!(tombstone.get::<i64>(1)?, committed.1);
+    let messages = SyncServer::new(&db.context).calculate_deltas(&conn, &mut result, &ConnectedSessions::from([("client".into(), SyncSession::new())]), "main", None).await?;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].message.type_, "delta");
+    assert_eq!(messages[0].message.data[0].rows, vec![vec![json!(1)]]);
+    assert_eq!(messages[0].message.server_revision, Some(committed.1));
     let mut rows = conn.query("select count(*) from notes", ()).await?;
     let row = rows.next().await?.expect("count row should exist");
     assert_eq!(row.get::<i64>(0)?, 0);
@@ -2582,7 +2591,7 @@ query GetNotes {
         &session,
     )
     .await?;
-    assert_eq!(deleted.affected_rows.len(), 1);
+    assert_eq!(deleted.affected_rows[0].headers, ["$delete"]);
     let remaining = query::run(
         &conn,
         &manifest,

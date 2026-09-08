@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 pub struct QueryResult {
     pub response: JsonValue,
     pub affected_rows: Vec<AffectedRowTableGroup>,
+    pub sync_state: Option<(String, i64)>,
+    pub sync_session: Option<HashMap<String, crate::sync::SessionValue>>,
 }
 
 #[derive(Debug)]
@@ -143,8 +145,48 @@ async fn run_inner(
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
         .map_err(Error::Database)?;
+    let before = if sync_mode {
+        let mut rows = tx.query("select server_revision from _pyre_sync where id = 1", ()).await.map_err(Error::Database)?;
+        rows.next().await.map_err(Error::Database)?.ok_or_else(|| Error::UnsupportedRuntime("missing sync metadata".into()))?.get::<i64>(0).map_err(Error::Database)?
+    } else { 0 };
     match execute_generated_sql(&tx, sql, &args).await {
-        Ok(result) => {
+        Ok(mut result) => {
+            if sync_mode {
+                result.sync_session = Some(session.logical().clone());
+                let mut rows = tx.query("select database_epoch, server_revision from _pyre_sync where id = 1", ()).await.map_err(Error::Database)?;
+                let row = rows.next().await.map_err(Error::Database)?.ok_or_else(|| Error::UnsupportedRuntime("missing sync metadata; migrate database first".into()))?;
+                result.sync_state = Some((row.get::<String>(0).map_err(Error::Database)?, row.get::<i64>(1).map_err(Error::Database)?));
+                while rows.next().await.map_err(Error::Database)?.is_some() {}
+                let mut deleted = tx.query("select table_name, primary_key from _pyre_sync_tombstones where sequence > ? order by sequence", [before]).await.map_err(Error::Database)?;
+                let mut groups = Vec::new();
+                while let Some(row) = deleted.next().await.map_err(Error::Database)? {
+                    let key = match row.get_value(1).map_err(Error::Database)? {
+                        libsql::Value::Integer(key) => JsonValue::from(key),
+                        libsql::Value::Text(key) => JsonValue::from(key),
+                        _ => return Err(Error::UnsupportedRuntime("invalid tombstone key".into())),
+                    };
+                    let table = row.get::<String>(0).map_err(Error::Database)?;
+                    if result.affected_rows.iter().any(|group| group.table_name == table && !group.rows.is_empty()) {
+                        let mut columns = tx.query("select name from pragma_table_info(?) where pk = 1", [table.clone()]).await.map_err(Error::Database)?;
+                        let primary_key = columns.next().await.map_err(Error::Database)?.ok_or_else(|| Error::UnsupportedRuntime("missing primary key".into()))?.get::<String>(0).map_err(Error::Database)?;
+                        let sql = format!("select 1 from {} where {} = ?", crate::ext::string::quote(&table), crate::ext::string::quote(&primary_key));
+                        let param = if let Some(key) = key.as_i64() { libsql::Value::Integer(key) } else { libsql::Value::Text(key.as_str().unwrap().into()) };
+                        let mut existing = tx.query(&sql, [param]).await.map_err(Error::Database)?;
+                        if existing.next().await.map_err(Error::Database)?.is_none() {
+                            for group in &mut result.affected_rows {
+                                if group.table_name == table {
+                                    if let Some(index) = group.headers.iter().position(|header| header == &primary_key) {
+                                        group.rows.retain(|row| row.get(index) != Some(&key));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    groups.push(AffectedRowTableGroup { table_name: table, headers: vec!["$delete".into()], rows: vec![vec![key]] });
+                }
+                groups.append(&mut result.affected_rows);
+                result.affected_rows = groups;
+            }
             tx.commit().await.map_err(Error::Database)?;
             Ok(result)
         }
@@ -178,6 +220,8 @@ async fn execute_generated_sql(
     Ok(QueryResult {
         response: format_response(&included_result_sets)?,
         affected_rows: extract_affected_rows(&included_result_sets)?,
+        sync_state: None,
+        sync_session: None,
     })
 }
 

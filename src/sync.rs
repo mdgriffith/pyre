@@ -42,6 +42,8 @@ pub fn normalize_page_size(page_size: usize) -> Result<usize, SyncError> {
 /// Cursor state for a single table
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TableCursor {
+    #[serde(default)]
+    pub last_seen_delete_sequence: i64,
     pub last_seen_updated_at: Option<i64>, // Unix timestamp
     #[serde(default)]
     pub last_seen_primary_key: Option<JsonValue>,
@@ -137,6 +139,11 @@ pub fn validate_sync_cursor(
 
     let known_tables = synced_table_names(context);
     for (table_name, cursor) in sync_cursor {
+        if !(0..=9_007_199_254_740_991).contains(&cursor.last_seen_delete_sequence) {
+            return Err(SyncError::InvalidSyncCursor(
+                "deletion sequence must be a nonnegative safe integer".into(),
+            ));
+        }
         if !known_tables.contains(table_name) {
             return Err(SyncError::InvalidSyncCursor(format!(
                 "sync cursor references unknown table '{}'",
@@ -171,7 +178,7 @@ pub fn validate_sync_cursor(
     Ok(())
 }
 
-fn collect_sync_storage_columns(
+pub(crate) fn collect_sync_storage_columns(
     context: &typecheck::Context,
     column_type: &ast::ColumnType,
     base_name: &str,
@@ -526,7 +533,7 @@ fn render_permission_value(
 /// Render a permission WHERE clause to SQL
 /// This is a custom renderer for sync operations that doesn't require QueryField or QueryInfo
 /// Handles session variable replacement internally
-fn render_permission_where(
+pub(crate) fn render_permission_where(
     context: &typecheck::Context,
     where_arg: &WhereArg,
     table: &typecheck::Table,

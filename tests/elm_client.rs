@@ -465,9 +465,9 @@ record Post {
         content
     );
     assert!(
-        content.contains("type EntityChange\n    = CommentRow Comments.Row\n    | PostRow Posts.Row\n    | EntityDecodeFailed String Decode.Value")
-            && content.contains("\"comments\" ->\n                        decodeRow CommentRow Comments.decodeRow row")
-            && content.contains("\"posts\" ->\n                        decodeRow PostRow Posts.decodeRow row"),
+        content.contains("type EntityChange\n    = CommentRow Comments.Row\n    | CommentDeleted Comments.Id\n    | PostRow Posts.Row\n    | PostDeleted Posts.Id\n    | EntityDecodeFailed String Decode.Value")
+            && content.contains("decodeRow CommentRow (Decode.field \"row\" Comments.decodeRow) value")
+            && content.contains("decodeRow PostDeleted (Decode.field \"id\" Posts.decodeId) value"),
         "Db.Stream.elm should decode batches into typed table row variants. Generated:\n{}",
         content
     );
@@ -479,7 +479,7 @@ record Post {
     assert!(
         post_table
             .contents
-            .contains("module Db.Table.Posts exposing (Row, Stream, decodeRow, stream, idIn)")
+            .contains("module Db.Table.Posts exposing (Row, Stream, decodeRow, stream, Id, decodeId, idIn)")
             && post_table
                 .contents
                 .contains("type alias Row =\n    { id : Int\n    , title : String\n    }")
@@ -505,7 +505,7 @@ record Post {
     assert!(
         comment_table
             .contents
-            .contains("module Db.Table.Comments exposing (Row, Stream, decodeRow, stream, idIn, postIdIn)")
+            .contains("module Db.Table.Comments exposing (Row, Stream, decodeRow, stream, Id, decodeId, idIn, postIdIn)")
             && comment_table.contents.contains(
             "type alias Row =\n    { id : String\n    , postId : Int\n    , body : String\n    }"
         ) && comment_table
@@ -540,7 +540,7 @@ record Post {
         .expect("generated campaign posts table module");
     assert!(
         campaign_post_table.contents.contains(
-            "module Db.Campaign.Table.Posts exposing (Row, Stream, decodeRow, stream, idIn)"
+            "module Db.Campaign.Table.Posts exposing (Row, Stream, decodeRow, stream, Id, decodeId, idIn)"
         ),
         "named schema should generate schema-scoped table modules. Generated:\n{}",
         campaign_post_table.contents

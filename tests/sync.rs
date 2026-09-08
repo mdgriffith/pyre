@@ -609,6 +609,7 @@ record Note {
     cursor.insert(
         "not_a_table".to_string(),
         pyre::sync::TableCursor {
+            last_seen_delete_sequence: 0,
             last_seen_updated_at: Some(1),
             last_seen_primary_key: Some(serde_json::json!(1)),
             permission_hash: "perm".to_string(),
@@ -646,6 +647,7 @@ record Note {
     cursor.insert(
         "notes".to_string(),
         pyre::sync::TableCursor {
+            last_seen_delete_sequence: 0,
             last_seen_updated_at: Some(1),
             last_seen_primary_key: Some(serde_json::json!(1)),
             permission_hash: "x".repeat(pyre::sync::MAX_SYNC_CURSOR_PERMISSION_HASH_BYTES + 1),

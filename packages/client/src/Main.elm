@@ -43,6 +43,7 @@ type alias SyncConfig =
 type alias Model =
     { schema : Data.Schema.SchemaMetadata
     , db : Db.Db
+    , authoritativeDb : Db.Db
     , queryManager : QueryManager.Model
     , catchup : Catchup.Model
     , syncStatus : SyncState.SyncStatus
@@ -99,6 +100,7 @@ init : Flags -> ( Model, Cmd Msg )
 init flags =
     ( { schema = flags.schema
       , db = Db.init
+      , authoritativeDb = Db.init
       , queryManager = QueryManager.init
       , catchup = Catchup.init flags.server
       , syncStatus = SyncState.NotStarted
@@ -144,7 +146,7 @@ update msg model =
                             Db.update (Db.FromIndexedDb model.schema incoming) model.db
 
                         baseModel =
-                            { model | db = updatedDb }
+                            { model | db = updatedDb, authoritativeDb = updatedDb }
 
                         ( updatedModel, indexedDbCmd ) =
                             handleIndexedDbIncoming incoming baseModel
@@ -155,13 +157,19 @@ update msg model =
 
                 IndexedDb.DatabaseEpochResetCompleted databaseEpoch ->
                     applyCatchupUpdate
-                        (Catchup.update (Catchup.DatabaseEpochResetCompleted databaseEpoch) model.catchup model.db)
+                        (Catchup.update (Catchup.DatabaseEpochResetCompleted databaseEpoch) model.catchup model.authoritativeDb)
                         model
 
                 IndexedDb.DatabaseEpochResetFailed databaseEpoch message ->
                     applyCatchupUpdate
-                        (Catchup.update (Catchup.DatabaseEpochResetFailed databaseEpoch message) model.catchup model.db)
+                        (Catchup.update (Catchup.DatabaseEpochResetFailed databaseEpoch message) model.catchup model.authoritativeDb)
                         model
+
+                IndexedDb.CatchupPageStored epoch ->
+                    handleIndexedDbIncoming (IndexedDb.CatchupPageStored epoch) model
+
+                IndexedDb.CatchupPageFailed message ->
+                    handleIndexedDbIncoming (IndexedDb.CatchupPageFailed message) model
 
         LiveSyncReceived incoming ->
             let
@@ -211,7 +219,7 @@ update msg model =
             )
 
         CatchupMsg catchupMsg ->
-            applyCatchupUpdate (Catchup.update catchupMsg model.catchup model.db) model
+            applyCatchupUpdate (Catchup.update catchupMsg model.catchup model.authoritativeDb) model
 
         SyncControlReceived StartSync ->
             if model.syncRequested then
@@ -250,7 +258,7 @@ handleIndexedDbIncoming incoming model =
                     }
 
                 ( catchupModel, catchupCmd ) =
-                    applyCatchupUpdate (Catchup.update (Catchup.InitialDataLoaded initialData.cursor initialData.databaseEpoch) model.catchup model.db) baseModel
+                    applyCatchupUpdate (Catchup.update (Catchup.InitialDataLoaded initialData.cursor initialData.databaseEpoch) model.catchup model.authoritativeDb) baseModel
             in
             ( catchupModel
             , Cmd.batch [ Cmd.batch cmds, catchupCmd ]
@@ -261,6 +269,12 @@ handleIndexedDbIncoming incoming model =
 
         IndexedDb.DatabaseEpochResetFailed _ _ ->
             ( model, Cmd.none )
+
+        IndexedDb.CatchupPageStored epoch ->
+            applyCatchupUpdate (Catchup.update (Catchup.PageStored epoch) model.catchup model.authoritativeDb) model
+
+        IndexedDb.CatchupPageFailed message ->
+            applyCatchupUpdate (Catchup.update (Catchup.PageFailed message) model.catchup model.authoritativeDb) model
 
 
 handleLiveSyncIncoming : LiveSync.Incoming -> Model -> ( Model, Cmd Msg )
@@ -277,31 +291,12 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    if liveEpochMismatch model messageEpoch then
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
+                    case ( messageEpoch, serverRevision ) of
+                        ( Just epoch, Just revision ) ->
+                            applyCatchupUpdate (Catchup.update (Catchup.LiveDelta epoch revision "live" delta) model.catchup model.authoritativeDb) model
 
-                    else if isStaleServerRevision serverRevision model.lastAppliedServerRevision then
-                        ( model, Cmd.none )
-
-                    else
-                        let
-                            ( updatedDb, dbCmds ) =
-                                applyAuthoritativeDelta delta model
-
-                            ( updatedQueryManager, triggerCmds ) =
-                                QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager delta
-                        in
-                        ( { model
-                            | db = updatedDb
-                            , queryManager = updatedQueryManager
-                            , lastAppliedServerRevision = updateLastAppliedServerRevision serverRevision model.lastAppliedServerRevision
-                          }
-                        , Cmd.batch
-                            [ Cmd.batch (List.map (Cmd.map DbMsg) dbCmds)
-                            , Cmd.batch triggerCmds
-                            , writeServerRevisionCmd serverRevision
-                            ]
-                        )
+                        _ ->
+                            applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.authoritativeDb) model
 
         LiveSync.LiveSyncConnected messageDatabaseId messageEpoch _ ->
             case validateLiveSyncDatabaseId model messageDatabaseId "connected" of
@@ -311,19 +306,10 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    if liveEpochMismatch model messageEpoch then
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
-
-                    else
-                        ( model, Cmd.none )
+                    applyCatchupUpdate (Catchup.update Catchup.StreamConnected model.catchup model.authoritativeDb) model
 
         LiveSync.LiveSyncError error ->
-            ( { model | syncError = Just error }
-            , Cmd.batch
-                [ emitSyncState (toSyncState model)
-                , Data.Error.sendError error
-                ]
-            )
+            applyCatchupUpdate (Catchup.update (Catchup.StreamDisconnected error) model.catchup model.authoritativeDb) model
 
         LiveSync.SyncProgressReceived messageDatabaseId _ ->
             case validateLiveSyncDatabaseId model messageDatabaseId "syncProgress" of
@@ -349,17 +335,8 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    let
-                        updatedModel =
-                            { model
-                                | syncStatus = SyncState.Live
-                                , tableSyncStatuses = SyncState.markAllTablesLive model.tableSyncStatuses
-                                , syncError = Nothing
-                            }
-                    in
-                    ( updatedModel
-                    , emitSyncState (toSyncState updatedModel)
-                    )
+                    -- Only a persisted catchup page can complete synchronization.
+                    ( model, Cmd.none )
 
         LiveSync.SyncRequiredReceived messageDatabaseId messageEpoch serverRevision ->
             case validateLiveSyncDatabaseId model messageDatabaseId "syncRequired" of
@@ -369,15 +346,7 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    if not (liveEpochMismatch model messageEpoch) then
-                        if isStaleServerRevision serverRevision model.lastAppliedServerRevision then
-                            ( model, Cmd.none )
-
-                        else
-                            applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
-
-                    else
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
+                    applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.authoritativeDb) model
 
 
 liveEpochMismatch : Model -> Maybe String -> Bool
@@ -680,11 +649,11 @@ rollbackOptimisticMutation requestId mutationId error model =
 
         Just optimistic ->
             let
-                ( updatedDb, dbCmd ) =
-                    Db.update (Db.LocalDeltaReceived optimistic.inverse) model.db
+                ( updatedDb, dbCmds ) =
+                    replayOptimisticMutations cleanedModel model.authoritativeDb
 
                 ( updatedQueryManager, triggerCmds ) =
-                    QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager optimistic.inverse
+                    reExecuteAllQueries model.schema updatedDb model.queryManager
 
                 cleanedModel =
                     removeOptimisticMutation requestId model
@@ -695,8 +664,7 @@ rollbackOptimisticMutation requestId mutationId error model =
               }
             , Cmd.batch
                 (QueryManager.mutationResult requestId mutationId (Err error)
-                    :: Cmd.map DbMsg dbCmd
-                    :: triggerCmds
+                    :: (List.map (Cmd.map DbMsg) dbCmds ++ triggerCmds)
                 )
             )
 
@@ -730,62 +698,20 @@ missingAuthoritativeMutationEnvelope serverRevision maybeSyncMessage =
 settleSuccessfulMutationWithEnvelope : String -> String -> Encode.Value -> Maybe Int -> Maybe MutationSyncMessage -> Model -> ( Model, Cmd Msg )
 settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevision maybeSyncMessage model =
     let
-        shouldApplyAuthoritative =
-            not (isStaleServerRevision serverRevision model.lastAppliedServerRevision)
-
-        ( authoritativeModel, authoritativeDbCmds, authoritativeQueryCmds ) =
-            case maybeSyncMessage of
-                Just syncMessage ->
-                    case syncMessage.delta of
-                        Just delta ->
-                            if shouldApplyAuthoritative then
-                                let
-                                    ( updatedDb, dbCmds ) =
-                                        applyAuthoritativeDelta delta model
-
-                                    ( updatedQueryManager, triggerCmds ) =
-                                        QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager delta
-                                in
-                                ( { model | db = updatedDb, queryManager = updatedQueryManager }, dbCmds, triggerCmds )
-
-                            else
-                                ( model, [], [] )
-
-                        Nothing ->
-                            ( model, [], [] )
-
-                Nothing ->
-                    ( model, [], [] )
-
         updatedModel =
-            case serverRevision of
-                Nothing ->
-                    removeOptimisticMutation requestId authoritativeModel
-
-                Just revision ->
-                    authoritativeModel
-                        |> acknowledgeOptimisticMutation requestId revision
-                        |> updateModelLastAppliedServerRevision serverRevision
-                        |> pruneAcknowledgedOptimisticPrefix
+            removeOptimisticMutation requestId model
 
         ( finalModel, catchupCmd ) =
-            case maybeSyncMessage of
-                Just syncMessage ->
-                    if syncMessage.requiresCatchup && shouldApplyAuthoritative then
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired updatedModel.catchup updatedModel.db) updatedModel
+            case ( maybeSyncMessage |> Maybe.andThen .delta, Decode.decodeValue (Decode.field "databaseEpoch" Decode.string) response, serverRevision ) of
+                ( Just delta, Ok epoch, Just revision ) ->
+                    applyCatchupUpdate (Catchup.update (Catchup.LiveDelta epoch revision "mutation-response" delta) updatedModel.catchup updatedModel.authoritativeDb) updatedModel
 
-                    else
-                        ( updatedModel, Cmd.none )
-
-                Nothing ->
-                    ( updatedModel, Cmd.none )
+                _ ->
+                    applyCatchupUpdate (Catchup.update Catchup.CatchupRequired updatedModel.catchup updatedModel.authoritativeDb) updatedModel
     in
     ( finalModel
     , Cmd.batch
         [ QueryManager.mutationResult requestId mutationId (Ok response)
-        , writeServerRevisionCmd serverRevision
-        , Cmd.batch (List.map (Cmd.map DbMsg) authoritativeDbCmds)
-        , Cmd.batch authoritativeQueryCmds
         , catchupCmd
         ]
     )
@@ -853,8 +779,22 @@ replayOptimisticMutations model db =
 
                     Just optimistic ->
                         let
+                            stillPresent group =
+                                let
+                                    existing =
+                                        Dict.get group.tableName currentDb.tables |> Maybe.withDefault Dict.empty |> Dict.values
+
+                                    retained values =
+                                        let
+                                            key =
+                                                List.map2 Tuple.pair group.headers values |> Dict.fromList |> Dict.get "id"
+                                        in
+                                        List.any (\row -> Dict.get "id" row == key) existing
+                                in
+                                { group | rows = List.filter retained group.rows }
+
                             ( nextDb, cmd ) =
-                                Db.update (Db.LocalDeltaReceived optimistic.forward) currentDb
+                                Db.update (Db.LocalDeltaReceived { tableGroups = List.map stillPresent optimistic.forward.tableGroups }) currentDb
                         in
                         ( nextDb, cmd :: cmds )
             )
@@ -1041,16 +981,12 @@ applyCatchupUpdate result model =
                 ( result.db, [] )
 
             else
-                case result.delta of
-                    Just _ ->
-                        replayOptimisticMutations model result.db
-
-                    Nothing ->
-                        ( result.db, [] )
+                replayOptimisticMutations model result.db
 
         updatedModel =
             { model
                 | catchup = result.model
+                , authoritativeDb = result.db
                 , db = replayedDb
                 , syncStatus = nextSyncStatus
                 , tableSyncStatuses = nextTableSyncStatuses
@@ -1095,7 +1031,7 @@ applyCatchupUpdate result model =
             else
                 case result.delta of
                     Just delta ->
-                        QueryManager.notifyTablesChanged model.schema replayedDb model.queryManager delta
+                        reExecuteAllQueries model.schema replayedDb model.queryManager
 
                     Nothing ->
                         ( model.queryManager, [] )
@@ -1129,11 +1065,6 @@ applyCatchupUpdate result model =
             , errorCmd
             , Cmd.batch triggerCmds
             , liveSyncCmd
-            , if result.destructiveReset then
-                Cmd.none
-
-              else
-                writeServerRevisionCmd result.serverRevision
             , emitSyncState (toSyncState liveSyncModel)
             , epochChangeCmd
             , debugCmd "catchup-update"
@@ -1203,24 +1134,12 @@ port debugOut : Encode.Value -> Cmd msg
 
 startLiveSyncIfReady : Model -> ( Model, Cmd Msg )
 startLiveSyncIfReady model =
-    case ( model.liveSyncStarted, Catchup.status model.catchup ) of
-        ( False, Catchup.Synced ) ->
+    case ( model.liveSyncStarted, model.catchup.initialDataLoaded ) of
+        ( False, True ) ->
             ( { model | liveSyncStarted = True }
             , Cmd.batch
                 [ debugCmd "live-sync-connect"
-                    [ ( "reason", Encode.string "catchup-synced" )
-                    , ( "transport", Encode.string (liveSyncTransportToString model.liveSyncTransport) )
-                    ]
-                , LiveSync.connect
-                    { transport = model.liveSyncTransport }
-                ]
-            )
-
-        ( False, Catchup.Error _ ) ->
-            ( { model | liveSyncStarted = True }
-            , Cmd.batch
-                [ debugCmd "live-sync-connect"
-                    [ ( "reason", Encode.string "catchup-error" )
+                    [ ( "reason", Encode.string "before-catchup" )
                     , ( "transport", Encode.string (liveSyncTransportToString model.liveSyncTransport) )
                     ]
                 , LiveSync.connect

@@ -14,6 +14,7 @@ pub mod seed;
 pub mod server;
 pub mod session;
 pub mod sync;
+pub mod sync_v2;
 pub mod sync_deltas;
 pub mod sync_shape;
 pub mod typecheck;

@@ -66,6 +66,12 @@ update msg db =
                 Data.IndexedDb.DatabaseEpochResetFailed _ _ ->
                     ( db, Cmd.none )
 
+                Data.IndexedDb.CatchupPageStored _ ->
+                    ( db, Cmd.none )
+
+                Data.IndexedDb.CatchupPageFailed _ ->
+                    ( db, Cmd.none )
+
         DeltaReceived delta ->
             let
                 updatedDb =
@@ -187,17 +193,17 @@ convertInitialDataToTableData : Data.IndexedDb.InitialData -> Dict String TableD
 convertInitialDataToTableData initialData =
     Dict.map
         (\tableName rows ->
-            List.filterMap
-                (\row ->
-                    case getRowId row of
+            List.foldl
+                (\row table ->
+                    case rowKey row table of
                         Just id ->
-                            Just ( id, row )
+                            Dict.insert id row table
 
                         Nothing ->
-                            Nothing
+                            table
                 )
+                Dict.empty
                 rows
-                |> Dict.fromList
         )
         initialData.tables
 
@@ -214,6 +220,21 @@ getRowId row =
 
         _ ->
             Nothing
+
+
+rowKey : Dict String Value -> TableData -> Maybe Int
+rowKey row table =
+    case Dict.get "id" row of
+        Just (Data.Value.StringValue key) ->
+            Dict.toList table
+                |> List.filter (\( _, existing ) -> Dict.get "id" existing == Just (Data.Value.StringValue key))
+                |> List.head
+                |> Maybe.map Tuple.first
+                |> Maybe.withDefault ((Dict.keys table |> List.minimum |> Maybe.withDefault 0) - 1)
+                |> Just
+
+        _ ->
+            getRowId row
 
 
 
@@ -310,7 +331,28 @@ applyDeltaToTableData indices data delta =
                     Dict.get tableName accTables |> Maybe.withDefault Dict.empty
 
                 ( updatedTable, indexUpdates ) =
-                    applyTableGroupRows indices tableName currentTable tableGroup.headers tableGroup.rows
+                    if Data.Delta.isDeletion tableGroup then
+                        List.foldl
+                            (\values ( table, updates ) ->
+                                case List.head values |> Maybe.andThen (\key -> rowKey (Dict.singleton "id" key) table) of
+                                    Just key ->
+                                        -- Text rows use synthetic Int keys internally.
+                                        if (Dict.get key table |> Maybe.andThen (Dict.get "id")) == List.head values then
+                                            ( Dict.remove key table
+                                            , updates ++ calculateIndexUpdates indices tableName key (Dict.get key table) Dict.empty
+                                            )
+
+                                        else
+                                            ( table, updates )
+
+                                    Nothing ->
+                                        ( table, updates )
+                            )
+                            ( currentTable, [] )
+                            tableGroup.rows
+
+                    else
+                        applyTableGroupRows indices tableName currentTable tableGroup.headers tableGroup.rows
             in
             ( Dict.insert tableName updatedTable accTables
             , accUpdates ++ indexUpdates
@@ -332,7 +374,7 @@ applyTableGroupRows indices tableName table headers rows =
                 rowObj =
                     rowArrayToObject headers rowArray
             in
-            case getRowId rowObj of
+            case rowKey rowObj accTable of
                 Just rowId ->
                     let
                         existingRow =
@@ -905,7 +947,9 @@ lookupRowByPrimaryKey data tableName primaryKeyColumn primaryKeyValue =
                     Dict.get id tableRows
 
                 Nothing ->
-                    Nothing
+                    Dict.values tableRows
+                        |> List.filter (\row -> Dict.get primaryKeyColumn row == Just primaryKeyValue)
+                        |> List.head
 
         Nothing ->
             Nothing

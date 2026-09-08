@@ -200,7 +200,7 @@ subscription?.unsubscribe();
 
 ### Entity Change Streams
 
-Use `onEntityChanges` when you want table rows directly instead of a query-shaped result tree. The first callback is always an `indexeddb-initial` batch, even when no persisted rows match. Later callbacks contain matching incoming catchup or live table deltas.
+Use `onEntityChanges` when you want table rows directly instead of a query-shaped result tree. The first callback is always an `indexeddb-initial` batch, even when no persisted rows match. Later authoritative callbacks follow committed catchup pages, including pages requested by live notifications.
 
 ```typescript
 const posts = new Map<string | number, unknown>();
@@ -216,7 +216,11 @@ const unsubscribe = await client.onEntityChanges(
   (batch) => {
     for (const change of batch.changes) {
       if (change.tableName === 'posts') {
-        posts.set(change.id, change.row);
+        if (change.op === 'delete') {
+          posts.delete(change.id);
+        } else {
+          posts.set(change.id, change.row);
+        }
       }
     }
 
@@ -227,12 +231,17 @@ const unsubscribe = await client.onEntityChanges(
 unsubscribe();
 ```
 
-Entity streams emit current rows only:
+Entity streams emit current rows and hard deletes:
 
 - `source: 'indexeddb-initial'` for the initial persisted snapshot
-- `source: 'catchup'` or `source: 'live'` for incoming server deltas
-- `op: 'row'` for every change
-- no delete events, previous values, field-level diffs, or membership-left events
+- `source: 'catchup'` for persisted server pages, including live-triggered catchup
+- `op: 'row'` with the current row, or `op: 'delete'` with only the typed ID
+- delete IDs reach all subscriptions for that table, regardless of row filters; deleting an unknown key is a no-op
+- no previous values, field-level diffs, or permission-revocation/membership-left events
+
+Generated Elm streams expose typed deletion constructors such as `PostDeleted Posts.Id`.
+Sync protocol 2 requires upgrading server/WASM/client artifacts together. Its IndexedDB
+upgrade clears legacy row-only caches once; it does not rotate the server epoch.
 
 If filter inputs change, unsubscribe and create a new subscription.
 

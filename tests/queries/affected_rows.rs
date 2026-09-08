@@ -269,7 +269,7 @@ async fn test_update_affected_rows() -> Result<(), TestError> {
 }
 
 #[tokio::test]
-async fn test_delete_affected_rows() -> Result<(), TestError> {
+async fn test_delete_never_returns_upsert_affected_rows() -> Result<(), TestError> {
     let db = TestDatabase::new(&schema::full_schema()).await?;
     db.seed_standard_data().await?;
 
@@ -290,61 +290,12 @@ async fn test_delete_affected_rows() -> Result<(), TestError> {
     // Check that we have result sets
     assert!(!rows.is_empty(), "Should have at least one result set");
 
-    // Find _affectedRows result set
-    let mut affected_rows_found = false;
     for mut rows_set in rows {
-        let column_count = rows_set.column_count();
-        for i in 0..column_count {
-            if let Some(col_name) = rows_set.column_name(i) {
-                if col_name == "_affectedRows" {
-                    affected_rows_found = true;
-                    if let Some(row) = rows_set.next().await.map_err(TestError::Database)? {
-                        if let Ok(json_str) = row.get::<String>(i as i32) {
-                            let json_value: serde_json::Value = serde_json::from_str(&json_str)
-                                .map_err(|e| {
-                                    TestError::TypecheckError(format!(
-                                        "Failed to parse JSON: {}",
-                                        e
-                                    ))
-                                })?;
-
-                            assert!(json_value.is_array(), "_affectedRows should be an array");
-
-                            let arr = json_value.as_array().unwrap();
-                            // Should have at least one affected row
-                            assert!(arr.len() > 0, "Should have at least one affected row");
-
-                            // Verify structure
-                            if let Some(table_group) = arr.first() {
-                                assert!(table_group.is_object(), "Table group should be an object");
-
-                                let obj = table_group.as_object().unwrap();
-                                assert_eq!(
-                                    obj["table_name"].as_str().unwrap(),
-                                    "users",
-                                    "Table name should be 'users'"
-                                );
-                                assert!(
-                                    obj.contains_key("rows"),
-                                    "Table group should have 'rows' field"
-                                );
-                                assert!(
-                                    obj.contains_key("headers"),
-                                    "Table group should have 'headers' field"
-                                );
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
+        for i in 0..rows_set.column_count() {
+            assert_ne!(rows_set.column_name(i), Some("_affectedRows"));
         }
+        while rows_set.next().await.map_err(TestError::Database)?.is_some() {}
     }
-
-    assert!(
-        affected_rows_found,
-        "Should have found _affectedRows column in results"
-    );
 
     Ok(())
 }

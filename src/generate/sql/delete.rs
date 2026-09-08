@@ -9,7 +9,7 @@ pub fn delete_to_string(
     query_info: &typecheck::QueryInfo,
     table: &typecheck::Table,
     query_field: &ast::QueryField,
-    include_affected_rows: bool,
+    _include_affected_rows: bool,
 ) -> Vec<to_sql::Prepared> {
     let table_name = ast::get_tablename(&table.record.name, &table.record.fields);
     let mut statements = to_sql::format_attach(query_info);
@@ -36,12 +36,8 @@ pub fn delete_to_string(
         response,
         string::quote(&ast::get_aliased_name(query_field))
     ));
-    if include_affected_rows {
-        sql.push_str(&format!(
-            ", json_array({}) as _affectedRows",
-            returning::affected_rows_expression(context, table)
-        ));
-    }
+    // DELETE RETURNING is the mutation result, never an upsert delta. Durable
+    // delete capture (including cascades) belongs to the SQLite triggers.
     statements.push(to_sql::include(sql));
 
     statements

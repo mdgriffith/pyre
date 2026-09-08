@@ -10,6 +10,7 @@ use crate::typecheck;
 pub const MIGRATION_TABLE: &str = "_pyre_migrations";
 
 pub const SYNC_TABLE: &str = "_pyre_sync";
+pub const TOMBSTONE_TABLE: &str = "_pyre_sync_tombstones";
 
 pub const LIST_MIGRATIONS: &str = "select name from _pyre_migrations";
 
@@ -36,6 +37,65 @@ pub const CREATE_SYNC_TABLE: &str = "create table if not exists _pyre_sync (
 pub const INSERT_SYNC_STATE_ROW: &str =
     "insert into _pyre_sync (id, database_epoch, server_revision) values (1, lower(hex(randomblob(16))), 0) on conflict(id) do nothing";
 
+pub const CREATE_TOMBSTONE_TABLE: &str = "create table if not exists _pyre_sync_tombstones (
+    sequence integer primary key autoincrement,
+    table_name text not null,
+    primary_key not null check (typeof(primary_key) in ('integer', 'text'))
+)";
+
+/// Install on the selected physical schema only. SQLite also runs these triggers
+/// for foreign-key cascades; no deleted row contents or permissions are retained.
+pub fn sync_tombstone_trigger_sql(
+    context: &typecheck::Context,
+    schema: &ast::Schema,
+) -> Vec<SqlAndParams> {
+    use crate::ext::string::{quote, single_quote};
+
+    let mut tables = context
+        .tables
+        .values()
+        .filter(|table| table.schema == schema.namespace)
+        .collect::<Vec<_>>();
+    tables.sort_by_key(|table| ast::get_tablename(&table.record.name, &table.record.fields));
+    let mut statements = Vec::new();
+    for table in tables {
+        let name = ast::get_tablename(&table.record.name, &table.record.fields);
+        let trigger = quote(&format!("_pyre_delete_{}", name));
+        statements.push(SqlAndParams::Sql(format!(
+            "drop trigger if exists {trigger}"
+        )));
+        for operation in ["insert", "update"] {
+            statements.push(SqlAndParams::Sql(format!(
+                "drop trigger if exists {}",
+                quote(&format!("_pyre_{operation}_{name}"))
+            )));
+        }
+        if schema.sync_mode != ast::SyncMode::Synced {
+            continue;
+        }
+        if let Some(primary_key) = ast::get_primary_id_field_name(&table.record.fields) {
+            let key = quote(&primary_key);
+            let literal = single_quote(&name);
+            for operation in ["insert", "update"] {
+                let rename = if operation == "update" {
+                    format!("insert into _pyre_sync_tombstones (sequence, table_name, primary_key) select server_revision, {literal}, old.{key} from _pyre_sync where id = 1 and old.{key} is not new.{key};")
+                } else {
+                    String::new()
+                };
+                statements.push(SqlAndParams::Sql(format!(
+                    "create trigger {} after {operation} on {} begin update _pyre_sync set server_revision = server_revision + 1 where id = 1; select case when changes() != 1 then raise(abort, 'missing Pyre sync metadata') end; {rename} end",
+                    quote(&format!("_pyre_{operation}_{name}")), quote(&name)
+                )));
+            }
+            statements.push(SqlAndParams::Sql(format!(
+                "create trigger {trigger} after delete on {} begin update _pyre_sync set server_revision = server_revision + 1 where id = 1; select case when changes() != 1 then raise(abort, 'missing Pyre sync metadata') end; insert into _pyre_sync_tombstones (sequence, table_name, primary_key) select server_revision, {literal}, old.{key} from _pyre_sync where id = 1; end",
+                quote(&name)
+            )));
+        }
+    }
+    statements
+}
+
 pub const INSERT_MIGRATION_ERROR: &str =
     "insert into _pyre_migrations (name, sql, error) values (?, ?, ?)";
 
@@ -50,6 +110,9 @@ pub fn internal_setup_sql() -> Vec<SqlAndParams> {
         SqlAndParams::Sql(CREATE_MIGRATION_TABLE.to_string()),
         SqlAndParams::Sql(CREATE_SYNC_TABLE.to_string()),
         SqlAndParams::Sql(INSERT_SYNC_STATE_ROW.to_string()),
+        SqlAndParams::Sql(CREATE_TOMBSTONE_TABLE.to_string()),
+        SqlAndParams::Sql("create index if not exists _pyre_sync_tombstones_cursor on _pyre_sync_tombstones (table_name, sequence, primary_key)".to_string()),
+        SqlAndParams::Sql("update _pyre_sync set server_revision = max(server_revision, coalesce((select max(sequence) from _pyre_sync_tombstones), 0)) where id = 1".to_string()),
     ]
 }
 
@@ -67,8 +130,21 @@ pub fn quoted_internal_setup_sql() -> Vec<SqlAndParams> {
 }
 
 fn quote_internal_table_names(sql: &str) -> String {
-    sql.replace(MIGRATION_TABLE, &crate::ext::string::quote(MIGRATION_TABLE))
-        .replace(SYNC_TABLE, &crate::ext::string::quote(SYNC_TABLE))
+    // Quote tokens, not substrings: the tombstone name starts with SYNC_TABLE.
+    sql.split_inclusive(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .map(|token| {
+            let name = token.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+            if [MIGRATION_TABLE, SYNC_TABLE, TOMBSTONE_TABLE].contains(&name) {
+                format!(
+                    "{}{}",
+                    crate::ext::string::quote(name),
+                    &token[name.len()..]
+                )
+            } else {
+                token.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Result type for dynamic migrations (used in WASM)
@@ -76,6 +152,7 @@ fn quote_internal_table_names(sql: &str) -> String {
 #[derive(serde::Serialize)]
 pub struct MigrationSql {
     pub sql: Vec<SqlAndParams>,
+    pub schema_changed: bool,
     pub mark_success: SqlAndParams,
     pub mark_failure: SqlAndParams,
 }
@@ -159,7 +236,11 @@ pub(crate) fn migrate_dynamic_for_schema(
 
     if db_diff::is_empty(&db_diff) {
         return Ok(MigrationSql {
-            sql: vec![],
+            schema_changed: false,
+            sql: internal_setup_sql()
+                .into_iter()
+                .chain(sync_tombstone_trigger_sql(&new_context, &new_schema_clone))
+                .collect(),
             mark_success: SqlAndParams::SqlWithParams {
                 sql: INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
                 args: vec![
@@ -181,8 +262,10 @@ pub(crate) fn migrate_dynamic_for_schema(
     let sql_executed = String::new();
 
     sql.splice(0..0, internal_setup_sql());
+    sql.extend(sync_tombstone_trigger_sql(&new_context, &new_schema_clone));
 
     Ok(MigrationSql {
+        schema_changed: true,
         sql,
         mark_success: SqlAndParams::SqlWithParams {
             sql: INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),

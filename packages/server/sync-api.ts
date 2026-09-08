@@ -20,6 +20,7 @@ export type {
   SyncCursor,
   CatchupResult,
   SyncPageResult,
+  DurableSyncPage,
   SyncResetResult,
   SyncSession,
 } from "./sync";

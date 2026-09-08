@@ -25,12 +25,12 @@ export interface EntitySubscription {
   tables: EntityTableSubscription[];
 }
 
-export interface EntityChange {
+export type EntityChange = {
   tableName: string;
   id: string | number;
   op: 'row';
   row: Record<string, unknown>;
-}
+} | { tableName: string; id: string | number; op: 'delete' };
 
 export type EntityChangeBatchSource = 'indexeddb-initial' | 'catchup' | 'live' | 'optimistic' | 'mutation-response';
 
@@ -52,6 +52,7 @@ interface EntityStreamRegistration {
 export class EntityStreamService {
   private registrations: Set<EntityStreamRegistration> = new Set();
   private sequence = 0;
+  private knownEntities = new Map<string, { tableName: string; id: string | number }>();
 
   subscribe(subscription: EntitySubscription, callback: EntityChangeCallback): () => void {
     validateEntitySubscription(subscription);
@@ -59,6 +60,7 @@ export class EntityStreamService {
     this.registrations.add(registration);
     return () => {
       this.registrations.delete(registration);
+      if (this.registrations.size === 0) this.knownEntities.clear();
     };
   }
 
@@ -76,6 +78,7 @@ export class EntityStreamService {
   ): EntityChangeBatch | null {
     validateEntitySubscription(subscription);
     const changes = collectChanges(subscription, rowsByTable);
+    this.track(changes);
     if (changes.length === 0) {
       return null;
     }
@@ -98,19 +101,55 @@ export class EntityStreamService {
       return;
     }
 
-    const rowsByTable = expandTableGroups(tableGroups);
-    if (rowsByTable.size === 0) {
-      return;
-    }
-
     this.registrations.forEach((registration) => {
-      const batch = this.createBatchFromRows(registration.subscription, rowsByTable, source, databaseId);
-      if (!batch) {
-        return;
+      const changes: EntityChange[] = [];
+      // Keep event order, including delete/reinsert of the same typed key.
+      for (const group of tableGroups) {
+        if (group.headers.length === 1 && group.headers[0] === '$delete') {
+          if (registration.subscription.tables.some((table) => table.tableName === group.table_name)) {
+            for (const values of group.rows) {
+              const id = values[0];
+              if (typeof id === 'string' || typeof id === 'number') changes.push({ tableName: group.table_name, id, op: 'delete' });
+            }
+          }
+        } else {
+          changes.push(...collectChanges(registration.subscription, expandTableGroups([group])));
+        }
       }
-
-      registration.callback(batch);
+      // Deletions are broadcast even for filtered subscriptions: an unknown
+      // cached key is a no-op, and old row permissions are not consulted.
+      this.track(changes);
+      if (changes.length > 0) {
+        try {
+          registration.callback({ type: 'entity-change-batch', databaseId, sequence: this.reserveSequence(), source, changes });
+        } catch (error) {
+          console.error('[PyreClient] Entity subscriber failed:', error);
+        }
+      }
     });
+  }
+
+  private track(changes: EntityChange[]): void {
+    for (const change of changes) {
+      const key = JSON.stringify([change.tableName, typeof change.id, change.id]);
+      if (change.op === 'delete') this.knownEntities.delete(key);
+      else this.knownEntities.set(key, { tableName: change.tableName, id: change.id });
+    }
+  }
+
+  reset(databaseId?: string): void {
+    const deleted = [...this.knownEntities.values()].map((entity): EntityChange => ({ ...entity, op: 'delete' }));
+    this.knownEntities.clear();
+    for (const registration of this.registrations) {
+      const changes = deleted.filter((change) => registration.subscription.tables.some((table) => table.tableName === change.tableName));
+      if (changes.length > 0) {
+        try {
+          registration.callback({ type: 'entity-change-batch', databaseId, sequence: this.reserveSequence(), source: 'catchup', changes });
+        } catch (error) {
+          console.error('[PyreClient] Entity subscriber failed:', error);
+        }
+      }
+    }
   }
 }
 
@@ -224,7 +263,7 @@ function collectChanges(
         return;
       }
 
-      const key = `${tableSubscription.tableName}:${String(id)}`;
+      const key = JSON.stringify([tableSubscription.tableName, typeof id, id]);
       if (emitted.has(key)) {
         return;
       }

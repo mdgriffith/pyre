@@ -3,7 +3,7 @@ import * as wasm from "./wasm/pyre_wasm.js";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
 
 const DEFAULT_SCHEMA_KEY = "__default__";
-const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync"]);
+const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_sync_tombstones"]);
 const introspectionsByDatabaseId = new Map<string, unknown>();
 const INTERNAL_SETUP_SQL: InStatement[] = [
     `create table if not exists _pyre_migrations (
@@ -21,12 +21,18 @@ const INTERNAL_SETUP_SQL: InStatement[] = [
         server_revision integer not null default 0 check (server_revision >= 0)
     )`,
     "insert into _pyre_sync (id, database_epoch, server_revision) values (1, lower(hex(randomblob(16))), 0) on conflict(id) do nothing",
+    `create table if not exists _pyre_sync_tombstones (
+        sequence integer primary key autoincrement,
+        table_name text not null,
+        primary_key not null check (typeof(primary_key) in ('integer', 'text'))
+    )`,
 ];
 
 export type EnsureDatabaseOutcome = "created" | "migrated" | "up-to-date";
 
 type MigrationPlan = {
     sql: InStatement[];
+    schema_changed: boolean;
     mark_success: InStatement;
 };
 
@@ -56,10 +62,13 @@ export async function ensureDatabase(
 
         if (
             initialized
-            && result.Ok.sql.length === 0
+            && (result.Ok.schema_changed === false || result.Ok.sql.length === 0)
             && introspection.schema_source === schemaSource
         ) {
-            await tx.rollback();
+            if (result.Ok.sql.length > 0) {
+                await tx.batch(result.Ok.sql);
+            }
+            await tx.commit();
             return "up-to-date";
         }
 

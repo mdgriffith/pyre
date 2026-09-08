@@ -14,6 +14,8 @@ pub struct SyncCursorWasm {
 
 #[derive(Serialize, Deserialize)]
 pub struct TableCursorWasm {
+    #[serde(default)]
+    pub last_seen_delete_sequence: i64,
     pub last_seen_updated_at: Option<i64>,
     #[serde(default)]
     pub last_seen_primary_key: Option<serde_json::Value>,
@@ -61,6 +63,7 @@ fn convert_cursor_wasm_to_rust(cursor: &SyncCursorWasm) -> sync::SyncCursor {
             (
                 k.clone(),
                 sync::TableCursor {
+                    last_seen_delete_sequence: v.last_seen_delete_sequence,
                     last_seen_updated_at: v.last_seen_updated_at,
                     last_seen_primary_key: v.last_seen_primary_key.clone(),
                     permission_hash: v.permission_hash.clone(),
@@ -68,6 +71,65 @@ fn convert_cursor_wasm_to_rust(cursor: &SyncCursorWasm) -> sync::SyncCursor {
             )
         })
         .collect()
+}
+
+#[wasm_bindgen]
+pub fn sync_v2_statement(
+    cursor: JsValue,
+    session: JsValue,
+    page_size: usize,
+) -> Result<JsValue, JsValue> {
+    let introspection = cache::get().ok_or_else(|| JsValue::from_str("No schema found"))?;
+    let context = get_schema_context(&introspection).map_err(|e| JsValue::from_str(&e))?;
+    let cursor: SyncCursorWasm = serde_wasm_bindgen::from_value(cursor)?;
+    let session = prepare_session_wasm(context, session).map_err(|e| JsValue::from_str(&e))?;
+    let statement = pyre::sync_v2::statement(
+        context,
+        &convert_cursor_wasm_to_rust(&cursor),
+        &session,
+        page_size,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    let params = statement
+        .params
+        .into_iter()
+        .map(SessionValueWasm::from)
+        .collect::<Vec<_>>();
+    js_sys::JSON::parse(&serde_json::json!({ "sql": statement.sql, "params": params }).to_string())
+}
+
+#[wasm_bindgen]
+pub fn sync_v2_page(
+    cursor: JsValue,
+    rows: JsValue,
+    page_size: usize,
+    database_id: String,
+    snapshot_timestamp: f64,
+) -> Result<JsValue, JsValue> {
+    if !snapshot_timestamp.is_finite()
+        || snapshot_timestamp.fract() != 0.0
+        || snapshot_timestamp.abs() > 9_007_199_254_740_991.0
+    {
+        return Err(JsValue::from_str(
+            "snapshot timestamp must be a safe integer",
+        ));
+    }
+    let introspection = cache::get().ok_or_else(|| JsValue::from_str("No schema found"))?;
+    let context = get_schema_context(&introspection).map_err(|e| JsValue::from_str(&e))?;
+    let cursor: SyncCursorWasm = serde_wasm_bindgen::from_value(cursor)?;
+    let rows: Vec<HashMap<String, serde_json::Value>> = serde_wasm_bindgen::from_value(rows)?;
+    let page = pyre::sync_v2::page(
+        context,
+        &convert_cursor_wasm_to_rust(&cursor),
+        &rows,
+        page_size,
+        database_id,
+        snapshot_timestamp as i64,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    js_sys::JSON::parse(
+        &serde_json::to_string(&page).map_err(|e| JsValue::from_str(&e.to_string()))?,
+    )
 }
 
 fn convert_result_rust_to_wasm(result: sync::SyncPageResult) -> SyncPageResultWasm {

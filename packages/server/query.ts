@@ -94,7 +94,8 @@ export type SyncDeltasFn = (
     affectedRowGroups: any[],
     connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
     sendToSession: (sessionId: string, message: any) => void,
-    originSessionId?: string
+    originSessionId?: string,
+    committedState?: { databaseEpoch: string; serverRevision: number },
 ) => Promise<SyncResult | void>;
 
 export interface RunOptions {
@@ -273,8 +274,49 @@ export async function run(
     const sqlStatements: InStatement[] = toSqlStatements(activeSql, validArgs);
 
     // Execute query
-    const resultSets = await db.batch(sqlStatements);
-    const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
+    const durableMutation = useSyncMode && query.operation !== "query";
+    let committedState: { databaseEpoch: string; serverRevision: number } | undefined;
+    let resultSets;
+    const deletions: any[] = [];
+    const absent = new Set<string>();
+    const primaryKeys = new Map<string, string>();
+    let affectedRows: any[] = [];
+    if (durableMutation) {
+        const tx = await db.transaction("write");
+        try {
+            const before = (await tx.execute("select server_revision from _pyre_sync where id = 1")).rows[0]?.server_revision;
+            if (before == null) throw new Error("Missing sync metadata; migrate database");
+            resultSets = await tx.batch(sqlStatements);
+            affectedRows = extractAffectedRowGroups(activeSql, resultSets);
+            const state = (await tx.execute("select database_epoch, server_revision from _pyre_sync where id = 1")).rows[0];
+            if (typeof state?.database_epoch !== "string" || !Number.isSafeInteger(Number(state.server_revision))) {
+                throw new Error("Missing committed sync metadata; migrate database and regenerate queries");
+            }
+            committedState = { databaseEpoch: state.database_epoch, serverRevision: Number(state.server_revision) };
+            const deleted = await tx.execute({ sql: "select table_name, primary_key from _pyre_sync_tombstones where sequence > ? order by sequence", args: [before] });
+            for (const row of deleted.rows) {
+                const key = typeof row.primary_key === "bigint" ? Number(row.primary_key) : row.primary_key;
+                const table = String(row.table_name);
+                if (affectedRows.some(group => group.table_name === table && group.rows.length > 0)) {
+                    let primaryKey = primaryKeys.get(table);
+                    if (!primaryKey) {
+                        primaryKey = String((await tx.execute({ sql: 'select name from pragma_table_info(?) where pk = 1', args: [table] })).rows[0].name);
+                        primaryKeys.set(table, primaryKey);
+                    }
+                    if ((await tx.execute({ sql: `select 1 from "${table.replace(/"/g, '""')}" where "${primaryKey.replace(/"/g, '""')}" = ?`, args: [row.primary_key] })).rows.length === 0) absent.add(JSON.stringify([table, key]));
+                }
+                deletions.push({ table_name: table, headers: ["$delete"], rows: [[key]] });
+            }
+            await tx.commit();
+        } finally {
+            tx.close();
+        }
+    } else {
+        resultSets = await db.batch(sqlStatements, "write");
+        affectedRows = extractAffectedRowGroups(activeSql, resultSets);
+    }
+    const upserts = affectedRows.map(group => ({ ...group, rows: group.rows.filter((row: unknown[]) => !absent.has(JSON.stringify([group.table_name, row[group.headers.indexOf(primaryKeys.get(group.table_name) ?? 'id')]]))) }));
+    const affectedRowGroups: unknown[] = [...deletions, ...upserts];
     const response = formatResultData(activeSql, resultSets);
 
     // Always create sync function - it will be a no-op if there's nothing to send
@@ -302,7 +344,7 @@ export async function run(
      */
     async function sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
         // Early return if nothing to sync
-        if (affectedRowGroups.length === 0) {
+        if (affectedRowGroups.length === 0 && !committedState) {
             return {};
         }
 
@@ -310,13 +352,14 @@ export async function run(
             return {};
         }
 
-        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId) ?? {};
+        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId, committedState) ?? {};
         if (typeof syncResult.serverRevision === "number") {
             queryResult.response = {
+                syncVersion: 2,
                 ...(syncResult.databaseEpoch === undefined ? {} : { databaseEpoch: syncResult.databaseEpoch }),
                 serverRevision: syncResult.serverRevision,
                 ...(syncResult.originMessage === undefined ? {} : { sync: syncResult.originMessage }),
-                result: queryResult.response,
+                result: response,
             };
         }
 
@@ -336,7 +379,8 @@ export async function run(
  * Insert seed data using Pyre schema links to connect nested records.
  *
  * This is intended for server-side fixture/import setup. It bypasses Pyre query
- * permissions and does not currently integrate with Pyre sync metadata.
+ * permissions. Installed sync triggers capture durable metadata; the host is
+ * responsible for sending a live wake after an import.
  */
 export async function seed(
     db: Client,
