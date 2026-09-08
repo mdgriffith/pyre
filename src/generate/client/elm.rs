@@ -129,6 +129,10 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
                 "{}{}Row {}.Row\n",
                 prefix, record.record_name, record.table_module_segment
             ));
+            result.push_str(&format!(
+                "    | {}Deleted {}.Id\n",
+                record.record_name, record.table_module_segment
+            ));
         }
         result.push_str("    | EntityDecodeFailed String Decode.Value\n\n\n");
     }
@@ -193,24 +197,30 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
 
     result.push_str("entityChangeDecoder : Decode.Decoder EntityChange\n");
     result.push_str("entityChangeDecoder =\n");
-    result.push_str("    Decode.map2 Tuple.pair\n");
+    result.push_str("    Decode.map3 (\\tableName op value -> ( tableName, op, value ))\n");
     result.push_str("        (Decode.field \"tableName\" Decode.string)\n");
-    result.push_str("        (Decode.field \"row\" Decode.value)\n");
+    result.push_str("        (Decode.field \"op\" Decode.string)\n");
+    result.push_str("        Decode.value\n");
     result.push_str("        |> Decode.map\n");
-    result.push_str("            (\\( tableName, row ) ->\n");
-    result.push_str("                case tableName of\n");
+    result.push_str("            (\\( tableName, op, value ) ->\n");
+    result.push_str("                case ( tableName, op ) of\n");
     for record in records {
         result.push_str(&format!(
-            "                    \"{}\" ->\n",
+            "                    ( \"{}\", \"row\" ) ->\n",
             record.table_name
         ));
         result.push_str(&format!(
-            "                        decodeRow {}Row {}.decodeRow row\n\n",
+            "                        decodeRow {}Row (Decode.field \"row\" {}.decodeRow) value\n\n",
             record.record_name, record.table_module_segment
         ));
+        result.push_str(&format!(
+            "                    ( \"{}\", \"delete\" ) ->\n                        decodeRow {}Deleted (Decode.field \"id\" {}.decodeId) value\n\n",
+            record.table_name, record.record_name, record.table_module_segment
+        ));
     }
-    result.push_str("                    other ->\n");
-    result.push_str("                        EntityDecodeFailed other row\n");
+    result.push_str("                    _ ->\n");
+    result
+        .push_str("                        EntityDecodeFailed (tableName ++ \":\" ++ op) value\n");
     result.push_str("            )\n");
 
     result.push_str("\n\n");
@@ -235,7 +245,7 @@ fn to_entity_stream_table_module(
     let mut result = String::new();
 
     result.push_str(&format!(
-        "module {} exposing (Row, Stream, decodeRow, stream",
+        "module {} exposing (Row, Stream, decodeRow, stream, Id, decodeId",
         entity_stream_table_module_name(schema, record)
     ));
     for field in entity_stream_condition_fields(database, record) {
@@ -265,6 +275,14 @@ fn to_entity_stream_table_module(
     result.push_str(&entity_stream_condition_builders(database, record));
     result.push_str(&entity_stream_row_alias(database, record));
     result.push_str(&entity_stream_row_decoder(database, record));
+    if let Some(key) = ast::get_primary_id_field_name(&record.fields) {
+        if let Some(column) = record.fields.iter().find_map(|field| match field {
+            ast::Field::Column(column) if column.name == key => Some(column),
+            _ => None,
+        }) {
+            result.push_str(&format!("\n\ntype alias Id =\n    {}\n\n\ndecodeId : Decode.Decoder Id\ndecodeId =\n    {}\n", entity_stream_elm_type(database, &column.type_), entity_stream_decoder(database, &column.type_)));
+        }
+    }
 
     result
 }

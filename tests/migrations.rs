@@ -215,7 +215,10 @@ async fn migration_creates_single_pyre_sync_revision_row() -> Result<(), TestErr
     while let Some(row) = internal_tables.next().await.map_err(TestError::Database)? {
         names.push(row.get::<String>(0).map_err(TestError::Database)?);
     }
-    assert_eq!(names, vec!["_pyre_migrations", "_pyre_sync"]);
+    assert_eq!(
+        names,
+        vec!["_pyre_migrations", "_pyre_sync", "_pyre_sync_tombstones"]
+    );
 
     let schema: String = conn
         .query(

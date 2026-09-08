@@ -51,6 +51,9 @@ function validateSyncCursor(syncCursor: SyncCursor): void {
         if (!entry || typeof entry !== "object") {
             throw new Error(`syncCursor entry for ${tableName} must be an object`);
         }
+        if (entry.last_seen_delete_sequence !== undefined && (!Number.isSafeInteger(entry.last_seen_delete_sequence) || entry.last_seen_delete_sequence < 0)) {
+            throw new Error(`syncCursor deletion sequence for ${tableName} must be a nonnegative safe integer`);
+        }
 
         if (entry.last_seen_updated_at !== null && !Number.isSafeInteger(entry.last_seen_updated_at)) {
             throw new Error(`syncCursor last_seen_updated_at for ${tableName} must be a safe integer or null`);
@@ -80,7 +83,9 @@ function validateSyncCursor(syncCursor: SyncCursor): void {
  * Sync cursor tracks the last seen state for each table.
  */
 export interface SyncCursor {
+    version?: number;
     tables: Record<string, {
+        last_seen_delete_sequence?: number;
         last_seen_updated_at: number | null;
         last_seen_primary_key?: SyncPrimaryKey | null;
         permission_hash: string;
@@ -115,13 +120,15 @@ export interface SyncResetResult {
     reason: "database_epoch_changed";
 }
 
-export type CatchupResult = SyncPageResult | SyncResetResult;
+export type CatchupResult = DurableSyncPage | SyncResetResult;
 
+/** Explicit admin retention operation. Never invoked automatically by sync. */
 export async function rotateDatabaseEpoch(db: Client): Promise<string> {
-    const result = await db.execute(
+    const results = await db.batch([
         "update _pyre_sync set database_epoch = lower(hex(randomblob(16))), server_revision = 0 where id = 1 returning database_epoch",
-    );
-    const databaseEpoch = result.rows[0]?.database_epoch;
+        "delete from _pyre_sync_tombstones where exists (select 1 from _pyre_sync where id = 1)",
+    ], "write");
+    const databaseEpoch = results[0].rows[0]?.database_epoch;
     if (typeof databaseEpoch !== "string" || databaseEpoch.length === 0) {
         throw new Error("Failed to rotate Pyre database epoch");
     }
@@ -246,14 +253,14 @@ export interface SyncSession {
  * const result = await catchup(db, syncCursor, session, 1000);
  * ```
  */
-export async function catchup(
+export async function catchupLegacy(
     db: Client,
     syncCursor: SyncCursor,
     session: SyncSession,
     pageSize: number = DEFAULT_SYNC_PAGE_SIZE,
     databaseId?: DatabaseId,
     clientDatabaseEpoch?: string,
-): Promise<CatchupResult> {
+): Promise<SyncPageResult | SyncResetResult> {
     activateSchemaForDatabase(databaseId);
     const effectivePageSize = normalizePageSize(pageSize);
     validateSyncCursor(syncCursor);
@@ -408,4 +415,62 @@ export async function catchup(
     }
 
     return result;
+}
+
+export interface DurableSyncPage {
+    snapshotTimestamp: number;
+    syncVersion: 2;
+    databaseId: string;
+    databaseEpoch: string;
+    serverRevision: number;
+    tables: Record<string, {
+        changes: Array<{ op: "row" | "delete"; id: string | number; row?: Record<string, unknown> }>;
+        last_seen_delete_sequence: number;
+        permission_hash: string;
+        last_seen_updated_at: number | null;
+        last_seen_primary_key: string | number | null;
+    }>;
+    has_more: boolean;
+}
+
+/** A single SQLite SELECT reads the epoch, rows, tombstones and cursor snapshot. */
+export async function catchup(
+    db: Client,
+    syncCursor: SyncCursor,
+    session: SyncSession,
+    pageSize = DEFAULT_SYNC_PAGE_SIZE,
+    databaseId?: DatabaseId,
+    clientDatabaseEpoch?: string,
+): Promise<DurableSyncPage | SyncResetResult> {
+    if (syncCursor.version !== 2) throw new Error("Pyre sync protocol 2 required; upgrade the client");
+    validateSyncCursor(syncCursor);
+    const size = normalizePageSize(pageSize);
+    const id = requireDatabaseId(databaseId ?? "main");
+    activateSchemaForDatabase(databaseId);
+    const statement = wasm.sync_v2_statement(syncCursor, normalizeForWasmJson(session), size);
+    // The write barrier waits for transactions which may already have assigned
+    // updatedAt but not committed. Keep it only for this page's snapshot read.
+    // Establish the transaction before acquiring the writer lock so even a
+    // failed lock attempt is disposed by close() (including local libSQL).
+    const tx = await db.transaction("deferred");
+    let startedAt: number;
+    let result;
+    try {
+        await tx.execute("update _pyre_sync set server_revision = server_revision where id = 1");
+        const clock = await tx.execute("select unixepoch() as started_at");
+        startedAt = coerceUnixSeconds(clock.rows[0]?.started_at);
+        result = await tx.execute({ sql: statement.sql, args: normalizeParams(statement.params) as any[] });
+        await tx.commit();
+    } finally {
+        tx.close();
+    }
+    // WASM's schema cache is global; another physical database may have run
+    // while the database read was pending.
+    activateSchemaForDatabase(databaseId);
+    const page = wasm.sync_v2_page(syncCursor, normalizeForWasmJson(result.rows), size, id, startedAt) as DurableSyncPage;
+    if ((clientDatabaseEpoch !== undefined && clientDatabaseEpoch !== page.databaseEpoch)
+        || (clientDatabaseEpoch === undefined && Object.keys(syncCursor.tables).length > 0)) {
+        return { type: "reset", databaseId: id, databaseEpoch: page.databaseEpoch, operation: "replace", scope: "database", reason: "database_epoch_changed" };
+    }
+    return page;
 }

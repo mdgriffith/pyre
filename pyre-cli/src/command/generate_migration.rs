@@ -88,7 +88,12 @@ pub async fn generate_migration<'a>(
                             let migration_file = migration_folder.join("migration.sql");
                             let diff_file = migration_folder.join("schema.diff");
 
-                            let sql = pyre::db::diff::to_sql::to_sql(&db_diff);
+                            let mut sql = pyre::db::migrate::internal_setup_sql();
+                            sql.extend(pyre::db::diff::to_sql::to_sql(&db_diff));
+                            sql.extend(pyre::db::migrate::sync_tombstone_trigger_sql(
+                                &context,
+                                current_schema,
+                            ));
 
                             let mut all_sql_as_string = String::new();
                             for sql_statement in sql {

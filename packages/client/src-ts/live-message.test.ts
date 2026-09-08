@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { expect, test } from 'bun:test';
 
-import loadElm from '../dist/engine.mjs';
+import loadElm from './test-engine';
 
 const schema = {
   tables: {
@@ -18,6 +18,8 @@ function deltaMessage(databaseId?: string) {
   return {
     type: 'delta',
     databaseId,
+    databaseEpoch: 'test-epoch',
+    serverRevision: 1,
     data: [
       {
         table_name: 'maps',
@@ -39,7 +41,7 @@ async function startSyncedElmApp() {
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
+    response = JSON.stringify({ syncVersion: 2, serverRevision: 0, databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -88,6 +90,10 @@ async function startSyncedElmApp() {
   });
 
   app.ports.indexedDbOut.subscribe((message) => {
+    if (message?.type === 'writeCatchupPage') {
+      app.ports.receiveIndexedDbMessage.send({ type: 'catchupPageStored', databaseEpoch: message.databaseEpoch });
+      return;
+    }
     if (message?.type !== 'requestInitialData') {
       return;
     }
@@ -157,26 +163,29 @@ test('Elm live sync rejects mismatched delta databaseId before writing cache', a
   }
 });
 
-test('Elm live sync accepts matching delta databaseId', async () => {
+test('Elm matching live delta commits its rows without an HTTP catchup request', async () => {
   const errors: string[] = [];
   const writes: unknown[] = [];
-  const { app, restore } = await startSyncedElmApp();
+  const { app, requests, restore } = await startSyncedElmApp();
 
   try {
     app.ports.errorOut.subscribe((message) => {
       errors.push(message);
     });
     app.ports.indexedDbOut.subscribe((message) => {
-      if (message?.type === 'writeDelta') {
+      if (message?.type === 'writeCatchupPage') {
         writes.push(message);
       }
     });
 
+    const count = requests.length;
     app.ports.receiveSSEMessage.send(deltaMessage('campaign:123'));
+    await Bun.sleep(0);
     await Bun.sleep(0);
 
     expect(errors).toHaveLength(0);
     expect(writes).toHaveLength(1);
+    expect(requests).toHaveLength(count);
   } finally {
     restore();
   }
@@ -201,13 +210,8 @@ test('Elm live syncRequired starts catchup from the current cursor', async () =>
       databaseId: 'campaign:123',
       databaseEpoch: 'test-epoch',
       syncCursor: {
-        tables: {
-          maps: {
-            last_seen_updated_at: null,
-            last_seen_primary_key: null,
-            permission_hash: '',
-          },
-        },
+        version: 2,
+        tables: {},
       },
     });
   } finally {
@@ -215,7 +219,7 @@ test('Elm live syncRequired starts catchup from the current cursor', async () =>
   }
 });
 
-test('Elm live syncRequired ignores stale server revisions', async () => {
+test('Elm live syncRequired remains a harmless wake even with a late revision', async () => {
   const { app, requests, restore } = await startSyncedElmApp();
 
   try {
@@ -235,7 +239,7 @@ test('Elm live syncRequired ignores stale server revisions', async () => {
     await Bun.sleep(0);
     await Bun.sleep(0);
 
-    expect(requests).toHaveLength(requestCountAfterInitialCatchup);
+    expect(requests).toHaveLength(requestCountAfterInitialCatchup + 1);
   } finally {
     restore();
   }
@@ -267,12 +271,13 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
 
     send() {
       this.response = JSON.stringify({
+        syncVersion: 2,
         databaseId: 'campaign:123',
         databaseEpoch: 'test-epoch',
         serverRevision: 1,
         tables: {
           maps: {
-            rows: [{ id: 1, name: 'Catchup Map', updatedAt: 1 }],
+            changes: [{ op: 'row', id: 1, row: { id: 1, name: 'Catchup Map', updatedAt: 1 } }],
             permission_hash: 'allowed',
             last_seen_updated_at: 1,
           },
@@ -319,8 +324,8 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
         });
       }
 
-      if (message?.type === 'writeDelta' && message?.entityStreamSource === 'catchup') {
-        notifications.push(message);
+      if (message?.type === 'writeCatchupPage') {
+        notifications.push(message.tableGroups);
       }
     });
 
@@ -328,17 +333,13 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
     await Bun.sleep(0);
 
     expect(notifications).toEqual([
-      {
-        type: 'writeDelta',
-        entityStreamSource: 'catchup',
-        tableGroups: [
+      [
           {
             table_name: 'maps',
             headers: ['id', 'name', 'updatedAt'],
             rows: [[1, 'Catchup Map', 1]],
           },
-        ],
-      },
+      ],
     ]);
   } finally {
     globalThis.XMLHttpRequest = previousXmlHttpRequest;
@@ -346,8 +347,12 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
 });
 
 test('Elm mutation response sync preserves newer rapid optimistic state', async () => {
+  let catchupRequests = 0;
+  const sources: string[] = [];
   const previousXmlHttpRequest = globalThis.XMLHttpRequest;
   const pendingMutations: Array<{ url: string; complete: (response: unknown) => void }> = [];
+  let authoritativeName = 'Initial';
+  let authoritativeRevision = 0;
 
   class MockXMLHttpRequest {
     listeners: Record<string, Array<() => void>> = {};
@@ -372,7 +377,8 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
 
     send() {
       if (this.responseURL.endsWith('/sync')) {
-        this.response = JSON.stringify({ databaseId: 'campaign:123', databaseEpoch: 'test-epoch', serverRevision: 0, tables: {}, has_more: false });
+        catchupRequests += 1;
+        this.response = JSON.stringify({ syncVersion: 2, databaseId: 'campaign:123', databaseEpoch: 'test-epoch', serverRevision: authoritativeRevision, tables: { maps: { changes: [{ op: 'row', id: 1, row: { id: 1, name: authoritativeName, updatedAt: 0 } }], permission_hash: 'v2:test', last_seen_updated_at: authoritativeRevision, last_seen_primary_key: 1 } }, has_more: false });
         queueMicrotask(() => (this.listeners.load ?? []).forEach((listener) => listener()));
         return;
       }
@@ -380,6 +386,10 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       pendingMutations.push({
         url: this.responseURL,
         complete: (response: unknown) => {
+          if (response.serverRevision > authoritativeRevision) {
+            authoritativeRevision = response.serverRevision;
+            authoritativeName = response.sync.data[0].rows[0][1];
+          }
           this.response = JSON.stringify(response);
           (this.listeners.load ?? []).forEach((listener) => listener());
         },
@@ -416,6 +426,11 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       }
     });
     app.ports.indexedDbOut.subscribe((message) => {
+      if (message?.type === 'writeCatchupPage') {
+        sources.push(message.entityStreamSource);
+        app.ports.receiveIndexedDbMessage.send({ type: 'catchupPageStored', databaseEpoch: message.databaseEpoch });
+        return;
+      }
       if (message?.type !== 'requestInitialData') {
         return;
       }
@@ -428,15 +443,6 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
           lastAppliedServerRevision: null,
         },
       });
-    });
-
-    app.ports.receiveIndexedDbMessage.send({
-      type: 'initialData',
-      data: {
-        tables: { maps: [{ id: 1, name: 'Initial', updatedAt: 0 }] },
-        cursor: { tables: {} },
-        lastAppliedServerRevision: null,
-      },
     });
 
     await Bun.sleep(0);
@@ -469,6 +475,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
     expect(pendingMutations).toHaveLength(2);
 
     pendingMutations[1].complete({
+      databaseEpoch: 'test-epoch',
       serverRevision: 2,
       sync: {
         type: 'delta',
@@ -481,6 +488,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
     await Bun.sleep(0);
 
     pendingMutations[0].complete({
+      databaseEpoch: 'test-epoch',
       serverRevision: 1,
       sync: {
         type: 'delta',
@@ -500,7 +508,12 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
     });
     await Bun.sleep(0);
 
+    for (let attempt = 0; attempt < 50 && queryResults.at(-1)?.maps?.[0]?.name !== 'B'; attempt++) {
+      await Bun.sleep(2);
+    }
     const latest = queryResults.at(-1) as { maps?: Array<{ name?: string }> };
+    expect(catchupRequests).toBe(1);
+    expect(sources).toContain('mutation-response');
     expect(latest.maps?.[0]?.name).toBe('B');
   } finally {
     globalThis.XMLHttpRequest = previousXmlHttpRequest;

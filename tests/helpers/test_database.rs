@@ -58,6 +58,7 @@ impl TestDatabase {
         // Generate migration SQL
         let db_diff = diff::diff(&context, &schema, &introspection);
         let mut migration_sql = diff::to_sql::to_sql(&db_diff);
+        migration_sql.extend(migrate::sync_tombstone_trigger_sql(&context, &schema));
 
         // Add migration table creation if needed
         match introspection.migration_state {

@@ -98,6 +98,7 @@ export class WebSocketManager {
       if (!this.shouldReconnect) {
         return;
       }
+      this.emitMessage({ type: 'error', error: 'WebSocket connection interrupted' });
       if (this.reconnectTimer !== null) {
         return;
       }

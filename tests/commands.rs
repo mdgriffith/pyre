@@ -1371,6 +1371,34 @@ query GetUsers {
     assert_eq!(query_status, 200, "query body: {}", query_body);
     let result: serde_json::Value = serde_json::from_str(&query_body).unwrap();
     assert_eq!(result["user"], serde_json::json!([]));
+
+    let mutation_id = |operation: &str| {
+        manifest["queries"].as_object().unwrap().values()
+            .find(|query| query["operation"] == operation).unwrap()["id"].as_str().unwrap().to_string()
+    };
+    let (created_status, created_body) = http_request(port, "POST", &format!("/db/{}?sync=true", mutation_id("insert")), Some(r#"{"name":"durable"}"#));
+    assert_eq!(created_status, 200, "{created_body}");
+    let created: serde_json::Value = serde_json::from_str(&created_body).unwrap();
+    let id = &created["result"]["user"][0]["id"];
+    assert!(id.is_number());
+    let (sync_status, sync_body) = http_request(port, "POST", "/sync", Some(r#"{"databaseId":"default","syncCursor":{"version":2,"tables":{}}}"#));
+    assert_eq!(sync_status, 200, "{sync_body}");
+    let first: serde_json::Value = serde_json::from_str(&sync_body).unwrap();
+    assert_eq!(first["syncVersion"], 2);
+    assert_eq!(first["tables"]["users"]["changes"][0]["row"]["name"], "durable");
+    let body = serde_json::json!({"id":id}).to_string();
+    let (deleted_status, deleted_body) = http_request(port, "POST", &format!("/db/{}?sync=true", mutation_id("delete")), Some(&body));
+    assert_eq!(deleted_status, 200, "{deleted_body}");
+    let deleted: serde_json::Value = serde_json::from_str(&deleted_body).unwrap();
+    assert_eq!(deleted["sync"]["type"], "delta");
+    assert_eq!(deleted["sync"]["data"][0]["headers"], serde_json::json!(["$delete"]));
+    let body = serde_json::json!({"databaseId":"default", "databaseEpoch":first["databaseEpoch"], "syncCursor":{"version":2,"tables":first["tables"]}}).to_string();
+    let (sync_status, sync_body) = http_request(port, "POST", "/sync", Some(&body));
+    assert_eq!(sync_status, 200, "{sync_body}");
+    let last: serde_json::Value = serde_json::from_str(&sync_body).unwrap();
+    assert_eq!(last["tables"]["users"]["changes"], serde_json::json!([{"op":"delete", "id":id}]));
+    let (legacy_status, _) = http_request(port, "POST", "/sync", Some(r#"{"syncCursor":{"tables":{}}}"#));
+    assert_eq!(legacy_status, 400);
 }
 
 #[test]

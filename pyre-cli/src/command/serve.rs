@@ -79,7 +79,13 @@ struct SyncRequest {
     #[serde(rename = "databaseEpoch")]
     database_epoch: Option<String>,
     #[serde(rename = "syncCursor")]
-    sync_cursor: SyncCursor,
+    sync_cursor: CursorRequest,
+}
+
+#[derive(Deserialize)]
+struct CursorRequest {
+    version: Option<u32>,
+    tables: SyncCursor,
 }
 
 #[derive(Deserialize)]
@@ -291,6 +297,9 @@ async fn sync(
     Json(body): Json<SyncRequest>,
 ) -> Result<Response, ServeError> {
     ensure_database_id(&state, body.database_id.as_deref())?;
+    if body.sync_cursor.version != Some(2) {
+        return Err(ServeError::BadRequest("Pyre sync protocol 2 required; upgrade the client".into()));
+    }
     let session = pyre_session_from_request(&state, &headers)?;
     let conn = state
         .db
@@ -302,9 +311,9 @@ async fn sync(
         .map_err(|error| ServeError::Internal(error.to_string()))?;
     let server = SyncServer::new(context);
     let result = server
-        .catchup_protocol(
+        .catchup_durable(
             &conn,
-            &body.sync_cursor,
+            &body.sync_cursor.tables,
             session.logical(),
             state.page_size,
             &state.database_id,

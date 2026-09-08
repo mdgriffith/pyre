@@ -208,6 +208,10 @@ pub async fn push<'a>(
                                     let mut sql = pyre::db::diff::to_sql::to_sql(&db_diff);
 
                                     sql.splice(0..0, pyre::db::migrate::internal_setup_sql());
+                                    sql.extend(pyre::db::migrate::sync_tombstone_trigger_sql(
+                                        &current_context,
+                                        current_schema,
+                                    ));
 
                                     let schema_source = pyre::db::migrate::schema_to_storage_string(
                                         &current_context,

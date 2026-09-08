@@ -87,6 +87,7 @@ export class SSEManager {
       const eventSource = new EventSource(sseUrl, {
         withCredentials: shouldIncludeCredentials(this.config),
       });
+      this.eventSource = eventSource;
       this.debugLog('[PyreClient] SSE EventSource constructed', {
         sseUrl,
         withCredentials: shouldIncludeCredentials(this.config),
@@ -112,6 +113,8 @@ export class SSEManager {
 
       eventSource.onerror = () => {
         const state = eventSource.readyState;
+        this.connectionId = null;
+        this.emitMessage({ type: 'error', error: 'SSE connection interrupted' });
         this.debugLog('[PyreClient] SSE connection state changed', {
           readyState: state,
           connectionId: this.connectionId,
@@ -123,13 +126,8 @@ export class SSEManager {
           if (this.shouldReconnect) {
             this.debugLog('[PyreClient] SSE waiting for EventSource auto-reconnect');
           }
-        } else if (state === EventSource.CONNECTING && !this.connectionId) {
+        } else if (state === EventSource.CONNECTING) {
           this.debugLog('[PyreClient] SSE failed before session established');
-          const errorMessage = {
-            type: 'error',
-            error: 'SSE connection failed',
-          };
-          this.emitMessage(errorMessage);
         }
       };
     } catch (error) {

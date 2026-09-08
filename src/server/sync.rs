@@ -24,6 +24,37 @@ impl<'a> SyncServer<'a> {
         Self { context }
     }
 
+    /// Protocol v2: only pass sessions authorized for this physical connection.
+    pub async fn catchup_durable(
+        &self,
+        conn: &libsql::Connection,
+        cursor: &SyncCursor,
+        session: &SyncSession,
+        page_size: usize,
+        database_id: &str,
+        client_epoch: Option<&str>,
+    ) -> Result<JsonValue, Error> {
+        let database_id = database_id::require_database_id(database_id).map_err(Error::DatabaseId)?;
+        let statement = crate::sync_v2::statement(self.context, cursor, session, page_size)
+            .map_err(|e| Error::Sync(sync::SyncError::SqlGenerationError(e)))?;
+        // Wait for in-flight writers before fencing the clock. Otherwise a
+        // transaction can timestamp an upsert before the fence but commit later.
+        let tx = conn.transaction_with_behavior(libsql::TransactionBehavior::Immediate).await.map_err(Error::Database)?;
+        let clock = query_objects(&tx, "select unixepoch() as started_at", &[]).await?;
+        let started_at = clock.first().and_then(|row| row.get("started_at")).and_then(JsonValue::as_i64)
+            .ok_or_else(|| Error::Sync(sync::SyncError::DatabaseError("missing database clock".into())))?;
+        let rows = query_objects(&tx, &statement.sql, &statement.params).await?;
+        tx.commit().await.map_err(Error::Database)?;
+        let page = crate::sync_v2::page(self.context, cursor, &rows, page_size, database_id, started_at)
+            .map_err(|e| Error::Sync(sync::SyncError::DatabaseError(e)))?;
+        if client_epoch.is_some_and(|epoch| epoch != page.database_epoch)
+            || (client_epoch.is_none() && !cursor.is_empty())
+        {
+            return Ok(serde_json::json!({"type":"reset", "syncVersion":2, "databaseId":page.database_id, "databaseEpoch":page.database_epoch, "operation":"replace", "scope":"database", "reason":"database_epoch_changed"}));
+        }
+        serde_json::to_value(page).map_err(Error::Json)
+    }
+
     pub async fn catchup(
         &self,
         conn: &libsql::Connection,
@@ -44,22 +75,8 @@ impl<'a> SyncServer<'a> {
         page_size: usize,
         database_id: impl AsRef<str>,
         client_database_epoch: Option<&str>,
-    ) -> Result<CatchupResponse, Error> {
-        let page = self
-            .catchup(conn, sync_cursor, session, page_size, database_id)
-            .await?;
-        if client_database_epoch.is_some_and(|client_epoch| client_epoch != page.database_epoch) {
-            return Ok(CatchupResponse::Reset(DatabaseReset {
-                type_: "reset".to_string(),
-                database_id: page.database_id.clone(),
-                database_epoch: page.database_epoch,
-                operation: "replace".to_string(),
-                scope: "database".to_string(),
-                reason: "database_epoch_changed".to_string(),
-            }));
-        }
-
-        Ok(CatchupResponse::Page(page))
+    ) -> Result<JsonValue, Error> {
+        self.catchup_durable(conn, sync_cursor, session, page_size, database_id.as_ref(), client_database_epoch).await
     }
 
     pub async fn calculate_deltas(
@@ -71,6 +88,53 @@ impl<'a> SyncServer<'a> {
         origin_session_id: Option<&str>,
     ) -> Result<Vec<SessionDeltaMessage>, Error> {
         let database_id = database_id.as_ref();
+        if let Some((epoch, revision)) = &query_result.sync_state {
+            let (deletes, rows): (Vec<_>, Vec<_>) = query_result.affected_rows.iter().cloned().partition(|group| group.headers == ["$delete"]);
+            let filtered = build_delta_messages_for_database(self.context, &rows, connected_sessions, database_id)?;
+            let mut by_session: HashMap<_, _> = filtered.into_iter().map(|message| (message.session_id, message.message)).collect();
+            let mut messages = Vec::new();
+            let mut origin = None;
+            for id in connected_sessions.keys() {
+                let mut message = by_session.remove(id).unwrap_or(DeltaMessage::delta_for_database(database_id, Vec::new())?);
+                if message.type_ == "delta" {
+                    let mut data = deletes.clone();
+                    data.append(&mut message.data);
+                    message.data = data;
+                    if message.data.iter().map(|group| group.rows.len()).sum::<usize>() > MAX_LIVE_SYNC_DELTA_ROWS
+                        || serde_json::to_vec(&message).map_err(Error::Json)?.len() > MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES {
+                        message = DeltaMessage::sync_required_for_database(database_id)?;
+                    }
+                }
+                message.database_epoch = Some(epoch.clone());
+                message.server_revision = Some(*revision);
+                if Some(id.as_str()) == origin_session_id && query_result.sync_session.as_ref().map_or(true, |session| connected_sessions.get(id) == Some(session)) { origin = Some(message); }
+                else { messages.push(SessionDeltaMessage { session_id: id.clone(), message }); }
+            }
+            if origin.is_none() {
+                if let Some(session) = &query_result.sync_session {
+                    let sessions = HashMap::from([("origin".to_string(), session.clone())]);
+                    let mut message = build_origin_delta_message(self.context, &rows, &sessions, database_id, Some("origin"))?
+                        .unwrap_or(DeltaMessage::delta_for_database(database_id, Vec::new())?);
+                    if message.type_ == "delta" {
+                        let mut data = deletes.clone();
+                        data.append(&mut message.data);
+                        message.data = data;
+                        if message.data.iter().map(|group| group.rows.len()).sum::<usize>() > MAX_LIVE_SYNC_DELTA_ROWS
+                            || serde_json::to_vec(&message).map_err(Error::Json)?.len() > MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES {
+                            message = DeltaMessage::sync_required_for_database(database_id)?;
+                        }
+                    }
+                    message.database_epoch = Some(epoch.clone());
+                    message.server_revision = Some(*revision);
+                    origin = Some(message);
+                }
+            }
+            query_result.response = serde_json::json!({
+                "syncVersion": 2, "databaseEpoch": epoch, "serverRevision": revision,
+                "sync": origin, "result": query_result.response,
+            });
+            return Ok(messages);
+        }
         let broadcast_sessions = sessions_without_origin(connected_sessions, origin_session_id);
         let messages = build_delta_messages_for_database(
             self.context,
@@ -143,7 +207,7 @@ pub struct DeltaMessage {
     pub database_epoch: Option<String>,
     #[serde(rename = "databaseId", skip_serializing_if = "Option::is_none")]
     pub database_id: Option<DatabaseId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub data: Vec<AffectedRowTableGroup>,
 }
 
@@ -366,9 +430,15 @@ async fn next_server_revision(conn: &libsql::Connection) -> Result<(String, i64)
     ))
 }
 
-/// Start a new database sync lifetime and reset its revision sequence.
+/// Explicit administrative operation: start a new sync lifetime and clear its
+/// tombstones atomically. Callers choose the retention cadence; sync never calls
+/// this automatically. The tombstone AUTOINCREMENT high-water mark is retained.
 pub async fn rotate_database_epoch(conn: &libsql::Connection) -> Result<String, Error> {
-    let mut rows = conn
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .map_err(Error::Database)?;
+    let mut rows = tx
         .query(
             "UPDATE _pyre_sync SET database_epoch = lower(hex(randomblob(16))), server_revision = 0 WHERE id = 1 RETURNING database_epoch",
             (),
@@ -380,7 +450,14 @@ pub async fn rotate_database_epoch(conn: &libsql::Connection) -> Result<String, 
             "failed to rotate Pyre database epoch".to_string(),
         )));
     };
-    row.get::<String>(0).map_err(Error::Database)
+    let epoch = row.get::<String>(0).map_err(Error::Database)?;
+    while rows.next().await.map_err(Error::Database)?.is_some() {}
+    drop(rows);
+    tx.execute("DELETE FROM _pyre_sync_tombstones", ())
+        .await
+        .map_err(Error::Database)?;
+    tx.commit().await.map_err(Error::Database)?;
+    Ok(epoch)
 }
 
 async fn stamp_messages_and_response_with_next_server_revision(

@@ -1,419 +1,110 @@
 // @ts-nocheck
-import { beforeEach, expect, mock, test } from "bun:test";
+import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createClient } from "@libsql/client";
 import { z } from "zod";
+import { runWithSync } from "./query-sync";
+import initWasm from "./wasm/pyre_wasm.js";
+import { ensureDatabase, loadSchemaFromDatabase } from "./schema";
+import { catchup } from './sync';
 
-let introspectionResult = { schema_source: "test schema" };
-let sessionIds = ["s1"];
-let reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]];
-let deltaError: string | undefined;
+await initWasm({ module_or_path: await Bun.file(new URL('./wasm/pyre_wasm_bg.wasm', import.meta.url)).arrayBuffer() });
 
-mock.module("./wasm/pyre_wasm.js", () => ({
-  sql_is_initialized: () => "select 1 as is_initialized",
-  sql_introspect: () => "select introspection",
-  sql_introspect_uninitialized: () => "select uninitialized introspection",
-  migrate_with_introspection: (_name: string, _source: string, introspection: any) => ({
-    Ok: {
-      sql: introspection.schema_source ? [] : ["create table notes (id integer primary key)"],
-      mark_success: "record migration",
-    },
-  }),
-  set_schema: () => undefined,
-  get_sync_status_sql: () => "select 1",
-  get_sync_sql: () => ({ tables: [] }),
-  calculate_sync_deltas: (_affectedRows: unknown, connectedSessions: Map<string, unknown>) => {
-    if (deltaError) return deltaError;
-    const recipientIds = Array.from(connectedSessions.keys()).filter((sessionId) => sessionIds.includes(sessionId));
-    return {
-      groups: recipientIds.length === 0 ? [] : [
-        {
-          session_ids: recipientIds,
-          table_groups: [
-            {
-              table_name: "maps",
-              headers: [
-                "id",
-                "name",
-                "tiling",
-                "tiling__tileRootKey",
-                "tiling__tileWidth",
-                "tiling__format",
-              ],
-              rows: [[1, "World", "Tiling", "tiles/root", 256, "Png"]],
-            },
-          ],
-        },
-      ],
-    };
-  },
-  reshape_sync_table_groups: () => ([
-    {
-      table_name: "maps",
-      headers: ["id", "name", "tiling"],
-      rows: reshapedRows,
-    },
-  ]),
-}));
-
-const { runWithSync } = await import("./query-sync");
-const { MAX_LIVE_SYNC_DELTA_ROWS, MAX_LIVE_SYNC_FANOUT_RECIPIENTS, MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES } = await import("./query-sync");
-const { loadSchemaFromDatabase } = await import("./schema");
-
-beforeEach(() => {
-  introspectionResult = { schema_source: "test schema" };
-  sessionIds = ["s1"];
-  reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]];
-  deltaError = undefined;
-});
-
-function withoutServerRevision(message: unknown): unknown {
-  if (typeof message !== "object" || message === null || !("serverRevision" in message)) {
-    return message;
-  }
-
-  const { serverRevision: _serverRevision, databaseEpoch: _databaseEpoch, ...rest } = message as Record<string, unknown>;
-  return rest;
-}
-
-function syncDb() {
-  let revision = 0;
-  const executedSql: string[] = [];
-  return {
-    batch: mock(async () => [{
-      columns: ["_affectedRows"],
-      rows: [{
-        _affectedRows: JSON.stringify([{
-          table_name: "maps",
-          headers: ["id", "name", "tiling", "tiling__tileRootKey", "tiling__tileWidth", "tiling__format"],
-          rows: [[1, "World", "Tiling", "tiles/root", 256, "Png"]],
-        }]),
-      }],
-    }]),
-    execute: mock(async (sql: string) => {
-      executedSql.push(sql);
-      if (sql.includes("returning database_epoch, server_revision")) {
-        revision += 1;
-        return { rows: [{ database_epoch: "test-epoch", server_revision: revision }] };
-      }
-
-      return { rows: [] };
-    }),
-    executedSql,
-  };
-}
-
-const queryMap = {
-  "query-id": {
-    id: "query-id",
-    sql: [{ include: true, params: [], sql: "select _affectedRows" }],
-    session_args: [],
-    optional_input_args: [],
-    json_input_args: [],
-    InputValidator: z.object({}),
-    SessionValidator: z.object({}),
+const queries = {
+  remove: {
+    id: "remove", operation: "delete", sql: [{ include: true, params: [], sql: "delete from notes returning json_object('id', id) as note" }],
+    session_args: [], optional_input_args: [], json_input_args: [], InputValidator: z.object({}), SessionValidator: z.object({}),
   },
 };
 
-const schemaDb = {
-  execute: mock(async (sql: string) => {
-    if (sql.includes("is_initialized")) {
-      return { rows: [{ is_initialized: 1 }] };
-    }
-
-    return { rows: [{ result: JSON.stringify(introspectionResult) }] };
-  }),
-};
-
-test("runWithSync sends reshaped sync deltas", async () => {
-  await loadSchemaFromDatabase(schemaDb as any);
-
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map([["s1", { session: {} }]]),
-  );
-
-  expect(result.kind).toBe("success");
-
-  const sent: Array<{ sessionId: string; message: unknown }> = [];
-  const syncResult = await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(syncResult.serverRevision).toBe(1);
-  expect(sent.map((entry) => ({ ...entry, message: withoutServerRevision(entry.message) }))).toEqual([
-    {
-      sessionId: "s1",
-      message: {
-        type: "delta",
-        data: [
-          {
-            table_name: "maps",
-            headers: ["id", "name", "tiling"],
-            rows: [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]],
-          },
-        ],
-      },
-    },
-  ]);
+test('catchup cannot certify a timestamp past an in-flight writer and releases its page barrier', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pyre-fence-'));
+  const url = `file:${join(directory, 'db')}`;
+  const writer = createClient({ url });
+  const reader = createClient({ url });
+  try {
+    await writer.execute('pragma journal_mode = wal');
+    await ensureDatabase(writer, 'Db', 'record Note {\n    @public\n    id Id.Int @id\n}\n');
+    await loadSchemaFromDatabase('main', writer);
+    await reader.execute('pragma busy_timeout = 0');
+    const tx = await writer.transaction('write');
+    try {
+      await tx.execute('insert into notes (id, updatedAt) values (1, 10)');
+      await expect(catchup(reader, { version: 2, tables: {} }, {}, 1, 'main')).rejects.toThrow();
+      await tx.commit();
+    } finally { tx.close(); }
+    const page = await catchup(reader, { version: 2, tables: {} }, {}, 1, 'main');
+    expect(page.tables.notes.changes[0].id).toBe(1);
+    expect(page.snapshotTimestamp).toBeGreaterThanOrEqual(10);
+    await writer.execute('delete from notes');
+  } finally { writer.close(); reader.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("runWithSync stamps sync deltas with databaseId", async () => {
-  introspectionResult = { schema_source: "campaign schema" };
-  await loadSchemaFromDatabase("campaign:123", schemaDb as any);
-
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map([["s1", { session: {} }]]),
-    "campaign:123",
-  );
-
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(sent[0].message.databaseId).toBe("campaign:123");
-  expect(typeof sent[0].message.serverRevision).toBe("number");
+test("deletes broadcast transaction-stamped direct IDs only to scoped connections", async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pyre-live-'));
+  const db = createClient({ url: `file:${join(directory, 'db')}` });
+  try {
+    await ensureDatabase(db, 'Db', 'record Note {\n    @public\n    id Id.Int @id\n}\n');
+    await loadSchemaFromDatabase('main', db);
+    await db.execute('insert into notes (id) values (1)');
+    const registry = new Map([
+      ["same", { session: {}, databaseId: "main" }],
+      ["other", { session: {}, databaseId: "other" }],
+      ["origin", { session: {}, databaseId: "main" }],
+    ]);
+    const result = await runWithSync(db, queries, "remove", {}, {}, registry, "main", "origin");
+    registry.set('late', { session: {}, databaseId: 'main' });
+    const sent: unknown[] = [];
+    await result.sync((id, message) => sent.push({ id, message }));
+    expect(sent).toEqual(['same', 'late'].map(id => ({ id, message: expect.objectContaining({ type: 'delta', serverRevision: 2, data: [{ table_name: 'notes', headers: ['$delete'], rows: [[1]] }] }) })));
+    expect(result.response).toMatchObject({ syncVersion: 2, serverRevision: 2, sync: { type: "delta" }, result: { note: [{ id: 1 }] } });
+  } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("runWithSync allocates live sync revisions from _pyre_sync", async () => {
-  await loadSchemaFromDatabase(schemaDb as any);
-  const db = syncDb();
-
-  const result = await runWithSync(
-    db as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map([["s1", { session: {} }]]),
-  );
-
-  await result.sync(() => {});
-
-  expect(db.executedSql).toEqual([
-    expect.stringContaining("update _pyre_sync"),
-  ]);
+test("a rolled back mutation never returns a publication callback", async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pyre-rollback-'));
+  const db = createClient({ url: `file:${join(directory, 'db')}` });
+  try {
+    await ensureDatabase(db, 'Db', 'record Note {\n    @public\n    id Id.Int @id\n}\n');
+    await db.execute('insert into notes (id) values (1)');
+    const broken = { ...queries, remove: { ...queries.remove, sql: [...queries.remove.sql, { include: false, params: [], sql: 'insert into missing values (1)' }] } };
+    await expect(runWithSync(db, broken, 'remove', {}, {})).rejects.toThrow();
+    expect((await db.execute('select id from notes')).rows).toHaveLength(1);
+    expect((await db.execute('select * from _pyre_sync_tombstones')).rows).toHaveLength(0);
+  } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("runWithSync allocates a revision even with no live recipients", async () => {
-  sessionIds = [];
-  await loadSchemaFromDatabase(schemaDb as any);
+test('live upserts are permission filtered and keep their precommit revision, including the origin response', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pyre-live-rows-'));
+  const db = createClient({ url: `file:${join(directory, 'db')}` });
+  try {
+    await ensureDatabase(db, 'Db', 'session {\n    userId Int\n}\nrecord Note {\n    id Id.Int @id\n    ownerId Int\n    body String\n    @allow(*) { ownerId == Session.userId }\n}\n');
+    await loadSchemaFromDatabase('main', db);
+    await db.execute("insert into notes (id, ownerId, body) values (1, 1, 'old')");
+    const update = { ...queries.remove, id: 'change', operation: 'update', sql: [
+      { include: false, params: [], sql: "update notes set body = 'committed', updatedAt = unixepoch() where id = 1" },
+      { include: true, params: [], sql: "select json_array(json_object('table_name', 'notes', 'headers', json_array('id', 'ownerId', 'body', 'updatedAt'), 'rows', (select json_group_array(json_array(id, ownerId, body, updatedAt)) from notes where id = 1))) as _affectedRows" },
+    ] };
+    const result = await runWithSync(db, { change: update }, 'change', {}, { userId: 1 }, new Map([
+      ['allowed', { session: { userId: 1 }, databaseId: 'main' }],
+      ['hidden', { session: { userId: 2 }, databaseId: 'main' }],
+    ]), 'main');
+    await db.execute("update notes set body = 'later' where id = 1");
+    const sent = new Map();
+    await result.sync((id, message) => sent.set(id, message));
+    expect(sent.get('allowed')).toMatchObject({ type: 'delta', serverRevision: 2 });
+    expect(sent.get('allowed').data[0].rows[0][2]).toBe('committed');
+    expect(sent.get('hidden').data).toEqual([]);
+    expect(result.response.sync.data[0].rows[0][2]).toBe('committed');
+    expect(result.response.serverRevision).toBe(2);
 
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map(),
-  );
-
-  const sent: Array<{ sessionId: string; message: unknown }> = [];
-  const syncResult = await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(sent).toHaveLength(0);
-  expect(syncResult.serverRevision).toBe(1);
-});
-
-test("runWithSync skips the origin session when provided", async () => {
-  sessionIds = ["s1", "s2"];
-  await loadSchemaFromDatabase(schemaDb as any);
-
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map(sessionIds.map((sessionId) => [sessionId, { session: {} }])),
-    undefined,
-    "s1",
-  );
-
-  const sent: Array<{ sessionId: string; message: unknown }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(sent.map((entry) => entry.sessionId)).toEqual(["s2"]);
-});
-
-test("runWithSync includes origin authoritative sync in mutation response envelope", async () => {
-  sessionIds = ["s1", "s2"];
-  await loadSchemaFromDatabase(schemaDb as any);
-
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map(sessionIds.map((sessionId) => [sessionId, { session: {} }])),
-    "campaign:123",
-    "s1",
-  );
-
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(sent.map((entry) => entry.sessionId)).toEqual(["s2"]);
-  expect((result.response as any).serverRevision).toBe(1);
-  expect((result.response as any).sync).toEqual(sent[0].message);
-  expect((result.response as any).sync.databaseId).toBe("campaign:123");
-});
-
-test("runWithSync builds origin sync from executing session when origin is not live-connected", async () => {
-  sessionIds = ["s1"];
-  await loadSchemaFromDatabase(schemaDb as any);
-
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map(),
-    "campaign:123",
-    "s1",
-  );
-
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(sent).toHaveLength(0);
-  expect((result.response as any).serverRevision).toBe(1);
-  expect((result.response as any).sync).toEqual({
-    type: "delta",
-    serverRevision: 1,
-    databaseEpoch: "test-epoch",
-    databaseId: "campaign:123",
-    data: [
-      {
-        table_name: "maps",
-        headers: ["id", "name", "tiling"],
-        rows: [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]],
-      },
-    ],
-  });
-});
-
-test("runWithSync sends syncRequired when delta row count exceeds cap", async () => {
-  reshapedRows = Array.from({ length: MAX_LIVE_SYNC_DELTA_ROWS + 1 }, (_, index) => [index, "World", null]);
-  await loadSchemaFromDatabase(schemaDb as any);
-
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map([["s1", { session: {} }]]),
-  );
-
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(sent).toHaveLength(1);
-  expect(sent[0].sessionId).toBe("s1");
-  expect(sent[0].message.type).toBe("syncRequired");
-  expect(typeof sent[0].message.serverRevision).toBe("number");
-});
-
-test("runWithSync sends syncRequired when fanout recipient count exceeds cap", async () => {
-  sessionIds = Array.from({ length: MAX_LIVE_SYNC_FANOUT_RECIPIENTS + 1 }, (_, index) => `s${index}`);
-  await loadSchemaFromDatabase(schemaDb as any);
-
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map(sessionIds.map((sessionId) => [sessionId, { session: {} }])),
-  );
-
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(sent).toHaveLength(MAX_LIVE_SYNC_FANOUT_RECIPIENTS + 1);
-  expect(sent.every((entry) => entry.message.type === "syncRequired")).toBe(true);
-});
-
-test("runWithSync sends syncRequired when payload bytes exceed cap", async () => {
-  reshapedRows = [[1, "x".repeat(MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES), null]];
-  await loadSchemaFromDatabase(schemaDb as any);
-
-  const result = await runWithSync(
-    syncDb() as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map([["s1", { session: {} }]]),
-    "campaign:123",
-  );
-
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
-
-  expect(sent).toHaveLength(1);
-  expect(sent[0].sessionId).toBe("s1");
-  expect(sent[0].message.type).toBe("syncRequired");
-  expect(sent[0].message.databaseId).toBe("campaign:123");
-  expect(typeof sent[0].message.serverRevision).toBe("number");
-});
-
-test("runWithSync advances revision and requires catchup when delta calculation fails", async () => {
-  deltaError = "Error: invalid connected session";
-  await loadSchemaFromDatabase(schemaDb as any);
-  const db = syncDb();
-  const result = await runWithSync(
-    db as any,
-    queryMap,
-    "query-id",
-    {},
-    {},
-    new Map([
-      ["origin", { session: {} }],
-      ["recipient", { session: { invalid: true } }],
-    ]),
-    undefined,
-    "origin",
-  );
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  const syncResult = await result.sync((sessionId, message) => sent.push({ sessionId, message }));
-
-  expect(syncResult.serverRevision).toBe(1);
-  expect(syncResult.originMessage.type).toBe("syncRequired");
-  expect(sent).toEqual([
-    {
-      sessionId: "recipient",
-      message: {
-        type: "syncRequired",
-        serverRevision: 1,
-        databaseEpoch: "test-epoch",
-      },
-    },
-  ]);
-  expect(db.executedSql.some((sql) => sql.includes("returning database_epoch, server_revision"))).toBe(true);
+    const remove = { ...update, sql: [...update.sql, { include: false, params: [], sql: 'delete from notes where id = 1' }] };
+    const deleted = await runWithSync(db, { change: remove }, 'change', {}, { userId: 1 }, undefined, 'main');
+    await deleted.sync(() => {});
+    const groups = deleted.response.sync.data;
+    expect(groups[0]).toEqual({ table_name: 'notes', headers: ['$delete'], rows: [[1]] });
+    expect(groups.slice(1).flatMap(group => group.rows)).toEqual([]);
+  } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
 });

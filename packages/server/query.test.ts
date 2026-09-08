@@ -1,4 +1,7 @@
 import { expect, mock, test } from "bun:test";
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { SchemaMetadata } from "@pyre/core";
 import { createClient } from "@libsql/client";
 import { z } from "zod";
@@ -81,11 +84,14 @@ test("transaction runner executes every step in exactly one ordered batch", asyn
 });
 
 test("failed transaction batch rolls back before sync publication", async () => {
-  const db = createClient({ url: "file::memory:" });
+  const directory = mkdtempSync(join(tmpdir(), 'pyre-rollback-'));
+  const db = createClient({ url: `file:${join(directory, 'db')}` });
   const syncDeltas = mock(async () => ({ serverRevision: 1 }));
 
   try {
     await db.execute("create table notes (id integer primary key, body text unique not null)");
+    await db.execute("create table _pyre_sync (server_revision integer)");
+    await db.execute("insert into _pyre_sync values (0)");
     await db.execute({
       sql: "insert into notes (body) values (?)",
       args: ["taken"],
@@ -130,6 +136,7 @@ test("failed transaction batch rolls back before sync publication", async () => 
     expect(syncDeltas).not.toHaveBeenCalled();
   } finally {
     db.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -180,6 +187,7 @@ test("sync wraps mutation responses with server revision metadata", async () => 
 
   expect(result.response).toEqual({
     serverRevision: 42,
+    syncVersion: 2,
     result: {
       createdNote: [{ id: 1, body: "one" }],
     },
@@ -204,6 +212,12 @@ test("sync mode includes the mutation result", async () => {
         ],
       },
     ]),
+    transaction: async () => ({
+      batch: (...args: any[]) => db.batch(...args),
+      execute: async (sql: unknown) => ({ rows: typeof sql === 'string' ? [{ database_epoch: 'epoch', server_revision: 42 }] : [] }),
+      commit: async () => {},
+      close: () => {},
+    }),
   };
 
   const result = await run(
@@ -237,6 +251,7 @@ test("sync mode includes the mutation result", async () => {
   expect(result.response).toEqual({
     serverRevision: 42,
     sync: { type: "delta" },
+    syncVersion: 2,
     result: {
       createdNote: [{ id: 1, body: "one" }],
     },

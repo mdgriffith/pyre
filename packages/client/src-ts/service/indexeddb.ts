@@ -8,6 +8,7 @@ export interface TableGroup {
 }
 
 export interface SyncCursorEntry {
+  last_seen_delete_sequence?: number;
   last_seen_updated_at: number | null;
   last_seen_primary_key?: number | string | null;
   permission_hash: string;
@@ -24,7 +25,7 @@ export interface PutRowsResult {
   skippedOlder: number;
 }
 
-const DB_VERSION = 2;
+const DB_VERSION = 4;
 
 export class IndexedDBStorage {
   private dbName: string;
@@ -72,7 +73,13 @@ export class IndexedDBStorage {
         }
 
         if (!db.objectStoreNames.contains('meta')) {
-          db.createObjectStore('meta');
+            db.createObjectStore('meta');
+        }
+        // Older caches either lack deletion coverage or persisted unfenced
+        // pagination positions. Neither proves a safe timestamp checkpoint.
+        // This is a one-time local cache upgrade, not a server epoch rotation.
+        if (event.oldVersion > 0 && event.oldVersion < 4) {
+          for (const name of ['tables', 'syncCursor', 'meta']) request.transaction!.objectStore(name).clear();
         }
       };
     });
@@ -219,6 +226,27 @@ export class IndexedDBStorage {
       request.onerror = () => {
         reject(new Error(`Failed to read sync cursor: ${request.error}`));
       };
+    });
+  }
+
+  async getInitialSnapshot(): Promise<{ tables: Record<string, unknown[]>; cursor: SyncCursor; lastAppliedServerRevision: number | null; databaseEpoch: string | null }> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['tables', 'syncCursor', 'meta'], 'readonly');
+      const snapshot = { tables: {} as Record<string, unknown[]>, cursor: { tables: {} } as SyncCursor, lastAppliedServerRevision: null as number | null, databaseEpoch: null as string | null };
+      const rows = tx.objectStore('tables').getAll();
+      rows.onsuccess = () => {
+        for (const { tableName, ...row } of rows.result) (snapshot.tables[tableName] ??= []).push(row);
+      };
+      const cursor = tx.objectStore('syncCursor').get('cursor');
+      cursor.onsuccess = () => { snapshot.cursor = cursor.result ?? { tables: {} }; };
+      const revision = tx.objectStore('meta').get('lastAppliedServerRevision');
+      revision.onsuccess = () => { snapshot.lastAppliedServerRevision = revision.result ?? null; };
+      const epoch = tx.objectStore('meta').get('databaseEpoch');
+      epoch.onsuccess = () => { snapshot.databaseEpoch = epoch.result ?? null; };
+      tx.oncomplete = () => resolve(snapshot);
+      tx.onerror = () => reject(new Error(`Failed to read sync snapshot: ${tx.error}`));
+      tx.onabort = () => reject(new Error(`Sync snapshot read aborted: ${tx.error}`));
     });
   }
 
@@ -391,6 +419,65 @@ export class IndexedDBStorage {
     });
   }
 
+  async putCatchupPage(databaseEpoch: string, serverRevision: number, cursor: SyncCursor, groups: TableGroup[]): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['tables', 'syncCursor', 'meta'], 'readwrite');
+      let failure: Error | undefined;
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(failure ?? new Error(`Catchup transaction failed: ${tx.error}`));
+      tx.onabort = () => reject(failure ?? new Error(`Catchup transaction aborted: ${tx.error}`));
+      const meta = tx.objectStore('meta');
+      const epoch = meta.get('databaseEpoch');
+      epoch.onsuccess = () => {
+        if (epoch.result !== undefined && epoch.result !== databaseEpoch) {
+          failure = new Error('Catchup page epoch does not match storage');
+          tx.abort();
+          return;
+        }
+        const revision = meta.get('lastAppliedServerRevision');
+        revision.onsuccess = () => {
+          if (revision.result !== undefined && serverRevision < revision.result) {
+            failure = new Error('Stale catchup revision');
+            tx.abort();
+          }
+        };
+        const cursors = tx.objectStore('syncCursor');
+        const previous = cursors.get('cursor');
+        previous.onsuccess = () => {
+          try {
+            for (const [table, next] of Object.entries(cursor.tables)) {
+              const old = (previous.result as SyncCursor | undefined)?.tables[table];
+              // Catchup checkpoints deliberately overlap their fenced interval.
+              // Snapshot revision and serialized page acknowledgements provide
+              // ordering; a smaller key at the same timestamp is not stale.
+              if (old?.permission_hash === next.permission_hash && (next.last_seen_delete_sequence ?? 0) < (old.last_seen_delete_sequence ?? 0)) throw new Error('Stale deletion cursor');
+            }
+            const store = tx.objectStore('tables');
+            for (const group of groups) {
+              for (const values of group.rows) {
+                if (group.headers.length === 1 && group.headers[0] === '$delete') {
+                  const key = values[0];
+                  if (typeof key !== 'string' && !Number.isSafeInteger(key)) throw new Error('Invalid deletion key');
+                  store.delete([group.table_name, key as IDBValidKey]);
+                } else {
+                  const row = Object.fromEntries(group.headers.map((header, index) => [header, values[index]]));
+                  store.put({ ...row, tableName: group.table_name });
+                }
+              }
+            }
+            cursors.put(cursor, 'cursor');
+            meta.put(databaseEpoch, 'databaseEpoch');
+            meta.put(serverRevision, 'lastAppliedServerRevision');
+          } catch (error) {
+            failure = error instanceof Error ? error : new Error(String(error));
+            tx.abort();
+          }
+        };
+      };
+    });
+  }
+
   async deleteDatabase(): Promise<void> {
     if (this.db) {
       this.db.close();
@@ -446,6 +533,23 @@ export class IndexedDbService {
   }
 
   private async handleMessage(message: { type?: string; tableGroups?: TableGroup[]; cursor?: SyncCursor; serverRevision?: number; databaseEpoch?: string; entityStreamSource?: string }): Promise<void> {
+    if (message.type === 'writeCatchupPage') {
+      try {
+        if (!message.databaseEpoch || !message.cursor || !Number.isSafeInteger(message.serverRevision)) throw new Error('Invalid catchup page');
+        await this.storage.putCatchupPage(message.databaseEpoch, message.serverRevision!, message.cursor, message.tableGroups ?? []);
+        this.onDatabaseEpochStored?.(message.databaseEpoch);
+        try {
+          const source = message.entityStreamSource === 'live' || message.entityStreamSource === 'mutation-response' ? message.entityStreamSource : 'catchup';
+          this.onEntityDelta?.(message.tableGroups ?? [], source);
+        } catch (error) {
+          console.error('[PyreClient] Entity subscriber failed:', error);
+        }
+        this.elmApp?.ports.receiveIndexedDbMessage?.send({ type: 'catchupPageStored', databaseEpoch: message.databaseEpoch });
+      } catch (error) {
+        this.elmApp?.ports.receiveIndexedDbMessage?.send({ type: 'catchupPageFailed', error: String(error) });
+      }
+      return;
+    }
     if (message.type === 'requestInitialData') {
       await this.sendInitialData();
       return;
@@ -486,10 +590,7 @@ export class IndexedDbService {
       const startedAt = Date.now();
       this.debugLog('[PyreClient] IndexedDB initial data request started');
       await this.storage.init();
-      const tables = await this.storage.getAllTables();
-      const cursor = await this.storage.getSyncCursor();
-      const lastAppliedServerRevision = await this.storage.getServerRevision();
-      const databaseEpoch = await this.storage.getDatabaseEpoch();
+      const { tables, cursor, lastAppliedServerRevision, databaseEpoch } = await this.storage.getInitialSnapshot();
 
       const tableCounts = Object.fromEntries(
         Object.entries(tables).map(([tableName, rows]) => [tableName, rows.length])

@@ -1,4 +1,4 @@
-module Data.Delta exposing (Delta, TableGroup, decodeDelta, decodeTableGroup, encodeDelta, encodeTableGroup)
+module Data.Delta exposing (Delta, TableGroup, decodeDelta, decodeTableGroup, deletion, encodeDelta, encodeTableGroup, isDeletion)
 
 import Data.Value exposing (Value)
 import Json.Decode as Decode
@@ -22,6 +22,19 @@ type alias TableGroup =
     , headers : List String
     , rows : List (List Value)
     }
+
+
+{-| Compact live/port representation of a typed deletion. `$delete` cannot be a
+Pyre column name. Catchup and entity streams use `{ op: "delete", id: ... }`.
+-}
+deletion : String -> Value -> TableGroup
+deletion tableName key =
+    { tableName = tableName, headers = [ "$delete" ], rows = [ [ key ] ] }
+
+
+isDeletion : TableGroup -> Bool
+isDeletion group =
+    group.headers == [ "$delete" ]
 
 
 decodeDelta : Decode.Decoder Delta
@@ -50,4 +63,3 @@ encodeTableGroup group =
         , ( "headers", Encode.list Encode.string group.headers )
         , ( "rows", Encode.list (Encode.list Data.Value.encodeValue) group.rows )
         ]
-

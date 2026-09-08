@@ -33,6 +33,7 @@ type alias SyncCursorEntry =
     { lastSeenUpdatedAt : Maybe Float
     , lastSeenPrimaryKey : Maybe Data.Value.Value
     , permissionHash : String
+    , lastSeenDeleteSequence : Int
     }
 
 
@@ -41,11 +42,17 @@ type alias SyncCursor =
 
 
 type alias CatchupTableResult =
-    { rows : List (Dict String Data.Value.Value)
+    { changes : List Change
     , permissionHash : String
     , lastSeenUpdatedAt : Maybe Float
     , lastSeenPrimaryKey : Maybe Data.Value.Value
+    , lastSeenDeleteSequence : Int
     }
+
+
+type Change
+    = RowChange (Dict String Data.Value.Value)
+    | DeleteChange Data.Value.Value
 
 
 type CatchupResponse
@@ -59,6 +66,7 @@ type alias CatchupPage =
     , serverRevision : Maybe Int
     , tables : Dict String CatchupTableResult
     , hasMore : Bool
+    , snapshotTimestamp : Maybe Float
     }
 
 
@@ -77,6 +85,19 @@ type alias Model =
     , initialDataLoaded : Bool
     , inProgress : Bool
     , tablesSynced : Int
+    , pendingPage : Maybe CatchupPage
+    , pendingWake : Bool
+    , streamReady : Bool
+    , buffered : List { epoch : String, revision : Int, source : String, delta : Data.Delta.Delta }
+    , keyRevisions : Dict String Int
+    , persistedRevision : Int
+    , storingLive : Maybe String
+    , restartFull : Bool
+    , roundStart : Maybe SyncCursor
+    , roundTimestamp : Maybe Float
+    , persistedCursor : SyncCursor
+    , pendingCursor : Maybe SyncCursor
+    , drainRemaining : Int
     }
 
 
@@ -86,6 +107,11 @@ type Msg
     | CatchupResponseReceived (Result Http.Error CatchupResponse)
     | DatabaseEpochResetCompleted String
     | DatabaseEpochResetFailed String String
+    | PageStored String
+    | PageFailed String
+    | StreamConnected
+    | StreamDisconnected String
+    | LiveDelta String Int String Data.Delta.Delta
 
 
 type alias UpdateResult =
@@ -111,6 +137,19 @@ init server =
     , initialDataLoaded = False
     , inProgress = False
     , tablesSynced = 0
+    , pendingPage = Nothing
+    , pendingWake = False
+    , streamReady = False
+    , buffered = []
+    , keyRevisions = Dict.empty
+    , persistedRevision = 0
+    , storingLive = Nothing
+    , restartFull = False
+    , roundStart = Nothing
+    , roundTimestamp = Nothing
+    , persistedCursor = Dict.empty
+    , pendingCursor = Nothing
+    , drainRemaining = 0
     }
 
 
@@ -137,13 +176,77 @@ pendingDatabaseEpoch model =
 update : Msg -> Model -> Db.Db -> UpdateResult
 update msg model db =
     case msg of
+        StreamConnected ->
+            update CatchupRequired { model | streamReady = True } db
+
+        StreamDisconnected message ->
+            let
+                result =
+                    emptyUpdate { model | streamReady = False, status = Error message } db
+            in
+            { result | error = Just message }
+
+        LiveDelta epoch revision source delta ->
+            if model.databaseEpoch /= Nothing && model.databaseEpoch /= Just epoch then
+                update CatchupRequired model db
+
+            else if model.inProgress || not model.initialDataLoaded || not model.streamReady || model.databaseEpoch == Nothing || model.status /= Synced then
+                if List.length model.buffered >= 5000 || List.sum (List.map (\buffered -> List.sum (List.map (.rows >> List.length) buffered.delta.tableGroups)) model.buffered) + List.sum (List.map (.rows >> List.length) delta.tableGroups) > 5000 then
+                    -- Overflow restarts a full scan; never silently drop changes
+                    -- and declare the handoff complete.
+                    let
+                        ( next, cmd ) =
+                            startCatchupIfReady { model | buffered = [], restartFull = True, pendingWake = True }
+
+                        result =
+                            emptyUpdate next db
+                    in
+                    { result | cmd = cmd }
+
+                else
+                    let
+                        ( next, cmd ) =
+                            startCatchupIfReady { model | buffered = model.buffered ++ [ { epoch = epoch, revision = revision, source = source, delta = delta } ] }
+
+                        result =
+                            emptyUpdate next db
+                    in
+                    { result | cmd = cmd }
+
+            else
+                let
+                    tables =
+                        List.foldl
+                            (\group acc ->
+                                let
+                                    entry =
+                                        Dict.get group.tableName model.cursor
+                                            |> Maybe.withDefault { lastSeenUpdatedAt = Nothing, lastSeenPrimaryKey = Nothing, permissionHash = "", lastSeenDeleteSequence = 0 }
+
+                                    changes =
+                                        if Data.Delta.isDeletion group then
+                                            List.filterMap (List.head >> Maybe.map DeleteChange) group.rows
+
+                                        else
+                                            List.map (\row -> RowChange (List.map2 Tuple.pair group.headers row |> Dict.fromList)) group.rows
+
+                                    previous =
+                                        Dict.get group.tableName acc |> Maybe.map .changes |> Maybe.withDefault []
+                                in
+                                Dict.insert group.tableName { changes = previous ++ changes, permissionHash = entry.permissionHash, lastSeenUpdatedAt = entry.lastSeenUpdatedAt, lastSeenPrimaryKey = entry.lastSeenPrimaryKey, lastSeenDeleteSequence = entry.lastSeenDeleteSequence } acc
+                            )
+                            Dict.empty
+                            delta.tableGroups
+                in
+                handleCatchupResponse (Ok (CatchupPageReceived { databaseId = model.server.databaseId, databaseEpoch = epoch, serverRevision = Just revision, tables = tables, hasMore = False, snapshotTimestamp = Nothing })) { model | storingLive = Just source } db
+
         InitialDataLoaded initialCursor storedEpoch ->
             let
                 updatedCursor =
-                    computeSyncCursor db initialCursor
+                    initialCursor
 
                 baseModel =
-                    { model | cursor = updatedCursor, databaseEpoch = storedEpoch, initialDataLoaded = True }
+                    { model | cursor = updatedCursor, persistedCursor = updatedCursor, databaseEpoch = storedEpoch, initialDataLoaded = True }
 
                 ( nextModel, cmd ) =
                     startCatchupIfReady baseModel
@@ -151,7 +254,7 @@ update msg model db =
             { model = nextModel
             , db = db
             , cmd = cmd
-            , dbCmds = [ Data.IndexedDb.writeSyncCursor updatedCursor ]
+            , dbCmds = []
             , delta = Nothing
             , serverRevision = Nothing
             , touchedTables = []
@@ -162,7 +265,7 @@ update msg model db =
         CatchupRequired ->
             let
                 ( nextModel, cmd ) =
-                    startCatchupIfReady model
+                    startCatchupIfReady { model | pendingWake = model.pendingWake || model.inProgress }
             in
             { model = nextModel
             , db = db
@@ -177,6 +280,84 @@ update msg model db =
 
         CatchupResponseReceived result ->
             handleCatchupResponse result model db
+
+        PageStored epoch ->
+            case model.pendingPage of
+                Just page ->
+                    if page.databaseEpoch == epoch then
+                        let
+                            ( delta, updatedDb, _ ) =
+                                applyCatchupDelta page db
+
+                            next =
+                                { model
+                                    | cursor =
+                                        if model.storingLive == Nothing then
+                                            updateSyncCursor page model.cursor
+
+                                        else
+                                            model.cursor
+                                    , persistedCursor = Maybe.withDefault model.persistedCursor model.pendingCursor
+                                    , databaseEpoch = Just epoch
+                                    , pendingPage = Nothing
+                                    , pendingCursor = Nothing
+                                    , inProgress = False
+                                    , storingLive = Nothing
+                                    , keyRevisions = rememberKeys page model.keyRevisions
+                                    , persistedRevision = max model.persistedRevision (Maybe.withDefault 0 page.serverRevision)
+                                    , drainRemaining =
+                                        if model.storingLive == Nothing && not page.hasMore then
+                                            List.length model.buffered
+
+                                        else
+                                            model.drainRemaining
+                                }
+
+                            ( final, cmd ) =
+                                if not model.streamReady then
+                                    ( { next | status = Error "Live stream disconnected" }, Cmd.none )
+
+                                else if model.restartFull then
+                                    startCatchupIfReady next
+
+                                else if page.hasMore then
+                                    ( { next | inProgress = True }, requestCatchup next.cursor next.server next.databaseEpoch )
+
+                                else if not (List.isEmpty next.buffered) && (not next.pendingWake || next.drainRemaining > 0) then
+                                    ( { next | status = Synced }, Cmd.none )
+
+                                else if next.pendingWake then
+                                    startCatchupIfReady next
+
+                                else
+                                    ( { next | status = Synced, roundStart = Nothing, roundTimestamp = Nothing }, Cmd.none )
+
+                            result =
+                                emptyUpdate final updatedDb
+                        in
+                        if not final.inProgress && final.streamReady then
+                            case final.buffered of
+                                buffered :: rest ->
+                                    let
+                                        drained =
+                                            update (LiveDelta buffered.epoch buffered.revision buffered.source buffered.delta) { final | buffered = rest, drainRemaining = max 0 (final.drainRemaining - 1) } updatedDb
+                                    in
+                                    { drained | delta = delta, serverRevision = page.serverRevision, touchedTables = Dict.keys page.tables }
+
+                                [] ->
+                                    { result | cmd = cmd, delta = delta, serverRevision = page.serverRevision, touchedTables = Dict.keys page.tables }
+
+                        else
+                            { result | cmd = cmd, delta = delta, serverRevision = page.serverRevision, touchedTables = Dict.keys page.tables }
+
+                    else
+                        emptyUpdate model db
+
+                Nothing ->
+                    emptyUpdate model db
+
+        PageFailed message ->
+            failedUpdate message { model | pendingPage = Nothing } db
 
         DatabaseEpochResetCompleted completedEpoch ->
             if model.pendingResetEpoch == Just completedEpoch then
@@ -222,9 +403,30 @@ update msg model db =
 
 startCatchupIfReady : Model -> ( Model, Cmd Msg )
 startCatchupIfReady model =
-    case ( model.initialDataLoaded, model.inProgress ) of
+    case ( model.initialDataLoaded && model.streamReady, model.inProgress ) of
         ( True, False ) ->
             let
+                boundary =
+                    Dict.map
+                        (\_ entry ->
+                            { entry
+                                | lastSeenPrimaryKey = Nothing
+                                , lastSeenDeleteSequence = 0
+                                , lastSeenUpdatedAt =
+                                    if model.restartFull then
+                                        Nothing
+
+                                    else
+                                        entry.lastSeenUpdatedAt
+                            }
+                        )
+                        (if model.restartFull then
+                            model.persistedCursor
+
+                         else
+                            Maybe.withDefault model.persistedCursor model.roundStart
+                        )
+
                 progress =
                     { table = Nothing
                     , tablesSynced = model.tablesSynced
@@ -233,8 +435,8 @@ startCatchupIfReady model =
                     , error = Nothing
                     }
             in
-            ( { model | inProgress = True, status = Syncing progress }
-            , requestCatchup model.cursor model.server model.databaseEpoch
+            ( { model | cursor = boundary, roundStart = Just boundary, roundTimestamp = Nothing, inProgress = True, status = Syncing progress, pendingWake = False, storingLive = Nothing, restartFull = False, drainRemaining = 0 }
+            , requestCatchup boundary model.server model.databaseEpoch
             )
 
         _ ->
@@ -262,6 +464,16 @@ handleCatchupResponse result model db =
                                     }
                             , cursor = Dict.empty
                             , pendingResetEpoch = Just reset.databaseEpoch
+                            , pendingPage = Nothing
+                            , buffered = []
+                            , keyRevisions = Dict.empty
+                            , persistedRevision = 0
+                            , persistedCursor = Dict.empty
+                            , pendingCursor = Nothing
+                            , roundStart = Just Dict.empty
+                            , roundTimestamp = Nothing
+                            , drainRemaining = 0
+                            , restartFull = False
                             , inProgress = True
                             , tablesSynced = 0
                         }
@@ -275,7 +487,34 @@ handleCatchupResponse result model db =
                     , destructiveReset = True
                     }
 
-        Ok (CatchupPageReceived response) ->
+        Ok (CatchupPageReceived unfiltered) ->
+            let
+                response =
+                    { unfiltered
+                        | tables =
+                            Dict.map
+                                (\name table ->
+                                    { table
+                                        | changes =
+                                            List.filter
+                                                (\change ->
+                                                    not (model.storingLive /= Nothing && liveChangeCovered name change model)
+                                                        && (Maybe.withDefault -1 (Dict.get (changeKey name change) model.keyRevisions)
+                                                                < Maybe.withDefault 0 unfiltered.serverRevision
+                                                                + (if model.storingLive /= Nothing then
+                                                                    0
+
+                                                                   else
+                                                                    1
+                                                                  )
+                                                           )
+                                                )
+                                                table.changes
+                                    }
+                                )
+                                unfiltered.tables
+                    }
+            in
             case validateResponseDatabaseId model.server.databaseId response.databaseId of
                 Just message ->
                     { model = { model | status = Error message, inProgress = False }
@@ -291,11 +530,45 @@ handleCatchupResponse result model db =
 
                 Nothing ->
                     let
-                        ( maybeDelta, updatedDb, dbCmds ) =
-                            applyCatchupDelta response db
+                        tableGroups =
+                            response.tables
+                                |> Dict.toList
+                                |> List.concatMap (\( name, table ) -> catchupChangesToGroups name table.changes)
 
                         updatedCursor =
                             updateSyncCursor response model.cursor
+
+                        roundTimestamp =
+                            case model.roundTimestamp of
+                                Just timestamp ->
+                                    Just timestamp
+
+                                Nothing ->
+                                    response.snapshotTimestamp
+
+                        checkpoint =
+                            if model.storingLive /= Nothing then
+                                model.persistedCursor
+
+                            else
+                                Dict.map
+                                    (\name entry ->
+                                        let
+                                            timestamp =
+                                                case ( entry.lastSeenUpdatedAt, roundTimestamp ) of
+                                                    ( Just scanned, Just started ) ->
+                                                        Just (min scanned started)
+
+                                                    _ ->
+                                                        model.roundStart |> Maybe.andThen (Dict.get name) |> Maybe.andThen .lastSeenUpdatedAt
+                                        in
+                                        { entry
+                                            | lastSeenUpdatedAt = timestamp
+                                            , lastSeenPrimaryKey = Nothing
+                                            , lastSeenDeleteSequence = max entry.lastSeenDeleteSequence (Dict.get name model.persistedCursor |> Maybe.map .lastSeenDeleteSequence |> Maybe.withDefault 0)
+                                        }
+                                    )
+                                    updatedCursor
 
                         syncedCount =
                             model.tablesSynced + Dict.size response.tables
@@ -309,37 +582,34 @@ handleCatchupResponse result model db =
                             }
 
                         nextStatus =
-                            if response.hasMore then
-                                Syncing progress
-
-                            else
-                                Synced
+                            Syncing { progress | complete = False }
 
                         baseModel =
+                            -- Rejected storage writes must not alter authoritative memory.
                             { model
-                                | cursor = updatedCursor
-                                , databaseEpoch = Just response.databaseEpoch
+                                | pendingPage = Just response
+                                , pendingCursor = Just checkpoint
+                                , roundTimestamp = roundTimestamp
                                 , tablesSynced = syncedCount
                                 , status = nextStatus
-                                , inProgress = response.hasMore
+                                , inProgress = True
                             }
 
                         ( nextModel, cmd ) =
-                            if response.hasMore then
-                                ( baseModel, requestCatchup updatedCursor model.server (Just response.databaseEpoch) )
-
-                            else
-                                ( { baseModel | inProgress = False }, Cmd.none )
+                            ( baseModel, Cmd.none )
                     in
                     { model = nextModel
-                    , db = updatedDb
+                    , db = db
                     , cmd = cmd
                     , dbCmds =
-                        Data.IndexedDb.writeSyncCursor updatedCursor
-                            :: Data.IndexedDb.writeDatabaseEpoch response.databaseEpoch
-                            :: dbCmds
-                    , delta = maybeDelta
-                    , serverRevision = response.serverRevision
+                        [ Data.IndexedDb.writeCatchupPage response.databaseEpoch
+                            (max (Maybe.withDefault 0 response.serverRevision) model.persistedRevision)
+                            checkpoint
+                            tableGroups
+                            (Maybe.withDefault "catchup" model.storingLive)
+                        ]
+                    , delta = Nothing
+                    , serverRevision = Nothing
                     , touchedTables = Dict.keys response.tables
                     , error = Nothing
                     , destructiveReset = False
@@ -453,9 +723,9 @@ applyCatchupDelta response db =
         tableGroups =
             response.tables
                 |> Dict.toList
-                |> List.filterMap
+                |> List.concatMap
                     (\( tableName, tableResult ) ->
-                        catchupTableToGroup tableName tableResult
+                        catchupChangesToGroups tableName tableResult.changes
                     )
 
         dbWithKnownTables =
@@ -472,7 +742,7 @@ applyCatchupDelta response db =
             ( updatedDb, _ ) =
                 Db.update (Db.LocalDeltaReceived delta) dbWithKnownTables
         in
-        ( Just delta, updatedDb, [ Data.IndexedDb.writeDeltaWithEntityNotification "catchup" delta.tableGroups ] )
+        ( Just delta, updatedDb, [] )
 
 
 ensureTablesExist : List String -> Db.Db -> Db.Db
@@ -494,34 +764,18 @@ ensureTablesExist tableNames db =
     { db | tables = updatedTables }
 
 
-catchupTableToGroup : String -> CatchupTableResult -> Maybe Data.Delta.TableGroup
-catchupTableToGroup tableName tableResult =
-    case tableResult.rows of
-        [] ->
-            Nothing
+catchupChangesToGroups : String -> List Change -> List Data.Delta.TableGroup
+catchupChangesToGroups tableName changes =
+    List.map
+        (\change ->
+            case change of
+                DeleteChange key ->
+                    Data.Delta.deletion tableName key
 
-        firstRow :: _ ->
-            let
-                headers =
-                    Dict.keys firstRow
-
-                rows =
-                    tableResult.rows
-                        |> List.map
-                            (\row ->
-                                headers
-                                    |> List.map
-                                        (\header ->
-                                            Dict.get header row
-                                                |> Maybe.withDefault Data.Value.NullValue
-                                        )
-                            )
-            in
-            Just
-                { tableName = tableName
-                , headers = headers
-                , rows = rows
-                }
+                RowChange row ->
+                    { tableName = tableName, headers = Dict.keys row, rows = [ Dict.values row ] }
+        )
+        changes
 
 
 updateSyncCursor : CatchupPage -> SyncCursor -> SyncCursor
@@ -532,6 +786,7 @@ updateSyncCursor response cursor =
                 { lastSeenUpdatedAt = tableResult.lastSeenUpdatedAt
                 , lastSeenPrimaryKey = tableResult.lastSeenPrimaryKey
                 , permissionHash = tableResult.permissionHash
+                , lastSeenDeleteSequence = tableResult.lastSeenDeleteSequence
                 }
                 acc
         )
@@ -589,6 +844,7 @@ computeSyncCursor db cursor =
                                 Dict.get tableName cursor
                                     |> Maybe.andThen .lastSeenPrimaryKey
                     , permissionHash = existingPermission
+                    , lastSeenDeleteSequence = Dict.get tableName cursor |> Maybe.map .lastSeenDeleteSequence |> Maybe.withDefault 0
                     }
             in
             Dict.insert tableName updatedEntry acc
@@ -605,6 +861,7 @@ resetCursorIfRowsAreMissing tableName entry cursor =
                 { lastSeenUpdatedAt = Nothing
                 , lastSeenPrimaryKey = Nothing
                 , permissionHash = ""
+                , lastSeenDeleteSequence = 0
                 }
                 cursor
 
@@ -675,7 +932,9 @@ valueToTimestamp value =
 encodeSyncCursor : SyncCursor -> Encode.Value
 encodeSyncCursor cursor =
     Encode.object
-        [ ( "tables", Encode.dict identity encodeSyncCursorEntry cursor ) ]
+        [ ( "version", Encode.int 2 )
+        , ( "tables", Encode.dict identity encodeSyncCursorEntry cursor )
+        ]
 
 
 encodeSyncCursorEntry : SyncCursorEntry -> Encode.Value
@@ -695,6 +954,7 @@ encodeSyncCursorEntry entry =
                 |> Maybe.withDefault Encode.null
           )
         , ( "permission_hash", Encode.string entry.permissionHash )
+        , ( "last_seen_delete_sequence", Encode.int entry.lastSeenDeleteSequence )
         ]
 
 
@@ -719,12 +979,26 @@ decodeCatchupResponse =
 
 decodeCatchupPage : Decode.Decoder CatchupPage
 decodeCatchupPage =
-    Decode.map5 CatchupPage
+    Decode.field "syncVersion" Decode.int
+        |> Decode.andThen
+            (\version ->
+                if version == 2 then
+                    decodeDurablePage
+
+                else
+                    Decode.fail "Pyre sync protocol 2 required"
+            )
+
+
+decodeDurablePage : Decode.Decoder CatchupPage
+decodeDurablePage =
+    Decode.map6 CatchupPage
         (Decode.maybe (Decode.field "databaseId" Decode.string))
         (Decode.field "databaseEpoch" Decode.string)
-        (Decode.maybe (Decode.field "serverRevision" Decode.int))
+        (Decode.map Just (Decode.field "serverRevision" Decode.int))
         (Decode.field "tables" (Decode.dict decodeCatchupTable))
         (Decode.field "has_more" Decode.bool)
+        (Decode.maybe (Decode.field "snapshotTimestamp" Decode.float))
 
 
 validateResponseDatabaseId : Maybe String -> Maybe String -> Maybe String
@@ -748,13 +1022,73 @@ validateResponseDatabaseId expected actual =
 
 decodeCatchupTable : Decode.Decoder CatchupTableResult
 decodeCatchupTable =
-    Decode.map4 CatchupTableResult
-        (Decode.field "rows" (Decode.list (Decode.dict Data.Value.decodeValue)))
+    Decode.map5 CatchupTableResult
+        (Decode.field "changes" (Decode.list decodeChange))
         (Decode.field "permission_hash" Decode.string)
         (Decode.field "last_seen_updated_at" decodeMaybeTimestamp)
         (Decode.maybe (Decode.field "last_seen_primary_key" Data.Value.decodeValue)
             |> Decode.map (Maybe.andThen valueToPrimaryKey)
         )
+        (Decode.oneOf [ Decode.field "last_seen_delete_sequence" Decode.int, Decode.succeed 0 ])
+
+
+changeKey : String -> Change -> String
+changeKey table change =
+    Encode.encode 0
+        (Encode.list identity
+            [ Encode.string table
+            , case change of
+                DeleteChange key ->
+                    Data.Value.encodeValue key
+
+                RowChange row ->
+                    Dict.get "id" row |> Maybe.map Data.Value.encodeValue |> Maybe.withDefault Encode.null
+            ]
+        )
+
+
+liveChangeCovered : String -> Change -> Model -> Bool
+liveChangeCovered name change model =
+    -- Only rows strictly BEFORE a safe persisted timestamp interval are
+    -- certified by the cursor. Equal-second rows still require observations.
+    case ( change, Dict.get (changeKey name change) model.keyRevisions ) of
+        ( RowChange row, Nothing ) ->
+            case ( Dict.get "updatedAt" row |> Maybe.andThen valueToTimestamp, Dict.get name model.persistedCursor |> Maybe.andThen .lastSeenUpdatedAt ) of
+                ( Just timestamp, Just boundary ) ->
+                    timestamp < boundary
+
+                _ ->
+                    False
+
+        _ ->
+            False
+
+
+rememberKeys : CatchupPage -> Dict String Int -> Dict String Int
+rememberKeys page revisions =
+    Dict.foldl
+        (\name table acc -> List.foldl (\change keys -> Dict.insert (changeKey name change) (Maybe.withDefault 0 page.serverRevision) keys) acc table.changes)
+        revisions
+        page.tables
+
+
+decodeChange : Decode.Decoder Change
+decodeChange =
+    Decode.field "op" Decode.string
+        |> Decode.andThen
+            (\op ->
+                case op of
+                    "delete" ->
+                        Decode.map DeleteChange (Decode.field "id" Data.Value.decodeValue)
+
+                    "row" ->
+                        Decode.map2 (\key row -> RowChange (Dict.insert "id" key row))
+                            (Decode.field "id" Data.Value.decodeValue)
+                            (Decode.field "row" (Decode.dict Data.Value.decodeValue))
+
+                    _ ->
+                        Decode.fail ("Unknown sync operation: " ++ op)
+            )
 
 
 valueToPrimaryKey : Data.Value.Value -> Maybe Data.Value.Value

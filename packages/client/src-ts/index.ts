@@ -121,6 +121,7 @@ export interface PyreDevtoolsTableSnapshot {
   rows?: unknown[];
   sync?: TableSyncStatus;
   cursor?: {
+    last_seen_delete_sequence?: number;
     last_seen_updated_at: number | null;
     last_seen_primary_key?: number | string | null;
     permission_hash: string;
@@ -132,6 +133,7 @@ export interface DevtoolsTableSummary {
   count?: number;
   sync?: TableSyncStatus;
   cursor?: {
+    last_seen_delete_sequence?: number;
     last_seen_updated_at: number | null;
     last_seen_primary_key?: number | string | null;
     permission_hash: string;
@@ -380,6 +382,7 @@ class SingleDatabasePyreClient {
   private queryManager: QueryManagerService;
   private queryClient: QueryClientService;
   private entityStream: EntityStreamService;
+  private authoritativeGeneration = 0;
   private bridgeCleanup: (() => void) | null = null;
   private debug: boolean;
   private session: Record<string, unknown>;
@@ -454,9 +457,12 @@ class SingleDatabasePyreClient {
     this.storage = new IndexedDBStorage(dbName);
     this.entityStream = new EntityStreamService();
     this.indexedDbService = new IndexedDbService(this.storage, this.logDebug, (tableGroups, source) => {
+      this.authoritativeGeneration += 1;
       this.entityStream.handleTableDelta(tableGroups, source, this.databaseId);
     }, () => {
       this.lastAppliedServerRevision = null;
+      this.authoritativeGeneration += 1;
+      this.entityStream.reset(this.databaseId);
     }, (databaseEpoch) => {
       this.databaseEpoch = databaseEpoch;
     });
@@ -636,7 +642,15 @@ class SingleDatabasePyreClient {
       pendingBatches.push(batch);
     });
 
-    const initialRows = await this.loadInitialEntityRows(subscription);
+    let snapshotGeneration = this.authoritativeGeneration;
+    let initialRows = await this.loadInitialEntityRows(subscription);
+    // A page commit or epoch reset during the read invalidates the initial
+    // view. Reload rather than deliver old rows after their deletion/reset.
+    while (snapshotGeneration !== this.authoritativeGeneration) {
+      pendingBatches.length = 0;
+      snapshotGeneration = this.authoritativeGeneration;
+      initialRows = await this.loadInitialEntityRows(subscription);
+    }
     const initialBatch = this.entityStream.createBatchFromRows(
       subscription,
       initialRows,
@@ -758,28 +772,10 @@ class SingleDatabasePyreClient {
       tableCount: tableNames.length,
     });
 
-    await Promise.all(tableNames.map(async (tableName) => {
+    const snapshot = await this.storage.getInitialSnapshot();
+    tableNames.forEach((tableName) => {
       const tableStartedAt = Date.now();
-      const rows: Array<Record<string, unknown>> = [];
-      let offset = 0;
-      const limit = 500;
-      let pageCount = 0;
-
-      while (true) {
-        const page = await this.storage.getRowsPage(tableName, offset, limit);
-        pageCount += 1;
-        page.rows.forEach((row) => {
-          if (isRecord(row)) {
-            rows.push(row);
-          }
-        });
-
-        if (!page.hasMore) {
-          break;
-        }
-
-        offset += limit;
-      }
+      const rows = (snapshot.tables[tableName] ?? []).filter(isRecord);
 
       if (rows.length > 0) {
         rowsByTable.set(tableName, rows);
@@ -789,10 +785,10 @@ class SingleDatabasePyreClient {
         databaseId: this.databaseId,
         tableName,
         rowCount: rows.length,
-        pageCount,
+        pageCount: 1,
         elapsedMs: Date.now() - tableStartedAt,
       });
-    }));
+    });
 
     this.logDebug('[PyreClient] Entity stream IndexedDB snapshot scan finished', {
       databaseId: this.databaseId,
@@ -861,22 +857,8 @@ class SingleDatabasePyreClient {
   private handleLiveSyncMessage = (message: LiveSyncMessage): void => {
     this.emitDevtoolsEvent(`sync:${message.type}`, message);
 
-    if (message.type === 'delta' && this.shouldAcceptLiveDelta(message)) {
-      const tableGroups = message.data as ServerTableGroup[];
-      this.logDebug('[PyreClient] Live sync delta accepted', {
-        databaseId: this.databaseId,
-        source: this.lastSyncState.status === 'live' ? 'live' : 'catchup',
-        serverRevision: message.serverRevision,
-        tableGroupCount: tableGroups.length,
-        rowCount: tableGroups.reduce((sum, group) => sum + group.rows.length, 0),
-      });
-      this.noteAppliedServerRevision(message.serverRevision);
-      this.entityStream.handleTableDelta(
-        tableGroups,
-        this.lastSyncState.status === 'live' ? 'live' : 'catchup',
-        this.databaseId
-      );
-    }
+    // Authoritative entity events are emitted only after atomic catchup storage.
+    // A late live payload must never resurrect a deleted entity.
 
     if (message.type === 'connected') {
       const connectionId = message.connectionId;
@@ -904,21 +886,11 @@ class SingleDatabasePyreClient {
       this.handleRawSyncState(nextState);
     }
 
-    if (message.type === 'syncComplete') {
-      const liveTables: Record<string, TableSyncStatus> = {};
-      Object.keys(this.lastSyncState.tables).forEach((tableName) => {
-        liveTables[tableName] = 'live';
-      });
-      const nextState = {
-        ...this.lastSyncState,
-        status: 'live' as const,
-        tables: liveTables,
-      };
-      this.handleRawSyncState(nextState);
-    }
+    // Only Elm's acknowledgement of durable catchup storage marks sync live.
   };
 
   private async notifyEntityStreamFromOptimisticMutation(optimistic: unknown, input: unknown): Promise<void> {
+    const generation = this.authoritativeGeneration;
     const metadata = parseOptimisticMutation(optimistic);
     if (!metadata) {
       return;
@@ -926,6 +898,7 @@ class SingleDatabasePyreClient {
 
     try {
       const tableGroups = await this.buildOptimisticTableGroups(metadata, input);
+      if (generation !== this.authoritativeGeneration) return;
       this.entityStream.handleTableDelta(tableGroups, 'optimistic', this.databaseId);
     } catch (error) {
       console.error('[PyreClient] Failed to notify optimistic entity stream:', error);
@@ -969,22 +942,8 @@ class SingleDatabasePyreClient {
   }
 
   private notifyEntityStreamFromMutationResult(result: unknown): void {
-    const envelope = mutationResultEnvelope(result);
-    const serverRevision = extractServerRevision(envelope);
-    if (this.isStaleServerRevision(serverRevision)) {
-      return;
-    }
-
-    const syncDelta = extractMutationSyncDelta(envelope);
-    if (!syncDelta) {
-      return;
-    }
-
-    if (this.databaseId && syncDelta.databaseId !== undefined && syncDelta.databaseId !== this.databaseId) {
-      return;
-    }
-
-    this.entityStream.handleTableDelta(syncDelta.data, 'mutation-response', this.databaseId);
+    // The Elm mutation handler schedules catchup, which owns ordering and
+    // persistence. Mutation response row payloads are not authoritative here.
   }
 
   private shouldAcceptLiveDelta(message: LiveSyncMessage): boolean {

@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { expect, test } from 'bun:test';
 
-import loadElm from '../dist/engine.mjs';
+import loadElm from './test-engine';
 
 const schema = {
   tables: {
@@ -26,7 +26,7 @@ test('Elm catchup request includes restored syncCursor on startup', async () => 
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseEpoch: 'test-epoch', tables: {}, has_more: false });
+    response = JSON.stringify({ syncVersion: 2, serverRevision: 0, databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
     c = false;
@@ -104,10 +104,12 @@ test('Elm catchup request includes restored syncCursor on startup', async () => 
     expect(requestedUrls[0]).toBe('http://example.test/sync');
     expect(JSON.parse(requestBodies[0])).toEqual({
       syncCursor: {
+        version: 2,
         tables: {
           maps: {
             last_seen_updated_at: null,
             last_seen_primary_key: null,
+            last_seen_delete_sequence: 0,
             permission_hash: 'perm-hash',
           },
         },
@@ -130,7 +132,7 @@ test('Elm catchup request includes databaseId when configured', async () => {
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
+    response = JSON.stringify({ syncVersion: 2, serverRevision: 0, databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -202,13 +204,8 @@ test('Elm catchup request includes databaseId when configured', async () => {
     expect(JSON.parse(requestBodies[0])).toEqual({
       databaseId: 'campaign:123',
       syncCursor: {
-        tables: {
-          maps: {
-            last_seen_updated_at: null,
-            last_seen_primary_key: null,
-            permission_hash: '',
-          },
-        },
+        version: 2,
+        tables: {},
       },
     });
   } finally {
@@ -228,7 +225,7 @@ test('Elm catchup waits for startSync when autoStart is false', async () => {
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
+    response = JSON.stringify({ syncVersion: 2, serverRevision: 0, databaseId: 'campaign:123', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -320,7 +317,7 @@ test('Elm catchup rejects missing response databaseId when configured', async ()
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseEpoch: 'test-epoch', tables: {}, has_more: false });
+    response = JSON.stringify({ syncVersion: 2, serverRevision: 0, databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -403,7 +400,7 @@ test('Elm catchup rejects mismatched response databaseId', async () => {
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseId: 'campaign:456', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
+    response = JSON.stringify({ syncVersion: 2, serverRevision: 0, databaseId: 'campaign:456', databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -487,7 +484,7 @@ test('Elm catchup request includes credentials and headers when configured', asy
     statusText = 'OK';
     responseURL = '';
     responseType = '';
-    response = JSON.stringify({ databaseEpoch: 'test-epoch', tables: {}, has_more: false });
+    response = JSON.stringify({ syncVersion: 2, serverRevision: 0, databaseEpoch: 'test-epoch', tables: {}, has_more: false });
     timeout = 0;
     withCredentials = false;
 
@@ -590,7 +587,7 @@ test('Elm destructively resets persisted state before retrying a changed databas
             scope: 'database',
             reason: 'database_epoch_changed',
           })
-        : JSON.stringify({ databaseEpoch: 'new-epoch', tables: {}, has_more: false });
+        : JSON.stringify({ syncVersion: 2, serverRevision: 0, databaseEpoch: 'new-epoch', tables: {}, has_more: false });
       queueMicrotask(() => (this.listeners.load ?? []).forEach((listener) => listener()));
     }
     abort() {}
@@ -647,12 +644,13 @@ test('Elm destructively resets persisted state before retrying a changed databas
       {
         databaseEpoch: 'old-epoch',
         syncCursor: {
+          version: 2,
           tables: {
-            maps: { last_seen_updated_at: 9, last_seen_primary_key: 1, permission_hash: 'old' },
+            maps: { last_seen_updated_at: 9, last_seen_primary_key: null, last_seen_delete_sequence: 0, permission_hash: 'old' },
           },
         },
       },
-      { databaseEpoch: 'new-epoch', syncCursor: { tables: {} } },
+      { databaseEpoch: 'new-epoch', syncCursor: { version: 2, tables: {} } },
     ]);
   } finally {
     globalThis.XMLHttpRequest = previousXmlHttpRequest;

@@ -5,6 +5,7 @@ port module Data.IndexedDb exposing
     , receiveIncoming
     , requestInitialData
     , resetForDatabaseEpoch
+    , writeCatchupPage
     , writeDatabaseEpoch
     , writeDelta
     , writeDeltaWithEntityNotification
@@ -39,6 +40,7 @@ type alias SyncCursorEntry =
     { lastSeenUpdatedAt : Maybe Float
     , lastSeenPrimaryKey : Maybe Value
     , permissionHash : String
+    , lastSeenDeleteSequence : Int
     }
 
 
@@ -61,6 +63,8 @@ type Incoming
     = InitialDataReceived InitialData
     | DatabaseEpochResetCompleted String
     | DatabaseEpochResetFailed String String
+    | CatchupPageStored String
+    | CatchupPageFailed String
 
 
 
@@ -146,6 +150,12 @@ decodeIncoming =
                             (Decode.field "databaseEpoch" Decode.string)
                             (Decode.field "error" Decode.string)
 
+                    "catchupPageStored" ->
+                        Decode.map CatchupPageStored (Decode.field "databaseEpoch" Decode.string)
+
+                    "catchupPageFailed" ->
+                        Decode.map CatchupPageFailed (Decode.field "error" Decode.string)
+
                     _ ->
                         Decode.fail ("Unknown IndexedDB incoming type: " ++ type_)
             )
@@ -167,12 +177,13 @@ decodeSyncCursor =
 
 decodeSyncCursorEntry : Decode.Decoder SyncCursorEntry
 decodeSyncCursorEntry =
-    Decode.map3 SyncCursorEntry
+    Decode.map4 SyncCursorEntry
         (Decode.field "last_seen_updated_at" decodeMaybeTimestamp)
         (Decode.maybe (Decode.field "last_seen_primary_key" Data.Value.decodeValue)
             |> Decode.map (Maybe.andThen valueToPrimaryKey)
         )
         (Decode.field "permission_hash" Decode.string)
+        (Decode.oneOf [ Decode.field "last_seen_delete_sequence" Decode.int, Decode.succeed 0 ])
 
 
 decodeMaybeTimestamp : Decode.Decoder (Maybe Float)
@@ -207,6 +218,7 @@ encodeSyncCursorEntry entry =
                 |> Maybe.withDefault Encode.null
           )
         , ( "permission_hash", Encode.string entry.permissionHash )
+        , ( "last_seen_delete_sequence", Encode.int entry.lastSeenDeleteSequence )
         ]
 
 
@@ -250,6 +262,20 @@ writeDeltaWithEntityNotification source tableGroups =
 writeSyncCursor : SyncCursor -> Cmd msg
 writeSyncCursor cursor =
     sendMessage (WriteSyncCursor cursor)
+
+
+writeCatchupPage : String -> Int -> SyncCursor -> List TableGroup -> String -> Cmd msg
+writeCatchupPage epoch revision cursor groups source =
+    indexedDbOut
+        (Encode.object
+            [ ( "type", Encode.string "writeCatchupPage" )
+            , ( "databaseEpoch", Encode.string epoch )
+            , ( "serverRevision", Encode.int revision )
+            , ( "cursor", encodeSyncCursor cursor )
+            , ( "tableGroups", Encode.list Data.Delta.encodeTableGroup groups )
+            , ( "entityStreamSource", Encode.string source )
+            ]
+        )
 
 
 writeServerRevision : Int -> Cmd msg

@@ -84,8 +84,11 @@ pub async fn ensure_database(
     } else {
         None
     };
-    if initialized && plan.sql.is_empty() && recorded_schema.as_deref() == Some(schema_source) {
-        tx.rollback().await.map_err(EnsureDatabaseError::Database)?;
+    if initialized && !plan.schema_changed && recorded_schema.as_deref() == Some(schema_source) {
+        for statement in plan.sql {
+            execute_statement(&tx, statement).await?;
+        }
+        tx.commit().await.map_err(EnsureDatabaseError::Database)?;
         return Ok(EnsureDatabaseOutcome::UpToDate);
     }
 
