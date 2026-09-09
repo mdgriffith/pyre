@@ -417,16 +417,11 @@ fn to_query_metadata_file(
         .trim_end()
         .to_string();
 
-    let local_plan = local_query_plan(context, query);
-    let required_client_session_fields = local_plan
-        .as_ref()
-        .map(|(_, fields)| {
-            fields
-                .iter()
-                .map(|field| string::quote(field))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let query_shape_block = if query.operation == ast::QueryOperation::Query {
+        Some(to_query_shape(context, query).trim_end().to_string())
+    } else {
+        None
+    };
 
     let session_args = match query_info {
         Some(info) => get_session_args(&info.variables),
@@ -490,10 +485,6 @@ fn to_query_metadata_file(
         }
     ));
     meta_block.push_str(&format!("  session_args: {},\n", session_args));
-    meta_block.push_str(&format!(
-        "  required_client_session_fields: [{}],\n",
-        required_client_session_fields.join(", ")
-    ));
     meta_block.push_str(&format!("  optional_input_args: {},\n", omittable_args));
     meta_block.push_str(&format!("  json_input_args: {},\n", json_input_args));
     meta_block.push_str("  InputValidator,\n");
@@ -515,8 +506,8 @@ fn to_query_metadata_file(
     if !input_block.is_empty() {
         blocks.push(input_block);
     }
-    if let Some((query_shape_block, _)) = local_plan {
-        blocks.push(query_shape_block.trim_end().to_string());
+    if let Some(query_shape_block) = query_shape_block {
+        blocks.push(query_shape_block);
     }
     if !return_data.trim().is_empty() {
         blocks.push(return_data.trim_end().to_string());
@@ -787,14 +778,7 @@ fn to_optimistic_update_metadata(query: &ast::Query) -> Option<String> {
     ))
 }
 
-pub(crate) fn local_query_plan(
-    context: &typecheck::Context,
-    query: &ast::Query,
-) -> Option<(String, BTreeSet<String>)> {
-    if query.operation != ast::QueryOperation::Query {
-        return None;
-    }
-    let mut dependencies = BTreeSet::new();
+fn to_query_shape(context: &typecheck::Context, query: &ast::Query) -> String {
     let mut result = "const queryShape: QueryShape = {\n".to_string();
 
     let mut is_first_table = true;
@@ -811,12 +795,7 @@ pub(crate) fn local_query_plan(
                 result.push_str(&format!("  {}: {{\n", string::quote(&field_name)));
 
                 let table = context.tables.get(&query_field.name);
-                result.push_str(&to_query_field_spec(
-                    context,
-                    query_field,
-                    table,
-                    &mut dependencies,
-                ));
+                result.push_str(&to_query_field_spec(context, query_field, table));
 
                 result.push_str("\n  }");
             }
@@ -825,20 +804,19 @@ pub(crate) fn local_query_plan(
     }
 
     result.push_str("\n};\n");
-    Some((result, dependencies))
+    result
 }
 
 fn to_query_field_spec(
     context: &typecheck::Context,
     query_field: &ast::QueryField,
     table: Option<&typecheck::Table>,
-    dependencies: &mut BTreeSet<String>,
 ) -> String {
     let mut result = String::new();
     let mut is_first = true;
     let table = table.or_else(|| context.tables.get(&query_field.name));
 
-    let mut where_clause = None;
+    let mut where_clause: Option<String> = None;
     let mut sort_clauses: Vec<String> = Vec::new();
     let mut limit: Option<i32> = None;
 
@@ -868,7 +846,7 @@ fn to_query_field_spec(
         match arg_field {
             ast::ArgField::Arg(located_arg) => match &located_arg.arg {
                 ast::Arg::Where(where_arg) => {
-                    where_clause = Some(where_arg);
+                    where_clause = Some(to_where_clause_ts(where_arg));
                 }
                 ast::Arg::OrderBy(direction, field_name) => {
                     let dir_str = match direction {
@@ -937,10 +915,7 @@ fn to_query_field_spec(
     }
 
     if let Some(where_clause) = where_clause {
-        result.push_str(&format!(
-            "  \"@where\": {}",
-            to_where_clause_ts(where_clause, dependencies)
-        ));
+        result.push_str(&format!("  \"@where\": {}", where_clause));
         is_first = false;
     }
 
@@ -976,12 +951,7 @@ fn to_query_field_spec(
                         string::quote(&field_name)
                     ));
                 }
-                result.push_str(&to_query_field_spec(
-                    context,
-                    nested_field,
-                    nested_table,
-                    dependencies,
-                ));
+                result.push_str(&to_query_field_spec(context, nested_field, nested_table));
                 result.push_str("\n    }");
             }
         } else if is_relationship {
@@ -1027,51 +997,12 @@ fn to_query_shape_leaf(field_name: &str, aliased_name: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod local_query_plan_tests {
-    use super::*;
-
-    #[test]
-    fn only_reads_have_a_local_plan() {
-        let context = typecheck::check_schema(&ast::Database {
-            schemas: vec![ast::Schema::default()],
-        })
-        .expect("empty schema typechecks");
-        let query_list = crate::parser::parse_query("query.pyre", "query Read { item { id } }")
-            .expect("query parses");
-        let mut query = query_list
-            .queries
-            .iter()
-            .find_map(|def| match def {
-                ast::QueryDef::Query(query) => Some(query.clone()),
-                _ => None,
-            })
-            .expect("query");
-        let (shape, dependencies) = local_query_plan(&context, &query).expect("read plan");
-        assert_eq!(
-            shape,
-            "const queryShape: QueryShape = {\n  \"item\": {\n    \"id\": true\n  }\n};\n"
-        );
-        assert!(dependencies.is_empty());
-        for operation in [
-            ast::QueryOperation::Insert,
-            ast::QueryOperation::Update,
-            ast::QueryOperation::Delete,
-            ast::QueryOperation::Transaction,
-        ] {
-            query.operation = operation;
-            assert!(local_query_plan(&context, &query).is_none());
-        }
-    }
-}
-
-fn to_where_clause_ts(where_arg: &ast::WhereArg, dependencies: &mut BTreeSet<String>) -> String {
+fn to_where_clause_ts(where_arg: &ast::WhereArg) -> String {
     match where_arg {
         ast::WhereArg::Constant(_) => unreachable!("constant predicates are permission-only"),
         ast::WhereArg::Exists(..) => unreachable!("exists is permission-only"),
         ast::WhereArg::Column(is_session_field, path, operator, value, _) => {
             let key = if *is_session_field {
-                dependencies.insert(path.root().to_string());
                 format!("Session.{}", path.authored())
             } else {
                 path.authored()
@@ -1081,13 +1012,13 @@ fn to_where_clause_ts(where_arg: &ast::WhereArg, dependencies: &mut BTreeSet<Str
                 ast::Operator::Equal => format!(
                     "{{ {}: {} }}",
                     string::quote(&key),
-                    to_query_value_ts(value, dependencies)
+                    to_query_value_ts(value)
                 ),
                 _ => format!(
                     "{{ {}: {{ {}: {} }} }}",
                     string::quote(&key),
                     string::quote(to_filter_operator_key(operator)),
-                    to_query_value_ts(value, dependencies)
+                    to_query_value_ts(value)
                 ),
             }
         }
@@ -1095,7 +1026,7 @@ fn to_where_clause_ts(where_arg: &ast::WhereArg, dependencies: &mut BTreeSet<Str
             "{{ \"$and\": [ {} ] }}",
             items
                 .iter()
-                .map(|item| to_where_clause_ts(item, dependencies))
+                .map(to_where_clause_ts)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -1103,20 +1034,17 @@ fn to_where_clause_ts(where_arg: &ast::WhereArg, dependencies: &mut BTreeSet<Str
             "{{ \"$or\": [ {} ] }}",
             items
                 .iter()
-                .map(|item| to_where_clause_ts(item, dependencies))
+                .map(to_where_clause_ts)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
 }
 
-fn to_query_value_ts(value: &ast::QueryValue, dependencies: &mut BTreeSet<String>) -> String {
+fn to_query_value_ts(value: &ast::QueryValue) -> String {
     match value {
         ast::QueryValue::Variable((_, details)) => match &details.session_field {
-            Some(field) => {
-                dependencies.insert(field.split('.').next().unwrap_or(field).to_string());
-                format!("{{ \"$session\": {} }}", string::quote(field))
-            }
+            Some(field) => format!("{{ \"$session\": {} }}", string::quote(field)),
             None => format!("{{ \"$var\": {} }}", string::quote(&details.name)),
         },
         ast::QueryValue::String((_, value)) => string::quote(value),
@@ -1131,7 +1059,7 @@ fn to_query_value_ts(value: &ast::QueryValue, dependencies: &mut BTreeSet<String
                     fields.push(format!(
                         "{}: {}",
                         string::quote(name),
-                        to_query_value_ts(value, dependencies)
+                        to_query_value_ts(value)
                     ));
                 }
             }
@@ -1159,7 +1087,6 @@ fn to_filter_operator_key(operator: &ast::Operator) -> &'static str {
 fn to_schema_metadata(context: &typecheck::Context) -> String {
     let mut result = String::new();
     result.push_str("import type { SchemaMetadata } from '@pyre/core';\n\n");
-    result.push_str("export { schemaArtifact } from './artifact';\n\n");
 
     result.push_str("export const schemaMetadata: SchemaMetadata = {\n");
     result.push_str("  tables: {\n");

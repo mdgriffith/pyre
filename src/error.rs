@@ -150,14 +150,6 @@ pub enum ErrorType {
     },
 
     // Query Validation Errors
-    DuplicateQueryName {
-        name: String,
-    },
-    DuplicateOperationId {
-        first_query: String,
-        second_query: String,
-        operation_id: String,
-    },
     UnknownTable {
         found: String,
         existing: Vec<String>,
@@ -861,16 +853,6 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
 
             result
         }
-        ErrorType::DuplicateQueryName { name } => format!(
-            "More than one query is named {}. Query names must be unique. Rename one of these queries.\n",
-            yellow_if(in_color, name)
-        ),
-        ErrorType::DuplicateOperationId { first_query, second_query, operation_id } => format!(
-            "Queries {} and {} have the same operation ID {}. Operation IDs must be unique. Rename one of these queries.\n",
-            yellow_if(in_color, first_query),
-            yellow_if(in_color, second_query),
-            cyan_if(in_color, operation_id)
-        ),
         ErrorType::DuplicateQueryField { field } => {
             let mut result = "".to_string();
             result.push_str(&format!(
@@ -1674,8 +1656,6 @@ pub fn to_error_title(error_type: &ErrorType) -> String {
         ErrorType::ForeignKeyToNonIdField { .. } => "Foreign key to non-ID field",
         ErrorType::UnknownTable { .. } => "Unknown Table",
         ErrorType::DuplicateQueryField { .. } => "Duplicate Query Field",
-        ErrorType::DuplicateQueryName { .. } => "Duplicate Query Name",
-        ErrorType::DuplicateOperationId { .. } => "Duplicate Operation ID",
         ErrorType::InvalidWildcardSelection { .. } => "Invalid Wildcard Selection",
         ErrorType::NoFieldsSelected => "No Fields Selected",
         ErrorType::UnknownField { .. } => "Unknown Field",

@@ -1,6 +1,3 @@
-export { parseContextRequest, parseContextMessage } from './database-context';
-export type { ContextRequest, ContextMessage, JsonValue, JsonObject } from './database-context';
-
 export interface LinkInfo {
   type: 'many-to-one' | 'one-to-many' | 'one-to-one';
   from: string;
