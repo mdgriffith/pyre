@@ -1,193 +1,143 @@
 # Authorized Database Context Lifecycle
 
-## Status
+## Status and Scope
 
-MEC-128, contract slice MEC-132 and internal server lifecycle slice MEC-129. This
-document specifies the target lifecycle. Version 1 negotiation/control wire types,
-decoders, and shared fixtures are public; an internal Rust resolver/registry now
-exercises the server authority boundary. Existing sync routes are **not**
-context-aware, and no client context installation is implemented.
+MEC-128 and its contract/server/client integration slices describe a convenient
+way to plug an application's existing TypeScript or Rust server session system
+into Pyre context management. The application remains the authentication and
+authorization authority. This is not a replacement session system or a new sync
+service.
 
-Server integration is MEC-129, client installation is MEC-130, and end-to-end
-conformance/Lore adoption is MEC-131. The API names below describe the intended
-boundary, not methods currently exported by Pyre.
+Version 1 negotiation/control wire types, decoders, and shared fixtures are
+public. TypeScript currently has the context codec only, not a context manager.
+`src/server/context/runtime.rs` contains a crate-private Rust context-manager
+prototype; there is no TypeScript/Rust lifecycle parity claim. Existing sync
+routes are not context-aware, and client context installation is not implemented.
 
-### Internal Rust Checkpoint
+The release scope stays narrow: context resolution, validation, scoped execution,
+leases, and local invalidation integrated with existing application authority.
+No new HTTP/SSE routes, prescribed transport, live connection registry, or
+publication queue subsystem belongs to this change. Public manager integration
+is not complete. MEC-130 client installation and MEC-131 end-to-end conformance
+and Lore adoption remain future work, not guarantees established by the codec
+or private prototype.
 
-`src/server/context/runtime.rs` remains crate-private until transport/live
-integration is complete. It currently provides:
+## Component Ownership
 
-- An application resolver for exactly the requested database, with trusted
-  identity, credential identifier, and credential deadline inputs.
-- Validated effective sessions and explicitly configured projections. Required
-  client fields are collected while emitting generated local query plans, including
-  Session predicate keys, `$session` operands, and nested predicates/values. Server
-  permission-only `session_args` do not require browser disclosure. All shipped
-  local plans contribute dependencies, independently of server operation exposure.
-- A private schema artifact constructor that checks schema and queries together
-  and generates the manifest, local plans, dependencies, and SHA-256 fingerprint.
-  The versioned fingerprint includes structural schema/session/permission metadata,
-  namespace sync modes, and generated execution and local plans. Sorted maps omit
-  source paths/locations; schema field order and generated plan text are retained,
-  so compatible edits may conservatively change the ID. Compiler semantic changes
-  not reflected in these inputs require bumping the fingerprint domain version.
-  Duplicate operation IDs/names fail typechecking instead of dropping plans.
-  `manifest.json` carries `schema_id` and per-query local metadata; generated
-  `typescript/core/artifact.ts` exports the same ID and aggregate dependencies via
-  `schema.ts`. Regenerate/deploy these files together, not independently. Legacy
-  loaded manifests are not accepted as authority-runtime artifacts; the independent
-  MCP manifest builder remains outside this private lifecycle.
-- Schema artifacts shared by allocation identity, and database
-  handles whose clones serialize complete operations on one libSQL connection.
-  Applications must transfer exclusive connection use to the handle, not retain
-  raw connection clones or wrap them in independent handles.
-- Random 256-bit context IDs and leases bounded from before resolution by maximum
-  age, credential expiration, and application deadline. Both wall and monotonic
-  clocks enforce expiration; millisecond wire deadlines round down. A backwards
-  wall-clock adjustment cannot extend an existing monotonic lease, while a forward
-  adjustment can expire it early. Authoritative-read staleness and clock error at
-  negotiation still affect the deployment revocation bound.
-- Credential, identity+database, and database invalidation under a local registry
-  lock. A retained allocation token prevents old resolutions from registering.
-  Invalidation conservatively fences **all** pending resolutions, even unrelated
-  ones, while withdrawing only matching installed contexts.
-- Authenticated request scopes with fixed operation exposure, existing query and
-  catchup permission enforcement, and checks before dispatch (including after
-  waiting for the connection lock) and after completion. Results retain their
-  original database/context binding. Invalidated dispatched mutations produce an
-  outcome-unknown error, not a retry-safe context rejection.
-- Owned live connections with random 256-bit IDs, bound to the exact registered
-  context allocation and runtime. Opening requires an authenticated scope;
-  enqueue requires that same context, identity, credential, and database, not just
-  knowledge of a connection ID. No caller-supplied session or automatic database
-  fanout is accepted. Dropping the connection releases its registry slot and queue.
-- Private bounded queues with eligibility checks at enqueue and delivery. The
-  synchronous `deliver` callback runs under the same registry mutex as invalidation:
-  either handoff completes before invalidation acquires the lock, or invalidation
-  removes eligibility and the callback is not invoked. The callback receives the
-  original database/context binding and borrowed bytes, not an unchecked receiver.
-  It must be short, nonblocking, and must not reenter the runtime. It must hand off
-  to transport synchronously; copying into an adapter queue is already a handoff,
-  not a promise that later network delivery is still authorized. Bytes already
-  handed off cannot be recalled. Callback panic poisons the registry when unwinding,
-  failing subsequent operations closed; abort-on-panic builds terminate instead.
-  HTTP query/catchup results do not yet use this gate.
-- Invalidation and authenticated context disposal discard affected queues and wake
-  waiting consumers with terminal closure (`deliver` returns false). Disposal also
-  fences all pending resolutions. Closure, not a reason-bearing wire control frame,
-  is the current primitive. Fresh negotiation is required; stale handles cannot
-  reopen or enqueue into a replacement context.
-- One weak-reference OS-thread poller per runtime sweeps expired contexts and live
-  connections every 25 ms, including streams not being polled by transport. Both
-  clocks remain enforced at enqueue/delivery; poll scheduling and mutex contention
-  can delay cleanup/wakeup, not authorize a delivery after its eligibility check
-  fails. Stream leases also honor a shorter authenticating request deadline.
-  Shutdown/drop clears contexts/queues, wakes consumers, replaces the allocation
-  token, and fences retained scopes and pending work. The poller exits on its next
-  scheduled pass. Already dispatched SQL is not cancelled or rolled back.
-  This runtime is native-only: the WASM crate check excludes the database-gated
-  lifecycle module and does not establish WASM lifecycle support.
-- Fixed private per-runtime limits: 1,024 installed contexts, 64 pending resolutions,
-  and 1,024 live connections. Each connection holds at most 32 messages and 1 MiB
-  of payload bytes (boxed slices, without spare vector capacity). Queue overflow
-  closes that connection and discards its entire queue rather than silently losing
-  a delta. Admission returns `Capacity`; installation rechecks context capacity
-  after resolution. Pending reservations release on completion, error, or future
-  cancellation. Invalidated but unresolved futures still occupy slots until they
-  complete or are cancelled, bounding rather than replacing outstanding work.
+The application persists credentials, membership, roles, access deadlines, and
+database routing. It authenticates requests using its existing session system
+and supplies trusted identity, credential identifier, and credential expiration
+to the manager. No second durable login-session store is introduced.
 
-This checkpoint does not implement publication, refresh orchestration, routes, or
-public runtime configuration. The private enqueue primitive accepts already prepared
-recipient bytes only; it is not a permission-filtering publisher. Ordinary mutations
-still execute without live publication. Integrating authorized delta calculation,
-origin ownership, revision ordering, bounded transport handoff/backpressure, and
-overflow recovery remains required before exposing a completed sync service.
-Registry counts and queued bytes are bounded, not total application memory: resolver
-inputs/results, session sizes, retained request scopes, concurrent SQL waiters, and
-transport buffers need admission/body/time limits at integration. Limits are global,
-not per-identity fairness guarantees. No cluster-wide invalidation or deployment
-freshness guarantee is claimed.
+The manager resolves exactly one requested database and derives a context binding
+the authenticated identity **and credential** to that database, effective server
+session, schema, and bounded lease. Different identities, or one identity in
+different databases, may have different session values. Tabs and connections
+must not share a mutable current-database selection in the login session.
 
-## Ownership
+The high-level client should know the accessible database list supplied by
+application authority and independently select its active sync set through the
+existing explicit sync selection. Accessibility is not subscription: neither
+the list nor context resolution activates sync for every accessible database.
+This work adds no database enumeration implementation or API. How the application
+supplies and refreshes that list belongs to its existing integration. Every
+requested database still requires current server authorization; a client-held
+list is not a grant. Explicit query/mutation routing remains independent of sync
+selection.
 
-The application persists authentication and authorization facts: credentials,
-membership, roles, access deadlines, and database routing. Pyre manages the
-derived database scopes. No second durable login-session store is introduced.
+The application also owns handlers, transport, live subscriptions, publication,
+buffering, and delivery. It must integrate context invalidation and eligibility
+checks with those systems. The manager does not send control frames, close
+streams, discard application queues, or revoke bytes already returned to a caller
+or handed to transport.
 
-A scope binds an authenticated identity **and credential** to one requested
-database. Different identities, or the same identity in different databases, may
-have different session values. Multiple connections may have equivalent scopes;
-they must not share a mutable current-database selection in the login session.
+## Current Rust Prototype
 
-The client selects database IDs using its configured authentication transport.
-The resolver authorizes exactly the requested database; it neither discovers
-databases nor subscribes to every accessible database. Existing explicit query
-routing and independent active-sync selection remain intact.
+The private manager currently provides:
+
+- An application resolver for exactly the requested database. The returned
+  canonical ID must equal the requested ID; alias resolution belongs before this
+  boundary. A resolution supplies an authorized database handle, effective session,
+  cache scope, authority revision, and optional application access deadline.
+- A coherent schema artifact compiled from schema and queries together, with a
+  generated manifest, local-plan dependencies, and versioned SHA-256 fingerprint.
+  The manager requires the same artifact allocation for its database handles.
+  Generated `manifest.json` and TypeScript schema/artifact metadata must be
+  regenerated and deployed together. Independently loaded legacy manifests are
+  not authority-runtime artifacts.
+- Validation of the effective session and an explicitly configured browser
+  projection that includes required local-plan session fields. Operation exposure
+  is fixed application configuration, not a projection override.
+- Database handles whose clones serialize complete operations on one libSQL
+  connection. Applications must transfer exclusive connection use to the handle,
+  not retain raw clones or wrap them in independent handles.
+- Random 256-bit context IDs, source database epoch lookup, and leases bounded
+  from before resolution by maximum age, credential expiration, and application
+  deadline. Wall and monotonic clocks both enforce expiration; wire deadlines
+  round down to milliseconds. A backwards wall-clock adjustment cannot extend an
+  existing monotonic lease; a forward adjustment may expire it early.
+- Credential, identity-plus-database, and database invalidation under a local
+  context registry lock. An allocation token captured before resolution prevents
+  stale results from installing. Invalidation conservatively fences **all** pending
+  resolutions, including unrelated ones, while removing only matching installed
+  contexts.
+- Authenticated scopes for existing query and catchup permission enforcement,
+  checked before dispatch, after waiting for the connection lock, and after
+  completion. Results retain their original database/context binding. A mutation
+  invalidated after dispatch reports outcome unknown, not retry-safe rejection.
+- Authenticated context disposal that rejects foreign/stale scopes, removes the
+  context, and fences all pending resolutions. Shutdown/drop clears contexts and
+  fences retained scopes and pending work. Already dispatched SQL is not cancelled
+  or rolled back.
+- Fixed private bounds of 1,024 installed contexts and 64 pending resolutions.
+  Installation rechecks capacity. Pending reservations release on completion,
+  error, or cancellation; invalidated unresolved futures retain their slots until
+  completion or cancellation.
+- One weak-reference native OS-thread poller per manager that prunes expired
+  contexts every 25 ms and exits after shutdown/drop. Cleanup scheduling does not
+  replace lease checks at scoped operations. This is context cleanup, not a stream
+  expiry or delivery mechanism. The database-gated module is excluded from the
+  WASM crate check; that check does not establish WASM manager support.
+
+These bounds do not bound total application memory, resolver/session sizes,
+retained scopes, concurrent SQL waiters, or transport buffers. Applications need
+their own admission, body, and time limits. No per-identity fairness, cluster-wide
+invalidation, or deployment freshness guarantee is established by this prototype.
+Scoped mutations use ordinary execution without live publication.
 
 ## Schema and Projection
 
-Reuse the schema's existing `session { ... }` contract and runtime validation.
-One compiled schema context has one session shape, shared by its database
-instances, not one set of values. An empty session contract is valid. This work
-does not introduce independent sessions per namespace or arbitrary schema-family
-multiplexing.
+Reuse the existing `session { ... }` schema contract and runtime validation. One
+compiled schema context has one session shape shared by its database instances,
+not one set of values. An empty contract is valid. Independent sessions per
+namespace and arbitrary schema-family multiplexing are outside this scope.
 
-The resolver returns a validated effective server session and an explicitly
-selected browser projection. The runtime must validate that every projected
-field is declared and equals its effective server-session value. Required fields
-are determined by session references in generated local query plans; missing
-dependencies prevent installation rather than silently becoming null. Server
-integration must supply this dependency metadata before enabling the API.
+The application resolver supplies the effective server session; the manager
+selects its browser projection from server configuration, never browser input.
+Every projected field must be declared and equal its effective server value.
+Required fields come from session references in generated local query plans,
+including nested predicates/values and `$session` operands. All shipped local
+plans contribute dependencies regardless of server operation exposure. Server
+permission-only `session_args` do not require browser disclosure. Missing required
+projection fields prevent installation rather than silently becoming null.
 
-Projection selection is server configuration, never browser input. Authentication
-objects, credential hashes, cookies, and database handles are not serializable
-parts of the context. The wire decoder checks only that `session` is a JSON
-object; schema, dependency, and authority validation belong to the runtime.
+The schema fingerprint covers structural schema/session/permission metadata,
+namespace sync modes, and generated execution/local plans. Sorted maps omit
+source paths/locations; field order and plan text are retained, so compatible
+edits may conservatively change the ID. Compiler semantic changes not represented
+in these inputs require a fingerprint-domain version bump. Duplicate operation
+IDs/names fail typechecking rather than silently dropping plans.
 
-## Server Boundary
-
-Conceptual configuration:
-
-```text
-runtime = PyreRuntime(schema, resolver, clientSessionFields, maxContextAge)
-resolver(authenticatedRequest, requestedDatabaseId)
-    -> authorized database + effective session + cache scope
-       + authority revision + optional application access deadline
-    | unauthenticated | denied | unavailable
-
-runtime.routes()
-runtime.authorize(authenticatedRequest, databaseId, contextId)
-    -> authorized execution scope | context error
-
-runtime.invalidate(credential)
-runtime.invalidate(identity, databaseId)
-runtime.invalidate(databaseId)
-```
-
-The application hosts this runtime and supplies trusted authenticated-request
-metadata, including identity/credential associations and credential expiration.
-The authorized database handle binds its canonical ID, schema, and manifest;
-execution must not take an unrelated session and connection afterward. Version 1
-requires the returned ID to equal the requested ID exactly; alias resolution
-belongs before this protocol, not in client cache routing.
-
-The runtime checks schema compatibility and validates the server session before
-returning a context. It creates a fresh opaque context ID, reads the source
-database epoch, and bounds the lease by the minimum of `maxContextAge`, credential
-expiration, and application access deadline. `maxContextAge` is required and
-finite; there is no indefinitely valid live context.
-
-An authorized scope preserves existing query permissions, operation exposure,
-and same-database publication rules. A context or connection ID is **not a bearer
-credential**. Every request still authenticates and binds to the registered
-identity, credential, database, and valid authority. Untrusted origin connection
-IDs must never select another session's mutation-response visibility.
+Authentication objects, credential hashes, cookies, and database handles are not
+serializable context fields. The codec validates the `session` JSON object and
+interoperable values, not schema, projection dependencies, or authority.
 
 ## Version 1 Wire Contract
 
-The future opt-in route adapter negotiates through `POST /context` beneath its
-configured mount. Existing routes do not gain this behavior merely by upgrading
-the wire package. Authentication stays in the existing transport, not JSON.
+These envelopes define a transport-neutral codec contract. The application
+chooses how to exchange them through its existing authenticated integration;
+this specification introduces no endpoint, header, URL parameter, or transport
+requirement. Authentication stays outside the context JSON.
 
 Request:
 
@@ -212,7 +162,7 @@ Success:
 }
 ```
 
-Invalidation sent to an established connection:
+Invalidation control envelope, for future application/client integration:
 
 ```json
 {
@@ -225,8 +175,8 @@ Invalidation sent to an established connection:
 ```
 
 Reasons are `authority_changed`, `expired`, or `revoked`. Invalidation applies
-only to the matching installed context; a delayed invalidation for an older ID
-must not invalidate its replacement.
+only to the matching installed context; a delayed message for an older ID must
+not invalidate its replacement. The manager does not emit this envelope.
 
 Request failure:
 
@@ -239,29 +189,29 @@ Request failure:
 }
 ```
 
-Error codes are `unauthenticated` (HTTP 401), `denied` (403), `unavailable` (503),
-and `context_mismatch` (409). Unknown or inaccessible databases use the same
-non-disclosing denial. Malformed protocol input is HTTP 400, not a resolver
-invocation. Error bodies do not echo sessions or internal authorization details.
-Request errors are associated with the local request generation, not broadcast
-as unscoped errors on a live connection.
+Error codes are `unauthenticated`, `denied`, `unavailable`, and
+`context_mismatch`. Transport status mapping belongs to the application. Unknown
+or inaccessible databases use the same non-disclosing denial. Malformed protocol
+input must be rejected before invoking the resolver. Errors must not echo
+sessions or internal authorization details. Request errors belong to the local
+request generation, not an unscoped broadcast.
 
 All fields are required; unknown envelope fields, versions, tags, and enum values
-are rejected. Identifiers are nonblank strings and are preserved exactly, never
-trimmed or sanitized into another identity. Blank means only Unicode White_Space
-characters or U+FEFF. Context IDs additionally use only `[A-Za-z0-9_-]` so they
-roundtrip through HTTP headers unchanged; the server runtime must generate them
-with cryptographically strong uniqueness, not derive them from user identifiers.
+are rejected. Identifiers are nonblank strings preserved exactly, never trimmed
+or sanitized into another identity. Blank means only Unicode White_Space
+characters or U+FEFF. Context IDs additionally use only `[A-Za-z0-9_-]`; this
+alphabet does not prescribe where an application carries them. Servers must
+generate cryptographically strong unique IDs, not derive them from user IDs.
+
 All strings and object keys must contain Unicode scalar values, not unpaired
-surrogates. `expiresAt` is an integer Unix timestamp in milliseconds in
-the JavaScript-safe range 0 through 9007199254740991. Decoding checks shape, not
-whether a lease is currently valid. Nested session values are JSON values, with
-finite numbers and integer values restricted to the JavaScript-safe range
-(-9007199254740991 through 9007199254740991). Exact larger values require a
-schema-compatible string representation; never silently round or coerce IDs.
-Fractional values use ordinary JSON/IEEE-754 semantics, not exact decimal math.
-Schema validation remains separate. Transport adapters must bound body size/depth before
-decoding; these codecs are not resource-limit or authentication middleware.
+surrogates. `expiresAt` is an integer Unix timestamp in milliseconds in the
+JavaScript-safe range 0 through 9007199254740991. Decoding checks shape, not current
+lease validity. Nested session values are JSON values with finite numbers;
+integers must be in -9007199254740991 through 9007199254740991. Exact larger values
+require a schema-compatible string representation, never silent rounding or
+coercion. Fractions use ordinary JSON/IEEE-754 semantics, not exact decimal math.
+Adapters must bound input size/depth before decoding; codecs are not resource-limit
+or authentication middleware.
 
 The codec boundary is the parsed JSON data model: `JSON.parse` followed by the
 TypeScript parser, or `serde_json::Value` followed by typed deserialization in
@@ -271,62 +221,60 @@ value, not an independent first-member parser. Direct Rust struct deserializatio
 from raw JSON can reject duplicates more strictly. Shared raw JSON fixtures test
 the data-model path, numeric notation, safe-integer limits, and surrogate handling.
 
-### Subsequent Requests and Data
+## Application Integration Requirements
 
-The opt-in context-aware adapter must carry `databaseId` and `contextId` on every
-catchup, execution, and live establishment request. Use a `Pyre-Context-Id` header
-for HTTP requests and `contextId` URL routing metadata for native EventSource,
-which cannot set custom headers. Neither location carries a secret or replaces
-authentication. The exact existing sync-envelope integration is MEC-129 work.
+The following requirements guide integration; they are not implemented transport
+behavior. Every context-aware operation must authenticate again and bind to the
+registered identity, credential, requested database, and valid lease. A context
+ID is **not a bearer credential**. Execution must not substitute an unrelated
+session or connection after authorization. Application-owned live connection IDs
+likewise must not let callers select another session's mutation visibility.
 
-All resulting data/control deliveries must carry the originating context binding
-in addition to existing database/epoch metadata. Never attach a newer context ID
-to a result authorized under an older context. Client request closures also
-capture a local generation, including for HTTP errors without a context ID.
-Legacy unbound responses cannot be accepted by a context-aware runtime.
+Results and control deliveries must retain their originating context binding
+alongside database/epoch metadata. Never attach a replacement context ID to data
+authorized under an older context. Future clients must capture a local generation
+for completions, including errors lacking a context ID, and reject unbound or
+stale results. Existing envelopes do not gain this behavior by upgrading the codec.
 
-A missing/expired/restarted binding or incompatible fresh authority returns
-`context_mismatch` before execution. The client renegotiates and rebuilds if
-needed. A transport failure after a write might have committed is not a definite
-context rejection and must retain the existing outcome-unknown distinction.
+A missing, expired, restarted, or incompatible binding requires fresh resolution
+before execution. A failure after a write may have committed is outcome unknown,
+not a definite context rejection and not permission to retry automatically.
 
-## Invalidation and Freshness
+### Invalidation and Freshness
 
-Invalidate after the application commits its authority change. Invalidation
-immediately removes affected local contexts from delivery eligibility, fences
-in-flight resolver attempts, discards queued unauthorized payloads, and notifies
-or closes subscriptions. Check eligibility at delivery as well as enqueue time.
-A new context may only be registered from a fresh successful resolution.
+After committing an authority change, the application must invalidate affected
+manager contexts and coordinate invalidation with its own handlers, subscriptions,
+and delivery paths. The manager's synchronous invalidation is a local context
+barrier: it removes matching entries and fences pending allocations. It does not
+revoke returned results, discard queued bytes, notify consumers, or close streams.
 
-The registry's invalidation generation is captured **before** resolution begins
-and checked when installing its result. Retain sufficient generation information
-until older work finishes; do not reset counters on disconnect or restart within
-the same live registry. Refresh must withdraw stale eligibility before replacing
-the context. Concurrent resolution cannot resurrect invalidated authority.
+The application must check eligibility at delivery, not just at initial
+authorization or preparation, and coordinate that check with invalidation to
+avoid a check-to-send race. Any application-owned buffering must preserve the
+original binding and prevent stale delivery; bytes already handed off cannot be
+recalled. Manager operation completion checks alone do not establish this
+transport barrier. No queue or handoff API is prescribed here.
 
-Revalidate authentication at each request and check registered lease/binding
-validity. Refresh authority through the resolver on negotiation, invalidation,
-and lease renewal, rather than indefinitely extending a cached grant. Expiry
-checks must stop already-open streams without waiting for reconnect. Background
-timers are an optimization; dispatch checks are mandatory.
+Refresh must withdraw stale eligibility before replacement and obtain fresh
+authority from the resolver rather than indefinitely extending a cached grant.
+The retained pre-resolution allocation token prevents pending work from
+resurrecting invalidated contexts. Application stream integration must enforce
+expiry without waiting for reconnect; the manager's cleanup poller does not stop
+open streams.
 
-Invalidation completion acknowledges the local runtime barrier only (the internal
-Rust method is synchronous). Cross-instance
-invalidation requires application-delivered shared events or another documented
-backend; publish local invalidation to all instances holding affected contexts.
-Commit-to-event failures require durable retry or acceptance of the lease bound.
+Cross-instance invalidation requires application-delivered events or authoritative
+checks on every instance holding affected contexts. Commit-to-event failures need
+durable retry or explicit acceptance of the lease bound. State the effective
+revocation bound including authoritative-read staleness and supported clock error.
+Fail closed when freshness cannot be established. An in-process map is not
+cluster-wide revocation; deployment guarantees require integration tests.
 
-Even if an invalidation event is lost, a lease must expire within the configured
-maximum age. State the effective revocation bound including authoritative-read
-staleness and supported clock tolerance. Fail closed when freshness cannot be
-established. Deployments requiring stronger immediate guarantees must supply
-durable invalidation/authoritative checks; do not advertise an in-process map as
-cluster-wide revocation. Clock/deadline enforcement and deployment tests are
-release gates for MEC-129/MEC-131, not implemented by the timestamp decoder.
+## Future Client Lifecycle
 
-## Client Installation
-
-Each selected database has an independent lifecycle:
+This section specifies future client work, not implemented context installation,
+cache isolation upgrades, or readiness behavior. The high-level client should
+retain application-supplied accessible databases separately from its independently
+selected active sync set. Each selected database has an independent lifecycle:
 
 ```text
 resolving -> installing -> catching_up -> ready
@@ -335,77 +283,74 @@ resolving -> installing -> catching_up -> ready
 ready -> resolving (refresh/reconnect/invalidation)
 ```
 
-Selection/replacement increments a non-reused local generation before any async
-work. Failures and stale attempts cannot make another database appear ready.
-Subscriptions may register while waiting, but publish no local query/entity
-results until projection installation and compatible cache hydration/catchup
-complete. Ready means coherent query-visible data at a completed catchup boundary
-for a valid installed context with live recovery established, not just an open
-socket, a completed handshake, or durable disk flush.
+Selection/replacement increments a non-reused local generation before async work.
+Stale attempts or failures cannot make another database ready. Subscriptions may
+register while waiting, but must not expose local query/entity results until
+projection installation and compatible hydration/catchup complete. Ready means
+coherent query-visible data at a completed catchup boundary for a valid context
+with live recovery established, not merely a handshake or durable disk flush.
 
-An invalidated/expired context withdraws all affected query and entity views,
-including generated application-side result storage, before new results appear.
-Pyre cannot erase arbitrary data copied by application code or a hostile client.
-Offline/reconnecting state is not implicit authorization to expose cached data
-as ready. Automatic offline authorization is out of scope for version 1.
+Invalidation/expiry must withdraw affected query/entity views, including generated
+application-side result storage, before new results appear. Pyre cannot erase
+data copied by application code or a hostile client. Offline/reconnecting state
+is not implicit authorization to expose cached data as ready; automatic offline
+authorization is outside version 1.
 
-All resolver, worker, registration, query/entity, catchup, transport, mutation,
-and persistence completions check their originating generation/context. Disposal
-must invalidate callbacks immediately, close pending and established transports,
-detach ports/listeners, and prevent stale writes to replacement storage. Aborting
-requests is useful cleanup, not sufficient race protection.
+Resolver, worker, query/entity, catchup, transport, mutation, and persistence
+completions must check their originating generation/context. Client disposal must
+invalidate callbacks immediately, close owned transports, detach ports/listeners,
+and prevent stale writes to replacement storage. Aborting requests alone is not
+sufficient race protection.
 
 ### Cache Compatibility
 
-Reuse requires a successful fresh negotiation and equality of the configured
+Reuse requires successful fresh negotiation and equality of the configured
 server/deployment boundary, canonical database ID, schema ID, cache scope,
-authority revision, and database epoch. Also compare the normalized projected
-session structurally; a changed projection with a reused revision must never
-silently reuse the cache. The resolver must change the authority revision when
-effective permissions or their inputs change, even if projected values do not.
+authority revision, and database epoch. Also compare the normalized projection
+structurally: a changed projection with a reused revision must not silently reuse
+the cache. Application authority must change the revision when effective
+permissions or their inputs change, even if projected values do not.
 
-Context ID, connection ID, lease expiry, and local generation are not cache
-identity. Encode the identity tuple losslessly or with collision-resistant
+Context ID, application connection ID, lease expiry, and local generation are not
+cache identity. Encode the identity tuple losslessly or with collision-resistant
 canonical hashing, not lossy name sanitization. Store verified compatibility
-metadata alongside the cache. Existing caches without this metadata are not
-trusted by the new lifecycle and require rebuild; legacy APIs are not silently
-reinterpreted.
+metadata alongside the cache. Existing caches without that metadata require
+rebuilding for the new lifecycle; legacy APIs are not silently reinterpreted.
 
-On incompatibility, withdraw old views and isolate or clear the entire affected
-cache before fresh catchup. Merely merging new rows does not remove old secrets.
-Rows, cursors, revisions, worker state, query/entity results, and optimistic
-overlays all belong to the transition. Prevent incomplete rebuild metadata from
-advertising a reusable complete snapshot after a crash.
+On incompatibility, withdraw views and isolate or clear the entire affected cache
+before catchup. Merging rows does not remove old secrets. Rows, cursors, revisions,
+worker state, query/entity results, and optimistic overlays all participate in
+the transition. Incomplete rebuild metadata must not advertise a reusable complete
+snapshot after a crash.
 
-### Pending Writes
+### Pending Writes and Restart
 
-Capture database, context, and local sequence before asynchronous preparation.
-Never retarget or automatically retry a write on a different or renewed context.
-Locally cancelled work not dispatched is distinct from dispatched work with an
-unknown server outcome. Late replies cannot update a replacement context/cache;
-callbacks still require explicit settlement. Reconnect/catchup can restore data
-without proving the outcome of a particular lost response. Coordinate receipt
-semantics with MEC-107/MEC-111; durable retries/idempotency remain MEC-116.
+Capture database, context, and local sequence before async preparation. Never
+retarget or automatically retry a write on a different or renewed context. Work
+cancelled before dispatch differs from a dispatched write with unknown outcome.
+Late replies cannot update replacement storage, but callbacks still need explicit
+settlement. Catchup can restore data without proving a lost write's outcome.
+Receipt semantics remain MEC-107/MEC-111 work; durable retries/idempotency remain
+MEC-116.
 
-## Restart
+Contexts are ephemeral. Reconnect may reach another server, authenticate through
+the application's persisted session, and resolve current authority for the
+requested database. Unknown context IDs require fresh negotiation, never trust
+in the browser projection. Revoked access must be denied.
 
-Contexts and connection IDs are ephemeral. Reconnect may land on another server
-instance, authenticate through the application's persisted session, and resolve
-current authority for the requested database. Revoked access is denied rather
-than reconstructed as its former grant. An unknown context ID prompts fresh
-negotiation, not a fallback to trusting its browser projection.
+Cache scope and authority revision must derive from durable authority or force
+conservative rebuilding. Restart alone does not change the database epoch. A
+fresh context with compatible metadata may reuse a cache after negotiation and
+catchup; source replacement changes the epoch separately.
 
-Cache scope/authority revision must derive from durable authority or otherwise
-force conservative rebuilding. A process restart alone does not change the
-database epoch. A fresh context ID with compatible metadata can reuse a cache
-after negotiation and catchup; source replacement changes the epoch separately.
-
-## Verification and Implementation Boundaries
+## Verification Boundaries
 
 `tests/fixtures/database-context.json` is shared by Rust and TypeScript. Valid
-wire cases roundtrip without changing identifiers or projected values; malformed
-requests, injected authority fields, unknown variants, and unsafe timestamps are
-rejected. Fixture scenario names describe envelopes, not proven runtime behavior.
+envelopes roundtrip without changing identifiers or projections; malformed input,
+injected authority fields, unknown variants, and unsafe timestamps are rejected.
+Fixture scenario names describe envelopes, not proven lifecycle behavior.
+
+Relevant checks:
 
 ```sh
 cargo test --test database_context
@@ -416,21 +361,15 @@ bun test packages/core/database-context.test.ts
 tsc --noEmit --strict --target ES2020 --module ESNext --moduleResolution bundler packages/core/index.ts
 ```
 
-Internal runtime tests now cover separate database roles/tabs, authenticated scope
-ownership, generated query/catchup permission parity, projection rejection,
-invalidation during resolution and connection-lock waits, leases, restart mismatch,
-and post-dispatch outcome classification. Live primitive tests cover cross-context
-and cross-runtime ownership forgery, enqueue/delivery invalidation fencing, a
-concurrent handoff barrier, pending consumer closure, idle expiry/drop wakeups,
-context/connection/pending/queue bounds, overflow, disposal, cancelled resolutions,
-shutdown, and stale-handle rejection. Generation tests cover nested local
-dependencies, fingerprint stability/change sensitivity, browser/manifest parity,
-inline union directives, and operation-ID collisions. These do not exercise HTTP
-or network transports; live tests exercise only the private queue/delivery API.
+Private Rust tests cover database/credential scope ownership, generated query and
+catchup permissions, projection rejection, invalidation during resolution and
+connection-lock waits, leases, context/pending bounds, disposal, cancellation,
+shutdown, restart mismatch, and post-dispatch outcome classification. These are
+manager tests, not network delivery or TypeScript lifecycle conformance tests.
 
-Remaining component/integration gates include transport origin-connection ownership,
-A-B-A/out-of-order completion,
-invalidation during resolution, permission contraction across every reader and
-cache layer, expiry on open network streams, distributed freshness bounds, restart with
-valid/revoked credentials, and late mutation/persistence outcomes. Passing wire
-fixtures is not evidence these lifecycle guarantees are implemented.
+Remaining work includes the public application integration boundary, client
+installation and accessible-list integration, stale/A-B-A completion handling,
+permission contraction across every cache/reader, application delivery fencing,
+expiry on open streams, distributed freshness, and restart/late-write behavior.
+Those are separate integration and release gates. Passing codec or private
+manager tests does not establish a completed end-to-end session/sync service.

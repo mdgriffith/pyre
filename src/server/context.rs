@@ -5,7 +5,12 @@
 //! server must derive authority and session values; caller-supplied values are not
 //! authority. Session-schema validation and expiration checks against the current
 //! time are separate responsibilities. Public codecs manage no lifecycle or cache;
-//! the crate-private runtime is an incomplete server integration checkpoint.
+//! the crate-private runtime is a context-manager prototype for integration with
+//! existing application session authority. It owns no routes, live connections,
+//! publication queues, or transport delivery. Applications must coordinate their
+//! delivery checks with invalidation; the manager cannot revoke queued bytes.
+//! TypeScript currently has the context codec only, not lifecycle parity, and
+//! client context installation remains future work.
 //! Identifiers are preserved verbatim rather than normalized.
 //! Public fields allow direct construction; serialization does not validate
 //! manually constructed values. Use serde deserialization to validate wire input.

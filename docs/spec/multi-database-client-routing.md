@@ -2,8 +2,12 @@
 
 The [authorized database context lifecycle](database-context-lifecycle.md)
 specifies the next layer of server-resolved per-database sessions, cache
-compatibility, and readiness. Its protocol foundation does not yet change the
-runtime behavior described here.
+compatibility, and readiness. It connects existing application session authority
+to context management, without adding routes or prescribing transport. TypeScript
+currently has the context codec only; Rust has a private manager prototype, not
+lifecycle parity. Future client installation does not yet change the routing
+behavior described here. Transport examples below describe existing routing,
+not new context-manager endpoints or requirements.
 
 ## Goal
 
@@ -65,6 +69,13 @@ client.setSyncedDatabases(databaseIds);
 ```
 
 The app is the source of truth for the active sync set. Pyre should start and stop catchup/live sync work to match that set.
+
+For the future context-aware client, the high-level client should also know the
+accessible database list supplied by application authority. That list is separate
+from the independently selected active sync set: accessibility does not start
+sync. The context work adds no enumeration implementation or API and leaves list
+delivery to the existing application integration. Each request still requires
+server authorization.
 
 The public client is a meta-client. Internally, Pyre may create one single-database client per database ID so existing one-database assumptions remain local to those internal clients.
 
@@ -318,6 +329,13 @@ This keeps the existing single-database runtime model intact while giving apps a
 ## Server Contract
 
 The app server owns database lookup, authorization, and connection grouping.
+
+The context-manager work preserves this ownership. Applications integrate their
+existing session system and handlers with context resolution and scoped execution;
+they continue to own publication and transport. Application delivery paths must
+coordinate eligibility checks and invalidation. The manager does not close live
+connections or revoke application-queued bytes. The examples below are existing
+server integration, not an implemented context-aware lifecycle.
 
 ```ts
 const { databaseId, syncCursor } = await request.json();
