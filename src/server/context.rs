@@ -4,13 +4,17 @@
 //! its provenance, authenticate a caller, or authorize database access. A trusted
 //! server must derive authority and session values; caller-supplied values are not
 //! authority. Session-schema validation and expiration checks against the current
-//! time are separate responsibilities. No context lifecycle or cache is managed
-//! here, and identifiers are preserved verbatim rather than normalized.
+//! time are separate responsibilities. Public codecs manage no lifecycle or cache;
+//! the crate-private runtime is an incomplete server integration checkpoint.
+//! Identifiers are preserved verbatim rather than normalized.
 //! Public fields allow direct construction; serialization does not validate
 //! manually constructed values. Use serde deserialization to validate wire input.
 
 use serde::{de::Error, Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
+
+#[cfg(feature = "database")]
+pub(crate) mod runtime;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

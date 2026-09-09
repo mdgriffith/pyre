@@ -2,14 +2,54 @@
 
 ## Status
 
-MEC-128, contract slice MEC-132. This document specifies the target lifecycle;
-only the version 1 negotiation/control wire types, decoders, and shared fixtures
-are implemented here. They do **not** authenticate requests, manage contexts,
-install sessions, or make existing sync routes context-aware.
+MEC-128, contract slice MEC-132 and initial internal server slice MEC-129. This
+document specifies the target lifecycle. Version 1 negotiation/control wire types,
+decoders, and shared fixtures are public; an internal Rust resolver/registry now
+exercises the server authority boundary. Existing sync routes are **not**
+context-aware, and no client context installation is implemented.
 
 Server integration is MEC-129, client installation is MEC-130, and end-to-end
 conformance/Lore adoption is MEC-131. The API names below describe the intended
 boundary, not methods currently exported by Pyre.
+
+### Internal Rust Checkpoint
+
+`src/server/context/runtime.rs` is crate-private until generated local-session
+dependency metadata, schema fingerprinting, and transport/live integration are
+complete. It currently provides:
+
+- An application resolver for exactly the requested database, with trusted
+  identity, credential identifier, and credential deadline inputs.
+- Validated effective sessions and explicitly configured projections; required
+  client fields must be supplied and included. These dependencies and the schema
+  ID are currently trusted configuration, not generated or independently verified.
+- A coherent schema/manifest artifact shared by allocation identity, and database
+  handles whose clones serialize complete operations on one libSQL connection.
+  Applications must transfer exclusive connection use to the handle, not retain
+  raw connection clones or wrap them in independent handles.
+- Random 256-bit context IDs and leases bounded from before resolution by maximum
+  age, credential expiration, and application deadline. Both wall and monotonic
+  clocks enforce expiration; millisecond wire deadlines round down. A backwards
+  wall-clock adjustment cannot extend an existing monotonic lease, while a forward
+  adjustment can expire it early. Authoritative-read staleness and clock error at
+  negotiation still affect the deployment revocation bound.
+- Credential, identity+database, and database invalidation under a local registry
+  lock. A retained allocation token prevents old resolutions from registering.
+  Invalidation conservatively fences **all** pending resolutions, even unrelated
+  ones, while withdrawing only matching installed contexts.
+- Authenticated request scopes with fixed operation exposure, existing query and
+  catchup permission enforcement, and checks before dispatch (including after
+  waiting for the connection lock) and after completion. Results retain their
+  original database/context binding. Invalidated dispatched mutations produce an
+  outcome-unknown error, not a retry-safe context rejection.
+
+This checkpoint does not implement live connection ownership, queued/delivery-time
+checks, stream expiry, publication, refresh/disposal, routes, or public runtime
+configuration. Ordinary mutations execute without the eventual live publication
+path; the internal scopes must not be exposed as a completed sync service. Returning
+a checked result is not an atomic delivery barrier. Expired entries are pruned on
+negotiation; idle-registry cleanup and resource limits also remain integration work.
+No cluster-wide invalidation or deployment freshness guarantee is claimed.
 
 ## Ownership
 
@@ -311,12 +351,18 @@ rejected. Fixture scenario names describe envelopes, not proven runtime behavior
 
 ```sh
 cargo test --test database_context
+cargo test --locked --lib server::context::runtime
 bun test packages/core/database-context.test.ts
 tsc --noEmit --strict --target ES2020 --module ESNext --moduleResolution bundler packages/core/index.ts
 ```
 
-Remaining component/integration gates include two databases with different
-roles, independent tabs, forged ownership, A-B-A/out-of-order completion,
+Internal runtime tests now cover separate database roles/tabs, authenticated scope
+ownership, generated query/catchup permission parity, projection rejection,
+invalidation during resolution and connection-lock waits, leases, restart mismatch,
+and post-dispatch outcome classification. These do not exercise HTTP or live streams.
+
+Remaining component/integration gates include forged connection ownership,
+A-B-A/out-of-order completion,
 invalidation during resolution, permission contraction across every reader and
 cache layer, expiry on open streams, distributed freshness bounds, restart with
 valid/revoked credentials, and late mutation/persistence outcomes. Passing wire

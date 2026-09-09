@@ -7,7 +7,7 @@ edition = "2021"
 [features]
 default = ["filesystem", "database", "json", "serve", "lsp"]
 filesystem = ["walkdir"]
-database = ["libsql", "tokio"]
+database = ["libsql", "tokio", "tokio/sync", "getrandom"]
 serve = [
     "async-stream",
     "axum",
