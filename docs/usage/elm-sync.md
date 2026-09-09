@@ -81,9 +81,6 @@ const client = await PyreClient.create({
         },
       },
       cacheNamespace: userId,
-      session: {
-        userId,
-      },
     }
   },
   onError: (error) => console.error(error),
@@ -94,11 +91,9 @@ await client.setSyncedDatabases([mainDatabaseId])
 
 Set `debug: true` if you want verbose runtime logging while debugging sync behavior. Leave it off in normal app usage.
 
-If session-backed filters change, refresh the runtime session so active queries are re-evaluated:
+The browser runtime has no `Session` configuration, `connect` session result, `setSession` API, or local `$session` substitution. Update ordinary query inputs through the generated Elm query API or the TypeScript subscription instead.
 
-```ts
-client.setSession({ userId: 2 })
-```
+Explicit `Session`-dependent local query filters must receive a clear rejection directing the app to use ordinary inputs or explicitly execute on the authenticated server, never an automatic server fallback. Inputs filter already-authorized data; they are not permission grants. Queries whose only `Session` use is in server schema permissions remain normal local queries. Server sessions, permissions, and auth cookies are unchanged.
 
 Use `client.run(databaseId, queryModule, input, callback)` for TypeScript-native consumers. For generated Elm clients, prefer `PyreClient.create({ connect, elm: { ... } })` so the runtime owns the port bridge.
 
@@ -236,7 +231,6 @@ const client = await PyreClient.create({
         },
       },
       cacheNamespace: userId,
-      session: { userId },
     }
   },
   elm: {
@@ -350,8 +344,8 @@ If you are bridging those generated messages into `@pyre/client`, prefer `await 
    - If you send custom request headers, include them in `Access-Control-Allow-Headers`.
    - If you use `credentials: "include"`, configure CORS to allow credentials and use an explicit allowed origin.
 
-2. **Session consistency**
-   - Keep one session per runtime instance. Recreating sessions repeatedly can produce confusing behavior.
+2. **Cache authorization lifecycle**
+   - Removing browser sessions does not clean up cached rows after permissions contract. Permission-contraction cache cleanup remains a separate concern.
 
 3. **Fail loudly on decode/contract mismatches**
    - Log query id/source and decode error details. Silent drops make sync debugging very hard.

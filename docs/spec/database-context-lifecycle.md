@@ -140,6 +140,18 @@ from the active sync set selected with `setSyncedDatabases`. Accessibility does
 not start sync and is not an authorization grant. This introduces no enumeration
 API and does not change existing multi-database routing.
 
+## Client Integration Status
+
+The approved client contract removes browser `Session` entirely: no session in
+client configuration or `connect` results, no `setSession`, and no local `$session`
+substitution. Explicit `Session`-dependent local filters must be rejected clearly,
+directing callers to ordinary query inputs or explicit authenticated server
+execution, with no automatic fallback. Inputs are not permission grants. Queries
+whose only `Session` use is in server schema permissions remain normal local
+queries over authorized data. Server sessions, permissions, and auth cookies are
+unchanged. This documentation update does not implement client removal or solve
+permission-contraction cache cleanup; that cleanup remains separate work.
+
 ## Verification
 
 Manager tests should establish isolation by session key and database ID, cache

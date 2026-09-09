@@ -2229,6 +2229,12 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
 }
 
 fn to_query_shape_json(context: &typecheck::Context, query: &ast::Query) -> String {
+    if crate::generate::local_query::references_session(query) {
+        return format!(
+            "queryShape : Encode.Value\nqueryShape =\n    Encode.object\n        [ ( \"$error\", Encode.string {} ) ]\n",
+            string::quote(crate::generate::local_query::SESSION_ERROR)
+        );
+    }
     let mut result = "queryShape : Encode.Value\n".to_string();
     result.push_str("queryShape =\n");
     result.push_str("    Encode.object\n");

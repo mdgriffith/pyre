@@ -46,6 +46,20 @@ pub const DOC_RESOURCES: &[DocResource] = &[
         content: include_str!("../../../docs/usage/sync.md"),
     },
     DocResource {
+        topic: "server-contexts",
+        uri: "pyre://guides/server-contexts",
+        name: "Server Contexts Guide",
+        description: "Thin server-only TypeScript/Rust context integration, TTL, and invalidation.",
+        content: include_str!("../../../docs/usage/server-contexts.md"),
+    },
+    DocResource {
+        topic: "session-free-client",
+        uri: "pyre://guides/session-free-client",
+        name: "Session-Free Client Guide",
+        description: "App-owned accessible database IDs, independent sync selection, and local query boundaries.",
+        content: include_str!("../../../docs/usage/session-free-client.md"),
+    },
+    DocResource {
         topic: "migrations",
         uri: "pyre://guides/migrations",
         name: "Pyre Migrations",

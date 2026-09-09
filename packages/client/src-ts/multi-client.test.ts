@@ -2,6 +2,7 @@
 import { expect, test } from 'bun:test';
 
 import { PyreClient } from './index';
+import { QueryClientService } from './service/query-client';
 import {
   __resetPyreDevtoolsRegistryForTests,
   getPyreDevtoolsRegistrySnapshot,
@@ -97,6 +98,103 @@ test('PyreClient requires cacheNamespace', async () => {
     schema,
     server,
   })).rejects.toThrow('PyreClient.create requires cacheNamespace');
+});
+
+test('connect and sync selection create session-free internal clients', async () => {
+  const configs: unknown[] = [];
+  const starts: string[] = [];
+  const internals = new Map();
+  const client = await PyreClient.create({
+    schema,
+    connect: async () => ({ server, cacheNamespace: 'browser-cache' }),
+    createInternalClient: async (config) => {
+      configs.push(config);
+      const internal = fakeInternalClient([], config.databaseId, starts);
+      internals.set(config.databaseId, internal);
+      return internal;
+    },
+  });
+  await client.setSyncedDatabases(['main', 'project:1']);
+  expect(starts).toEqual(['main']);
+  internals.get('main').emitLive();
+  await Bun.sleep(0);
+  expect(starts).toEqual(['main', 'project:1']);
+  expect(configs).toHaveLength(2);
+  expect(configs.every((config) => !('session' in config))).toBe(true);
+  expect('setSession' in client).toBe(false);
+  client.disconnect();
+});
+
+test('Elm bridge rejects templates and resolved inputs without replacing an existing query', async () => {
+  const incoming = fakePort();
+  const engineResults = fakePort();
+  const results = fakePort();
+  const errors: Error[] = [];
+  const sent: unknown[] = [];
+  const service = new QueryClientService();
+  service.attachPorts({ ports: {
+    queryClientOut: engineResults.port,
+    receiveQueryClientMessage: { send: (message) => sent.push(message) },
+  } });
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'browser-cache',
+    createInternalClient: async (config) => ({
+      ...fakeInternalClient([], config.databaseId),
+      run(_databaseId, module, input, callback) {
+        service.registerQuery({ queryId: 'internal-query', querySource: module.queryShape, input }, (update) => callback(update.result));
+        return { unsubscribe: () => service.unregisterQuery('internal-query'), update: (input) => service.updateQueryInput('internal-query', input) };
+      },
+    }),
+    elm: { app: { ports: { pyreStoreOut: incoming.port, pyre_receiveQueryDelta: results.port } }, onError: (error) => errors.push(error) },
+  });
+  const register = { type: 'register', databaseId: 'main', queryId: 'bridge-query', queryName: 'Posts', queryInput: { owner: 1 } };
+  const querySource = { posts: { '@where': { owner: { $var: 'owner' } } } };
+  incoming.emit({ ...register, querySource });
+  await Bun.sleep(0);
+  engineResults.emit({ type: 'full', queryId: 'internal-query', revision: 0, result: { posts: [{ id: 1 }] } });
+  expect(results.sent).toHaveLength(1);
+  sent.length = 0;
+  for (const querySource of [
+    { $error: 'Local queries cannot reference Session; use explicit inputs or execute on the server.' },
+    { posts: { comments: { '@where': { 'Session.userId': 1 } } } },
+    { posts: { '@where': { owner: { $session: 'userId' } } } },
+  ]) {
+    incoming.emit({ ...register, querySource });
+  }
+  incoming.emit({ ...register, queryName: 'RejectedReplacement', querySource, queryInput: { owner: { $session: 'userId' } } });
+  await Bun.sleep(0);
+  expect(errors).toHaveLength(4);
+  expect(errors.every((error) => error.message.includes('queryId=bridge-query path='))).toBe(true);
+  expect(sent).toEqual([]);
+  expect(service.getRegisteredQueryIds()).toEqual(['internal-query']);
+  service.refreshQuery('internal-query');
+  expect(sent[0].queryInput).toEqual({ owner: 1 });
+  sent.length = 0;
+  incoming.emit({ type: 'update-input', databaseId: 'main', queryId: 'bridge-query', queryInput: { owner: 2 } });
+  await Bun.sleep(0);
+  expect(sent[0].querySource).toEqual({ posts: { '@where': { owner: 2 } } });
+  engineResults.emit({ type: 'full', queryId: 'internal-query', revision: 1, result: { posts: [{ id: 2 }] } });
+  expect(results.sent).toHaveLength(2);
+  expect(results.sent[1]).toMatchObject({ queryId: 'bridge-query', queryName: 'Posts', result: { posts: [{ id: 2 }] } });
+  client.disconnect();
+});
+
+test('Elm bridge reports asynchronous run rejection through onError', async () => {
+  const incoming = fakePort();
+  const errors: unknown[] = [];
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'browser-cache',
+    createInternalClient: async (config) => ({
+      ...fakeInternalClient([], config.databaseId),
+      run() { throw new Error('asynchronous registration failure'); },
+    }),
+    elm: { app: { ports: { pyreStoreOut: incoming.port } }, onError: (error, context) => errors.push({ message: error.message, ...context }) },
+  });
+  incoming.emit({ type: 'register', databaseId: 'main', queryId: 'query', queryName: 'Posts', querySource: { posts: { id: true } } });
+  await Bun.sleep(0);
+  expect(errors).toEqual([{ message: 'asynchronous registration failure', phase: 'incoming-message' }]);
+  client.disconnect();
+  await Bun.sleep(0);
 });
 
 test('PyreClient creates one internal client per databaseId', async () => {

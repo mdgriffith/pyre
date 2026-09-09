@@ -1,4 +1,4 @@
-port module Main exposing (main)
+port module Main exposing (init, main, queryClientMessage, update)
 
 import Data.Catchup as Catchup
 import Data.Delta
@@ -1331,16 +1331,7 @@ subscriptions model =
                         -- Send error to console
                         Error ("Failed to decode QueryManager message: " ++ Decode.errorToString err)
             )
-        , QueryManager.receiveQueryClientIncoming
-            (\result ->
-                case result of
-                    Ok incoming ->
-                        QueryClientReceived incoming
-
-                    Err err ->
-                        -- Send error to console
-                        Error ("Failed to decode QueryClient message: " ++ Decode.errorToString err)
-            )
+        , QueryManager.receiveQueryClientIncoming queryClientMessage
         , receiveSyncControlMessage
             (\jsonValue ->
                 case Decode.decodeValue decodeSyncControlMessage jsonValue of
@@ -1351,6 +1342,16 @@ subscriptions model =
                         Error ("Failed to decode sync control message: " ++ Decode.errorToString err)
             )
         ]
+
+
+queryClientMessage : Result Decode.Error QueryManager.QueryClientIncoming -> Msg
+queryClientMessage result =
+    case result of
+        Ok incoming ->
+            QueryClientReceived incoming
+
+        Err err ->
+            Error ("Failed to decode QueryClient message: " ++ Decode.errorToString err)
 
 
 

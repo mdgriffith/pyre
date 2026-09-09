@@ -29,7 +29,6 @@ const client = await PyreClient.create({
       query: "/db",
     },
   },
-  session: bootstrap.pyreSession,
 })
 ```
 
@@ -41,6 +40,10 @@ await client.setSyncedDatabases([
   bootstrap.activeTenantDatabaseId,
 ])
 ```
+
+The application supplies the accessible database list through its own bootstrap or other app-owned source; Pyre adds no enumeration or session routes. That list is independent of the active sync set selected with `setSyncedDatabases`. Neither list membership nor sync selection is a permission grant; the server still authorizes each request.
+
+Do not send effective Pyre sessions to the browser. Client configuration and `connect` results have no session field, and there is no `setSession` API or local `$session` substitution. Explicit `Session`-dependent local filters must be rejected clearly: use ordinary query inputs over already-authorized data, or explicitly execute on the authenticated server, with no automatic fallback. Inputs do not grant permissions. Queries whose only `Session` dependency is in server schema permissions remain normal local queries; server sessions, permissions, and auth cookies are unchanged.
 
 Route every TypeScript query or mutation with a `databaseId`:
 
@@ -163,6 +166,8 @@ Choose one cache policy during the upgrade:
 
 Do not assume existing local caches will be reused automatically after changing the naming scheme.
 
+Removing browser sessions does not clean up cached rows when permissions contract. Permission-contraction cache cleanup remains separate work, not a guarantee of this upgrade.
+
 ## Command Plane And Tenant Schemas
 
 If the app has one command-plane schema and one tenant schema, treat them as different Pyre schema families.
@@ -185,7 +190,7 @@ If Pyre is extended later to support multiple schema families inside one public 
 
 ## Handoff Checklist
 
-- Bootstrap returns `cacheNamespace`, Pyre session data, and allowed database IDs.
+- The app supplies `cacheNamespace` and accessible database IDs, not effective Pyre session data.
 - Client passes `databaseId` to every query and mutation.
 - Elm apps centralize concrete database ID constructors and pass generated typed IDs to query/mutation constructors.
 - Client calls `setSyncedDatabases` with the databases that should sync locally.

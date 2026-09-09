@@ -460,6 +460,109 @@ fn docs_are_exposed_as_resources() {
 }
 
 #[test]
+fn context_and_session_free_guides_are_discoverable_and_retrievable() {
+    let ctx = TestContext::new();
+    let tools = call_mcp(
+        &ctx,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    let docs_tool = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "pyre_docs")
+        .unwrap();
+    let topics = docs_tool["inputSchema"]["properties"]["topic"]["enum"]
+        .as_array()
+        .unwrap();
+    let resources = call_mcp(
+        &ctx,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/list" }),
+    );
+    let index = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "mcp" }));
+
+    for (topic, title, expected) in [
+        (
+            "server-contexts",
+            "Server Contexts Guide",
+            vec![
+                "@pyre/server/context",
+                "getSessionKey",
+                "resolveSession",
+                "getDatabase",
+                "maxAgeMs",
+                "contexts.get(session, dbId)",
+                "context.run(",
+                "args: Record<string, unknown>",
+                "run(db, queries, operationId, args, dbSession)",
+                "pyre::server::context::{ContextManager, Config}",
+                "invalidateSession",
+                "invalidate_pair",
+                "invalidate_database",
+                "Never automatically retry or replay stale",
+                "connection locking",
+                "Neither session nor context is serialized to the browser",
+            ],
+        ),
+        (
+            "session-free-client",
+            "Session-Free Client Guide",
+            vec![
+                "no `Session` configuration",
+                "no local `$session` substitution",
+                "accessible database ID list",
+                "client.syncDatabase(selectedId)",
+                "client.setSyncedDatabases(selectedIds)",
+                "\"$error\": \"Local queries cannot reference Session; use explicit inputs or execute on the server.\"",
+                "no automatic server fallback",
+                "inputs are not permission grants",
+                "Permission-only schema usage remains valid",
+                "permission-contraction cache cleanup",
+            ],
+        ),
+    ] {
+        let uri = format!("pyre://guides/{topic}");
+        assert!(topics.contains(&json!(topic)), "missing topic: {topic}");
+        let resource = resources["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|resource| resource["uri"] == uri)
+            .unwrap_or_else(|| panic!("missing resource: {uri}"));
+        assert_eq!(resource["name"], title);
+        assert!(index["content"].as_str().unwrap().contains(&uri));
+
+        let read = call_mcp(
+            &ctx,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+                "params": { "uri": uri }
+            }),
+        );
+        assert_eq!(read["result"]["contents"][0]["mimeType"], "text/markdown");
+        let tool = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": topic }));
+        assert_eq!(tool["topic"], topic);
+        assert_eq!(read["result"]["contents"][0]["text"], tool["content"]);
+        let content = tool["content"].as_str().unwrap();
+        assert!(content.contains(title));
+        for text in expected {
+            assert!(content.contains(text), "{topic} missing: {text}");
+        }
+    }
+
+    let query = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "query" }));
+    assert!(query["content"]
+        .as_str()
+        .unwrap()
+        .contains("rejected for local browser execution"));
+    let schema = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "schema" }));
+    assert!(schema["content"]
+        .as_str()
+        .unwrap()
+        .contains("@allow(insert, update, delete) { authorId == Session.userId }"));
+}
+
+#[test]
 fn introspect_tool_runs_cli_introspect() {
     let ctx = TestContext::new();
     let db_path = ctx.workspace_path.join("sample.db");

@@ -14,12 +14,12 @@ If your main goal is Elm port wiring, also see [Elm + Sync Runtime Setup](./elm-
 
 The shortest sync path looks like this:
 
-1. Add a `session { ... }` block and at least one session-aware query.
+1. Define server-side schema permissions and a local query using ordinary inputs.
 2. Apply the schema to a database with `pyre migrate db/app.db --push`.
 3. Run `pyre generate`.
 4. Start a Pyre-backed server that exposes `/sync`, `/sync/events`, and `/db`.
 5. Create a `PyreClient` in your browser app.
-6. Register queries and keep session state current.
+6. Select databases to sync and register local queries.
 
 The rest of this guide walks through those steps.
 
@@ -36,7 +36,7 @@ For browser sync, add `@pyre/client` from the same GitHub Release used for `@pyr
 }
 ```
 
-## 1. Define Session-Aware Schema And Queries
+## 1. Define Server Permissions And Local Queries
 
 Create `pyre/schema.pyre` and a query file such as `pyre/query.pyre`:
 
@@ -46,7 +46,7 @@ session {
 }
 
 record User {
-    @public
+    @allow(query) { ownerId == Session.userId }
 
     id Int @id
     ownerId Int
@@ -55,12 +55,7 @@ record User {
 
 query GetUser($id: Int) {
     user {
-        @where {
-            And(
-                id == $id,
-                ownerId == Session.userId,
-            )
-        }
+        @where { id == $id }
 
         id
         name
@@ -68,11 +63,9 @@ query GetUser($id: Int) {
 }
 ```
 
-Why the session matters:
+The server validates its authenticated session against the schema and enforces the schema permissions when selecting data to sync. `GetUser` remains a normal local query: its only explicit filter uses the ordinary `$id` input, and its only `Session` dependency is in server-side schema permissions.
 
-- Pyre validates session values against the schema
-- session values can participate in query filters
-- sync visibility and query results can depend on session data
+Explicit local query filters that depend on `Session` must be rejected with a clear error. Use ordinary query inputs to filter already-authorized data, or explicitly execute the query on the authenticated server; there is no automatic server fallback. Inputs are not permission grants and must not replace server authorization.
 
 ## 2. Apply The Schema To A Database
 
@@ -188,7 +181,6 @@ return result.response;
 - catchup sync
 - live sync transport
 - query registration and refresh
-- session-aware query re-evaluation
 
 Typical setup:
 
@@ -208,20 +200,15 @@ const client = await PyreClient.create({
       query: '/db',
     },
   },
-  session: {
-    userId: bootstrap.userId,
-  },
   cacheNamespace: bootstrap.userId,
 });
 
 await client.setSyncedDatabases([bootstrap.mainDatabaseId]);
 ```
 
-If session values change later, refresh them so active queries are re-evaluated correctly:
+The browser client has no `Session` configuration, `connect` session result, `setSession` API, or local `$session` substitution. Authentication stays in ordinary HTTP headers/cookies; the server constructs the effective Pyre session.
 
-```typescript
-client.setSession({ userId: 2 });
-```
+The accessible database list comes from the application, independently of the active sync set selected with `setSyncedDatabases`. Neither the list nor sync selection grants access, and no new routes are required. Removing browser sessions does not remove cached rows after permissions contract; permission-contraction cache cleanup remains separate work.
 
 ### Optional Devtools
 
@@ -310,7 +297,7 @@ Information moves through the system in three main paths:
 ```mermaid
 flowchart TD
     Elm[Elm app\nUI state + generated Pyre module]
-    Bridge[TypeScript host / bridge\nports + app session]
+    Bridge[TypeScript host / bridge\nports + HTTP auth configuration]
     Cache[(IndexedDB\nlocal persistence)]
     Catchup[/POST /sync\ncatchup/]
     Events[/GET /sync/events\nSSE live stream/]
@@ -318,7 +305,7 @@ flowchart TD
     Server[Pyre server sync runtime\npermissions + delta generation]
 
     subgraph Client [PyreClient]
-        QueryClient[Query client\nquery shape + session resolution]
+        QueryClient[Query client\nquery shape + input resolution]
         QueryManager[Query manager\ncallbacks + query state bridge]
         ElmRuntime[Internal Elm runtime\nDb + QueryManager + Catchup + LiveSync]
         IndexedDbService[IndexedDB service\nport bridge to browser storage]
@@ -335,7 +322,7 @@ flowchart TD
     Bridge -->|forward generated payloads| QueryClient
     IndexedDbService -->|read / write rows| Cache
     Cache -->|stored rows| IndexedDbService
-    ElmRuntime -->|catchup request + session + cursor| Catchup
+    ElmRuntime -->|catchup request + databaseId + cursor| Catchup
     Transport -->|open live connection| Events
     ElmRuntime -->|run query / mutation| Query
 
@@ -363,4 +350,4 @@ flowchart TD
 - Generated Elm query and mutation constructors require typed database IDs by schema namespace.
 - `Pyre.elm` uses generated `queryShape` values automatically.
 - `@where`, `@sort`, and `@limit` are preserved in generated query shapes.
-- Session-aware filters require keeping `PyreClient` session state current via `setSession`.
+- Explicit `Session`-dependent filters are not supported locally; schema permissions using `Session` remain server-enforced and do not prevent local queries.

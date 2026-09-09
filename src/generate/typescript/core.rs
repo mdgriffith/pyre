@@ -396,7 +396,7 @@ fn to_query_metadata_file(
     let mut imports = String::new();
     imports.push_str("import { z } from 'zod';\n");
     if query.operation == ast::QueryOperation::Query {
-        imports.push_str("import type { QueryShape } from '@pyre/core';\n");
+        imports.push_str("import type { GeneratedQueryShape } from '@pyre/core';\n");
     }
     if uses_coerced_bool || uses_coerced_date {
         imports.push_str("import { ");
@@ -779,7 +779,13 @@ fn to_optimistic_update_metadata(query: &ast::Query) -> Option<String> {
 }
 
 fn to_query_shape(context: &typecheck::Context, query: &ast::Query) -> String {
-    let mut result = "const queryShape: QueryShape = {\n".to_string();
+    if crate::generate::local_query::references_session(query) {
+        return format!(
+            "const queryShape: GeneratedQueryShape = {{ \"$error\": {} }};\n",
+            string::quote(crate::generate::local_query::SESSION_ERROR)
+        );
+    }
+    let mut result = "const queryShape: GeneratedQueryShape = {\n".to_string();
 
     let mut is_first_table = true;
     for field in &query.fields {

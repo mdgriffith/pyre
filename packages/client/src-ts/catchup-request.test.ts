@@ -3,6 +3,9 @@ import { expect, test } from 'bun:test';
 
 import loadElm from '../dist/engine.mjs';
 
+// Elm ports use setTimeout(0); Bun.sleep(0) can finish before those timers run.
+const nextElmTurn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 const schema = {
   tables: {
     maps: {
@@ -96,8 +99,8 @@ test('Elm catchup request includes restored syncCursor on startup', async () => 
       });
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(requestedUrls).toHaveLength(1);
     expect(requestedMethods).toEqual(['POST']);
@@ -193,8 +196,8 @@ test('Elm catchup request includes databaseId when configured', async () => {
       });
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(requestedUrls).toHaveLength(1);
     expect(requestedMethods).toEqual(['POST']);
@@ -294,13 +297,13 @@ test('Elm catchup waits for startSync when autoStart is false', async () => {
       });
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
     expect(requestedUrls).toHaveLength(0);
 
     app.ports.receiveSyncControlMessage.send({ type: 'startSync' });
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(requestedUrls).toHaveLength(1);
     expect(requestedMethods).toEqual(['POST']);
@@ -384,8 +387,8 @@ test('Elm catchup rejects missing response databaseId when configured', async ()
       });
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(errors).toContain('Catchup response missing databaseId: expected campaign:123');
   } finally {
@@ -467,8 +470,8 @@ test('Elm catchup rejects mismatched response databaseId', async () => {
       });
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(errors).toContain('Catchup response databaseId mismatch: expected campaign:123, got campaign:456');
   } finally {
@@ -551,8 +554,8 @@ test('Elm catchup request includes credentials and headers when configured', asy
       });
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(requestCredentials).toEqual([true]);
     expect(requestHeaders.Authorization).toBe('Bearer token-1');
@@ -631,9 +634,9 @@ test('Elm destructively resets persisted state before retrying a changed databas
       }
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(resetMessages).toEqual([
       { type: 'resetForDatabaseEpoch', databaseEpoch: 'new-epoch' },

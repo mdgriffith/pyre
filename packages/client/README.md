@@ -55,9 +55,6 @@ const client = await PyreClient.create({
   indexedDbName: 'pyre-client',
   cacheNamespace: bootstrap.userId,
   debug: true,
-  session: {
-    userId: 1,
-  },
 });
 
 await client.setSyncedDatabases([bootstrap.mainDatabaseId]);
@@ -105,7 +102,6 @@ const factoryClient = await PyreClient.create({
         },
       },
       cacheNamespace: userId,
-      session: { userId },
     };
   },
 });
@@ -122,9 +118,6 @@ const unsubscribeSync = client.onSyncState((syncState) => {
 client.onSyncProgress((progress) => {
   console.log(progress.complete);
 });
-
-// Refresh active queries when session-backed filters change
-client.setSession({ userId: 2 });
 ```
 
 ### Server auth configuration
@@ -243,12 +236,11 @@ If filter inputs change, unsubscribe and create a new subscription.
 - `@sort`
 - `@limit`
 
-Generated query shapes can contain placeholders in `@where`:
+Generated query shapes use `{"$var":"fieldName"}` placeholders in `@where` for ordinary query inputs. `PyreClient` resolves these inputs before sending the query to the internal Elm query engine.
 
-- `{"$var":"fieldName"}` for query input values
-- `{"$session":"fieldName"}` for client session values
+There is no browser `Session`: client configuration and `connect` results do not supply a session, and there is no `setSession` API or local `$session` substitution. An explicit query filter that depends on `Session` must be rejected locally with a clear error directing the app to use ordinary query inputs or explicitly execute the query on the authenticated server. There is no automatic server fallback.
 
-`PyreClient` resolves those placeholders before sending the query to the internal Elm query engine.
+Ordinary inputs only filter already-authorized local data; they are not permission grants. Queries whose only `Session` usage is in server-side schema permissions remain normal local queries over that data. Server sessions, permission enforcement, and authentication cookies are unchanged. Removing browser sessions does not clean up cached rows after permissions contract; permission-contraction cache cleanup remains a separate concern.
 
 ### Updating Query Input
 
@@ -285,7 +277,6 @@ const client = await PyreClient.create({
         },
       },
       cacheNamespace: userId,
-      session: { userId },
     };
   },
   elm: {

@@ -126,7 +126,7 @@ query SearchUsers($name: String) {
 }
 ```
 
-Session values can also participate in query conditions:
+Server-supplied Session values can also participate in authenticated server query conditions:
 
 ```pyre
 query MyNotes {
@@ -137,6 +137,13 @@ query MyNotes {
     }
 }
 ```
+
+This explicit `Session` dependency is rejected for local browser execution, not
+filled from browser configuration. Use an ordinary `$ownerId` input to filter
+already-authorized local data, or explicitly execute on the authenticated server;
+there is no automatic server fallback. Inputs do not grant permissions. A query
+whose only `Session` usage is in server schema permissions remains a normal local
+query. See [Session-Free Client](./session-free-client.md).
 
 ## Generated CRUD
 

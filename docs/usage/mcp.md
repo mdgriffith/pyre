@@ -106,10 +106,20 @@ Examples:
 - `pyre_docs` with topic `query` for selects, mutations, and transaction blocks
 - `pyre_docs` with topic `migrations`
 - `pyre_docs` with topic `serve`
+- `pyre_docs` with topic `server-contexts` for thin server-only TypeScript/Rust integration and invalidation
+- `pyre_docs` with topic `session-free-client` for accessible IDs, sync selection, and local query rejection
 - `pyre_docs` with topic `project-structure`
 - `pyre_docs` with topic `troubleshooting`
 - `pyre://project/schema`
 - `pyre://guides/query`
+- `pyre://guides/server-contexts`
+- `pyre://guides/session-free-client`
+
+Discover topics through `tools/list` (the `pyre_docs` topic enum) or guides through
+`resources/list`. Retrieve a guide with `tools/call` using
+`{"name":"pyre_docs","arguments":{"topic":"server-contexts"}}`, or
+`resources/read` using `{"uri":"pyre://guides/server-contexts"}`. The same topics
+are available through `pyre docs` and `pyre docs <topic>`.
 
 ## When Not To Use MCP
 

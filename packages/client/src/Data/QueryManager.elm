@@ -1212,7 +1212,16 @@ decodeQueryClientIncoming =
                     "update-input" ->
                         Decode.map3 QCUpdateInput
                             (Decode.field "queryId" Decode.string)
-                            (Decode.maybe (Decode.field "querySource" Db.Query.decodeQuery))
+                            (Decode.dict Decode.value
+                                |> Decode.andThen
+                                    (\fields ->
+                                        if Dict.member "querySource" fields then
+                                            Decode.field "querySource" Db.Query.decodeQuery |> Decode.map Just
+
+                                        else
+                                            Decode.succeed Nothing
+                                    )
+                            )
                             (Decode.field "queryInput" Decode.value)
 
                     "unregister" ->

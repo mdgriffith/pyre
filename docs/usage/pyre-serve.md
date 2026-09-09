@@ -84,9 +84,10 @@ const client = await PyreClient.create({
   server: {
     baseUrl: "http://127.0.0.1:3000",
   },
-  session: {},
 });
 ```
+
+No browser session configuration is needed, including when the server uses `--dev-session`. Server sessions, schema permissions, and application authentication cookies are unchanged. Explicit `Session`-dependent local filters must be rejected clearly: use ordinary inputs to filter already-authorized data (not grant permissions), or explicitly execute on the authenticated server. There is no automatic server fallback. Queries whose only `Session` usage is in server schema permissions remain normal local queries.
 
 If your browser app runs on a different origin, allow it with CORS:
 

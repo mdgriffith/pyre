@@ -41,11 +41,7 @@ export interface QueryVariableReference {
   $var: string;
 }
 
-export interface SessionVariableReference {
-  $session: string;
-}
-
-export type FilterPlaceholder = QueryVariableReference | SessionVariableReference;
+export type FilterPlaceholder = QueryVariableReference;
 
 export type FilterValue =
   | string
@@ -88,3 +84,9 @@ export interface QueryField {
 export interface QueryShape {
   [tableName: string]: QueryField;
 }
+
+export interface RejectedQueryShape {
+  $error: 'Local queries cannot reference Session; use explicit inputs or execute on the server.';
+}
+
+export type GeneratedQueryShape = QueryShape | RejectedQueryShape;
