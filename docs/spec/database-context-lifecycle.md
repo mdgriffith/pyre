@@ -14,16 +14,30 @@ boundary, not methods currently exported by Pyre.
 
 ### Internal Rust Checkpoint
 
-`src/server/context/runtime.rs` is crate-private until generated local-session
-dependency metadata, schema fingerprinting, and transport/live integration are
-complete. It currently provides:
+`src/server/context/runtime.rs` remains crate-private until transport/live
+integration is complete. It currently provides:
 
 - An application resolver for exactly the requested database, with trusted
   identity, credential identifier, and credential deadline inputs.
-- Validated effective sessions and explicitly configured projections; required
-  client fields must be supplied and included. These dependencies and the schema
-  ID are currently trusted configuration, not generated or independently verified.
-- A coherent schema/manifest artifact shared by allocation identity, and database
+- Validated effective sessions and explicitly configured projections. Required
+  client fields are collected while emitting generated local query plans, including
+  Session predicate keys, `$session` operands, and nested predicates/values. Server
+  permission-only `session_args` do not require browser disclosure. All shipped
+  local plans contribute dependencies, independently of server operation exposure.
+- A private schema artifact constructor that checks schema and queries together
+  and generates the manifest, local plans, dependencies, and SHA-256 fingerprint.
+  The versioned fingerprint includes structural schema/session/permission metadata,
+  namespace sync modes, and generated execution and local plans. Sorted maps omit
+  source paths/locations; schema field order and generated plan text are retained,
+  so compatible edits may conservatively change the ID. Compiler semantic changes
+  not reflected in these inputs require bumping the fingerprint domain version.
+  Duplicate operation IDs/names fail typechecking instead of dropping plans.
+  `manifest.json` carries `schema_id` and per-query local metadata; generated
+  `typescript/core/artifact.ts` exports the same ID and aggregate dependencies via
+  `schema.ts`. Regenerate/deploy these files together, not independently. Legacy
+  loaded manifests are not accepted as authority-runtime artifacts; the independent
+  MCP manifest builder remains outside this private lifecycle.
+- Schema artifacts shared by allocation identity, and database
   handles whose clones serialize complete operations on one libSQL connection.
   Applications must transfer exclusive connection use to the handle, not retain
   raw connection clones or wrap them in independent handles.
@@ -359,7 +373,10 @@ tsc --noEmit --strict --target ES2020 --module ESNext --moduleResolution bundler
 Internal runtime tests now cover separate database roles/tabs, authenticated scope
 ownership, generated query/catchup permission parity, projection rejection,
 invalidation during resolution and connection-lock waits, leases, restart mismatch,
-and post-dispatch outcome classification. These do not exercise HTTP or live streams.
+and post-dispatch outcome classification. Generation tests cover nested local
+dependencies, fingerprint stability/change sensitivity, browser/manifest parity,
+inline union directives, and operation-ID collisions. These do not exercise HTTP
+or live streams.
 
 Remaining component/integration gates include forged connection ownership,
 A-B-A/out-of-order completion,

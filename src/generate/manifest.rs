@@ -3,8 +3,11 @@ use crate::filesystem;
 use crate::generate::sql;
 use crate::typecheck;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+
+mod schema;
 
 #[derive(Serialize)]
 struct Manifest {
@@ -21,6 +24,8 @@ struct QueryManifest {
     attached_dbs: Vec<String>,
     input_schema: BTreeMap<String, FieldSchema>,
     session_args: Vec<String>,
+    required_client_session_fields: Vec<String>,
+    local_query_plan: Option<String>,
     optional_input_args: Vec<String>,
     json_input_args: Vec<String>,
     sql: Vec<SqlInfo>,
@@ -89,10 +94,39 @@ fn write_manifest(
             .map(|query| (query.id.clone(), query))
             .collect(),
     };
+    let mut manifest = serde_json::to_value(manifest).expect("manifest should serialize");
+    // Hash the complete generated execution/local-plan payload and schema, not
+    // query interface IDs alone. Structural encoding omits source metadata.
+    let schema = schema::structural_schema(context);
+    let namespaces: BTreeMap<_, _> = context
+        .namespace_sync_modes
+        .iter()
+        .map(|(name, mode)| (name, mode.as_str()))
+        .collect();
+    let payload = serde_json::to_vec(&("pyre-schema-artifact-v1", schema, namespaces, &manifest))
+        .expect("schema artifact should serialize");
+    manifest["schema_id"] = serde_json::Value::String(format!("{:x}", Sha256::digest(payload)));
     let content = serde_json::to_string_pretty(&manifest).expect("manifest should serialize");
 
     files.retain(|file| file.path != Path::new("manifest.json"));
     files.push(filesystem::generate_text_file("manifest.json", content));
+    let required: BTreeSet<_> = manifest["queries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|query| query["required_client_session_fields"].as_array().unwrap())
+        .map(|field| field.as_str().unwrap())
+        .collect();
+    let artifact = serde_json::json!({
+        "schemaId": manifest["schema_id"],
+        "requiredClientSessionFields": required,
+    });
+    let path = Path::new("typescript/core/artifact.ts");
+    files.retain(|file| file.path != path);
+    files.push(filesystem::generate_text_file(path, format!(
+        "// Generated with manifest.json; regenerate schema and queries together.\nexport const schemaArtifact = {} as const;\n",
+        serde_json::to_string_pretty(&artifact).expect("artifact should serialize")
+    )));
 }
 
 fn query_manifest(
@@ -100,6 +134,7 @@ fn query_manifest(
     query: &ast::Query,
     query_info: &typecheck::QueryInfo,
 ) -> QueryManifest {
+    let plan = crate::generate::typescript::core::local_query_plan(context, query);
     QueryManifest {
         id: query.interface_hash.clone(),
         operation: operation_to_string(&query.operation),
@@ -107,6 +142,11 @@ fn query_manifest(
         attached_dbs: sorted_strings(&query_info.attached_dbs),
         input_schema: input_schema(context, query),
         session_args: session_args(&query_info.variables),
+        required_client_session_fields: plan
+            .as_ref()
+            .map(|(_, fields)| fields.iter().cloned().collect())
+            .unwrap_or_default(),
+        local_query_plan: plan.map(|(shape, _)| shape),
         optional_input_args: query
             .args
             .iter()

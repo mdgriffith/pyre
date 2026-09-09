@@ -2111,12 +2111,53 @@ pub fn check_queries<'a>(
 ) -> Result<HashMap<String, QueryInfo>, Vec<Error>> {
     let mut errors: Vec<Error> = Vec::new();
     let mut all_params: HashMap<String, QueryInfo> = HashMap::new();
+    let mut queries_by_name: HashMap<&str, &ast::Query> = HashMap::new();
+    let mut queries_by_id: HashMap<&str, &ast::Query> = HashMap::new();
 
     for query in &query_list.queries {
         match query {
             ast::QueryDef::Query(q) => {
+                let previous_name = queries_by_name.get(q.name.as_str()).copied();
+                let previous_id = queries_by_id.get(q.interface_hash.as_str()).copied();
+                let collision = if let Some(previous) = previous_name {
+                    Some((
+                        previous,
+                        ErrorType::DuplicateQueryName {
+                            name: q.name.clone(),
+                        },
+                    ))
+                } else {
+                    previous_id.map(|previous| {
+                        (
+                            previous,
+                            ErrorType::DuplicateOperationId {
+                                first_query: previous.name.clone(),
+                                second_query: q.name.clone(),
+                                operation_id: q.interface_hash.clone(),
+                            },
+                        )
+                    })
+                };
+                if let Some((previous, error_type)) = collision {
+                    errors.push(Error {
+                        filepath: context.current_filepath.clone(),
+                        error_type,
+                        locations: vec![
+                            Location {
+                                contexts: vec![],
+                                primary: to_range(&previous.start, &previous.end),
+                            },
+                            Location {
+                                contexts: vec![],
+                                primary: to_range(&q.start, &q.end),
+                            },
+                        ],
+                    });
+                }
+                queries_by_name.entry(q.name.as_str()).or_insert(q);
+                queries_by_id.entry(q.interface_hash.as_str()).or_insert(q);
                 let query_info = check_query(context, &mut errors, &q);
-                all_params.insert(q.name.clone(), query_info);
+                all_params.entry(q.name.clone()).or_insert(query_info);
                 continue;
             }
             _ => continue,

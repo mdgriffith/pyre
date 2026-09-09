@@ -1,6 +1,6 @@
 //! Internal lifecycle slice. No routes, live delivery, or delta publication.
-//! Schema coherence, projection dependencies, and operation exposure are trusted
-//! configuration until generated metadata can establish them. Invalidation is a
+//! Schema coherence and projection dependencies come from one compilation.
+//! Operation exposure remains application configuration. Invalidation is a
 //! local barrier only; authoritative-read staleness adds to the maximum lease.
 #![allow(dead_code)] // Deliberately not wired into the public server API yet.
 
@@ -28,9 +28,56 @@ pub(crate) struct AuthenticatedRequest {
 
 /// Construct once from a coherent compilation, then share this exact allocation.
 pub(crate) struct SchemaArtifact {
-    pub schema_id: String,
-    pub manifest: Arc<Manifest>,
-    pub context: Arc<typecheck::Context>,
+    schema_id: String,
+    manifest: Arc<Manifest>,
+    context: Arc<typecheck::Context>,
+    required_client_fields: HashSet<String>,
+}
+
+impl SchemaArtifact {
+    /// Recheck and compile together; never pair a loaded manifest or claimed ID
+    /// with an independently supplied permission context.
+    pub(crate) fn compile(
+        database: &crate::ast::Database,
+        queries: &crate::ast::QueryList,
+    ) -> Result<Arc<Self>, Error> {
+        let context = typecheck::check_schema(database).map_err(|_| Error::InvalidConfiguration)?;
+        let info =
+            typecheck::check_queries(queries, &context).map_err(|_| Error::InvalidConfiguration)?;
+        let mut files = Vec::new();
+        crate::generate::manifest::generate_queries(&context, queries, &info, &mut files);
+        let generated: Value =
+            serde_json::from_str(&files[0].contents).map_err(|_| Error::InvalidConfiguration)?;
+        let schema_id = generated["schema_id"]
+            .as_str()
+            .ok_or(Error::InvalidConfiguration)?
+            .to_owned();
+        let mut required_client_fields = HashSet::new();
+        for query in generated["queries"]
+            .as_object()
+            .ok_or(Error::InvalidConfiguration)?
+            .values()
+        {
+            let fields: Vec<String> =
+                serde_json::from_value(query["required_client_session_fields"].clone())
+                    .map_err(|_| Error::InvalidConfiguration)?;
+            required_client_fields.extend(fields);
+        }
+        let manifest: Manifest =
+            serde_json::from_value(generated).map_err(|_| Error::InvalidConfiguration)?;
+        if required_client_fields
+            .iter()
+            .any(|field| !manifest.session_schema.contains_key(field))
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(Arc::new(Self {
+            schema_id,
+            manifest: Arc::new(manifest),
+            context: Arc::new(context),
+            required_client_fields,
+        }))
+    }
 }
 
 #[derive(Clone)]
@@ -68,7 +115,6 @@ pub(crate) struct Resolution {
 pub(crate) struct Config {
     pub schema: Arc<SchemaArtifact>,
     pub client_fields: HashSet<String>,
-    pub required_client_fields: HashSet<String>,
     pub exposed_operations: HashSet<String>,
     pub max_age: Duration,
 }
@@ -153,6 +199,7 @@ impl<R> Runtime<R> {
             || SystemTime::now().checked_add(config.max_age).is_none()
             || Instant::now().checked_add(config.max_age).is_none()
             || !config
+                .schema
                 .required_client_fields
                 .is_subset(&config.client_fields)
             || config
@@ -485,6 +532,7 @@ mod tests {
     fn schema() -> Arc<SchemaArtifact> {
         Arc::new(SchemaArtifact {
             schema_id: "test-schema".into(),
+            required_client_fields: HashSet::from(["role".into()]),
             context: Arc::new(typecheck::empty_context()),
             manifest: Arc::new(serde_json::from_value(json!({
                 "version": 1,
@@ -514,7 +562,6 @@ mod tests {
         Config {
             schema,
             client_fields: HashSet::from(["role".into()]),
-            required_client_fields: HashSet::from(["role".into()]),
             exposed_operations: HashSet::from(["role".into(), "write".into()]),
             max_age: Duration::from_secs(60),
         }
@@ -580,6 +627,66 @@ mod tests {
             Poll::Ready(())
         })
         .await;
+    }
+
+    #[test]
+    fn compiled_projection_cannot_omit_local_dependencies() {
+        let mut schema = crate::ast::Schema::default();
+        crate::parser::run(
+            "schema.pyre",
+            r#"
+session {
+    userId Int
+    secret Int
+}
+record Note {
+    id Int @id
+    ownerId Int
+    @allow(*) { ownerId == Session.secret }
+}
+"#,
+            &mut schema,
+        )
+        .unwrap();
+        let queries = crate::parser::parse_query(
+            "queries.pyre",
+            r#"
+query Notes {
+    note {
+        @where { ownerId == Session.userId }
+        id
+    }
+}
+"#,
+        )
+        .unwrap();
+        let database = crate::ast::Database {
+            schemas: vec![schema],
+        };
+        let compiled = SchemaArtifact::compile(&database, &queries).unwrap();
+        assert_eq!(
+            compiled.required_client_fields,
+            HashSet::from(["userId".into()])
+        );
+        let make_config = |client_fields| Config {
+            schema: compiled.clone(),
+            client_fields,
+            // All shipped local plans require their inputs even if no server
+            // operations are exposed. Exposure is not a projection override.
+            exposed_operations: HashSet::new(),
+            max_age: Duration::from_secs(60),
+        };
+        assert!(matches!(
+            Runtime::new(make_config(HashSet::new()), ()),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert!(Runtime::new(make_config(HashSet::from(["userId".into()])), ()).is_ok());
+        assert_eq!(
+            compiled.schema_id,
+            SchemaArtifact::compile(&database, &queries)
+                .unwrap()
+                .schema_id
+        );
     }
 
     #[test]
@@ -691,17 +798,19 @@ insert CreateNote($body: String) {
                 }
             }
             connection.execute_batch("INSERT INTO notes(id, ownerId, body, updatedAt) VALUES (1, 1, 'alice-only', 10), (2, 2, 'bob-only', 20);").await.unwrap();
-            let schema = Arc::new(SchemaArtifact {
-                schema_id: "owner-permission-schema".into(),
-                manifest: Arc::new(manifest),
-                context: Arc::new(context),
-            });
+            let schema = SchemaArtifact::compile(
+                &ast::Database {
+                    schemas: vec![schema],
+                },
+                &queries,
+            )
+            .unwrap();
+            assert!(schema.required_client_fields.is_empty());
             let database = AuthorizedDatabase::new("a".into(), connection, schema.clone());
             let runtime = Runtime::new(
                 Config {
                     schema,
                     client_fields: HashSet::from(["userId".into()]),
-                    required_client_fields: HashSet::from(["userId".into()]),
                     exposed_operations: HashSet::from([read_id.clone(), write_id.clone()]),
                     max_age: Duration::from_secs(60),
                 },
@@ -1073,6 +1182,7 @@ insert CreateNote($body: String) {
                                 schema_id: schema.schema_id.clone(),
                                 manifest: schema.manifest.clone(),
                                 context: schema.context.clone(),
+                                required_client_fields: schema.required_client_fields.clone(),
                             });
                         }
                         std::future::ready(Ok(result))
