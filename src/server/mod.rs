@@ -1,3 +1,5 @@
+#[cfg(feature = "json")]
+pub mod context;
 #[cfg(feature = "database")]
 pub mod database_id;
 pub mod manifest;

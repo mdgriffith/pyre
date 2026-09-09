@@ -4,6 +4,10 @@
   "description": "Shared TypeScript contracts for Pyre packages",
   "license": "MIT",
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit --strict --target ES2020 --module ESNext --moduleResolution bundler index.ts",
+    "test": "bun test"
+  },
   "main": "./index.ts",
   "module": "./index.ts",
   "types": "./index.ts",
@@ -15,6 +19,7 @@
   },
   "files": [
     "index.ts",
+    "database-context.ts",
     "README.md",
     "package.json"
   ],

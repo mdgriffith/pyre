@@ -51,5 +51,8 @@ jobs:
       - name: Test server package
         run: bun run --cwd packages/server test
 
+      - name: Test shared context protocol
+        run: bun run --cwd packages/core test
+
       - name: Run tests
         run: cargo test --locked

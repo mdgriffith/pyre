@@ -1,5 +1,10 @@
 # Multi-Database Client Routing
 
+The [authorized database context lifecycle](database-context-lifecycle.md)
+specifies the next layer of server-resolved per-database sessions, cache
+compatibility, and readiness. Its protocol foundation does not yet change the
+runtime behavior described here.
+
 ## Goal
 
 Support apps where one app-facing Pyre client may query, mutate, and sync against different source databases over the same server endpoints.
