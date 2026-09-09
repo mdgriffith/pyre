@@ -30,27 +30,29 @@ npm run typecheck
 
 ## Usage
 
+Start with the [sync guide](../../docs/usage/sync.md) for authentication, app-owned database selection, and local query boundaries. See [Elm integration](../../docs/usage/elm-sync.md) for generated UI wiring and [multi-database integration](../../docs/usage/multi-database-upgrade.md) when adding source databases.
+
+Use one `PyreClient` per schema family in your browser app. A `databaseId` selects a source database within that family, not a different schema.
+
 ### Initialization
 
 ```typescript
 import { PyreClient } from '@pyre/client';
 import { schemaMetadata } from './generated/typescript/core/schema';
 
-const bootstrap = await fetch('/bootstrap').then((response) => response.json());
+const bootstrap = await fetch('/bootstrap', { credentials: 'include' })
+  .then((response) => response.json());
 
 const client = await PyreClient.create({
   schema: schemaMetadata,
   server: {
-    baseUrl: 'http://localhost:3000',
+    baseUrl: window.location.origin,
     endpoints: {
       catchup: '/sync',
       events: '/sync/events',
       query: '/db',
     },
-    headers: {
-      Authorization: 'Bearer token',
-    },
-    credentials: 'same-origin',
+    credentials: 'include',
   },
   indexedDbName: 'pyre-client',
   cacheNamespace: bootstrap.userId,
@@ -59,54 +61,8 @@ const client = await PyreClient.create({
 
 await client.setSyncedDatabases([bootstrap.mainDatabaseId]);
 
-// Or:
-const readyClient = await PyreClient.create({
-  schema: schemaMetadata,
-  cacheNamespace: bootstrap.userId,
-  debug: true,
-  server: {
-    baseUrl: 'http://localhost:3000',
-    endpoints: {
-      catchup: '/sync',
-      events: '/sync/events',
-      query: '/db',
-    },
-  },
-});
-
 // Set `debug: true` to enable verbose runtime logging. By default,
 // `@pyre/client` does not emit its internal `console.log` diagnostics.
-
-// Or resolve async setup during create. Auth is supplied through normal HTTP
-// configuration; Pyre does not treat live-sync ids as credentials.
-const factoryClient = await PyreClient.create({
-  schema: schemaMetadata,
-  connect: async () => {
-    const response = await fetch('http://localhost:3000/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ userId: 1 }),
-    });
-
-    const { userId } = await response.json();
-
-    return {
-      server: {
-        baseUrl: 'http://localhost:3000',
-        credentials: 'include',
-        endpoints: {
-          catchup: '/sync',
-          events: '/sync/events',
-          query: '/db',
-        },
-      },
-      cacheNamespace: userId,
-    };
-  },
-});
-
-await factoryClient.setSyncedDatabases([bootstrap.mainDatabaseId]);
 
 const unsubscribeSync = client.onSyncState((syncState) => {
   console.log(syncState.status); // "not_started" | "catching_up" | "live"
@@ -137,7 +93,7 @@ const client = await PyreClient.create({
 });
 ```
 
-Bearer tokens, API keys, and CSRF headers can use static headers:
+For HTTP catchup and mutation requests, bearer tokens, API keys, and CSRF headers can use static headers. These headers are not sent by native browser SSE; use cookie authentication for that live transport.
 
 ```typescript
 const client = await PyreClient.create({
@@ -173,13 +129,13 @@ const client = await PyreClient.create({
 
 `credentials` accepts the standard fetch values: `'omit'`, `'same-origin'`, or `'include'`. The older `withCredentials: true` option is equivalent to `credentials: 'include'`.
 
-Custom headers are applied to HTTP catchup and mutation requests. Native browser `EventSource` does not support custom headers, so SSE live sync can only use cookie credentials via `credentials: 'include'`.
+Custom headers are applied to HTTP catchup and mutation requests. Native browser `EventSource` does not support custom headers. Same-origin cookies are sent normally; use `credentials: 'include'` for cross-origin cookie-authenticated SSE, with the corresponding server CORS and cookie configuration.
 
 ### Registering Queries
 
 ```typescript
-const subscription = client.run(
-  'main',
+const subscription = await client.run(
+  bootstrap.mainDatabaseId,
   ListUsersAndPosts,
   {},
   (result) => {
@@ -238,9 +194,7 @@ If filter inputs change, unsubscribe and create a new subscription.
 
 Generated query shapes use `{"$var":"fieldName"}` placeholders in `@where` for ordinary query inputs. `PyreClient` resolves these inputs before sending the query to the internal Elm query engine.
 
-There is no browser `Session`: client configuration and `connect` results do not supply a session, and there is no `setSession` API or local `$session` substitution. An explicit query filter that depends on `Session` must be rejected locally with a clear error directing the app to use ordinary query inputs or explicitly execute the query on the authenticated server. There is no automatic server fallback.
-
-Ordinary inputs only filter already-authorized local data; they are not permission grants. Queries whose only `Session` usage is in server-side schema permissions remain normal local queries over that data. Server sessions, permission enforcement, and authentication cookies are unchanged. Removing browser sessions does not clean up cached rows after permissions contract; permission-contraction cache cleanup remains a separate concern.
+Local query inputs filter already-authorized data; they do not grant permissions. Keep `Session` on the server. See the [sync guide](../../docs/usage/sync.md) for the local query boundary and the [query reference](../../docs/usage/query.md) for explicit server execution.
 
 ### Updating Query Input
 
@@ -253,31 +207,21 @@ subscription?.update({});
 If your app already has Elm ports for Pyre messages, you can let `@pyre/client` own the bridge wiring:
 
 ```typescript
+const bootstrap = await fetch('/bootstrap', { credentials: 'include' })
+  .then((response) => response.json());
+
 const client = await PyreClient.create({
   schema: schemaMetadata,
-  connect: async () => {
-    const response = await fetch('http://localhost:3000/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ userId: 1 }),
-    });
-
-    const { mainDatabaseId, userId } = await response.json();
-
-    return {
-      server: {
-        baseUrl: 'http://localhost:3000',
-        credentials: 'include',
-        liveSyncTransport: 'sse',
-        endpoints: {
-          catchup: '/sync',
-          events: '/sync/events',
-          query: '/db',
-        },
-      },
-      cacheNamespace: userId,
-    };
+  cacheNamespace: bootstrap.userId,
+  server: {
+    baseUrl: window.location.origin,
+    credentials: 'include',
+    liveSyncTransport: 'sse',
+    endpoints: {
+      catchup: '/sync',
+      events: '/sync/events',
+      query: '/db',
+    },
   },
   elm: {
     app,
@@ -287,7 +231,7 @@ const client = await PyreClient.create({
   },
 });
 
-await client.setSyncedDatabases([mainDatabaseId]);
+await client.setSyncedDatabases([bootstrap.mainDatabaseId]);
 ```
 
 `PyreClient.create(...)` automatically attaches the bridge when `elm` is provided.
@@ -323,7 +267,7 @@ Provide `elm.onMutation` only when you need to override that default mutation be
 ### Sending Mutations
 
 ```typescript
-client.run('main', CreatePost, { title: 'Hello' }, (result) => {
+await client.run(bootstrap.mainDatabaseId, CreatePost, { title: 'Hello' }, (result) => {
   console.log('Mutation result:', result);
 });
 ```
@@ -331,18 +275,23 @@ client.run('main', CreatePost, { title: 'Hello' }, (result) => {
 For generated Elm mutation modules, send the generated request payload through your outbound port:
 
 ```elm
+import Db.Database
+
+
 port pyreStoreOut : Encode.Value -> Cmd msg
 
 
-sendCreatePost : Cmd msg
-sendCreatePost =
+sendCreatePost : Db.Database.DatabaseId Db.Database.Main -> Cmd msg
+sendCreatePost databaseId =
     pyreStoreOut
-        (Query.CreatePost.mutationRequest "main" "create-post-1"
+        (Query.CreatePost.mutationRequest databaseId "create-post-1"
             { title = "Hello" }
         )
 ```
 
 `PyreClient` will POST that mutation to the configured query endpoint and publish the result to `pyre_receiveMutationResult`.
+
+This example assumes `CreatePost` belongs to the `Main` schema namespace. Construct its typed database ID from your app's bootstrap string with `Db.Database.fromString`; use the generated namespace for your own schema.
 
 ## Ports
 
@@ -385,7 +334,7 @@ Generated Elm mutation modules expose:
 
 - `id`
 - `name`
-- `mutationRequest : String -> String -> Input -> Encode.Value`
+- `mutationRequest : DatabaseId Main -> RequestId -> Input -> Encode.Value` (for a mutation in `Main`)
 - `decodeMutationResult : Decode.Decoder MutationResult`
 
 That lets Elm send a fully-specified mutation request with a server-defined `databaseId` and caller-owned `requestId`, while `PyreClient` handles the HTTP request and live sync remains the read path.

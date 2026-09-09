@@ -1,6 +1,14 @@
 # Multi-Database Upgrade Guide
 
-Use this guide when an app needs one Pyre client/server integration to talk to more than one source database.
+Use this guide when upgrading a Pyre client/server integration for multiple source databases. The client session API migration below also applies to single-database apps. For a new integration, start with [Sync Setup](./sync.md).
+
+## Client Session API Migration
+
+Remove `session` from client configuration and `connect` results (`connect.session`), and remove `setSession` calls. The browser no longer performs local `$session` substitution. Keep effective Pyre sessions on the server, constructed from ordinary authenticated requests; server sessions, schema permissions, and auth cookies still apply.
+
+Replace explicit local `Session` filters with ordinary query inputs, or explicitly execute those queries on the authenticated server. See [Local Queries And Session](./query.md#local-queries-and-session) for examples and the rejection behavior. Permission-only schema usage remains compatible with local queries.
+
+This change is required even when the app uses only one database. Supply its database ID through the application and select it for sync as described in [Sync Setup](./sync.md#select-databases-to-sync).
 
 ## Model
 
@@ -21,7 +29,7 @@ const client = await PyreClient.create({
   schema: schemaMetadata,
   cacheNamespace: bootstrap.cacheNamespace,
   server: {
-    baseUrl: "/",
+    baseUrl: window.location.origin,
     credentials: "include",
     endpoints: {
       catchup: "/sync",
@@ -43,7 +51,7 @@ await client.setSyncedDatabases([
 
 The application supplies the accessible database list through its own bootstrap or other app-owned source; Pyre adds no enumeration or session routes. That list is independent of the active sync set selected with `setSyncedDatabases`. Neither list membership nor sync selection is a permission grant; the server still authorizes each request.
 
-Do not send effective Pyre sessions to the browser. Client configuration and `connect` results have no session field, and there is no `setSession` API or local `$session` substitution. Explicit `Session`-dependent local filters must be rejected clearly: use ordinary query inputs over already-authorized data, or explicitly execute on the authenticated server, with no automatic fallback. Inputs do not grant permissions. Queries whose only `Session` dependency is in server schema permissions remain normal local queries; server sessions, permissions, and auth cookies are unchanged.
+Use `syncDatabase(id)` to add to the active set instead of replacing it. Awaiting either selection method completes scheduling, not catchup or query readiness; see [Sync Setup](./sync.md#select-databases-to-sync).
 
 Route every TypeScript query or mutation with a `databaseId`:
 

@@ -34,6 +34,9 @@ Useful CLI docs commands:
 
 ```bash
 pyre docs
+pyre docs getting-started
+pyre docs sync
+pyre docs elm-sync
 pyre docs schema
 pyre docs query
 pyre docs serve
@@ -44,11 +47,11 @@ Built-in docs are also available under `docs/usage/`.
 
 Recommended reading order:
 
-1. `docs/usage/getting-started.md`
-2. `docs/usage/schema.md`
-3. `docs/usage/query.md`
-4. `docs/usage/migrations.md`
-5. `docs/usage/pyre-serve.md` or `docs/usage/sync.md`
+1. [Getting started](docs/usage/getting-started.md): set up a project and generate your first schema and queries.
+2. [Sync](docs/usage/sync.md): connect your app and server, select databases, and query local data.
+3. [Elm integration](docs/usage/elm-sync.md), if your UI uses Elm.
+
+Keep the [query](docs/usage/query.md) and [schema](docs/usage/schema.md) references handy as you build. For additional workflows, see [migrations](docs/usage/migrations.md), the [built-in server](docs/usage/pyre-serve.md), and [multi-database integration](docs/usage/multi-database-upgrade.md). [Server contexts](docs/usage/server-contexts.md) is an optional server-side session caching API, not a prerequisite for sync.
 
 ## Examples
 

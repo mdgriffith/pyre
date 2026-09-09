@@ -122,13 +122,15 @@ For the exact persisted representation, discriminator layout, and migration impl
 
 ## Sessions
 
-Session definitions describe values supplied by the application runtime, often for authorization-aware queries. Define the single shared session in `pyre/session.pyre`; it is available to every schema namespace.
+Session definitions describe trusted values supplied by the server from its authenticated request context for permissions and server queries. Define the single shared session in `pyre/session.pyre`; it is available to every schema namespace.
 
 ```pyre
 session {
     userId Int
 }
 ```
+
+The browser client does not hold the effective Pyre session. Using `Session` only in schema permissions does not prevent local queries: the server enforces permissions when selecting synced data. For explicit local query filters, see [Local Queries And Session](./query.md#local-queries-and-session); for server and client setup, see [Sync Setup](./sync.md).
 
 ## Permissions
 

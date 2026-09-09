@@ -460,7 +460,7 @@ fn docs_are_exposed_as_resources() {
 }
 
 #[test]
-fn context_and_session_free_guides_are_discoverable_and_retrievable() {
+fn sync_and_optional_guides_are_discoverable_and_retrievable() {
     let ctx = TestContext::new();
     let tools = call_mcp(
         &ctx,
@@ -486,6 +486,7 @@ fn context_and_session_free_guides_are_discoverable_and_retrievable() {
             "server-contexts",
             "Server Contexts Guide",
             vec![
+                "optional server-only adapter",
                 "@pyre/server/context",
                 "getSessionKey",
                 "resolveSession",
@@ -505,20 +506,27 @@ fn context_and_session_free_guides_are_discoverable_and_retrievable() {
             ],
         ),
         (
-            "session-free-client",
-            "Session-Free Client Guide",
+            "sync",
+            "Pyre Sync Setup",
             vec![
-                "no `Session` configuration",
-                "no local `$session` substitution",
-                "accessible database ID list",
+                "# Sync Setup",
+                "Session.userId",
+                "client.setSyncedDatabases",
                 "client.syncDatabase(selectedId)",
-                "client.setSyncedDatabases(selectedIds)",
-                "\"$error\": \"Local queries cannot reference Session; use explicit inputs or execute on the server.\"",
-                "no automatic server fallback",
-                "inputs are not permission grants",
-                "Permission-only schema usage remains valid",
-                "permission-contraction cache cleanup",
+                "The accessible-list check is UI behavior, not authorization",
+                "query.md#local-queries-and-session",
+                "one client per schema family",
             ],
+        ),
+        (
+            "elm-sync",
+            "Elm + Sync Runtime Setup",
+            vec!["Db.Database.fromString", "elm:", "setSyncedDatabases"],
+        ),
+        (
+            "multi-database-upgrade",
+            "Multi-Database Upgrade Guide",
+            vec!["databaseId", "schema family", "setSyncedDatabases"],
         ),
     ] {
         let uri = format!("pyre://guides/{topic}");
@@ -544,7 +552,6 @@ fn context_and_session_free_guides_are_discoverable_and_retrievable() {
         assert_eq!(tool["topic"], topic);
         assert_eq!(read["result"]["contents"][0]["text"], tool["content"]);
         let content = tool["content"].as_str().unwrap();
-        assert!(content.contains(title));
         for text in expected {
             assert!(content.contains(text), "{topic} missing: {text}");
         }
@@ -555,6 +562,10 @@ fn context_and_session_free_guides_are_discoverable_and_retrievable() {
         .as_str()
         .unwrap()
         .contains("rejected for local browser execution"));
+    assert!(query["content"]
+        .as_str()
+        .unwrap()
+        .contains("no automatic server fallback"));
     let schema = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "schema" }));
     assert!(schema["content"]
         .as_str()

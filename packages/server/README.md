@@ -10,9 +10,9 @@ Typical usage:
 - seed fixture data with the generated `seed` helper from `pyre/generated/typescript/seed`
 - use sync helpers from `@pyre/server/sync` and `@pyre/server/query-sync`
 
-## Database Sessions
+## Optional Session Caching
 
-`createContextManager` from `@pyre/server/context` caches a server-only session
+The optional `createContextManager` from `@pyre/server/context` caches a server-only session
 for each authenticated login-session/database pair. Supply `getSessionKey`,
 `resolveSession`, `getDatabase`, and `maxAgeMs`; then use
 `await manager.get(session, databaseId)` and `context.run(operation, input)`.
@@ -21,8 +21,10 @@ session, so it can call the existing executor without changing a global session.
 
 The application keeps connection management and authentication. No session values
 are sent to clients, and no routes or operation policies are added. See the
-[context manager guide](../../docs/spec/database-context-lifecycle.md) for an
+[server contexts guide](../../docs/usage/server-contexts.md) for an
 annotated example and invalidation requirements.
+
+For the normal client/server integration, start with the [sync guide](../../docs/usage/sync.md). The context manager is not required for sync.
 
 ## Database Provisioning
 

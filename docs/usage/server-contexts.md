@@ -1,9 +1,10 @@
 # Server Contexts Guide
 
-Use this thin server-only adapter when a custom TypeScript or Rust server needs
-an effective Pyre session per authenticated login and database. It caches session
-resolution, not connections. It is not a login system or a client lifecycle.
-Read `session-free-client` (`pyre://guides/session-free-client`) for the browser boundary.
+This optional server-only adapter caches effective Pyre session resolution per
+authenticated login and database, not connections. Use it when a custom TypeScript
+or Rust server benefits from that cache. It is not required for server authentication
+or sync, and is not a login system or a client lifecycle. Start with
+[Sync Setup](./sync.md) for ordinary server authentication and browser sync.
 
 ## TypeScript Custom Server
 
