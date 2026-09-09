@@ -1,4 +1,4 @@
-//! Internal lifecycle slice. No routes, live delivery, or delta publication.
+//! Internal lifecycle slice. No routes or delta publication.
 //! Schema coherence and projection dependencies come from one compilation.
 //! Operation exposure remains application configuration. Invalidation is a
 //! local barrier only; authoritative-read staleness adds to the maximum lease.
@@ -12,7 +12,7 @@ use crate::server::{
 use crate::typecheck;
 use serde_json::{Map, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -132,8 +132,17 @@ pub(crate) enum Error {
     MutationOutcomeUnknown,
     Query(query::Error),
     Sync(sync::Error),
+    Capacity,
 }
 
+const MAX_CONTEXTS: usize = 1024;
+const MAX_PENDING: usize = 64;
+const MAX_CONNECTIONS: usize = 1024;
+const MAX_QUEUE_MESSAGES: usize = 32;
+const MAX_QUEUE_BYTES: usize = 1024 * 1024;
+const EXPIRY_POLL: Duration = Duration::from_millis(25);
+
+#[derive(Clone)]
 struct Lease {
     wall: SystemTime,
     monotonic: Instant,
@@ -174,6 +183,112 @@ struct Registry {
     // be reused (unlike a wrapping counter). Unrelated pending work is fenced too.
     generation: Arc<()>,
     entries: HashMap<String, Arc<Entry>>,
+    connections: HashMap<String, LiveEntry>,
+    pending: usize,
+    closed: bool,
+}
+
+struct LiveEntry {
+    token: Arc<()>,
+    entry: Arc<Entry>,
+    lease: Lease,
+    queue: VecDeque<Box<[u8]>>,
+    bytes: usize,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Registry {
+    fn prune(&mut self) {
+        self.entries.retain(|_, entry| entry.lease.valid());
+        self.connections.retain(|_, live| {
+            let keep = live.lease.valid()
+                && self
+                    .entries
+                    .get(&live.entry.id)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &live.entry));
+            if !keep {
+                live.notify.notify_one();
+            }
+            keep
+        });
+    }
+
+    fn shutdown(&mut self) {
+        self.closed = true;
+        self.generation = Arc::new(());
+        self.entries.clear();
+        self.prune();
+    }
+}
+
+// The reservation follows the future, including cancellation and resolver errors.
+struct PendingResolution(Arc<Mutex<Registry>>);
+
+impl Drop for PendingResolution {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending -= 1;
+    }
+}
+
+/// Owns one subscription. No raw receiver or transferable authority is exposed.
+pub(crate) struct LiveConnection {
+    registry: Arc<Mutex<Registry>>,
+    id: String,
+    token: Arc<()>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl LiveConnection {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The synchronous callback is the local transport handoff barrier. It must
+    /// not block or reenter this runtime. Borrowed bytes cannot escape; copies or
+    /// bytes handed to transport are outside revocation control after this call.
+    /// Returns false on terminal closure, including overflow and lease expiry.
+    pub(crate) async fn deliver(&mut self, handoff: impl FnOnce(&str, &str, &[u8])) -> bool {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let Ok(mut registry) = self.registry.lock() else {
+                    return false;
+                };
+                registry.prune();
+                let Some(live) = registry.connections.get_mut(&self.id) else {
+                    return false;
+                };
+                if !Arc::ptr_eq(&live.token, &self.token) {
+                    return false;
+                }
+                if let Some(payload) = live.queue.pop_front() {
+                    live.bytes -= payload.len();
+                    handoff(&live.entry.database.database_id, &live.entry.id, &payload);
+                    return true;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if registry
+            .connections
+            .get(&self.id)
+            .is_some_and(|live| Arc::ptr_eq(&live.token, &self.token))
+        {
+            registry.connections.remove(&self.id);
+        }
+    }
 }
 
 pub(crate) struct Runtime<R> {
@@ -213,14 +328,41 @@ impl<R> Runtime<R> {
         {
             return Err(Error::InvalidConfiguration);
         }
+        let registry = Arc::new(Mutex::new(Registry {
+            generation: Arc::new(()),
+            entries: HashMap::new(),
+            connections: HashMap::new(),
+            pending: 0,
+            closed: false,
+        }));
+        let weak = Arc::downgrade(&registry);
+        // One bounded-cost poller per runtime, independent of transport polling
+        // and Tokio time features. It never keeps a dropped runtime alive.
+        std::thread::Builder::new()
+            .name("pyre-context-expiry".into())
+            .spawn(move || loop {
+                std::thread::sleep(EXPIRY_POLL);
+                let Some(registry) = weak.upgrade() else {
+                    break;
+                };
+                let mut registry = match registry.lock() {
+                    Ok(registry) => registry,
+                    Err(error) => {
+                        error.into_inner().shutdown();
+                        break;
+                    }
+                };
+                if registry.closed {
+                    break;
+                }
+                registry.prune();
+            })
+            .map_err(|_| Error::Unavailable)?;
         Ok(Self {
             operations: Arc::new(config.exposed_operations.clone()),
             config,
             resolver,
-            registry: Arc::new(Mutex::new(Registry {
-                generation: Arc::new(()),
-                entries: HashMap::new(),
-            })),
+            registry,
         })
     }
 
@@ -241,12 +383,21 @@ impl<R> Runtime<R> {
             serde_json::to_value(request).map_err(|_| Error::InvalidResolution)?,
         )
         .map_err(|_| Error::InvalidResolution)?;
-        let generation = self
-            .registry
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .generation
-            .clone();
+        let (generation, _pending) = {
+            let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+            registry.prune();
+            if registry.closed {
+                return Err(Error::Unavailable);
+            }
+            if registry.pending >= MAX_PENDING || registry.entries.len() >= MAX_CONTEXTS {
+                return Err(Error::Capacity);
+            }
+            registry.pending += 1;
+            (
+                registry.generation.clone(),
+                PendingResolution(self.registry.clone()),
+            )
+        };
         let resolution = (self.resolver)(auth.clone(), request.database_id.clone()).await?;
         if resolution.database.database_id != request.database_id {
             return Err(Error::Denied);
@@ -347,7 +498,10 @@ impl<R> Runtime<R> {
         if registry.entries.contains_key(&id) {
             return Err(Error::Unavailable);
         }
-        registry.entries.retain(|_, entry| entry.lease.valid());
+        registry.prune();
+        if registry.entries.len() >= MAX_CONTEXTS {
+            return Err(Error::Capacity);
+        }
         registry.entries.insert(
             id.clone(),
             Arc::new(Entry {
@@ -402,7 +556,105 @@ impl<R> Runtime<R> {
             }
             Invalidation::Database(database) => entry.database.database_id == database,
         });
+        registry.prune();
         Ok(())
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<(), Error> {
+        self.registry
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .shutdown();
+        Ok(())
+    }
+
+    pub(crate) fn dispose_context(&self, scope: &AuthorizedScope) -> Result<(), Error> {
+        let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+        self.check_scope(&registry, scope)?;
+        registry.generation = Arc::new(());
+        registry.entries.remove(&scope.entry.id);
+        registry.prune();
+        Ok(())
+    }
+
+    fn check_scope(&self, registry: &Registry, scope: &AuthorizedScope) -> Result<(), Error> {
+        if !Arc::ptr_eq(&self.registry, &scope.registry) {
+            return Err(Error::ContextMismatch);
+        }
+        scope.check_locked(registry)
+    }
+
+    pub(crate) fn open(&self, scope: &AuthorizedScope) -> Result<LiveConnection, Error> {
+        let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+        registry.prune();
+        self.check_scope(&registry, scope)?;
+        if registry.connections.len() >= MAX_CONNECTIONS {
+            return Err(Error::Capacity);
+        }
+        let mut random = [0u8; 32];
+        getrandom::getrandom(&mut random).map_err(|_| Error::Unavailable)?;
+        let id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        if registry.connections.contains_key(&id) {
+            return Err(Error::Unavailable);
+        }
+        let token = Arc::new(());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        registry.connections.insert(
+            id.clone(),
+            LiveEntry {
+                token: token.clone(),
+                entry: scope.entry.clone(),
+                lease: scope.request_lease.clone(),
+                queue: VecDeque::new(),
+                bytes: 0,
+                notify: notify.clone(),
+            },
+        );
+        Ok(LiveConnection {
+            registry: self.registry.clone(),
+            id,
+            token,
+            notify,
+        })
+    }
+
+    /// Internal queue primitive, NOT a publisher. A future publication path must
+    /// produce permission-filtered bytes for this exact recipient scope first.
+    fn enqueue(
+        &self,
+        scope: &AuthorizedScope,
+        connection: &str,
+        payload: Vec<u8>,
+    ) -> Result<(), Error> {
+        let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+        registry.prune();
+        self.check_scope(&registry, scope)?;
+        let live = registry
+            .connections
+            .get_mut(connection)
+            .ok_or(Error::ContextMismatch)?;
+        if !Arc::ptr_eq(&live.entry, &scope.entry) {
+            return Err(Error::ContextMismatch);
+        }
+        if live.queue.len() >= MAX_QUEUE_MESSAGES || payload.len() > MAX_QUEUE_BYTES - live.bytes {
+            live.notify.notify_one();
+            registry.connections.remove(connection);
+            return Err(Error::Capacity);
+        }
+        live.bytes += payload.len();
+        live.queue.push_back(payload.into_boxed_slice());
+        live.notify.notify_one();
+        Ok(())
+    }
+}
+
+impl<R> Drop for Runtime<R> {
+    fn drop(&mut self) {
+        // Poison is already fail-closed for operations; still release queues.
+        self.registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .shutdown();
     }
 }
 
@@ -435,7 +687,12 @@ pub(crate) struct BoundResult<T> {
 impl AuthorizedScope {
     fn check(&self) -> Result<(), Error> {
         let registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
-        if !self.request_lease.valid()
+        self.check_locked(&registry)
+    }
+
+    fn check_locked(&self, registry: &Registry) -> Result<(), Error> {
+        if registry.closed
+            || !self.request_lease.valid()
             || !self.entry.lease.valid()
             || !registry
                 .entries
@@ -627,6 +884,305 @@ mod tests {
             Poll::Ready(())
         })
         .await;
+    }
+
+    #[test]
+    fn delivery_handoff_serializes_with_invalidation() {
+        run(async {
+            let schema = schema();
+            let conn = connection().await;
+            let runtime = Runtime::new(
+                config(schema.clone()),
+                |_: AuthenticatedRequest, database| {
+                    std::future::ready(Ok(resolution(schema.clone(), conn.clone(), database)))
+                },
+            )
+            .unwrap();
+            let message = runtime.negotiate(auth(), request("a")).await.unwrap();
+            let scope = runtime.authorize(&auth(), "a", id(&message)).unwrap();
+            let mut stream = runtime.open(&scope).unwrap();
+            runtime.enqueue(&scope, stream.id(), vec![1]).unwrap();
+            runtime.enqueue(&scope, stream.id(), vec![2]).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|threads| {
+                let stream = &mut stream;
+                threads.spawn(move || {
+                    run(async {
+                        assert!(
+                            stream
+                                .deliver(|_, _, bytes| {
+                                    assert_eq!(bytes, [1]);
+                                    entered_tx.send(()).unwrap();
+                                    // Deliberately hold the barrier only in this test.
+                                    release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                                })
+                                .await
+                        );
+                    });
+                });
+                entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                threads.spawn(|| {
+                    attempt_tx.send(()).unwrap();
+                    runtime.invalidate(Invalidation::Database("a")).unwrap();
+                    done_tx.send(()).unwrap();
+                });
+                attempt_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert!(done_rx.try_recv().is_err());
+                assert!(runtime.registry.try_lock().is_err());
+                release_tx.send(()).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            });
+            assert!(
+                !stream
+                    .deliver(|_, _, _| panic!("second queued payload revoked"))
+                    .await
+            );
+            assert!(runtime.enqueue(&scope, stream.id(), vec![3]).is_err());
+        });
+    }
+
+    #[test]
+    fn live_ownership_delivery_and_terminal_fences() {
+        run(async {
+            let schema = schema();
+            let conn = connection().await;
+            let runtime = Runtime::new(
+                config(schema.clone()),
+                |_: AuthenticatedRequest, database| {
+                    std::future::ready(Ok(resolution(schema.clone(), conn.clone(), database)))
+                },
+            )
+            .unwrap();
+            let first = runtime.negotiate(auth(), request("a")).await.unwrap();
+            let second = runtime.negotiate(auth(), request("a")).await.unwrap();
+            let scope = runtime.authorize(&auth(), "a", id(&first)).unwrap();
+            let other = runtime.authorize(&auth(), "a", id(&second)).unwrap();
+            let foreign = Runtime::new(config(schema.clone()), ()).unwrap();
+            assert!(matches!(foreign.open(&scope), Err(Error::ContextMismatch)));
+            let mut stream = runtime.open(&scope).unwrap();
+            assert!(matches!(
+                runtime.enqueue(&other, stream.id(), vec![1]),
+                Err(Error::ContextMismatch)
+            ));
+            assert!(matches!(
+                foreign.enqueue(&scope, stream.id(), vec![1]),
+                Err(Error::ContextMismatch)
+            ));
+            for (identity, credential, database) in [
+                ("mallory", "login-1", "a"),
+                ("alice", "forged", "a"),
+                ("alice", "login-1", "b"),
+            ] {
+                let mut forged = auth();
+                forged.identity = identity.into();
+                forged.credential = credential.into();
+                assert!(runtime.authorize(&forged, database, id(&first)).is_err());
+            }
+            runtime.enqueue(&scope, stream.id(), vec![7]).unwrap();
+            assert!(
+                stream
+                    .deliver(|database, context, bytes| {
+                        assert_eq!(database, "a");
+                        assert_eq!(context, id(&first));
+                        assert_eq!(bytes, [7]);
+                    })
+                    .await
+            );
+            runtime.enqueue(&scope, stream.id(), vec![8]).unwrap();
+            runtime
+                .invalidate(Invalidation::Credential("login-1"))
+                .unwrap();
+            assert!(
+                !stream
+                    .deliver(|_, _, _| panic!("revoked queue delivered"))
+                    .await
+            );
+            assert!(runtime.enqueue(&scope, stream.id(), vec![9]).is_err());
+            assert!(runtime.open(&scope).is_err());
+            assert!(runtime.registry.lock().unwrap().connections.is_empty());
+
+            let fresh = runtime.negotiate(auth(), request("a")).await.unwrap();
+            let fresh_scope = runtime.authorize(&auth(), "a", id(&fresh)).unwrap();
+            assert!(runtime.enqueue(&fresh_scope, stream.id(), vec![]).is_err());
+            let mut fresh_stream = runtime.open(&fresh_scope).unwrap();
+            let mut delivery = Box::pin(fresh_stream.deliver(|_, _, _| panic!("disposed")));
+            pending(delivery.as_mut()).await;
+            runtime.dispose_context(&fresh_scope).unwrap();
+            assert!(!delivery.await);
+            assert!(fresh_scope.check().is_err());
+        });
+    }
+
+    #[test]
+    fn live_idle_expiry_and_drop_wake_consumers() {
+        run(async {
+            let schema = schema();
+            let conn = connection().await;
+            for mode in 0..4 {
+                let mut config = config(schema.clone());
+                if mode == 3 {
+                    config.max_age = Duration::from_millis(500);
+                }
+                let runtime = Runtime::new(config, |_: AuthenticatedRequest, database| {
+                    std::future::ready(Ok(resolution(schema.clone(), conn.clone(), database)))
+                })
+                .unwrap();
+                let message = runtime.negotiate(auth(), request("a")).await.unwrap();
+                let mut scope = runtime.authorize(&auth(), "a", id(&message)).unwrap();
+                if mode == 0 {
+                    scope.request_lease.monotonic = Instant::now() + Duration::from_millis(500);
+                }
+                let mut stream = runtime.open(&scope).unwrap();
+                let mut unpolled = runtime.open(&scope).unwrap();
+                runtime.enqueue(&scope, unpolled.id(), vec![1]).unwrap();
+                let registry = runtime.registry.clone();
+                // Spawn a real waiting consumer: completion depends on a wake,
+                // not on the test manually polling after invalidation/expiry.
+                let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+                let consumer = tokio::spawn(async move {
+                    let mut delivery =
+                        Box::pin(stream.deliver(|_, _, _| panic!("idle stream has no data")));
+                    pending(delivery.as_mut()).await;
+                    waiting_tx.send(()).unwrap();
+                    delivery.await
+                });
+                waiting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                if mode == 1 {
+                    runtime.invalidate(Invalidation::Database("a")).unwrap();
+                }
+                if mode == 2 {
+                    drop(runtime);
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                tokio::spawn(async move {
+                    tx.send(consumer.await.unwrap()).unwrap();
+                });
+                assert!(!rx.recv_timeout(Duration::from_secs(3)).unwrap());
+                assert!(registry.lock().unwrap().connections.is_empty());
+                assert!(
+                    !unpolled
+                        .deliver(|_, _, _| panic!("unpolled queue survived"))
+                        .await
+                );
+                if mode == 3 {
+                    assert!(registry.lock().unwrap().entries.is_empty());
+                }
+                assert!(scope.check().is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn live_bounds_overflow_and_disposal_release_slots() {
+        run(async {
+            let schema = schema();
+            let conn = connection().await;
+            let runtime = Runtime::new(
+                config(schema.clone()),
+                |_: AuthenticatedRequest, database| {
+                    std::future::ready(Ok(resolution(schema.clone(), conn.clone(), database)))
+                },
+            )
+            .unwrap();
+            let message = runtime.negotiate(auth(), request("a")).await.unwrap();
+            let scope = runtime.authorize(&auth(), "a", id(&message)).unwrap();
+            let mut streams: Vec<_> = (0..MAX_CONNECTIONS)
+                .map(|_| runtime.open(&scope).unwrap())
+                .collect();
+            assert!(matches!(runtime.open(&scope), Err(Error::Capacity)));
+            streams.pop();
+            let mut stream = runtime.open(&scope).unwrap();
+            for _ in 0..MAX_QUEUE_MESSAGES {
+                runtime.enqueue(&scope, stream.id(), vec![]).unwrap();
+            }
+            assert!(matches!(
+                runtime.enqueue(&scope, stream.id(), vec![]),
+                Err(Error::Capacity)
+            ));
+            assert!(!stream.deliver(|_, _, _| panic!("overflow queue")).await);
+            let mut stream = runtime.open(&scope).unwrap();
+            runtime
+                .enqueue(&scope, stream.id(), vec![0; MAX_QUEUE_BYTES])
+                .unwrap();
+            assert!(matches!(
+                runtime.enqueue(&scope, stream.id(), vec![0]),
+                Err(Error::Capacity)
+            ));
+            assert!(
+                !stream
+                    .deliver(|_, _, _| panic!("byte overflow queue"))
+                    .await
+            );
+            drop(streams);
+            assert!(runtime.registry.lock().unwrap().connections.is_empty());
+            for _ in 1..MAX_CONTEXTS {
+                runtime.negotiate(auth(), request("a")).await.unwrap();
+            }
+            assert!(matches!(
+                runtime.negotiate(auth(), request("a")).await,
+                Err(Error::Capacity)
+            ));
+            runtime.dispose_context(&scope).unwrap();
+            runtime.negotiate(auth(), request("a")).await.unwrap();
+            assert!(runtime.open(&scope).is_err());
+        });
+    }
+
+    #[test]
+    fn pending_bounds_cancellation_and_shutdown() {
+        run(async {
+            let schema = schema();
+            let conn = connection().await;
+            let release = AtomicBool::new(false);
+            let runtime = Runtime::new(
+                config(schema.clone()),
+                |_: AuthenticatedRequest, database| {
+                    let result = resolution(schema.clone(), conn.clone(), database);
+                    let release = &release;
+                    async move {
+                        std::future::poll_fn(|_| {
+                            if release.load(Ordering::SeqCst) {
+                                Poll::Ready(())
+                            } else {
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                        Ok(result)
+                    }
+                },
+            )
+            .unwrap();
+            let mut work = Vec::new();
+            for _ in 0..MAX_PENDING {
+                let mut future = Box::pin(runtime.negotiate(auth(), request("a")));
+                pending(future.as_mut()).await;
+                work.push(future);
+            }
+            assert!(matches!(
+                runtime.negotiate(auth(), request("a")).await,
+                Err(Error::Capacity)
+            ));
+            work.pop();
+            assert_eq!(runtime.registry.lock().unwrap().pending, MAX_PENDING - 1);
+            let mut future = Box::pin(runtime.negotiate(auth(), request("a")));
+            pending(future.as_mut()).await;
+            runtime.shutdown().unwrap();
+            release.store(true, Ordering::SeqCst);
+            assert!(matches!(future.await, Err(Error::ContextMismatch)));
+            for future in work {
+                assert!(matches!(future.await, Err(Error::ContextMismatch)));
+            }
+            assert_eq!(runtime.registry.lock().unwrap().pending, 0);
+            assert!(runtime.registry.lock().unwrap().entries.is_empty());
+            assert!(matches!(
+                runtime.negotiate(auth(), request("a")).await,
+                Err(Error::Unavailable)
+            ));
+        });
     }
 
     #[test]
@@ -1013,7 +1569,7 @@ insert CreateNote($body: String) {
                 runtime.negotiate(auth.clone(), request("unknown")).await,
                 Err(Error::Denied)
             ));
-            let restarted = Runtime::new(config(schema), ()).unwrap();
+            let restarted = Runtime::new(config(schema.clone()), ()).unwrap();
             assert!(matches!(
                 restarted.authorize(&auth, "a", id(&first)),
                 Err(Error::ContextMismatch)

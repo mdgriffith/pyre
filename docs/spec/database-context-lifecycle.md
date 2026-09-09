@@ -2,7 +2,7 @@
 
 ## Status
 
-MEC-128, contract slice MEC-132 and initial internal server slice MEC-129. This
+MEC-128, contract slice MEC-132 and internal server lifecycle slice MEC-129. This
 document specifies the target lifecycle. Version 1 negotiation/control wire types,
 decoders, and shared fixtures are public; an internal Rust resolver/registry now
 exercises the server authority boundary. Existing sync routes are **not**
@@ -56,14 +56,57 @@ integration is complete. It currently provides:
   waiting for the connection lock) and after completion. Results retain their
   original database/context binding. Invalidated dispatched mutations produce an
   outcome-unknown error, not a retry-safe context rejection.
+- Owned live connections with random 256-bit IDs, bound to the exact registered
+  context allocation and runtime. Opening requires an authenticated scope;
+  enqueue requires that same context, identity, credential, and database, not just
+  knowledge of a connection ID. No caller-supplied session or automatic database
+  fanout is accepted. Dropping the connection releases its registry slot and queue.
+- Private bounded queues with eligibility checks at enqueue and delivery. The
+  synchronous `deliver` callback runs under the same registry mutex as invalidation:
+  either handoff completes before invalidation acquires the lock, or invalidation
+  removes eligibility and the callback is not invoked. The callback receives the
+  original database/context binding and borrowed bytes, not an unchecked receiver.
+  It must be short, nonblocking, and must not reenter the runtime. It must hand off
+  to transport synchronously; copying into an adapter queue is already a handoff,
+  not a promise that later network delivery is still authorized. Bytes already
+  handed off cannot be recalled. Callback panic poisons the registry when unwinding,
+  failing subsequent operations closed; abort-on-panic builds terminate instead.
+  HTTP query/catchup results do not yet use this gate.
+- Invalidation and authenticated context disposal discard affected queues and wake
+  waiting consumers with terminal closure (`deliver` returns false). Disposal also
+  fences all pending resolutions. Closure, not a reason-bearing wire control frame,
+  is the current primitive. Fresh negotiation is required; stale handles cannot
+  reopen or enqueue into a replacement context.
+- One weak-reference OS-thread poller per runtime sweeps expired contexts and live
+  connections every 25 ms, including streams not being polled by transport. Both
+  clocks remain enforced at enqueue/delivery; poll scheduling and mutex contention
+  can delay cleanup/wakeup, not authorize a delivery after its eligibility check
+  fails. Stream leases also honor a shorter authenticating request deadline.
+  Shutdown/drop clears contexts/queues, wakes consumers, replaces the allocation
+  token, and fences retained scopes and pending work. The poller exits on its next
+  scheduled pass. Already dispatched SQL is not cancelled or rolled back.
+  This runtime is native-only: the WASM crate check excludes the database-gated
+  lifecycle module and does not establish WASM lifecycle support.
+- Fixed private per-runtime limits: 1,024 installed contexts, 64 pending resolutions,
+  and 1,024 live connections. Each connection holds at most 32 messages and 1 MiB
+  of payload bytes (boxed slices, without spare vector capacity). Queue overflow
+  closes that connection and discards its entire queue rather than silently losing
+  a delta. Admission returns `Capacity`; installation rechecks context capacity
+  after resolution. Pending reservations release on completion, error, or future
+  cancellation. Invalidated but unresolved futures still occupy slots until they
+  complete or are cancelled, bounding rather than replacing outstanding work.
 
-This checkpoint does not implement live connection ownership, queued/delivery-time
-checks, stream expiry, publication, refresh/disposal, routes, or public runtime
-configuration. Ordinary mutations execute without the eventual live publication
-path; the internal scopes must not be exposed as a completed sync service. Returning
-a checked result is not an atomic delivery barrier. Expired entries are pruned on
-negotiation; idle-registry cleanup and resource limits also remain integration work.
-No cluster-wide invalidation or deployment freshness guarantee is claimed.
+This checkpoint does not implement publication, refresh orchestration, routes, or
+public runtime configuration. The private enqueue primitive accepts already prepared
+recipient bytes only; it is not a permission-filtering publisher. Ordinary mutations
+still execute without live publication. Integrating authorized delta calculation,
+origin ownership, revision ordering, bounded transport handoff/backpressure, and
+overflow recovery remains required before exposing a completed sync service.
+Registry counts and queued bytes are bounded, not total application memory: resolver
+inputs/results, session sizes, retained request scopes, concurrent SQL waiters, and
+transport buffers need admission/body/time limits at integration. Limits are global,
+not per-identity fairness guarantees. No cluster-wide invalidation or deployment
+freshness guarantee is claimed.
 
 ## Ownership
 
@@ -267,7 +310,8 @@ and lease renewal, rather than indefinitely extending a cached grant. Expiry
 checks must stop already-open streams without waiting for reconnect. Background
 timers are an optimization; dispatch checks are mandatory.
 
-`invalidate().await` acknowledges the local runtime barrier only. Cross-instance
+Invalidation completion acknowledges the local runtime barrier only (the internal
+Rust method is synchronous). Cross-instance
 invalidation requires application-delivered shared events or another documented
 backend; publish local invalidation to all instances holding affected contexts.
 Commit-to-event failures require durable retry or acceptance of the lease bound.
@@ -366,6 +410,8 @@ rejected. Fixture scenario names describe envelopes, not proven runtime behavior
 ```sh
 cargo test --test database_context
 cargo test --locked --lib server::context::runtime
+cargo test --locked --no-default-features --features database,json --lib server::context::runtime
+cargo fmt --check
 bun test packages/core/database-context.test.ts
 tsc --noEmit --strict --target ES2020 --module ESNext --moduleResolution bundler packages/core/index.ts
 ```
@@ -373,14 +419,18 @@ tsc --noEmit --strict --target ES2020 --module ESNext --moduleResolution bundler
 Internal runtime tests now cover separate database roles/tabs, authenticated scope
 ownership, generated query/catchup permission parity, projection rejection,
 invalidation during resolution and connection-lock waits, leases, restart mismatch,
-and post-dispatch outcome classification. Generation tests cover nested local
+and post-dispatch outcome classification. Live primitive tests cover cross-context
+and cross-runtime ownership forgery, enqueue/delivery invalidation fencing, a
+concurrent handoff barrier, pending consumer closure, idle expiry/drop wakeups,
+context/connection/pending/queue bounds, overflow, disposal, cancelled resolutions,
+shutdown, and stale-handle rejection. Generation tests cover nested local
 dependencies, fingerprint stability/change sensitivity, browser/manifest parity,
 inline union directives, and operation-ID collisions. These do not exercise HTTP
-or live streams.
+or network transports; live tests exercise only the private queue/delivery API.
 
-Remaining component/integration gates include forged connection ownership,
+Remaining component/integration gates include transport origin-connection ownership,
 A-B-A/out-of-order completion,
 invalidation during resolution, permission contraction across every reader and
-cache layer, expiry on open streams, distributed freshness bounds, restart with
+cache layer, expiry on open network streams, distributed freshness bounds, restart with
 valid/revoked credentials, and late mutation/persistence outcomes. Passing wire
 fixtures is not evidence these lifecycle guarantees are implemented.
