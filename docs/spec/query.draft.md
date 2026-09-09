@@ -33,12 +33,11 @@ The JSON representation mirrors the `WhereArg` structure in the AST:
 }
 ```
 
-Session variables can be referenced as values using a `$session` object:
+Local conditions use ordinary input values, not browser session substitution:
 
 ```json
 {
-  "assigneeId": { "$eq": { "$session": "userId" } },
-  "role": { "$eq": { "$session": "role" } }
+  "assigneeId": { "$eq": 123 }
 }
 ```
 
@@ -51,7 +50,8 @@ Notes:
 - A plain value (e.g. `"status": "active"`) is treated as `$eq`.
 - `$and`/`$or` take a list of condition objects.
 - `Null` means “no conditions”.
-- Session variables can appear in value positions via `{ "$session": "fieldName" }`.
+- No local `$session` substitution is supported. Explicit `Session`-dependent local filters must be rejected with a clear error directing the app to ordinary query inputs or explicit execution on the authenticated server, without automatic fallback.
+- Ordinary inputs only filter already-authorized data and are not permission grants. Queries whose only `Session` usage is in server schema permissions remain normal local queries; server sessions and permissions are unchanged.
 
 ### `{Table}.OrderBy`
 

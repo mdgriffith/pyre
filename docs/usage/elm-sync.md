@@ -1,6 +1,6 @@
 # Elm + Sync Runtime Setup
 
-This guide covers using Pyre sync in an Elm app where Elm UI talks to a TypeScript bridge over ports.
+Continue here after [Sync Setup](./sync.md) to wire an Elm app to `PyreClient` through TypeScript ports. The server authentication, database selection, and transport model are the same; this guide focuses on generated Elm APIs and the bridge.
 
 ## Mental model
 
@@ -24,31 +24,11 @@ There are three layers:
 
 Elm should not reimplement sync transport details. Keep transport/stateful runtime concerns in the TS bridge.
 
-## Server requirements (non-optional)
-
-At startup:
-
-1. `await Sync.init()`
-2. Initialize DB/migrations
-3. `await Sync.loadSchemaFromDatabase(db)`
-
-Routes:
-
-- **POST `/sync`** with `{ databaseId, syncCursor }` → `Sync.catchup(db, syncCursor, session, pageSize, databaseId)`
-- **GET `/sync/events?databaseId=...`** → stream deltas to clients connected for that database ID
-- **query route** (e.g. `POST /db/:queryId?databaseId=...`) → `Sync.run(db, queries, queryId, args, session, connectedClients, databaseId)`
-
-The server must authenticate normally, authorize the requested `databaseId`, choose the DB connection for that ID, and group live-sync connections by `databaseId`. Deltas must not be broadcast across database IDs.
-
-If the app has separate command-plane and tenant schemas, use separate generated Pyre artifacts and separate client/server runtime wiring for each schema family. `databaseId` selects a source database within one schema family; it is not a replacement for schema selection.
-
-Generated Elm query and mutation constructors are typed by Pyre schema namespace, such as `Main` or `Campaign`, but the app still owns the concrete database ID string format. Keep that format in one app module and construct typed IDs with `Db.Database.fromString`.
-
-If schema/migrations run after startup, reload schema cache before expecting sync to work.
-
 ## Client runtime setup
 
-Create one `PyreClient` instance per browser app instance:
+Create one `PyreClient` per schema family in the browser app, with separate generated artifacts and runtime wiring for independently generated schemas. `databaseId` selects a database within that family, not a schema. See [Sync Setup](./sync.md#4-run-a-pyre-backed-server) for shared server requirements.
+
+With `app` as the initialized Elm application and the user already authenticated, use one application-owned bootstrap to configure the client and attach its built-in bridge:
 
 ```ts
 let mainDatabaseId = "main"
@@ -58,11 +38,8 @@ const client = await PyreClient.create({
   indexedDbName: "my-app-pyre",
   debug: true,
   connect: async () => {
-    const response = await fetch("http://localhost:3000/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    const response = await fetch("http://localhost:3000/bootstrap", {
       credentials: "include",
-      body: JSON.stringify({ userId: 1 }),
     })
 
     const bootstrap = await response.json()
@@ -81,12 +58,13 @@ const client = await PyreClient.create({
         },
       },
       cacheNamespace: userId,
-      session: {
-        userId,
-      },
     }
   },
   onError: (error) => console.error(error),
+  elm: {
+    app,
+    onError: (error) => console.error(error),
+  },
 });
 
 await client.setSyncedDatabases([mainDatabaseId])
@@ -94,11 +72,9 @@ await client.setSyncedDatabases([mainDatabaseId])
 
 Set `debug: true` if you want verbose runtime logging while debugging sync behavior. Leave it off in normal app usage.
 
-If session-backed filters change, refresh the runtime session so active queries are re-evaluated:
+The client does not hold the effective server session. Update ordinary query inputs through the generated Elm query API; see [Local Queries And Session](./query.md#local-queries-and-session) for the local execution boundary.
 
-```ts
-client.setSession({ userId: 2 })
-```
+Bootstrap is application-owned. Accessible IDs and the active sync set are independent; awaiting selection schedules sync rather than waiting for data. See [Select Databases To Sync](./sync.md#select-databases-to-sync) for additive and replacement selection.
 
 Use `client.run(databaseId, queryModule, input, callback)` for TypeScript-native consumers. For generated Elm clients, prefer `PyreClient.create({ connect, elm: { ... } })` so the runtime owns the port bridge.
 
@@ -149,45 +125,9 @@ Query.GameUpdate.mutationRequest
 
 The JSON sent through ports still contains a plain string `databaseId`. The type parameter only prevents accidentally sending a `Main` database ID to a `Campaign` query, or vice versa.
 
-### Auth-neutral server options
+## Sync State And Bridge Ports
 
-`PyreClient` does not prescribe an authentication scheme. The server should authenticate each request using its normal app mechanism, then build the server-side Pyre session from that authenticated request context.
-
-For cookie-authenticated APIs, configure standard credentialed browser requests:
-
-```ts
-let mainDatabaseId = "main"
-
-const client = await PyreClient.create({
-  schema: schemaMetadata,
-  cacheNamespace: userId,
-  server: {
-    baseUrl: "https://api.example.com",
-    credentials: "include",
-  },
-})
-```
-
-For bearer tokens, API keys, or CSRF headers, configure headers:
-
-```ts
-const client = await PyreClient.create({
-  schema: schemaMetadata,
-  cacheNamespace: userId,
-  server: {
-    baseUrl: "https://api.example.com",
-    credentials: "include",
-    headers: async () => ({
-      Authorization: `Bearer ${await getAccessToken()}`,
-      "X-CSRF-Token": getCsrfToken(),
-    }),
-  },
-})
-```
-
-`credentials` accepts the fetch credential modes: `"omit"`, `"same-origin"`, and `"include"`. `withCredentials: true` is still accepted as shorthand for `credentials: "include"`.
-
-Headers are used for HTTP catchup and mutation requests. Native browser `EventSource` cannot send custom headers, so SSE live sync can only use cookies through `credentials: "include"`.
+For cookies, headers, SSE limitations, and CORS, use the shared [Transport Authentication](./sync.md#transport-authentication) guidance.
 
 Use `client.onSyncState(...)` for high-level sync lifecycle updates:
 
@@ -205,48 +145,6 @@ const unsubscribeSync = client.onSyncState((syncState) => {
 ```
 
 `SyncState.error` is optional and reported separately from lifecycle transitions.
-
-Minimal Elm bridge setup:
-
-```ts
-const client = await PyreClient.create({
-  schema: schemaMetadata,
-  indexedDbName: "my-app-pyre",
-  connect: async () => {
-    const response = await fetch("http://localhost:3000/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ userId: 1 }),
-    })
-
-    const bootstrap = await response.json()
-    mainDatabaseId = bootstrap.mainDatabaseId
-    const { userId } = bootstrap
-
-    return {
-      server: {
-        baseUrl: "http://localhost:3000",
-        credentials: "include",
-        liveSyncTransport: "sse",
-        endpoints: {
-          catchup: "/sync",
-          events: "/sync/events",
-          query: "/db",
-        },
-      },
-      cacheNamespace: userId,
-      session: { userId },
-    }
-  },
-  elm: {
-    app,
-    onError: (error) => console.error(error),
-  },
-})
-
-await client.setSyncedDatabases([mainDatabaseId])
-```
 
 Default Elm bridge ports:
 
@@ -266,7 +164,7 @@ Elm → TS:
 - `unregister`
 - `mutate`
 
-Generated `Pyre` now returns effects as data:
+Generated `Pyre` returns effects as data:
 
 ```elm
 type Effect
@@ -279,7 +177,7 @@ The host app should map `Send`/`LogError` to its own outgoing ports.
 
 For standard writes, prefer the generated mutation modules in `Query.*`.
 
-Pyre now generates default CRUD mutations for each table:
+Pyre generates default CRUD mutations for writable tables:
 
 - `{Table}Create`
 - `{Table}Update`
@@ -342,7 +240,7 @@ TS → Elm:
 
 Generated mutation modules expose `mutationRequest databaseId requestId input` and `decodeMutationResult`, so Elm can initiate mutations and handle results without needing to know the bridge payload format.
 
-If you are bridging those generated messages into `@pyre/client`, prefer `await PyreClient.create({ ..., connect, elm: { ... } })`. That lets the client perform login or other bootstrap work, build the final server config, attach the built-in bridge automatically, execute standard mutations itself, and keep the host code close to app state.
+The `elm` configuration in the client setup above attaches the built-in bridge and executes standard mutations without custom host handlers.
 
 ## Things that are easy to miss
 
@@ -350,8 +248,8 @@ If you are bridging those generated messages into `@pyre/client`, prefer `await 
    - If you send custom request headers, include them in `Access-Control-Allow-Headers`.
    - If you use `credentials: "include"`, configure CORS to allow credentials and use an explicit allowed origin.
 
-2. **Session consistency**
-   - Keep one session per runtime instance. Recreating sessions repeatedly can produce confusing behavior.
+2. **Cache authorization lifecycle**
+   - The app owns cache policy; sync selection does not guarantee permission-contraction cleanup. See [Sync Setup](./sync.md#select-databases-to-sync).
 
 3. **Fail loudly on decode/contract mismatches**
    - Log query id/source and decode error details. Silent drops make sync debugging very hard.

@@ -102,6 +102,10 @@ The MCP server exposes bundled documentation as both tools and resources.
 Examples:
 
 - `pyre_docs` with topic `getting-started`
+- `pyre_docs` with topic `sync` for the primary client/server integration workflow
+- `pyre_docs` with topic `elm-sync` for optional Elm UI and port bridge integration
+- `pyre_docs` with topic `multi-database-upgrade` to extend sync to multiple source databases
+- `pyre_docs` with topic `server-contexts` for the optional server-side session caching API and invalidation
 - `pyre_docs` with topic `schema`
 - `pyre_docs` with topic `query` for selects, mutations, and transaction blocks
 - `pyre_docs` with topic `migrations`
@@ -110,6 +114,18 @@ Examples:
 - `pyre_docs` with topic `troubleshooting`
 - `pyre://project/schema`
 - `pyre://guides/query`
+- `pyre://guides/sync`
+- `pyre://guides/elm-sync`
+- `pyre://guides/multi-database-upgrade`
+- `pyre://guides/server-contexts`
+
+Discover topics through `tools/list` (the `pyre_docs` topic enum) or guides through
+`resources/list`. Retrieve a guide with `tools/call` using
+`{"name":"pyre_docs","arguments":{"topic":"sync"}}`, or
+`resources/read` using `{"uri":"pyre://guides/sync"}`. The same topics
+are available through `pyre docs` and `pyre docs <topic>`.
+
+Read `sync` first for authentication, app-owned database selection, and local query boundaries. Continue with `elm-sync` if the UI uses Elm or `multi-database-upgrade` when adding databases. `server-contexts` is optional and is not a prerequisite for these workflows.
 
 ## When Not To Use MCP
 

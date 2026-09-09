@@ -1,6 +1,14 @@
 # Multi-Database Upgrade Guide
 
-Use this guide when an app needs one Pyre client/server integration to talk to more than one source database.
+Use this guide when upgrading a Pyre client/server integration for multiple source databases. The client session API migration below also applies to single-database apps. For a new integration, start with [Sync Setup](./sync.md).
+
+## Client Session API Migration
+
+Remove `session` from client configuration and `connect` results (`connect.session`), and remove `setSession` calls. The browser no longer performs local `$session` substitution. Keep effective Pyre sessions on the server, constructed from ordinary authenticated requests; server sessions, schema permissions, and auth cookies still apply.
+
+Replace explicit local `Session` filters with ordinary query inputs, or explicitly execute those queries on the authenticated server. See [Local Queries And Session](./query.md#local-queries-and-session) for examples and the rejection behavior. Permission-only schema usage remains compatible with local queries.
+
+This change is required even when the app uses only one database. Supply its database ID through the application and select it for sync as described in [Sync Setup](./sync.md#select-databases-to-sync).
 
 ## Model
 
@@ -21,7 +29,7 @@ const client = await PyreClient.create({
   schema: schemaMetadata,
   cacheNamespace: bootstrap.cacheNamespace,
   server: {
-    baseUrl: "/",
+    baseUrl: window.location.origin,
     credentials: "include",
     endpoints: {
       catchup: "/sync",
@@ -29,7 +37,6 @@ const client = await PyreClient.create({
       query: "/db",
     },
   },
-  session: bootstrap.pyreSession,
 })
 ```
 
@@ -41,6 +48,10 @@ await client.setSyncedDatabases([
   bootstrap.activeTenantDatabaseId,
 ])
 ```
+
+The application supplies the accessible database list through its own bootstrap or other app-owned source; Pyre adds no enumeration or session routes. That list is independent of the active sync set selected with `setSyncedDatabases`. Neither list membership nor sync selection is a permission grant; the server still authorizes each request.
+
+Use `syncDatabase(id)` to add to the active set instead of replacing it. Awaiting either selection method completes scheduling, not catchup or query readiness; see [Sync Setup](./sync.md#select-databases-to-sync).
 
 Route every TypeScript query or mutation with a `databaseId`:
 
@@ -163,6 +174,8 @@ Choose one cache policy during the upgrade:
 
 Do not assume existing local caches will be reused automatically after changing the naming scheme.
 
+Removing browser sessions does not clean up cached rows when permissions contract. Permission-contraction cache cleanup remains separate work, not a guarantee of this upgrade.
+
 ## Command Plane And Tenant Schemas
 
 If the app has one command-plane schema and one tenant schema, treat them as different Pyre schema families.
@@ -185,7 +198,7 @@ If Pyre is extended later to support multiple schema families inside one public 
 
 ## Handoff Checklist
 
-- Bootstrap returns `cacheNamespace`, Pyre session data, and allowed database IDs.
+- The app supplies `cacheNamespace` and accessible database IDs, not effective Pyre session data.
 - Client passes `databaseId` to every query and mutation.
 - Elm apps centralize concrete database ID constructors and pass generated typed IDs to query/mutation constructors.
 - Client calls `setSyncedDatabases` with the databases that should sync locally.

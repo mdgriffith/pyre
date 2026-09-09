@@ -7,7 +7,7 @@ import {
   type EntitySubscription,
   type ServerTableGroup,
 } from './service/entity-stream';
-import { QueryClientService } from './service/query-client';
+import { QueryClientService, resolveLocalQuerySource } from './service/query-client';
 import { QueryManagerService, type MutationResult } from './service/query-manager';
 import { SSEManager, type LiveSyncMessage } from './service/sse';
 import { WebSocketManager } from './service/websocket';
@@ -293,7 +293,6 @@ interface SingleDatabasePyreClientConfig {
   indexedDbName?: string;
   debug?: boolean;
   onError?: (error: Error) => void;
-  session?: Record<string, unknown>;
   elm?: PyreElmConfig;
 }
 
@@ -306,22 +305,19 @@ interface SingleDatabasePyreClientCreateConfig {
   indexedDbName?: string;
   debug?: boolean;
   onError?: (error: Error) => void;
-  session?: Record<string, unknown>;
   connect?: () => Promise<{
     server: ServerConfig;
     databaseId?: DatabaseId;
     cacheNamespace?: CacheNamespace;
-    session?: Record<string, unknown>;
   }> | {
     server: ServerConfig;
     databaseId?: DatabaseId;
     cacheNamespace?: CacheNamespace;
-    session?: Record<string, unknown>;
   };
   elm?: PyreElmConfig;
 }
 
-export type PyreInternalClient = Pick<SingleDatabasePyreClient, 'run' | 'disconnect' | 'getDevtoolsSnapshot' | 'inspectDevtoolsTablePage' | 'startSync' | 'onSyncState' | 'setSession' | 'onEntityChanges' | 'onDevtoolsEvent'>;
+export type PyreInternalClient = Pick<SingleDatabasePyreClient, 'run' | 'disconnect' | 'getDevtoolsSnapshot' | 'inspectDevtoolsTablePage' | 'startSync' | 'onSyncState' | 'onEntityChanges' | 'onDevtoolsEvent'>;
 
 type PyreInternalClientFactory = (config: SingleDatabasePyreClientCreateConfig & {
   databaseId: DatabaseId;
@@ -335,15 +331,12 @@ export interface PyreClientConfig {
   indexedDbName?: string;
   debug?: boolean;
   onError?: (error: Error) => void;
-  session?: Record<string, unknown>;
   connect?: () => Promise<{
     server: ServerConfig;
     cacheNamespace?: CacheNamespace;
-    session?: Record<string, unknown>;
   }> | {
     server: ServerConfig;
     cacheNamespace?: CacheNamespace;
-    session?: Record<string, unknown>;
   };
   createInternalClient?: PyreInternalClientFactory;
   elm?: PyreElmConfig;
@@ -356,7 +349,6 @@ interface ResolvedPyreClientConfig {
   indexedDbName?: string;
   debug?: boolean;
   onError?: (error: Error) => void;
-  session?: Record<string, unknown>;
   createInternalClient: PyreInternalClientFactory;
   elm?: PyreElmConfig;
 }
@@ -382,7 +374,6 @@ class SingleDatabasePyreClient {
   private entityStream: EntityStreamService;
   private bridgeCleanup: (() => void) | null = null;
   private debug: boolean;
-  private session: Record<string, unknown>;
   private server: ServerConfig;
   private endpoints: ServerEndpoints;
   private queryCounter = 0;
@@ -413,7 +404,6 @@ class SingleDatabasePyreClient {
     };
     this.lastSyncState = createInitialSyncState(config.schema);
     this.lastSyncProgress = toSyncProgress(this.lastSyncState);
-    this.session = config.session ?? {};
 
     const elmScope = Object.create(globalThis) as typeof globalThis & { Elm?: unknown };
     elmScope.Elm = undefined;
@@ -473,7 +463,7 @@ class SingleDatabasePyreClient {
       databaseId: config.databaseId,
     }, undefined, this.logDebug);
     this.queryManager = new QueryManagerService(this.logDebug);
-    this.queryClient = new QueryClientService(() => this.session, (payload) => {
+    this.queryClient = new QueryClientService((payload) => {
       if (config.onError) {
         config.onError(new Error(payload.message));
       } else {
@@ -818,12 +808,6 @@ class SingleDatabasePyreClient {
     return this.connectionId;
   }
 
-  setSession(session: Record<string, unknown> | null): void {
-    this.session = session ?? {};
-    this.emitDevtoolsEvent('session:update', { keys: Object.keys(this.session) });
-    this.queryClient.refreshAllQueries();
-  }
-
   run<Input = unknown>(
     databaseId: DatabaseId,
     queryModule: QueryModule<Input>,
@@ -1112,12 +1096,6 @@ class SingleDatabasePyreClient {
     callback: (result: RegisteredQueryResult) => void
   ): QuerySubscription<Input> {
     const normalizedInput = (registration.input ?? {}) as Input;
-    this.emitDevtoolsEvent('query:register', {
-      queryId: registration.queryId,
-      queryName: registration.queryName,
-      input: normalizedInput,
-      querySource: registration.querySource,
-    });
     this.queryClient.registerQuery(
       {
         queryId: registration.queryId,
@@ -1139,6 +1117,12 @@ class SingleDatabasePyreClient {
         });
       }
     );
+    this.emitDevtoolsEvent('query:register', {
+      queryId: registration.queryId,
+      queryName: registration.queryName,
+      input: normalizedInput,
+      querySource: registration.querySource,
+    });
 
     return {
       unsubscribe: () => {
@@ -1146,8 +1130,8 @@ class SingleDatabasePyreClient {
         this.queryClient.unregisterQuery(registration.queryId);
       },
       update: (updatedInput: Input) => {
-        this.emitDevtoolsEvent('query:update-input', { queryId: registration.queryId, queryName: registration.queryName, input: updatedInput });
         this.queryClient.updateQueryInput(registration.queryId, updatedInput);
+        this.emitDevtoolsEvent('query:update-input', { queryId: registration.queryId, queryName: registration.queryName, input: updatedInput });
       },
     };
   }
@@ -1278,6 +1262,7 @@ class SingleDatabasePyreClient {
           if (message.type === 'register') {
             const queryName = asNonEmptyString(message.queryName, 'register message queryName');
             const querySource = asQueryShape(message.querySource);
+            resolveLocalQuerySource(message.queryId, querySource, message.queryInput ?? {});
 
             registrations.get(message.queryId)?.unsubscribe();
 
@@ -1762,15 +1747,6 @@ export class PyreClient {
     return null;
   }
 
-  setSession(session: Record<string, unknown> | null): void {
-    this.config.session = session ?? {};
-    this.clients.forEach((clientPromise) => {
-      void clientPromise.then((client) => {
-        client.setSession(session);
-      });
-    });
-  }
-
   attachElmBridge(config: ElmBridgeConfig): () => void {
     this.bridgeCleanup?.();
     const registrations = new Map<string, Promise<QuerySubscription<unknown> | void>>();
@@ -1921,6 +1897,7 @@ export class PyreClient {
           if (message.type === 'register') {
             const queryName = asNonEmptyString(message.queryName, 'register message queryName');
             const querySource = asQueryShape(message.querySource);
+            resolveLocalQuerySource(message.queryId, querySource, message.queryInput ?? {});
 
             const existingRegistration = registrations.get(message.queryId);
             if (existingRegistration) {
@@ -1943,7 +1920,12 @@ export class PyreClient {
                   result,
                 });
               }
-            ));
+            )).catch((error) => {
+              if (registrations.get(message.queryId) === subscriptionPromise) {
+                registrations.delete(message.queryId);
+              }
+              reportElmBridgeError(config, error, 'incoming-message');
+            });
 
             registrations.set(message.queryId, subscriptionPromise);
             return;
@@ -2148,7 +2130,6 @@ export class PyreClient {
       indexedDbName: this.config.indexedDbName,
       debug: this.config.debug,
       onError: this.config.onError,
-      session: this.config.session,
     };
   }
 
@@ -2510,8 +2491,8 @@ function getElmBridgePort(app: ElmBridgeApp, portName: string): ElmBridgePort | 
 }
 
 async function resolveCreateConfig(config: SingleDatabasePyreClientCreateConfig): Promise<SingleDatabasePyreClientConfig> {
-  if ((config.server || config.session) && config.connect) {
-    throw new Error('Provide either server/session or connect, not both');
+  if (config.server && config.connect) {
+    throw new Error('Provide either server or connect, not both');
   }
 
   const connected = config.connect ? await config.connect() : null;
@@ -2521,7 +2502,6 @@ async function resolveCreateConfig(config: SingleDatabasePyreClientCreateConfig)
     throw new Error('SingleDatabasePyreClient.create requires server or connect');
   }
 
-  const session = connected?.session ?? config.session;
   const databaseId = connected?.databaseId ?? config.databaseId;
   const cacheNamespace = connected?.cacheNamespace ?? config.cacheNamespace;
   const resolvedHeaders = await resolveServerHeaders(server);
@@ -2535,14 +2515,13 @@ async function resolveCreateConfig(config: SingleDatabasePyreClientCreateConfig)
     resolvedHeaders,
     indexedDbName: config.indexedDbName,
     onError: config.onError,
-    session,
     elm: config.elm,
   };
 }
 
 async function resolveMultiCreateConfig(config: PyreClientConfig): Promise<ResolvedPyreClientConfig> {
-  if ((config.server || config.session || config.cacheNamespace) && config.connect) {
-    throw new Error('Provide either server/session/cacheNamespace or connect, not both');
+  if ((config.server || config.cacheNamespace) && config.connect) {
+    throw new Error('Provide either server/cacheNamespace or connect, not both');
   }
 
   const connected = config.connect ? await config.connect() : null;
@@ -2564,7 +2543,6 @@ async function resolveMultiCreateConfig(config: PyreClientConfig): Promise<Resol
     indexedDbName: config.indexedDbName,
     debug: config.debug,
     onError: config.onError,
-    session: connected?.session ?? config.session,
     createInternalClient: config.createInternalClient ?? ((internalConfig) => SingleDatabasePyreClient.create(internalConfig)),
     elm: config.elm,
   };

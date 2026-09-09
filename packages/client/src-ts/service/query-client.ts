@@ -12,8 +12,6 @@ export interface QueryUpdate {
   result: unknown;
 }
 
-type SessionState = Record<string, unknown>;
-
 type QueryResultCallback = (update: QueryUpdate) => void;
 
 export type QueryDeltaEnvelope =
@@ -70,14 +68,11 @@ export class QueryClientService {
   private debugLog: (...args: unknown[]) => void;
   private onQueryResult: ((queryId: string) => void) | null = null;
   private onQueryUnregister: ((queryId: string) => void) | null = null;
-  private getSession: () => SessionState;
 
   constructor(
-    getSession?: () => SessionState,
     logger?: (payload: ErrorPayload) => void,
     debugLog?: (...args: unknown[]) => void
   ) {
-    this.getSession = getSession ?? (() => ({}));
     this.logger = logger ?? ((payload) => {
       console.error('[PyreClient] QueryClient error', payload);
     });
@@ -134,13 +129,12 @@ export class QueryClientService {
   }
 
   registerQuery(registration: QueryRegistration, callback: QueryResultCallback): void {
-    this.debugLog('[QueryClient] registerQuery:', registration.queryId);
-
-    const resolvedQuerySource = resolveQuerySource(
+    const resolvedQuerySource = resolveLocalQuerySource(
+      registration.queryId,
       registration.querySource,
-      registration.input,
-      this.getSession()
+      registration.input
     );
+    this.debugLog('[QueryClient] registerQuery:', registration.queryId);
 
     this.queryStates.set(registration.queryId, {
       querySourceTemplate: registration.querySource,
@@ -166,8 +160,8 @@ export class QueryClientService {
     let querySource: unknown = null;
 
     if (state) {
+      querySource = resolveLocalQuerySource(queryId, state.querySourceTemplate, input);
       state.input = input;
-      querySource = resolveQuerySource(state.querySourceTemplate, input, this.getSession());
     }
 
     const updateMessage = {
@@ -434,9 +428,39 @@ export class QueryClientService {
   }
 }
 
-function resolveQuerySource(template: unknown, input: unknown, session: SessionState): unknown {
+export function resolveLocalQuerySource(queryId: string, source: unknown, input: unknown): unknown {
+  validateLocalQuerySource(queryId, source);
+  const resolved = resolveQuerySource(source, input);
+  validateLocalQuerySource(queryId, resolved);
+  return resolved;
+}
+
+function validateLocalQuerySource(queryId: string, source: unknown, path = '$', context: 'selection' | 'predicate' | 'value' = 'selection'): void {
+  if (Array.isArray(source)) {
+    source.forEach((value, index) => validateLocalQuerySource(queryId, value, `${path}[${index}]`, context));
+    return;
+  }
+  if (!source || typeof source !== 'object') {
+    return;
+  }
+  const entries = Object.entries(source);
+  for (const [key, value] of entries) {
+    const childPath = `${path}[${JSON.stringify(key)}]`;
+    const sessionPlaceholder = entries.length === 1 && key === '$session' && typeof value === 'string';
+    if ((path === '$' && key === '$error') || sessionPlaceholder || (context === 'predicate' && key.startsWith('Session.'))) {
+      throw new Error(`Local queries cannot reference Session; use explicit inputs or execute on the server. queryId=${queryId} path=${childPath}`);
+    }
+    // Field operands are JSON, not predicate maps, even if their keys resemble query syntax.
+    const childContext = context === 'selection'
+      ? key === '@where' ? 'predicate' : key.startsWith('@') ? 'value' : 'selection'
+      : context === 'predicate' && (key === '$and' || key === '$or') ? 'predicate' : 'value';
+    validateLocalQuerySource(queryId, value, childPath, childContext);
+  }
+}
+
+function resolveQuerySource(template: unknown, input: unknown): unknown {
   if (Array.isArray(template)) {
-    return template.map((value) => resolveQuerySource(value, input, session));
+    return template.map((value) => resolveQuerySource(value, input));
   }
 
   if (!template || typeof template !== 'object') {
@@ -447,13 +471,9 @@ function resolveQuerySource(template: unknown, input: unknown, session: SessionS
     return lookupVariable(input, template.$var);
   }
 
-  if (isSessionReference(template)) {
-    return lookupVariable(session, template.$session);
-  }
-
   const result: Record<string, unknown> = {};
   Object.entries(template as Record<string, unknown>).forEach(([key, value]) => {
-    result[key] = resolveQuerySource(value, input, session);
+    result[key] = resolveQuerySource(value, input);
   });
   return result;
 }
@@ -461,11 +481,6 @@ function resolveQuerySource(template: unknown, input: unknown, session: SessionS
 function isVariableReference(value: object): value is { $var: string } {
   const entries = Object.entries(value);
   return entries.length == 1 && entries[0]?.[0] === '$var' && typeof entries[0][1] === 'string';
-}
-
-function isSessionReference(value: object): value is { $session: string } {
-  const entries = Object.entries(value);
-  return entries.length == 1 && entries[0]?.[0] === '$session' && typeof entries[0][1] === 'string';
 }
 
 function lookupVariable(source: unknown, key: string): unknown {

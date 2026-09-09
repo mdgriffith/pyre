@@ -13,6 +13,10 @@
   "module": "./index.ts",
   "types": "./index.ts",
   "exports": {
+    "./context": {
+      "types": "./context.ts",
+      "default": "./context.ts"
+    },
     ".": {
       "types": "./index.ts",
       "default": "./index.ts"
@@ -57,6 +61,7 @@
     "zod": "4.3.6"
   },
   "files": [
+    "context.ts",
     "index.ts",
     "init.ts",
     "database-id.ts",

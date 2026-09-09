@@ -3,6 +3,9 @@ import { expect, test } from 'bun:test';
 
 import loadElm from '../dist/engine.mjs';
 
+// Elm ports use setTimeout(0); Bun.sleep(0) can finish before those timers run.
+const nextElmTurn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 const schema = {
   tables: {
     maps: {
@@ -101,8 +104,8 @@ async function startSyncedElmApp() {
     });
   });
 
-  await Bun.sleep(0);
-  await Bun.sleep(0);
+  await nextElmTurn();
+  await nextElmTurn();
 
   return { app, requests, restore: () => { globalThis.XMLHttpRequest = previousXmlHttpRequest; } };
 }
@@ -123,7 +126,7 @@ test('Elm live sync rejects missing delta databaseId when configured', async () 
     });
 
     app.ports.receiveSSEMessage.send(deltaMessage());
-    await Bun.sleep(0);
+    await nextElmTurn();
 
     expect(errors).toContain('Live sync delta missing databaseId: expected campaign:123');
     expect(writes).toHaveLength(0);
@@ -148,7 +151,7 @@ test('Elm live sync rejects mismatched delta databaseId before writing cache', a
     });
 
     app.ports.receiveSSEMessage.send(deltaMessage('campaign:456'));
-    await Bun.sleep(0);
+    await nextElmTurn();
 
     expect(errors).toContain('Live sync delta databaseId mismatch: expected campaign:123, got campaign:456');
     expect(writes).toHaveLength(0);
@@ -173,7 +176,7 @@ test('Elm live sync accepts matching delta databaseId', async () => {
     });
 
     app.ports.receiveSSEMessage.send(deltaMessage('campaign:123'));
-    await Bun.sleep(0);
+    await nextElmTurn();
 
     expect(errors).toHaveLength(0);
     expect(writes).toHaveLength(1);
@@ -192,8 +195,8 @@ test('Elm live syncRequired starts catchup from the current cursor', async () =>
       type: 'syncRequired',
       databaseId: 'campaign:123',
     });
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(requests).toHaveLength(requestCountAfterInitialCatchup + 1);
     expect(requests.at(-1)?.method).toBe('POST');
@@ -223,7 +226,7 @@ test('Elm live syncRequired ignores stale server revisions', async () => {
       ...deltaMessage('campaign:123'),
       serverRevision: 7,
     });
-    await Bun.sleep(0);
+    await nextElmTurn();
 
     const requestCountAfterInitialCatchup = requests.length;
 
@@ -232,8 +235,8 @@ test('Elm live syncRequired ignores stale server revisions', async () => {
       databaseId: 'campaign:123',
       serverRevision: 7,
     });
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(requests).toHaveLength(requestCountAfterInitialCatchup);
   } finally {
@@ -324,8 +327,8 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
       }
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     expect(notifications).toEqual([
       {
@@ -439,8 +442,8 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       },
     });
 
-    await Bun.sleep(0);
-    await Bun.sleep(0);
+    await nextElmTurn();
+    await nextElmTurn();
 
     const optimistic = {
       queryField: 'maps',
@@ -464,7 +467,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       input: { id: 1, name: 'B' },
       optimistic,
     });
-    await Bun.sleep(0);
+    await nextElmTurn();
 
     expect(pendingMutations).toHaveLength(2);
 
@@ -478,7 +481,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       },
       result: {},
     });
-    await Bun.sleep(0);
+    await nextElmTurn();
 
     pendingMutations[0].complete({
       serverRevision: 1,
@@ -490,7 +493,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       },
       result: {},
     });
-    await Bun.sleep(0);
+    await nextElmTurn();
 
     app.ports.receiveQueryClientMessage.send({
       type: 'register',
@@ -498,7 +501,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       querySource: { maps: { id: true, name: true } },
       queryInput: {},
     });
-    await Bun.sleep(0);
+    await nextElmTurn();
 
     const latest = queryResults.at(-1) as { maps?: Array<{ name?: string }> };
     expect(latest.maps?.[0]?.name).toBe('B');

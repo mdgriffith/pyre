@@ -72,7 +72,87 @@ type SortDirection
 
 decodeQuery : Decode.Decoder Query
 decodeQuery =
-    Decode.dict decodeFieldQuery
+    Decode.dict Decode.value
+        |> Decode.andThen
+            (\fields ->
+                case Dict.get "$error" fields of
+                    Just error ->
+                        case Decode.decodeValue Decode.string error of
+                            Ok message ->
+                                Decode.fail message
+
+                            Err _ ->
+                                Decode.fail "Invalid local query $error marker"
+
+                    Nothing ->
+                        if List.any (containsSessionReference QueryShape) (Dict.values fields) then
+                            Decode.fail "Local queries cannot reference Session; use explicit inputs or execute on the server."
+
+                        else
+                            Decode.dict decodeFieldQuery
+            )
+
+
+type SessionReferenceContext
+    = QueryShape
+    | Predicate
+    | Operand
+
+
+-- Inspect raw shapes before permissive decoding, without treating JSON operands as predicates.
+containsSessionReference : SessionReferenceContext -> Decode.Value -> Bool
+containsSessionReference context value =
+    case Decode.decodeValue (Decode.keyValuePairs Decode.value) value of
+        Ok pairs ->
+            let
+                isSessionMarker =
+                    case pairs of
+                        [ ( "$session", name ) ] ->
+                            Result.toMaybe (Decode.decodeValue Decode.string name) /= Nothing
+
+                        _ ->
+                            False
+            in
+            isSessionMarker
+                || List.any
+                    (\( key, child ) ->
+                        case context of
+                            QueryShape ->
+                                containsSessionReference
+                                    (if key == "@where" then
+                                        Predicate
+
+                                     else if String.startsWith "@" key then
+                                        Operand
+
+                                     else
+                                        QueryShape
+                                    )
+                                    child
+
+                            Predicate ->
+                                String.startsWith "Session." key
+                                    || containsSessionReference
+                                        (if key == "$and" || key == "$or" then
+                                            Predicate
+
+                                         else
+                                            Operand
+                                        )
+                                        child
+
+                            Operand ->
+                                containsSessionReference Operand child
+                    )
+                    pairs
+
+        Err _ ->
+            case Decode.decodeValue (Decode.list Decode.value) value of
+                Ok items ->
+                    List.any (containsSessionReference context) items
+
+                Err _ ->
+                    False
 
 
 decodeFieldQuery : Decode.Decoder FieldQuery

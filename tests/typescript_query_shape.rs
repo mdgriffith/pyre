@@ -10,6 +10,107 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 }
 
 #[test]
+fn both_client_generators_reject_only_authored_session_arguments() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+type Scope
+    = Workspace { id Int }
+    | Account { id Int }
+type Root
+    = Nested { scope Scope }
+session {
+    userId Int
+    pageSize Int
+    scope Scope
+    root Root
+}
+record Note {
+    id Id.Int @id
+    ownerId Int
+    score Float
+    scope Scope
+    root Root
+    replies @link(Reply.noteId)
+    @allow(*) { ownerId == Session.userId }
+}
+record Reply {
+    id Id.Int @id
+    noteId Note.id
+    ownerId Int
+    @public
+}
+"#,
+        &mut schema,
+    )
+    .expect("schema parses");
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect("schema typechecks");
+    for (source, rejected, mutation) in [
+        ("query Test { note { @where { ownerId == Session.userId } id } }", true, false),
+        ("query Test { note { @where { Session.userId == 1 } id } }", true, false),
+        ("query Test { note { @where { Or(ownerId == 1, And(ownerId == 2, Session.scope.Workspace.id == 3)) } id } }", true, false),
+        ("query Test { note { @where { ownerId == Session.scope.Workspace.id } id } }", true, false),
+        ("query Test { note { @where { Session.root.Nested.scope.Workspace.id == 3 } id } }", true, false),
+        ("query Test { note { id replies { @where { ownerId == Session.userId } id } } }", true, false),
+        ("query Test { note { @limit(Session.pageSize) id } }", true, false),
+        ("query Test { note { id replies { @limit(Session.pageSize) id } } }", true, false),
+        ("query Test { note { @where { score == abs(abs(Session.userId)) } id } }", true, false),
+        ("query Test { note { @where { scope == Workspace { id = Session.userId } } id } }", true, false),
+        ("query Test { note { @where { root == Nested { scope = Workspace { id = Session.userId } } } id } }", true, false),
+        ("query Test { note { id } }", false, false),
+        ("query Test { note { @limit(5) id } }", false, false),
+        ("query Test { note { id replies { @limit(2) id } } }", false, false),
+        ("query Test($ownerId: Int) { note { @where { ownerId == $ownerId } id } }", false, false),
+        ("update Test { note { @where { ownerId == Session.userId } ownerId = Session.userId id } }", false, true),
+    ] {
+        let queries = parser::parse_query("query.pyre", source)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        let info = typecheck::check_queries(&queries, &context)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        let mut files = Vec::new();
+        pyre::generate::write_queries(&context, &queries, &info, &mut files);
+        assert!(files.iter().any(|file| file.contents.contains("session_userId")),
+            "server SQL must still bind Session: {source}");
+        if source.contains("note { @limit(Session.pageSize)") {
+            assert!(files.iter().any(|file| file.contents.contains("limit $session_pageSize")),
+                "server SQL must still use the Session limit: {source}");
+        }
+        for suffix in ["queries/metadata/test.ts", "Query/Test.elm"] {
+            let content = &files.iter().find(|file| path_ends_with(&file.path, suffix))
+                .expect("generated query").contents;
+            assert_eq!(content.contains("\"$error\""), rejected, "{source}: {content}");
+            assert!(!content.contains("\"$session\""), "{source}: {content}");
+            if rejected {
+                assert!(content.contains(pyre::generate::local_query::SESSION_ERROR));
+                assert!(!content.contains("\"@where\""));
+                assert!(!content.contains("\"@limit\""));
+            } else if !mutation {
+                assert!(content.contains("queryShape"));
+                if source.contains("$ownerId") {
+                    assert!(content.contains("\"$var\""));
+                }
+            } else {
+                assert!(!content.contains("queryShape"));
+            }
+            if suffix.ends_with(".ts") {
+                assert!(content.contains("SessionValidator: Decode.SessionValidator"));
+                assert!(content.contains("session_args:"));
+                assert!(content.contains("\"userId\""));
+                if source.contains("Session.pageSize") {
+                    assert!(content.lines().any(|line|
+                        line.contains("session_args:") && line.contains("\"pageSize\"")),
+                        "server metadata must still bind the Session limit: {content}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn generated_typescript_transaction_has_shared_input_and_step_results() {
     let schema_source = r#"
 record Note {
@@ -63,7 +164,7 @@ transaction ReplaceNote($id: Note.id, $body: String) {
 }
 
 #[test]
-fn generated_typescript_query_shape_preserves_where_placeholders() {
+fn generated_typescript_query_shape_rejects_session_filters() {
     let schema_source = r#"
 session {
     userId Int
@@ -117,11 +218,13 @@ query GetRulebookByName($name: String) {
     let content = &generated.contents;
 
     assert!(
-        content.contains("\"@where\": { \"$and\": [ { \"name\": { \"$var\": \"name\" } }, { \"ownerId\": { \"$session\": \"userId\" } } ] }")
-            || content.contains("\"@where\": { \"$and\": [{ \"name\": { \"$var\": \"name\" } }, { \"ownerId\": { \"$session\": \"userId\" } }] }"),
-        "TypeScript queryShape should preserve variable and session placeholders in @where. Generated:\n{}",
+        content.contains("\"$error\": \"Local queries cannot reference Session; use explicit inputs or execute on the server.\""),
+        "TypeScript queryShape should reject explicit session filters. Generated:\n{}",
         content
     );
+    assert!(content.contains("SessionValidator: Decode.SessionValidator"));
+    assert!(content.contains("session_args:"));
+    assert!(!content.contains("\"$session\""));
 }
 
 #[test]

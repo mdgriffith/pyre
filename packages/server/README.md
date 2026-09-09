@@ -10,6 +10,22 @@ Typical usage:
 - seed fixture data with the generated `seed` helper from `pyre/generated/typescript/seed`
 - use sync helpers from `@pyre/server/sync` and `@pyre/server/query-sync`
 
+## Optional Session Caching
+
+The optional `createContextManager` from `@pyre/server/context` caches a server-only session
+for each authenticated login-session/database pair. Supply `getSessionKey`,
+`resolveSession`, `getDatabase`, and `maxAgeMs`; then use
+`await manager.get(session, databaseId)` and `context.run(operation, input)`.
+The operation receives the application's database handle and the database-specific
+session, so it can call the existing executor without changing a global session.
+
+The application keeps connection management and authentication. No session values
+are sent to clients, and no routes or operation policies are added. See the
+[server contexts guide](../../docs/usage/server-contexts.md) for an
+annotated example and invalidation requirements.
+
+For the normal client/server integration, start with the [sync guide](../../docs/usage/sync.md). The context manager is not required for sync.
+
 ## Database Provisioning
 
 Generated output embeds each namespaced schema and binds it to the transactional

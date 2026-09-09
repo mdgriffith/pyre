@@ -332,11 +332,12 @@ const client = await PyreClient.create({
   server: {
     baseUrl: "http://localhost:3000",
   },
-  session: {},
 });
 ```
 
 For apps where upstream auth adds headers/cookies before requests reach `pyre serve`, the browser should usually not send `x-pyre-session` directly. The upstream should derive and set that header server-side.
+
+The browser has no `Session` configuration, `connect` session result, `setSession` API, or local `$session` substitution. Explicit `Session`-dependent local query filters must fail with a clear error directing the app to use ordinary query inputs or explicitly execute on the authenticated server. There is no automatic server fallback. Inputs filter already-authorized data, not grant permissions; queries whose only `Session` usage is in server schema permissions remain normal local queries. This does not change the server session model, permissions, auth cookies, or routes, and does not solve permission-contraction cache cleanup.
 
 ## Error Behavior
 

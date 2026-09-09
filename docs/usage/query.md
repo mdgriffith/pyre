@@ -126,7 +126,9 @@ query SearchUsers($name: String) {
 }
 ```
 
-Session values can also participate in query conditions:
+## Local Queries And Session
+
+Server-supplied `Session` values can participate in authenticated server query conditions:
 
 ```pyre
 query MyNotes {
@@ -137,6 +139,30 @@ query MyNotes {
     }
 }
 ```
+
+This explicit `Session` dependency is rejected for local browser execution. The client does not hold a session to substitute. Generated local query sources carry this rejection marker:
+
+```json
+{
+  "$error": "Local queries cannot reference Session; use explicit inputs or execute on the server."
+}
+```
+
+Do not remove the marker or silently run an unfiltered query. Use an ordinary input to filter already-authorized local data:
+
+```pyre
+query NotesByOwner($ownerId: Int) {
+    note {
+        @where { ownerId == $ownerId }
+        id
+        body
+    }
+}
+```
+
+Alternatively, explicitly execute the `Session`-dependent query on the authenticated server. There is no automatic server fallback. Ordinary inputs are filters, not permission grants, and cannot replace server authorization.
+
+A query whose only `Session` dependency is in schema permissions, such as `@allow(query) { ownerId == Session.userId }`, remains a normal local query. The server enforces those permissions when selecting data to sync; local queries operate over that data without receiving the effective server session. See [Sync Setup](./sync.md) for the complete flow.
 
 ## Generated CRUD
 

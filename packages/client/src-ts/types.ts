@@ -3,11 +3,12 @@ import type { SchemaMetadata } from '@pyre/core';
 export type {
   FilterPlaceholder,
   FilterValue,
+  GeneratedQueryShape,
   QueryField,
   QueryVariableReference,
   QueryShape,
   SchemaMetadata,
-  SessionVariableReference,
+  RejectedQueryShape,
   SortClause,
   SortDirection,
   WhereClause,

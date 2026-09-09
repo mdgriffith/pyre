@@ -120,7 +120,6 @@ function describeSemanticEvent(type: string, data: Record<string, unknown> | nul
     'mutation.custom_dispatched': { actor: 'APP', direction: '->', operation: 'mutation.dispatched' },
     'database.known': { actor: 'APP', operation: 'database.known' },
     'indexeddb:delete': { actor: 'IDB', operation: 'database.deleted' },
-    'session:update': { actor: 'APP', operation: 'session.updated' },
     'debug:value': { actor: 'APP', operation: 'debug-value.updated', level: 'trace' },
   };
   return descriptions[type] ?? { actor: 'APP', operation: normalizeOperation(type), level: 'trace' };

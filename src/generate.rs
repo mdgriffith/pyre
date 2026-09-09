@@ -6,6 +6,7 @@ use crate::generate;
 use crate::typecheck;
 
 pub mod client;
+pub mod local_query;
 pub mod manifest;
 pub mod server;
 pub mod sql;
