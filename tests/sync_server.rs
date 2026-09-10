@@ -105,20 +105,171 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     let server = SyncServer::new(&db.context);
     assert_eq!(result.response["commitRevision"], 1);
     assert_eq!(result.response["reconciliation"]["atLeast"], 1);
-    assert!(server
-        .batch_messages(&result, &ConnectedSessions::new())
-        .is_empty());
-    let sessions = ConnectedSessions::from([("subscriber".into(), SyncSession::new())]);
-    for _ in 0..2 {
-        let messages = server.batch_messages(&result, &sessions);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message.type_, "syncRequired");
-        assert_eq!(messages[0].message.server_revision, Some(1));
-        assert_eq!(
-            messages[0].message.database_epoch.as_deref(),
-            Some(epoch.as_str())
+    use pyre::server::sync::{ReplacementRequest, SyncFence};
+    let fence = SyncFence {
+        database_id: "main".into(),
+        instance: "test".into(),
+        auth_generation: 1,
+        namespace: create.primary_db.clone(),
+        manifest: fingerprint.clone(),
+        database_epoch: epoch.clone(),
+    };
+    let replacement_request = ReplacementRequest {
+        version: 1,
+        fence: fence.clone(),
+        request_id: "catchup-1".into(),
+        target: 1,
+    };
+    let wire = serde_json::to_value(&replacement_request)?;
+    let _: ReplacementRequest = serde_json::from_value(wire.clone())?;
+    for field in [
+        "version",
+        "databaseId",
+        "instance",
+        "authGeneration",
+        "namespace",
+        "manifest",
+        "databaseEpoch",
+        "requestId",
+        "target",
+    ] {
+        let mut incomplete = wire.clone();
+        incomplete.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<ReplacementRequest>(incomplete).is_err(),
+            "{field}"
         );
     }
+    let mut extra = wire;
+    extra["sql"] = json!("SELECT secret");
+    assert!(serde_json::from_value::<ReplacementRequest>(extra).is_err());
+    let snapshot = server
+        .replacement(&conn, &manifest, &binding, &replacement_request, &session)
+        .await?;
+    assert!(snapshot.complete);
+    assert_eq!(snapshot.revision, 1);
+    assert_eq!(snapshot.target, 1);
+    assert_eq!(snapshot.request_id, "catchup-1");
+    assert_eq!(snapshot.tables["items"].rows[0]["name"], "committed");
+    let serialized = serde_json::to_value(&snapshot)?;
+    let mut expected = serde_json::to_value(&fence)?;
+    expected["requestId"] = json!("catchup-1");
+    expected["target"] = json!(1);
+    expected["serverRevision"] = json!(1);
+    expected["type"] = json!("replacement");
+    expected["scope"] = json!("database");
+    expected["complete"] = json!(true);
+    expected["tables"] = json!({"items":{"rows":snapshot.tables["items"].rows}});
+    assert_eq!(serialized, expected);
+    let mut mismatched = serde_json::to_value(&manifest)?;
+    mismatched["compiledContract"] = json!("different-schema");
+    let mismatched: Manifest = serde_json::from_value(mismatched)?;
+    let mismatched_fingerprint = mismatched.fingerprint();
+    let mismatched_binding = query::BatchBinding {
+        manifest: &mismatched_fingerprint,
+        ..binding
+    };
+    let mut mismatched_request = replacement_request.clone();
+    mismatched_request.fence.manifest = mismatched_fingerprint.clone();
+    assert!(matches!(
+        server
+            .replacement(
+                &conn,
+                &mismatched,
+                &mismatched_binding,
+                &mismatched_request,
+                &session
+            )
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    assert_eq!(
+        result.response["results"][0],
+        json!({"index":0,"operation":create.id,"value":{"id":1}})
+    );
+    let before = result.response.clone();
+    let mut recipient = fence.clone();
+    recipient.instance = "other-tab".into();
+    recipient.auth_generation = 42;
+    let mut wrong_database = recipient.clone();
+    wrong_database.database_id = "other".into();
+    let mut wrong_epoch = recipient.clone();
+    wrong_epoch.database_epoch = "old".into();
+    let recipients = HashMap::from([
+        ("subscriber".into(), recipient.clone()),
+        ("wrong-db".into(), wrong_database),
+        ("wrong-epoch".into(), wrong_epoch),
+    ]);
+    for _ in 0..2 {
+        let hints = server.replacement_messages(&result, &recipients);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].message["instance"], "other-tab");
+        assert_eq!(hints[0].message["authGeneration"], 42);
+        let mut expected = serde_json::to_value(&recipient)?;
+        expected["type"] = json!("syncRequired");
+        expected["serverRevision"] = json!(1);
+        expected["reconciliation"] = json!({"kind":"replaceRequired", "atLeast":1, "invalidate":true, "minimumSafeRevision":1});
+        assert_eq!(hints[0].message, expected);
+        assert!(hints[0].message.get("requestId").is_none());
+        assert!(hints[0].message.get("data").is_none());
+    }
+    assert_eq!(result.response, before);
+    for field in [
+        "databaseId",
+        "instance",
+        "authGeneration",
+        "namespace",
+        "manifest",
+        "databaseEpoch",
+    ] {
+        let mut invalid = serde_json::to_value(&replacement_request)?;
+        invalid[field] = if field == "authGeneration" {
+            json!(999)
+        } else {
+            json!("wrong")
+        };
+        let invalid = serde_json::from_value(invalid)?;
+        assert!(
+            matches!(
+                server
+                    .replacement(&conn, &manifest, &binding, &invalid, &session)
+                    .await,
+                Err(pyre::server::sync::Error::InvalidFence)
+            ),
+            "{field}"
+        );
+    }
+    let mut future = replacement_request.clone();
+    future.target = 2;
+    assert!(matches!(
+        server
+            .replacement(&conn, &manifest, &binding, &future, &session)
+            .await,
+        Err(pyre::server::sync::Error::TargetNotReached)
+    ));
+    future.target = -1;
+    assert!(server
+        .replacement(&conn, &manifest, &binding, &future, &session)
+        .await
+        .is_err());
+    future = replacement_request.clone();
+    future.request_id.clear();
+    assert!(server
+        .replacement(&conn, &manifest, &binding, &future, &session)
+        .await
+        .is_err());
+    conn.execute("ATTACH DATABASE ':memory:' AS other", ())
+        .await?;
+    assert!(matches!(
+        server
+            .replacement(&conn, &manifest, &binding, &replacement_request, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    conn.execute("DETACH DATABASE other", ()).await?;
+    assert!(server
+        .replacement_messages(&result, &HashMap::new())
+        .is_empty());
     // Failure to allocate the next revision must roll back the write, not just its acknowledgement.
     conn.execute("CREATE TRIGGER fail_revision BEFORE UPDATE ON _pyre_sync BEGIN SELECT RAISE(ABORT, 'revision unavailable'); END", ()).await?;
     assert!(
@@ -136,6 +287,406 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     assert_eq!(row.get::<i64>(0)?, 1);
     assert_eq!(row.get::<i64>(1)?, 1);
     assert_eq!(result.response["status"], "accepted");
+    drop(rows);
+    conn.execute("UPDATE items SET updatedAt = 'invalid'", ()).await?;
+    assert!(
+        matches!(server.replacement(&conn, &manifest, &binding, &replacement_request, &session).await,
+        Err(pyre::server::sync::Error::Sync(pyre::sync::SyncError::SqlGenerationError(message))) if message == "InvalidReplacementTable")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_removes_deleted_revoked_and_old_keys_and_coalesces_commits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::{
+        manifest::Manifest,
+        query,
+        sync::{ReplacementRequest, SyncFence},
+    };
+    let db = TestDatabase::new(
+        r#"
+session {
+    userId Int
+}
+record Note {
+    id Int @id
+    ownerId Int
+    body String
+    @allow(query) { ownerId == Session.userId }
+    @allow(insert, update, delete) { True }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let mut queries = pyre::parser::parse_query(
+        "commands.pyre",
+        r#"
+update MoveKey($id: Int, $next: Int) {
+    note {
+        @where { id == $id }
+        id = $next
+    }
+}
+"#,
+    )
+    .unwrap();
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &db.context);
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|f| f.path.ends_with("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let fingerprint = manifest.fingerprint();
+    let namespace = db.context.valid_namespaces.iter().next().unwrap();
+    let binding = query::BatchBinding {
+        database_id: "main",
+        namespace,
+        manifest: &fingerprint,
+        instance: "tab",
+        auth_generation: 0,
+    };
+    let session = PyreSession::new(json!({"userId":1}), &manifest.session_schema)?;
+    let epoch = conn
+        .query("SELECT database_epoch FROM _pyre_sync", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<String>(0)?;
+    let fence = SyncFence {
+        database_id: "main".into(),
+        namespace: namespace.clone(),
+        manifest: fingerprint.clone(),
+        instance: "tab".into(),
+        auth_generation: 0,
+        database_epoch: epoch.clone(),
+    };
+    let mut request = query::BatchRequest {
+        version: 1,
+        database_id: "main".into(),
+        namespace: namespace.clone(),
+        manifest: fingerprint.clone(),
+        instance: "tab".into(),
+        auth_generation: 0,
+        database_epoch: epoch,
+        request_id: "write".into(),
+        sequence: 1,
+        operations: vec![],
+    };
+    let operation = |kind: &str, input| query::BatchOperation {
+        operation: manifest
+            .queries
+            .values()
+            .find(|q| q.generated_edit.as_ref().is_some_and(|e| e.kind == kind))
+            .unwrap()
+            .id
+            .clone(),
+        input,
+    };
+    request.operations = (1..=3)
+        .map(|_| operation("create", json!({"ownerId":1,"body":"visible"})))
+        .collect();
+    query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let server = SyncServer::new(&db.context);
+    let catchup = ReplacementRequest {
+        version: 1,
+        fence,
+        request_id: "read".into(),
+        target: 1,
+    };
+    let first = server
+        .replacement(&conn, &manifest, &binding, &catchup, &session)
+        .await?;
+    assert_eq!(first.tables["notes"].rows.len(), 3);
+    request.operations = vec![
+        operation("delete", json!({"id":1})),
+        operation("update", json!({"id":2,"ownerId":2})),
+    ];
+    let removed = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    assert_eq!(removed.response["commitRevision"], 2);
+    request.operations = vec![query::BatchOperation {
+        operation: manifest
+            .queries
+            .values()
+            .find(|q| q.generated_edit.is_none())
+            .unwrap()
+            .id
+            .clone(),
+        input: json!({"id":3,"next":30}),
+    }];
+    let moved = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    assert_eq!(moved.response["commitRevision"], 3);
+    // A fixed old target may return a newer complete revision, without replaying intermediate deltas.
+    let final_snapshot = server
+        .replacement(&conn, &manifest, &binding, &catchup, &session)
+        .await?;
+    assert_eq!(final_snapshot.target, 1);
+    assert_eq!(final_snapshot.revision, 3);
+    assert_eq!(final_snapshot.tables["notes"].rows.len(), 1);
+    assert_eq!(final_snapshot.tables["notes"].rows[0]["id"], 30);
+    request.operations = vec![operation("delete", json!({"id":30}))];
+    query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let empty = server
+        .replacement(&conn, &manifest, &binding, &catchup, &session)
+        .await?;
+    assert_eq!(empty.revision, 4);
+    assert!(empty.complete);
+    assert!(empty.tables["notes"].rows.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_rechecks_linked_permissions_and_does_not_truncate_scope(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::{
+        manifest::Manifest,
+        query::BatchBinding,
+        sync::{ReplacementRequest, SyncFence},
+    };
+    let db = TestDatabase::new(
+        r#"
+session {
+    userId Int
+}
+record Membership {
+    id Int @id
+    workspaceId Int
+    userId Int
+    updatedAt Int
+    @allow(query) { False }
+    @allow(insert, update, delete) { True }
+}
+record Workspace {
+    id Int @id
+    name String
+    updatedAt Int
+    memberships @link(Membership.workspaceId)
+    @allow(query) { exists memberships { userId == Session.userId } }
+    @allow(insert, update, delete) { True }
+}
+"#,
+    )
+    .await?;
+    let namespace = db.context.valid_namespaces.iter().next().unwrap().clone();
+    let mut files = vec![];
+    let queries = pyre::ast::QueryList { queries: vec![] };
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|f| f.path.ends_with("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let fingerprint = manifest.fingerprint();
+    let session = PyreSession::new(json!({"userId":1}), &manifest.session_schema)?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<5002) INSERT INTO workspaces SELECT x, 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces;").await?;
+    let epoch = conn
+        .query("SELECT database_epoch FROM _pyre_sync", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<String>(0)?;
+    let binding = BatchBinding {
+        database_id: "main",
+        namespace: &namespace,
+        manifest: &fingerprint,
+        instance: "tab",
+        auth_generation: 0,
+    };
+    let request = ReplacementRequest {
+        version: 1,
+        request_id: "linked".into(),
+        target: 0,
+        fence: SyncFence {
+            database_id: "main".into(),
+            namespace: namespace.clone(),
+            manifest: fingerprint.clone(),
+            instance: "tab".into(),
+            auth_generation: 0,
+            database_epoch: epoch,
+        },
+    };
+    let server = SyncServer::new(&db.context);
+    let before = server
+        .replacement(&conn, &manifest, &binding, &request, &session)
+        .await?;
+    assert_eq!(before.tables["workspaces"].rows.len(), 5002);
+    assert!(before.tables["memberships"].rows.is_empty());
+    // Only the linked permission table changes, not the visible table or its timestamp.
+    conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM memberships; UPDATE _pyre_sync SET server_revision=server_revision+1; COMMIT;").await?;
+    let after = server
+        .replacement(&conn, &manifest, &binding, &request, &session)
+        .await?;
+    assert_eq!(after.revision, 1);
+    assert!(after.tables["workspaces"].rows.is_empty());
+    assert!(after.tables["memberships"].rows.is_empty());
+    // Neither recipient can read the affected permission rows. Both still need
+    // invalidation, including the origin's embedded legacy sync response.
+    let sessions = ConnectedSessions::from([
+        ("origin".into(), session.logical().clone()),
+        (
+            "other".into(),
+            HashMap::from([("userId".into(), pyre::sync::SessionValue::Integer(2))]),
+        ),
+    ]);
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "memberships".into(),
+        headers: vec![
+            "id".into(),
+            "workspaceId".into(),
+            "userId".into(),
+            "updatedAt".into(),
+        ],
+        rows: vec![vec![json!(1), json!(1), json!(1), json!(0)]],
+    }];
+    let commit = pyre::server::query::CommittedRevision {
+        database_epoch: request.fence.database_epoch.clone(),
+        revision: 1,
+    };
+    for groups in [affected.clone(), vec![]] {
+        let mut result = QueryResult {
+            response: json!({"named":[]}),
+            affected_rows: groups,
+        };
+        let messages = server.calculate_committed_deltas(
+            &mut result,
+            &sessions,
+            "main",
+            Some("origin"),
+            &commit,
+        )?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "other");
+        let expected = json!({"type":"syncRequired", "databaseId":"main", "databaseEpoch":commit.database_epoch,
+            "serverRevision":1, "reconciliation":{"kind":"replaceRequired","invalidate":true,"atLeast":1,"minimumSafeRevision":1}});
+        assert_eq!(serde_json::to_value(&messages[0].message)?, expected);
+        assert_eq!(result.response["sync"], expected);
+        assert_eq!(result.response["result"], json!({"named":[]}));
+    }
+    assert_eq!(
+        conn.query("SELECT server_revision FROM _pyre_sync", ())
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get::<i64>(0)?,
+        1
+    );
+    let mut legacy = QueryResult {
+        response: json!({"named":[]}),
+        affected_rows: affected,
+    };
+    let messages = server
+        .calculate_deltas(&conn, &mut legacy, &sessions, "main", None)
+        .await?;
+    assert_eq!(messages.len(), 2);
+    for message in messages {
+        assert_eq!(message.message.type_, "syncRequired");
+        assert!(message.message.data.is_empty());
+        assert_eq!(
+            message.message.reconciliation.unwrap()["minimumSafeRevision"],
+            2
+        );
+    }
+    let invalid_session = PyreSession::new(json!({}), &HashMap::new())?;
+    assert!(matches!(
+        server
+            .replacement(&conn, &manifest, &binding, &request, &invalid_session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidSession)
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_pins_all_tables_and_revision_during_concurrent_commits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::{
+        manifest::Manifest,
+        query::BatchBinding,
+        sync::{ReplacementRequest, SyncFence},
+    };
+    let db = TestDatabase::new("record Alpha {\n    id Int @id\n    marker Int\n    @public\n}\nrecord Beta {\n    id Int @id\n    marker Int\n    @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO alphas(id,marker) VALUES(1,0); INSERT INTO betas(id,marker) VALUES(1,0);").await?;
+    let queries = pyre::ast::QueryList { queries: vec![] };
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = vec![];
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|f| f.path.ends_with("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let fingerprint = manifest.fingerprint();
+    let namespace = db.context.valid_namespaces.iter().next().unwrap();
+    let binding = BatchBinding {
+        database_id: "main",
+        namespace,
+        manifest: &fingerprint,
+        instance: "tab",
+        auth_generation: 0,
+    };
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let epoch = conn
+        .query("SELECT database_epoch FROM _pyre_sync", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<String>(0)?;
+    let request = ReplacementRequest {
+        version: 1,
+        request_id: "consistent".into(),
+        target: 0,
+        fence: SyncFence {
+            database_id: "main".into(),
+            namespace: namespace.clone(),
+            manifest: fingerprint.clone(),
+            instance: "tab".into(),
+            auth_generation: 0,
+            database_epoch: epoch,
+        },
+    };
+    let writer = db.db.connect()?;
+    let commits = tokio::spawn(async move {
+        for _ in 0..100 {
+            writer.execute_batch("BEGIN IMMEDIATE; UPDATE alphas SET marker=marker+1; UPDATE betas SET marker=marker+1; UPDATE _pyre_sync SET server_revision=server_revision+1; COMMIT;").await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+    let server = SyncServer::new(&db.context);
+    for _ in 0..100 {
+        let snapshot = server
+            .replacement(&conn, &manifest, &binding, &request, &session)
+            .await?;
+        assert_eq!(
+            snapshot.tables["alphas"].rows[0]["marker"],
+            snapshot.revision
+        );
+        assert_eq!(
+            snapshot.tables["betas"].rows[0]["marker"],
+            snapshot.revision
+        );
+    }
+    commits.await?;
+    let final_snapshot = server
+        .replacement(&conn, &manifest, &binding, &request, &session)
+        .await?;
+    assert_eq!(final_snapshot.revision, 100);
     Ok(())
 }
 

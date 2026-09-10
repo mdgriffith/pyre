@@ -426,7 +426,7 @@ record Item {
     assert_eq!(empty.response["results"], json!([]));
     assert!(empty.response.get("commitRevision").is_none());
     assert!(SyncServer::new(&db.context)
-        .batch_messages(&empty, &ConnectedSessions::new())
+        .replacement_messages(&empty, &std::collections::HashMap::new())
         .is_empty());
     Ok(())
 }

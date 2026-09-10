@@ -165,6 +165,52 @@ with `bun packages/server/fixtures/compiled-batch/regenerate.ts` after building
 the compiler. Regeneration also compiles the generated server module and verifies
 its `manifestVersion` export. Rust and TS tests execute the same fixture schema.
 
+### Authoritative Replacement
+
+`catchupReplacement` from `@pyre/server/query-sync` takes a database connection,
+generated `manifest`, trusted `BatchAuthority`, replacement request, and effective
+session. The request contains `version: 1`, `requestId`, `target`, and the same
+flat database/instance/auth/namespace/manifest/epoch fences as a batch. The host
+must authenticate the authority independently of the request.
+
+A successful response has `type: "replacement"`, `scope: "database"`,
+`complete: true`, `serverRevision`, `tables: { [name]: { rows: [...] } }`, and
+the request's fences, ID, and target. All rows and the revision are read in one
+transaction. Install the whole scope atomically, deleting absent rows; an empty
+scope is not a no-op. Legacy timestamp catchup pages are not replacement evidence.
+The generated `compiledContract` must match the captured schema, and malformed
+stored rows reject the entire snapshot. Synced linked read permissions require
+this replacement path; legacy catchup rejects them with `ReplacementRequired`.
+
+`runBatchWithSync` recipients contain `{ session, fence }` from authenticated
+registration. Hints contain each recipient's fence, `type: "syncRequired"`,
+`serverRevision`, and conservative `reconciliation` invalidation metadata, never
+private rows or origin request IDs. Hints only raise required/security revision;
+they cannot advance covered revision. Named `runWithSync` mutations also commit
+their revision with the write; call the returned `sync(send)` to publish it.
+Failed or delayed SSE delivery does not change known batch acceptance.
+
+The libraries register no routes. The built-in server exposes POST
+`/sync/replacement` and POST `/sync/replacement/events` for replacement and fenced
+SSE registration, separately from its legacy sync routes. Signed sessions bind
+the instance and auth generation as they do for POST `/db`.
+
+Replacement currently materializes a complete scope in memory, not pinned pages.
+TypeScript rejects payloads above 64 MiB rather than returning partial coverage;
+remote libSQL remains unverified. Client installation, pending-intent replay,
+and receipt settlement are downstream of this server protocol.
+
+Build WASM before running the production-boundary fixture:
+
+```sh
+npm exec --package=wasm-pack -- wasm-pack build wasm --target web --out-dir ../packages/server/wasm
+npm exec --package=bun -- bun packages/server/fixtures/replacement-wasm.ts
+```
+
+The focused query-sync suite runs this fixture when the ignored WASM artifact
+is present and explicitly skips it otherwise. Mocked WASM unit tests alone do
+not establish generated-schema conformance.
+
 Write codecs are separate from permissive read-projection codecs. Both runtimes
 require safe integers, canonical boolean inputs, and complete structured variants
 with explicit nullable fields. Unknown structured write fields reject rather than

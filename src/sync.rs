@@ -114,6 +114,89 @@ fn table_sync_enabled(context: &typecheck::Context, table: &typecheck::Table) ->
         == ast::SyncMode::Synced
 }
 
+/// A change in any linked table can revoke rows absent from the affected-row set.
+/// Hosts must send full invalidation rather than legacy deltas for these contexts.
+pub fn requires_replacement(context: &typecheck::Context) -> bool {
+    fn relational(arg: &WhereArg) -> bool {
+        match arg {
+            WhereArg::Exists(..) => true,
+            WhereArg::And(args) | WhereArg::Or(args) => args.iter().any(relational),
+            _ => false,
+        }
+    }
+    context.tables.values().any(|table| {
+        table_sync_enabled(context, table)
+            && ast::get_permissions(&table.record, &ast::QueryOperation::Query)
+                .as_ref()
+                .is_some_and(relational)
+    })
+}
+
+pub fn require_legacy_sync(context: &typecheck::Context) -> Result<(), SyncError> {
+    if requires_replacement(context) {
+        Err(SyncError::PermissionError("ReplacementRequired".into()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Strict materialization for complete replacement. JSON cells are already decoded
+/// by the replacement SQL aggregate; strings must not be parsed a second time.
+pub fn reshape_replacement_table(
+    context: &typecheck::Context,
+    namespace: &str,
+    group: &crate::sync_deltas::AffectedRowTableGroup,
+) -> Result<crate::sync_deltas::AffectedRowTableGroup, SyncError> {
+    let invalid = || SyncError::SqlGenerationError("InvalidReplacementTable".into());
+    let mut candidates = context.tables.values().filter(|table| {
+        ast::get_tablename(&table.record.name, &table.record.fields) == group.table_name
+    });
+    let table = candidates.next().ok_or_else(invalid)?;
+    // The shared reshaper resolves physical names; reject ambiguity rather than
+    // accidentally applying a different namespace's codec.
+    if candidates.next().is_some()
+        || table.schema != namespace
+        || !table_sync_enabled(context, table)
+    {
+        return Err(invalid());
+    }
+    let mut headers = Vec::new();
+    let mut json_columns = Vec::new();
+    let mut fields = Vec::new();
+    for field in &table.record.fields {
+        if let ast::Field::Column(column) = field {
+            collect_sync_storage_columns(
+                context,
+                &column.type_,
+                &column.name,
+                &mut headers,
+                &mut json_columns,
+            );
+            let schema: crate::server::manifest::FieldSchema = serde_json::from_value(
+                serde_json::to_value(crate::generate::manifest::session_field_schema(
+                    context, column,
+                ))
+                .map_err(|_| invalid())?,
+            )
+            .map_err(|_| invalid())?;
+            fields.push((column.name.as_str(), schema));
+        }
+    }
+    if group.headers != headers || group.rows.iter().any(|row| row.len() != headers.len()) {
+        return Err(invalid());
+    }
+    let mut reshaped =
+        crate::sync_shape::reshape_table_groups(std::slice::from_ref(group), context);
+    let result = reshaped.pop().ok_or_else(invalid)?;
+    for row in &result.rows {
+        for ((name, schema), value) in fields.iter().zip(row) {
+            crate::server::manifest::validate_storage_field(name, value, schema)
+                .map_err(|_| invalid())?;
+        }
+    }
+    Ok(result)
+}
+
 fn synced_table_names(context: &typecheck::Context) -> HashSet<String> {
     context
         .tables
@@ -506,6 +589,7 @@ fn render_session_param(value: &SessionValue, params: &mut Vec<SessionValue>) ->
 
 fn render_permission_value(
     value: &ast::QueryValue,
+    column: Option<&ast::Column>,
     session: &HashMap<String, SessionValue>,
     params: &mut Vec<SessionValue>,
 ) -> String {
@@ -514,12 +598,25 @@ fn render_permission_value(
             if let Some(path) = var.session_path() {
                 let session_key = path.flattened();
                 let session_value = session.get(&session_key).unwrap_or(&SessionValue::Null);
-                render_session_param(session_value, params)
+                let param = render_session_param(session_value, params);
+                // Match render_column_value's JSONB conversion, with positional session binds.
+                if column.is_some_and(|column| {
+                    matches!(
+                        column.type_,
+                        ast::ColumnType::Json | ast::ColumnType::JsonTyped(_)
+                    )
+                }) {
+                    format!("jsonb({})", param)
+                } else {
+                    param
+                }
             } else {
                 crate::generate::sql::to_sql::render_value(value)
             }
         }
-        _ => crate::generate::sql::to_sql::render_value(value),
+        _ => column
+            .map(|column| crate::generate::sql::to_sql::render_column_value(column, value))
+            .unwrap_or_else(|| crate::generate::sql::to_sql::render_value(value)),
     }
 }
 
@@ -533,9 +630,104 @@ fn render_permission_where(
     session: &HashMap<String, SessionValue>,
     params: &mut Vec<SessionValue>,
 ) -> String {
+    render_permission_where_inner(
+        context, where_arg, table, session, params, None, &mut 0, false,
+    )
+}
+
+fn render_permission_where_inner(
+    context: &typecheck::Context,
+    where_arg: &WhereArg,
+    table: &typecheck::Table,
+    session: &HashMap<String, SessionValue>,
+    params: &mut Vec<SessionValue>,
+    table_ref: Option<&str>,
+    next_alias: &mut usize,
+    allow_exists: bool,
+) -> String {
+    let table_name = table_ref.map(str::to_string).unwrap_or_else(|| {
+        crate::ext::string::quote(&ast::get_tablename(
+            &table.record.name,
+            &table.record.fields,
+        ))
+    });
     match where_arg {
         WhereArg::Constant(value) => if *value { "1" } else { "0" }.to_string(),
-        WhereArg::Exists(..) => "0".to_string(),
+        WhereArg::Exists(path, body) => {
+            if !allow_exists || path.is_empty() {
+                return "0".to_string();
+            }
+            let mut current = table;
+            let mut previous_ref = table_name;
+            let mut sources = Vec::new();
+            let mut predicates = Vec::new();
+            for (segment, _) in path {
+                let Some(link) = current.record.fields.iter().find_map(|field| match field {
+                    ast::Field::FieldDirective(ast::FieldDirective::Link(link))
+                        if link.link_name == *segment =>
+                    {
+                        Some(link)
+                    }
+                    _ => None,
+                }) else {
+                    return "0".to_string();
+                };
+                let Some(linked) = typecheck::get_linked_table(context, link) else {
+                    return "0".to_string();
+                };
+                // Replacement is one physical database, never an attached namespace.
+                if linked.schema != table.schema
+                    || link.local_ids.is_empty()
+                    || link.local_ids.len() != link.foreign.fields.len()
+                {
+                    return "0".to_string();
+                }
+                let alias = loop {
+                    let candidate = format!("__pyre_replacement_exists_{}", next_alias);
+                    *next_alias += 1;
+                    if !context.tables.values().any(|table| {
+                        ast::get_tablename(&table.record.name, &table.record.fields)
+                            .eq_ignore_ascii_case(&candidate)
+                    }) {
+                        break crate::ext::string::quote(&candidate);
+                    }
+                };
+                sources.push(format!(
+                    "{} as {}",
+                    crate::ext::string::quote(&ast::get_tablename(
+                        &linked.record.name,
+                        &linked.record.fields
+                    )),
+                    alias
+                ));
+                for (local, foreign) in link.local_ids.iter().zip(&link.foreign.fields) {
+                    predicates.push(format!(
+                        "{}.{} = {}.{}",
+                        alias,
+                        crate::ext::string::quote(foreign),
+                        previous_ref,
+                        crate::ext::string::quote(local)
+                    ));
+                }
+                current = linked;
+                previous_ref = alias;
+            }
+            predicates.push(render_permission_where_inner(
+                context,
+                body,
+                current,
+                session,
+                params,
+                Some(&previous_ref),
+                next_alias,
+                true,
+            ));
+            format!(
+                "exists (select 1 from {} where {})",
+                sources.join(", "),
+                predicates.join(" and ")
+            )
+        }
         WhereArg::Column(is_session_var, path, op, value, _field_name_range) => {
             let fieldname = path.root();
             let resolved = if *is_session_var {
@@ -553,10 +745,6 @@ fn render_permission_where(
                 let session_value = session.get(physical).unwrap_or(&SessionValue::Null);
                 render_session_param(session_value, params)
             } else {
-                let table_name = crate::ext::string::quote(&ast::get_tablename(
-                    &table.record.name,
-                    &table.record.fields,
-                ));
                 let physical = resolved
                     .as_ref()
                     .map(|path| path.physical_column.as_str())
@@ -564,7 +752,12 @@ fn render_permission_where(
                 format!("{}.{}", table_name, crate::ext::string::quote(physical))
             };
 
-            let value_str = render_permission_value(value, session, params);
+            let value_str = render_permission_value(
+                value,
+                resolved.as_ref().map(|resolved| &resolved.column),
+                session,
+                params,
+            );
             let value_str = if matches!(op, ast::Operator::In | ast::Operator::NotIn)
                 && matches!(value, ast::QueryValue::Variable((_, var)) if var.session_field.is_some())
             {
@@ -603,10 +796,6 @@ fn render_permission_where(
             let mut guards = Vec::new();
             if !*is_session_var {
                 if let Some(resolved) = &resolved {
-                    let table_name = crate::ext::string::quote(&ast::get_tablename(
-                        &table.record.name,
-                        &table.record.fields,
-                    ));
                     guards.extend(resolved.discriminators.iter().map(|(column, variant)| {
                         format!(
                             "{}.{} = '{}'",
@@ -660,14 +849,36 @@ fn render_permission_where(
         WhereArg::And(args) => {
             let inner_list: Vec<String> = args
                 .iter()
-                .map(|arg| render_permission_where(context, arg, table, session, params))
+                .map(|arg| {
+                    render_permission_where_inner(
+                        context,
+                        arg,
+                        table,
+                        session,
+                        params,
+                        table_ref,
+                        next_alias,
+                        allow_exists,
+                    )
+                })
                 .collect();
             format!("({})", inner_list.join(" and "))
         }
         WhereArg::Or(args) => {
             let inner_list: Vec<String> = args
                 .iter()
-                .map(|arg| render_permission_where(context, arg, table, session, params))
+                .map(|arg| {
+                    render_permission_where_inner(
+                        context,
+                        arg,
+                        table,
+                        session,
+                        params,
+                        table_ref,
+                        next_alias,
+                        allow_exists,
+                    )
+                })
                 .collect();
             format!("({})", inner_list.join(" or "))
         }
@@ -708,6 +919,7 @@ fn get_sync_status_sql_with_params(
     session: &HashMap<String, SessionValue>,
     params: &mut Vec<SessionValue>,
 ) -> Result<String, SyncError> {
+    require_legacy_sync(context)?;
     use crate::ext::string;
 
     let mut union_parts = Vec::new();
@@ -921,9 +1133,66 @@ pub fn get_sync_sql(
     session: &HashMap<String, SessionValue>,
     page_size: usize,
 ) -> Result<SyncSqlResult, SyncError> {
+    require_legacy_sync(context)?;
+    get_sync_sql_inner(
+        sync_status,
+        sync_cursor,
+        context,
+        session,
+        Some(normalize_page_size(page_size)?),
+        None,
+    )
+}
+
+/// Complete scope SQL has no timestamp cursor or row limit. The caller must pin
+/// all statements and the revision in one database read transaction.
+pub fn get_replacement_sql(
+    context: &typecheck::Context,
+    session: &HashMap<String, SessionValue>,
+    namespace: &str,
+) -> Result<SyncSqlResult, SyncError> {
+    if !context.valid_namespaces.contains(namespace) {
+        return Err(SyncError::SqlGenerationError(
+            "Unknown replacement namespace".to_string(),
+        ));
+    }
+    let status = SyncStatusResult {
+        server_revision: None,
+        database_epoch: String::new(),
+        tables: context
+            .tables
+            .values()
+            .filter(|table| table.schema == namespace && table_sync_enabled(context, table))
+            .map(|table| TableSyncStatus {
+                table_name: ast::get_tablename(&table.record.name, &table.record.fields),
+                sync_layer: 0,
+                needs_sync: true,
+                max_updated_at: None,
+                max_primary_key: None,
+                permission_hash: String::new(),
+            })
+            .collect(),
+    };
+    get_sync_sql_inner(
+        &status,
+        &SyncCursor::new(),
+        context,
+        session,
+        None,
+        Some(namespace),
+    )
+}
+
+fn get_sync_sql_inner(
+    sync_status: &SyncStatusResult,
+    sync_cursor: &SyncCursor,
+    context: &typecheck::Context,
+    session: &HashMap<String, SessionValue>,
+    page_size: Option<usize>,
+    namespace: Option<&str>,
+) -> Result<SyncSqlResult, SyncError> {
     use crate::ext::string;
     validate_sync_cursor(sync_cursor, context)?;
-    let effective_page_size = normalize_page_size(page_size)?;
 
     let mut result = SyncSqlResult { tables: Vec::new() };
 
@@ -941,6 +1210,7 @@ pub fn get_sync_sql(
             .find(|t| {
                 let actual_table_name = ast::get_tablename(&t.record.name, &t.record.fields);
                 actual_table_name == status.table_name
+                    && namespace.is_none_or(|namespace| t.schema == namespace)
             })
             .ok_or_else(|| {
                 SyncError::SqlGenerationError(
@@ -992,12 +1262,15 @@ pub fn get_sync_sql(
 
         // Add permission WHERE clause. Session values are emitted as bind parameters.
         if let Some(perm) = &permission {
-            where_parts.push(render_permission_where(
+            where_parts.push(render_permission_where_inner(
                 context,
                 perm,
                 table,
                 session,
                 &mut params,
+                None,
+                &mut 0,
+                page_size.is_none(),
             ));
         }
 
@@ -1081,7 +1354,7 @@ pub fn get_sync_sql(
             .collect::<Vec<_>>();
 
         let sql = format!(
-            "SELECT coalesce(json_group_array(json_array({})), json('[]')) AS {} FROM (SELECT {} FROM {}{} ORDER BY {}.updatedAt ASC, {}.{} ASC LIMIT {})",
+            "SELECT coalesce(json_group_array(json_array({})), json('[]')) AS {} FROM (SELECT {} FROM {}{} ORDER BY {}.updatedAt ASC, {}.{} ASC{})",
             row_values.join(", "),
             string::quote(SYNC_ROWS_JSON_COLUMN),
             columns.join(", "),
@@ -1090,7 +1363,7 @@ pub fn get_sync_sql(
             quoted_table_name,
             quoted_table_name,
             string::quote(&primary_key),
-            effective_page_size + 1 // +1 to check if there's more
+            page_size.map(|size| format!(" LIMIT {}", size + 1)).unwrap_or_default()
         );
 
         result.tables.push(TableSyncSql {

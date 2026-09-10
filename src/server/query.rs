@@ -365,6 +365,12 @@ pub struct QueryResult {
 }
 
 #[derive(Debug)]
+pub struct CommittedRevision {
+    pub database_epoch: String,
+    pub revision: i64,
+}
+
+#[derive(Debug)]
 pub struct ExplainStatement {
     pub include: bool,
     pub sql: String,
@@ -391,7 +397,9 @@ pub async fn run(
     input: JsonValue,
     session: &PyreSession,
 ) -> Result<QueryResult, Error> {
-    run_inner(conn, manifest, query_id, input, session, false).await
+    run_inner(conn, manifest, query_id, input, session, false, false)
+        .await
+        .map(|(result, _)| result)
 }
 
 pub async fn run_sync(
@@ -401,7 +409,23 @@ pub async fn run_sync(
     input: JsonValue,
     session: &PyreSession,
 ) -> Result<QueryResult, Error> {
-    run_inner(conn, manifest, query_id, input, session, true).await
+    run_inner(conn, manifest, query_id, input, session, true, false)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// Execute a named operation with a revision committed in the same transaction.
+/// Reads allocate no revision; successful mutations include named no-ops. The
+/// declared response remains unchanged, and publication must reuse this revision.
+pub async fn run_with_revision(
+    conn: &libsql::Connection,
+    manifest: &Manifest,
+    query_id: &str,
+    input: JsonValue,
+    session: &PyreSession,
+    sync_mode: bool,
+) -> Result<(QueryResult, Option<CommittedRevision>), Error> {
+    run_inner(conn, manifest, query_id, input, session, sync_mode, true).await
 }
 
 pub async fn explain(
@@ -478,7 +502,8 @@ async fn run_inner(
     input: JsonValue,
     session: &PyreSession,
     sync_mode: bool,
-) -> Result<QueryResult, Error> {
+    commit_revision: bool,
+) -> Result<(QueryResult, Option<CommittedRevision>), Error> {
     let query = manifest
         .queries
         .get(query_id)
@@ -491,14 +516,33 @@ async fn run_inner(
     };
 
     if query.operation == "query" {
-        return execute_generated_sql(conn, sql, &args, None).await;
+        return execute_generated_sql(conn, sql, &args, None)
+            .await
+            .map(|result| (result, None));
     }
 
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
         .map_err(|error| Error::Database(error).execution("begin transaction", None))?;
-    match execute_generated_sql(&tx, sql, &args, None).await {
+    let execution = async {
+        let result = execute_generated_sql(&tx, sql, &args, None).await?;
+        let revision = if commit_revision {
+            let (database_epoch, revision) =
+                crate::server::sync::next_server_revision(&tx)
+                    .await
+                    .map_err(|error| Error::UnsupportedRuntime(error.to_string()))?;
+            Some(CommittedRevision {
+                database_epoch,
+                revision,
+            })
+        } else {
+            None
+        };
+        Ok((result, revision))
+    }
+    .await;
+    match execution {
         Ok(result) => {
             tx.commit()
                 .await

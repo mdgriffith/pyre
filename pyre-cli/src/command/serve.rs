@@ -70,6 +70,7 @@ struct AppState {
 }
 
 struct Connection {
+    fence: Option<pyre::server::sync::SyncFence>,
     session: HashMap<String, pyre::sync::SessionValue>,
     sender: mpsc::UnboundedSender<JsonValue>,
 }
@@ -206,6 +207,14 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
         .route("/health", get(health).options(cors_preflight))
         .route("/sync", post(sync).options(cors_preflight))
         .route("/sync/events", get(sync_events).options(cors_preflight))
+        .route(
+            "/sync/replacement",
+            post(replacement).options(cors_preflight),
+        )
+        .route(
+            "/sync/replacement/events",
+            post(replacement_events).options(cors_preflight),
+        )
         .route("/db", post(run_batch).options(cors_preflight))
         .route("/db/:query_id", post(run_query).options(cors_preflight))
         .with_state(state);
@@ -357,6 +366,7 @@ async fn sync_events(
     state.connections.lock().await.insert(
         session_id.clone(),
         Connection {
+            fence: None,
             session: session.logical().clone(),
             sender,
         },
@@ -498,12 +508,153 @@ async fn run_batch(
     }
     .await;
     let response = match result {
-        // Legacy SSE connections have no local-edit fence. Do not broadcast origin
-        // fences to them; full fenced transport publication belongs to MEC-109.
-        Ok(result) => Json(result.response).into_response(),
+        Ok(result) => {
+            if let Ok(context) = state.loaded_schema.context() {
+                let connections = state.connections.lock().await;
+                let recipients = connections
+                    .iter()
+                    .filter_map(|(id, connection)| {
+                        connection.fence.clone().map(|fence| (id.clone(), fence))
+                    })
+                    .collect();
+                for hint in SyncServer::new(context).replacement_messages(&result, &recipients) {
+                    if let Some(connection) = connections.get(&hint.session_id) {
+                        let _ = connection.sender.send(hint.message);
+                    }
+                }
+            }
+            Json(result.response).into_response()
+        }
         Err((status, code, index)) => batch_failure(Some(&request), status, code, index),
     };
     with_cors(&state, &headers, response)
+}
+
+async fn materialize_replacement(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &pyre::server::sync::ReplacementRequest,
+) -> Result<pyre::server::sync::Replacement, ServeError> {
+    let (session, local_edit) = effective_session_from_request(state, headers)
+        .map_err(|_| ServeError::Unauthorized("InvalidSession".into()))?;
+    let signed = matches!(
+        &state.session_source,
+        SessionSource::Header {
+            secret: Some(_),
+            ..
+        }
+    );
+    let (instance, auth_generation) = match local_edit.as_ref() {
+        Some(binding) => (binding.instance.as_str(), binding.auth_generation),
+        None if !signed => (request.fence.instance.as_str(), 0),
+        None => return Err(ServeError::Unauthorized("InvalidSession".into())),
+    };
+    let context = state
+        .loaded_schema
+        .context()
+        .map_err(|_| ServeError::Internal("ReplacementFailed".into()))?;
+    let schema = state
+        .loaded_schema
+        .schema()
+        .map_err(|_| ServeError::Internal("ReplacementFailed".into()))?;
+    let fingerprint = state.manifest.fingerprint();
+    let binding = BatchBinding {
+        database_id: &state.database_id,
+        namespace: &schema.namespace,
+        manifest: &fingerprint,
+        instance,
+        auth_generation,
+    };
+    let conn = state
+        .db
+        .connect()
+        .map_err(|_| ServeError::Internal("ReplacementFailed".into()))?;
+    SyncServer::new(context)
+        .replacement(&conn, &state.manifest, &binding, request, &session)
+        .await
+        .map_err(|error| match error {
+            pyre::server::sync::Error::InvalidFence => {
+                ServeError::BadRequest("InvalidFence".into())
+            }
+            pyre::server::sync::Error::InvalidSession => {
+                ServeError::Unauthorized("InvalidSession".into())
+            }
+            pyre::server::sync::Error::TargetNotReached => {
+                ServeError::BadRequest("TargetNotReached".into())
+            }
+            _ => ServeError::Internal("ReplacementFailed".into()),
+        })
+}
+
+async fn replacement(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<pyre::server::sync::ReplacementRequest>,
+) -> Response {
+    let response = match materialize_replacement(&state, &headers, &request).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => replacement_failure(&request, error),
+    };
+    with_cors(&state, &headers, response)
+}
+
+fn replacement_failure(
+    request: &pyre::server::sync::ReplacementRequest,
+    error: ServeError,
+) -> Response {
+    let mut body = serde_json::to_value(&request.fence).expect("serializable fence");
+    body["requestId"] = json!(request.request_id);
+    body["target"] = json!(request.target);
+    body["error"] = json!(error.message());
+    (error.status(), Json(body)).into_response()
+}
+
+async fn replacement_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<pyre::server::sync::ReplacementRequest>,
+) -> Response {
+    let snapshot = match materialize_replacement(&state, &headers, &request).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return with_cors(&state, &headers, replacement_failure(&request, error)),
+    };
+    let session_id = new_connection_id();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    state.connections.lock().await.insert(
+        session_id.clone(),
+        Connection {
+            fence: Some(snapshot.fence.clone()),
+            session: HashMap::new(),
+            sender,
+        },
+    );
+    // Send a hint, not the pre-registration snapshot: the client fetches after
+    // registration, covering any commit between validation and registration.
+    let mut connected = serde_json::to_value(&snapshot.fence).expect("serializable fence");
+    connected["type"] = json!("syncRequired");
+    connected["serverRevision"] = json!(snapshot.revision);
+    connected["reconciliation"] = json!({
+        "kind": "replaceRequired", "atLeast": snapshot.revision,
+        "invalidate": true, "minimumSafeRevision": snapshot.revision
+    });
+    let cleanup = ConnectionCleanup {
+        state: Arc::clone(&state),
+        session_id,
+    };
+    let stream = async_stream::stream! {
+        let _cleanup = cleanup;
+        yield Ok::<_, Infallible>(Event::default().json_data(connected).unwrap_or_else(|_| Event::default()));
+        while let Some(message) = receiver.recv().await {
+            yield Ok::<_, Infallible>(Event::default().json_data(message).unwrap_or_else(|_| Event::default()));
+        }
+    };
+    with_cors(
+        &state,
+        &headers,
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response(),
+    )
 }
 
 fn batch_failure(
@@ -544,31 +695,57 @@ async fn run_query(
         .db
         .connect()
         .map_err(|error| ServeError::Internal(format!("database error: {}", error)))?;
-    let mut result = if query.sync.as_deref() == Some("true") {
-        pyre::server::query::run_sync(&conn, &state.manifest, &query_id, input, &session).await
-    } else {
-        pyre::server::query::run(&conn, &state.manifest, &query_id, input, &session).await
-    }
+    let (mut result, commit) = pyre::server::query::run_with_revision(
+        &conn,
+        &state.manifest,
+        &query_id,
+        input,
+        &session,
+        query.sync.as_deref() == Some("true"),
+    )
+    .await
     .map_err(|error| ServeError::BadRequest(error.to_string()))?;
 
-    if query.sync.as_deref() == Some("true") {
-        let connected_sessions = connected_sessions(&state).await;
+    if let Some(commit) = commit {
         let context = state
             .loaded_schema
             .context()
             .map_err(|error| ServeError::Internal(error.to_string()))?;
         let server = SyncServer::new(context);
-        let messages = server
-            .calculate_deltas(
-                &conn,
-                &mut result,
-                &connected_sessions,
+        let fingerprint = state.manifest.fingerprint();
+        {
+            let connections = state.connections.lock().await;
+            let recipients = connections
+                .iter()
+                .filter_map(|(id, connection)| {
+                    connection.fence.clone().map(|fence| (id.clone(), fence))
+                })
+                .collect();
+            for hint in server.committed_replacement_messages(
+                &commit,
                 &state.database_id,
-                query.connection_id.as_deref(),
-            )
-            .await
-            .map_err(|error| ServeError::Internal(error.to_string()))?;
-        send_messages(&state, messages).await;
+                &state.manifest.queries[&query_id].primary_db,
+                &fingerprint,
+                &recipients,
+            ) {
+                if let Some(connection) = connections.get(&hint.session_id) {
+                    let _ = connection.sender.send(hint.message);
+                }
+            }
+        }
+        if query.sync.as_deref() == Some("true") {
+            let connected_sessions = connected_sessions(&state).await;
+            let messages = server
+                .calculate_committed_deltas(
+                    &mut result,
+                    &connected_sessions,
+                    &state.database_id,
+                    query.connection_id.as_deref(),
+                    &commit,
+                )
+                .map_err(|error| ServeError::Internal(error.to_string()))?;
+            send_messages(&state, messages).await;
+        }
     }
 
     Ok(with_cors(
@@ -584,6 +761,7 @@ async fn connected_sessions(state: &AppState) -> ConnectedSessions {
         .lock()
         .await
         .iter()
+        .filter(|(_, connection)| connection.fence.is_none())
         .map(|(id, connection)| (id.clone(), connection.session.clone()))
         .collect()
 }
@@ -780,7 +958,7 @@ mod tests {
         let loaded_schema = load_schema_from_database(&conn).await.unwrap();
         let namespace = loaded_schema.schema().unwrap().namespace.clone();
         let manifest = serde_json::from_value(json!({
-            "version": 1, "session_schema": {}, "queries": {
+            "version": 1, "compiledContract": pyre::generate::manifest::compiled_schema_contract(loaded_schema.context().unwrap()), "session_schema": {}, "queries": {
                 "create": {
                     "id": "create", "operation": "insert", "primary_db": namespace,
                     "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
@@ -852,6 +1030,7 @@ mod tests {
         state.connections.lock().await.insert(
             "legacy".into(),
             Connection {
+                fence: None,
                 session: HashMap::new(),
                 sender,
             },
@@ -914,6 +1093,326 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
             assert_eq!(response_json(response).await["code"], "InvalidRequest");
         }
+    }
+
+    #[tokio::test]
+    async fn named_mutations_invalidate_replacement_recipients_at_the_committed_revision() {
+        for sync_mode in [false, true] {
+            let (_dir, mut state) = batch_state().await;
+            let conn = state.db.connect().unwrap();
+            pyre::server::schema::ensure_database(&conn, pyre::ast::DEFAULT_SCHEMANAME,
+                "record Item {\n id Id.Int @id\n name String\n @allow(query) { name != \"hidden\" }\n @allow(insert, update, delete) { True }\n}\n").await.unwrap();
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.loaded_schema = load_schema_from_database(&conn).await.unwrap();
+            mutable.manifest.compiled_contract = pyre::generate::manifest::compiled_schema_contract(
+                mutable.loaded_schema.context().unwrap(),
+            );
+            let namespace = mutable.loaded_schema.schema().unwrap().namespace.clone();
+            for (id, operation, sql, affected) in [
+                (
+                    "delete",
+                    "delete",
+                    "DELETE FROM items WHERE id=1",
+                    json!([{ "table_name":"items", "headers":["id","name"], "rows":[[1,"visible"]] }]),
+                ),
+                (
+                    "hide",
+                    "update",
+                    "UPDATE items SET name='hidden' WHERE id=2",
+                    json!([{ "table_name":"items", "headers":["id","name"], "rows":[[2,"hidden"]] }]),
+                ),
+                (
+                    "noop",
+                    "update",
+                    "UPDATE items SET name='unused' WHERE id=999",
+                    json!([]),
+                ),
+                ("read", "query", "SELECT 1", json!([])),
+                (
+                    "restore",
+                    "update",
+                    "UPDATE items SET name='visible' WHERE id=2",
+                    json!([]),
+                ),
+            ] {
+                mutable.manifest.queries.insert(id.into(), serde_json::from_value(json!({
+                    "id":id,"operation":operation,"primary_db":namespace,
+                    "input_schema":{},"session_args":[],"optional_input_args":[],"json_input_args":[],
+                    "sql":[{"include":operation == "query","params":[],"sql":sql},
+                        {"include":true,"params":[],"sql":format!("SELECT json('[]') AS item, '{}' AS _affectedRows", affected)}]
+                })).unwrap());
+            }
+            conn.execute(
+                "INSERT INTO items(id,name) VALUES(1,'visible'),(2,'visible')",
+                (),
+            )
+            .await
+            .unwrap();
+            let body = batch_body(&state).await;
+            let fence = pyre::server::sync::SyncFence {
+                database_id: state.database_id.clone(),
+                namespace,
+                manifest: state.manifest.fingerprint(),
+                database_epoch: body["databaseEpoch"].as_str().unwrap().into(),
+                instance: "recipient".into(),
+                auth_generation: 0,
+            };
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            state.connections.lock().await.insert(
+                "replacement".into(),
+                Connection {
+                    fence: Some(fence.clone()),
+                    session: HashMap::new(),
+                    sender,
+                },
+            );
+            let (sender, mut legacy_receiver) = mpsc::unbounded_channel();
+            state.connections.lock().await.insert(
+                "legacy".into(),
+                Connection {
+                    fence: None,
+                    session: HashMap::new(),
+                    sender,
+                },
+            );
+            for (index, name) in ["delete", "hide", "noop"].into_iter().enumerate() {
+                let revision = index as i64 + 1;
+                let response = run_query(
+                    State(state.clone()),
+                    origin_headers(),
+                    Query(RequestQuery {
+                        database_id: Some(state.database_id.clone()),
+                        connection_id: None,
+                        sync: sync_mode.then(|| "true".into()),
+                    }),
+                    AxumPath(name.into()),
+                    Json(json!({})),
+                )
+                .await
+                .unwrap();
+                let response = response_json(response).await;
+                if sync_mode && name != "noop" {
+                    assert_eq!(response["result"], json!({"item":[]}));
+                    assert_eq!(response["serverRevision"], revision);
+                    if name == "delete" {
+                        assert_eq!(
+                            legacy_receiver.try_recv().unwrap()["serverRevision"],
+                            revision
+                        );
+                    }
+                } else {
+                    assert_eq!(response, json!({"item":[]}));
+                }
+                let mut expected = serde_json::to_value(&fence).unwrap();
+                expected["type"] = json!("syncRequired");
+                expected["serverRevision"] = json!(revision);
+                expected["reconciliation"] = json!({"kind":"replaceRequired","atLeast":revision,"invalidate":true,"minimumSafeRevision":revision});
+                assert_eq!(receiver.try_recv().unwrap(), expected);
+                let snapshot = materialize_replacement(
+                    &state,
+                    &origin_headers(),
+                    &pyre::server::sync::ReplacementRequest {
+                        version: 1,
+                        fence: fence.clone(),
+                        request_id: format!("catchup-{revision}"),
+                        target: revision,
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(snapshot.revision, revision);
+                assert_eq!(
+                    snapshot.tables["items"].rows.len(),
+                    if name == "delete" { 1 } else { 0 }
+                );
+            }
+            for name in ["read", "fail", "restore"] {
+                if name == "restore" {
+                    conn.execute("CREATE TRIGGER reject_revision BEFORE UPDATE ON _pyre_sync BEGIN SELECT RAISE(ABORT, 'revision unavailable'); END", ()).await.unwrap();
+                }
+                let response = run_query(
+                    State(state.clone()),
+                    origin_headers(),
+                    Query(RequestQuery {
+                        database_id: None,
+                        connection_id: None,
+                        sync: sync_mode.then(|| "true".into()),
+                    }),
+                    AxumPath(name.into()),
+                    Json(json!({})),
+                )
+                .await;
+                assert_eq!(response.is_ok(), name == "read", "{name}: {response:?}");
+                assert!(receiver.try_recv().is_err());
+            }
+            let row = conn
+                .query(
+                    "SELECT server_revision, (SELECT name FROM items WHERE id=2) FROM _pyre_sync",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i64>(0).unwrap(), 3);
+            assert_eq!(row.get::<String>(1).unwrap(), "hidden");
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_route_and_publication_use_recipient_fences() {
+        let (_dir, state) = batch_state().await;
+        let body = batch_body(&state).await;
+        let request = pyre::server::sync::ReplacementRequest {
+            version: 1,
+            request_id: "catchup".into(),
+            target: 0,
+            fence: pyre::server::sync::SyncFence {
+                database_id: body["databaseId"].as_str().unwrap().into(),
+                namespace: body["namespace"].as_str().unwrap().into(),
+                manifest: body["manifest"].as_str().unwrap().into(),
+                database_epoch: body["databaseEpoch"].as_str().unwrap().into(),
+                instance: "recipient".into(),
+                auth_generation: 0,
+            },
+        };
+        let response = replacement(
+            State(state.clone()),
+            origin_headers(),
+            Json(request.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = response_json(response).await;
+        assert_eq!(snapshot["requestId"], "catchup");
+        assert_eq!(snapshot["instance"], "recipient");
+        assert_eq!(snapshot["tables"]["items"], json!({"rows":[]}));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        state.connections.lock().await.insert(
+            "recipient".into(),
+            Connection {
+                fence: Some(request.fence.clone()),
+                session: HashMap::new(),
+                sender,
+            },
+        );
+        let accepted = response_json(submit(state.clone(), body, origin_headers()).await).await;
+        let hint = receiver.try_recv().unwrap();
+        assert_eq!(hint["instance"], "recipient");
+        assert_eq!(hint["type"], "syncRequired");
+        assert_eq!(hint["serverRevision"], accepted["commitRevision"]);
+        assert_eq!(
+            hint["reconciliation"],
+            json!({"kind":"replaceRequired", "atLeast":accepted["commitRevision"], "invalidate":true, "minimumSafeRevision":accepted["commitRevision"]})
+        );
+        assert!(hint.get("results").is_none());
+        let mut catchup = request.clone();
+        catchup.target = accepted["commitRevision"].as_i64().unwrap();
+        let snapshot =
+            response_json(replacement(State(state.clone()), origin_headers(), Json(catchup)).await)
+                .await;
+        assert_eq!(snapshot["type"], "replacement");
+        assert_eq!(snapshot["serverRevision"], accepted["commitRevision"]);
+        assert_eq!(
+            snapshot["tables"]["items"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut invalid = request.clone();
+        invalid.fence.auth_generation = 123;
+        let response = replacement(State(state.clone()), origin_headers(), Json(invalid)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let failure = response_json(response).await;
+        assert_eq!(failure["requestId"], "catchup");
+        assert_eq!(failure["error"], "InvalidFence");
+        assert!(failure.get("tables").is_none());
+        let mut future = request;
+        future.target = 999;
+        let response = replacement(State(state), origin_headers(), Json(future)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["error"], "TargetNotReached");
+    }
+
+    #[tokio::test]
+    async fn replacement_events_authenticate_registration_and_stream_fenced_hints() {
+        let (_dir, mut state) = batch_state().await;
+        Arc::get_mut(&mut state).unwrap().session_source = SessionSource::Header {
+            name: DEFAULT_SESSION_HEADER.into(),
+            secret: Some("secret".into()),
+        };
+        let mut body = batch_body(&state).await;
+        let request = pyre::server::sync::ReplacementRequest {
+            version: 1,
+            request_id: "subscribe".into(),
+            target: 0,
+            fence: pyre::server::sync::SyncFence {
+                database_id: body["databaseId"].as_str().unwrap().into(),
+                namespace: body["namespace"].as_str().unwrap().into(),
+                manifest: body["manifest"].as_str().unwrap().into(),
+                database_epoch: body["databaseEpoch"].as_str().unwrap().into(),
+                instance: "recipient".into(),
+                auth_generation: 7,
+            },
+        };
+        let signed_headers = |claims: JsonValue| {
+            let payload = URL_SAFE_NO_PAD.encode(
+                json!({"session":{}, "exp":4102444800_i64, "localEdit":claims}).to_string(),
+            );
+            let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+            mac.update(payload.as_bytes());
+            let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+            let mut headers = origin_headers();
+            headers.insert(
+                DEFAULT_SESSION_HEADER,
+                HeaderValue::from_str(&format!("{payload}.{signature}")).unwrap(),
+            );
+            headers
+        };
+        let recipient_headers = signed_headers(json!({"instance":"recipient", "authGeneration":7}));
+        let mut wrong = request.clone();
+        wrong.fence.auth_generation = 8;
+        assert_eq!(
+            replacement_events(State(state.clone()), recipient_headers.clone(), Json(wrong))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.connections.lock().await.is_empty());
+        let response =
+            replacement_events(State(state.clone()), recipient_headers, Json(request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body();
+        let first = stream.data().await.unwrap().unwrap();
+        let first = std::str::from_utf8(&first).unwrap();
+        assert!(first.contains("\"instance\":\"recipient\""));
+        assert!(first.contains("\"authGeneration\":7"));
+        assert!(first.contains("\"type\":\"syncRequired\""));
+        assert!(first.contains("\"serverRevision\":0"));
+        assert!(first.contains("\"reconciliation\":{\"atLeast\":0,\"invalidate\":true,\"kind\":\"replaceRequired\",\"minimumSafeRevision\":0}"));
+        body["instance"] = json!("origin");
+        body["authGeneration"] = json!(2);
+        let accepted = response_json(
+            submit(
+                state.clone(),
+                body,
+                signed_headers(json!({"instance":"origin", "authGeneration":2})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(accepted["status"], "accepted");
+        let next = stream.data().await.unwrap().unwrap();
+        let next = std::str::from_utf8(&next).unwrap();
+        assert!(next.contains("\"instance\":\"recipient\""));
+        assert!(next.contains("\"authGeneration\":7"));
+        assert!(next.contains("\"minimumSafeRevision\":1"));
+        assert!(next.contains("\"serverRevision\":1"));
+        assert!(next.contains("\"type\":\"syncRequired\""));
+        assert!(!next.contains("origin"));
     }
 
     #[tokio::test]

@@ -4,6 +4,13 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 impl Manifest {
+    /// Authenticate the context used for permission SQL against this compiled manifest.
+    pub fn matches_context(&self, context: &crate::typecheck::Context) -> bool {
+        self.version == 1
+            && self.compiled_contract
+                == crate::generate::manifest::compiled_schema_contract(context)
+    }
+
     /// Content identity of this compiled allowlist, independent of HashMap insertion order.
     /// `version` is the manifest format version; this fingerprint is the request fence.
     pub fn fingerprint(&self) -> String {
@@ -213,12 +220,33 @@ fn validate_field_inner(
     schema: &FieldSchema,
     session: bool,
 ) -> Result<(), Error> {
+    validate_field_mode(name, value, schema, session, false)
+}
+
+/// Validate a reshaped SQLite field, allowing only SQLite's 0/1 Boolean storage
+/// representation in flattened columns (not inside typed JSON documents).
+pub(crate) fn validate_storage_field(
+    name: &str,
+    value: &JsonValue,
+    schema: &FieldSchema,
+) -> Result<(), Error> {
+    validate_field_mode(name, value, schema, false, true)
+}
+
+fn validate_field_mode(
+    name: &str,
+    value: &JsonValue,
+    schema: &FieldSchema,
+    session: bool,
+    storage: bool,
+) -> Result<(), Error> {
     fn check(
         value: &JsonValue,
         type_: &crate::ast::ColumnType,
         definitions: &HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
         depth: usize,
         session: bool,
+        storage: bool,
     ) -> bool {
         use crate::ast::ColumnType as T;
         if depth > 64 {
@@ -226,25 +254,26 @@ fn validate_field_inner(
         }
         match type_ {
             T::Nullable(inner) => {
-                value.is_null() || check(value, inner, definitions, depth + 1, session)
+                value.is_null() || check(value, inner, definitions, depth + 1, session, storage)
             }
             T::Json => !value.is_null(),
-            T::JsonTyped(inner) => check(value, inner, definitions, depth + 1, session),
+            T::JsonTyped(inner) => check(value, inner, definitions, depth + 1, session, false),
             T::List(inner) => value.as_array().is_some_and(|items| {
                 items
                     .iter()
-                    .all(|v| check(v, inner, definitions, depth + 1, session))
+                    .all(|v| check(v, inner, definitions, depth + 1, session, storage))
             }),
             T::Dict(inner) => value.as_object().is_some_and(|items| {
                 items
                     .values()
-                    .all(|v| check(v, inner, definitions, depth + 1, session))
+                    .all(|v| check(v, inner, definitions, depth + 1, session, storage))
             }),
             T::String | T::IdUuid { .. } => value.is_string(),
             T::Int | T::IdInt { .. } => integer_value(value).is_some(),
             T::Float => value.is_number(),
             T::Bool => {
-                value.is_boolean() || (session && matches!(integer_value(value), Some(0 | 1)))
+                value.is_boolean()
+                    || ((session || storage) && matches!(integer_value(value), Some(0 | 1)))
             }
             T::DateTime => datetime_to_epoch_seconds(value).is_some(),
             T::Date => value.is_string(),
@@ -278,6 +307,7 @@ fn validate_field_inner(
                                     definitions,
                                     depth + 1,
                                     session,
+                                    storage,
                                 )
                         }
                         Some(v) => check(
@@ -286,6 +316,7 @@ fn validate_field_inner(
                             definitions,
                             depth + 1,
                             session,
+                            storage,
                         ),
                     })
             }
@@ -300,6 +331,7 @@ fn validate_field_inner(
                 &HashMap::new(),
                 0,
                 session,
+                storage,
             )
     } else if schema.is_enum {
         let tag = value
@@ -318,6 +350,7 @@ fn validate_field_inner(
             &definitions,
             0,
             session,
+            storage,
         )
     };
     if valid {

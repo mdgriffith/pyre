@@ -1,9 +1,18 @@
 # Local Edit Contract (MEC-107)
 
 Status: Implementation contract for the approved Local Edit API in MEC-106.
-The protocol details below define target behavior, not shipped APIs.
+The protocol details below define target behavior, not a completed public API.
 `tests/fixtures/local-edits/protocol.json` and `tests/local_edit_contract.rs`
 execute a bounded reference model. They do not test production conformance.
+
+Implementation checkpoint: the Rust/TypeScript batch executors and complete
+replacement server protocol are implemented. Replacement is a single complete
+transactional response with flat fences, `type: "replacement"`, `serverRevision`,
+`scope: "database"`, `complete: true`, and `tables[name].rows`. It echoes the
+captured `requestId` and `target`; row-free live hints use `type: "syncRequired"`
+and the accepted response's reconciliation shape. Libraries remain route-independent.
+Client identity, authoritative installation/replay, typed builders and seed APIs
+remain downstream; the reference model is not a substitute for those implementations.
 
 ## Boundary
 

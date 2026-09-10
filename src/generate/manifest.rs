@@ -157,6 +157,11 @@ pub fn fingerprint(
     manifest.fingerprint()
 }
 
+/// Schema/session identity used by replacement readers, independent of query projections.
+pub fn compiled_schema_contract(context: &typecheck::Context) -> String {
+    compiled_contract(context, None)
+}
+
 fn compiled_contract(context: &typecheck::Context, query: Option<&ast::Query>) -> String {
     use sha2::{Digest, Sha256};
     let mut definitions = BTreeMap::new();
@@ -251,7 +256,10 @@ fn sorted_strings(values: &std::collections::HashSet<String>) -> Vec<String> {
     result
 }
 
-pub fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<String, FieldSchema> {
+pub fn input_schema(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> BTreeMap<String, FieldSchema> {
     query
         .args
         .iter()
@@ -304,7 +312,10 @@ pub fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSch
         .unwrap_or_default()
 }
 
-fn session_field_schema(context: &typecheck::Context, column: &ast::Column) -> FieldSchema {
+pub(crate) fn session_field_schema(
+    context: &typecheck::Context,
+    column: &ast::Column,
+) -> FieldSchema {
     let mut schema = session_field_schema_inner(context, column, &mut HashSet::new());
     collect_session_tagged_union_types(
         context,

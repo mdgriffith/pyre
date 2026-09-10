@@ -11,6 +11,56 @@ use std::collections::HashMap;
 pub type SyncSession = HashMap<String, sync::SessionValue>;
 pub type ConnectedSessions = HashMap<String, SyncSession>;
 
+/// Registered by the host after database authorization and authentication. Never
+/// construct a recipient's fence from a mutation's origin envelope.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyncFence {
+    pub database_id: String,
+    pub instance: String,
+    pub auth_generation: u64,
+    pub namespace: String,
+    pub manifest: String,
+    pub database_epoch: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReplacementRequest {
+    pub version: u32,
+    #[serde(flatten)]
+    pub fence: SyncFence,
+    pub request_id: String,
+    pub target: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Replacement {
+    #[serde(flatten)]
+    pub fence: SyncFence,
+    pub request_id: String,
+    pub target: i64,
+    #[serde(rename = "serverRevision")]
+    pub revision: i64,
+    pub scope: &'static str,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub complete: bool,
+    pub tables: HashMap<String, ReplacementTable>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReplacementTable {
+    pub rows: Vec<JsonValue>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionReplacementMessage {
+    pub session_id: String,
+    pub message: JsonValue,
+}
+
 pub const MAX_LIVE_SYNC_DELTA_ROWS: usize = 5000;
 pub const MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_LIVE_SYNC_FANOUT_RECIPIENTS: usize = 1000;
@@ -24,39 +74,206 @@ impl<'a> SyncServer<'a> {
         Self { context }
     }
 
-    /// Infallible postcommit hints: never allocate a second revision or reinterpret a commit.
-    /// Hosts may retry publication independently; the accepted response already requires replacement.
-    pub fn batch_messages(
+    /// Route-independent, single-response replacement. The host supplies the
+    /// authenticated binding, manifest/context pair and a dedicated connection.
+    /// A stale epoch is an error, never an implicit adoption of a new lifetime.
+    pub async fn replacement(
+        &self,
+        conn: &libsql::Connection,
+        manifest: &crate::server::manifest::Manifest,
+        binding: &crate::server::query::BatchBinding<'_>,
+        request: &ReplacementRequest,
+        session: &crate::server::manifest::PyreSession,
+    ) -> Result<Replacement, Error> {
+        let fence = &request.fence;
+        if request.version != 1
+            || manifest.version != 1
+            || !manifest.matches_context(self.context)
+            || request.request_id.is_empty()
+            || request.target < 0
+            || fence.database_id != binding.database_id
+            || fence.instance.is_empty()
+            || fence.instance != binding.instance
+            || fence.auth_generation != binding.auth_generation
+            || fence.namespace != binding.namespace
+            || !self.context.valid_namespaces.contains(&fence.namespace)
+            || fence.manifest != binding.manifest
+            || binding.manifest != manifest.fingerprint()
+            || fence.database_epoch.is_empty()
+        {
+            return Err(Error::InvalidFence);
+        }
+        database_id::require_database_id(binding.database_id).map_err(Error::DatabaseId)?;
+        let session = session
+            .revalidate(&manifest.session_schema)
+            .map_err(|_| Error::InvalidSession)?;
+        let sql = sync::get_replacement_sql(self.context, session.logical(), binding.namespace)
+            .map_err(Error::Sync)?;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
+            .await
+            .map_err(Error::Database)?;
+        let execution = async {
+            let mut databases = tx
+                .query("PRAGMA database_list", ())
+                .await
+                .map_err(Error::Database)?;
+            while let Some(database) = databases.next().await.map_err(Error::Database)? {
+                let name = database.get::<String>(1).map_err(Error::Database)?;
+                if name != "main" && name != "temp" {
+                    return Err(Error::InvalidFence);
+                }
+            }
+            drop(databases);
+            let mut rows = tx
+                .query(
+                    "SELECT database_epoch, server_revision FROM _pyre_sync WHERE id = 1",
+                    (),
+                )
+                .await
+                .map_err(Error::Database)?;
+            let row = rows
+                .next()
+                .await
+                .map_err(Error::Database)?
+                .ok_or(Error::InvalidFence)?;
+            let epoch = row.get::<String>(0).map_err(Error::Database)?;
+            let revision = row.get::<i64>(1).map_err(Error::Database)?;
+            drop(rows);
+            if epoch != fence.database_epoch {
+                return Err(Error::InvalidFence);
+            }
+            if revision < request.target {
+                return Err(Error::TargetNotReached);
+            }
+            let mut tables = HashMap::new();
+            for table in sql.tables {
+                let mut data = Vec::new();
+                for (statement, params) in table.sql.iter().zip(&table.params) {
+                    data.extend(expand_sync_rows(
+                        query_objects(&tx, statement, params).await?,
+                        &table.headers,
+                    )?);
+                }
+                let group = AffectedRowTableGroup {
+                    table_name: table.table_name.clone(),
+                    headers: table.headers.clone(),
+                    rows: data
+                        .iter()
+                        .map(|row| {
+                            table
+                                .headers
+                                .iter()
+                                .map(|header| row.get(header).cloned().unwrap_or(JsonValue::Null))
+                                .collect()
+                        })
+                        .collect(),
+                };
+                let shaped =
+                    sync::reshape_replacement_table(self.context, binding.namespace, &group)
+                        .map_err(Error::Sync)?;
+                let rows = shaped
+                    .rows
+                    .into_iter()
+                    .map(|row| row_array_to_object(&shaped.headers, row))
+                    .collect();
+                tables.insert(table.table_name, ReplacementTable { rows });
+            }
+            Ok(Replacement {
+                fence: fence.clone(),
+                request_id: request.request_id.clone(),
+                target: request.target,
+                revision,
+                scope: "database",
+                kind: "replacement",
+                complete: true,
+                tables,
+            })
+        }
+        .await;
+        match execution {
+            Ok(result) => {
+                tx.commit().await.map_err(Error::Database)?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Postcommit hints carry no row data or origin request identity. Repeated or
+    /// coalesced delivery only raises the recipient's required/security revision.
+    pub fn replacement_messages(
         &self,
         result: &crate::server::query::BatchResult,
-        connected_sessions: &ConnectedSessions,
-    ) -> Vec<SessionDeltaMessage> {
-        let Some(revision) = result
-            .response
+        recipients: &HashMap<String, SyncFence>,
+    ) -> Vec<SessionReplacementMessage> {
+        let response = &result.response;
+        let Some(revision) = response
             .get("commitRevision")
             .and_then(JsonValue::as_i64)
+            .filter(|r| *r >= 0)
         else {
             return Vec::new();
         };
-        let mut message = DeltaMessage::sync_required();
-        message.server_revision = Some(revision);
-        message.database_epoch = result
-            .response
-            .get("databaseEpoch")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string);
-        message.database_id = result
-            .response
-            .get("databaseId")
-            .and_then(JsonValue::as_str)
-            .and_then(|id| database_id::require_database_id(id).ok());
-        let mut messages = connected_sessions
-            .keys()
-            .map(|session_id| SessionDeltaMessage {
+        if response["status"] != "accepted" {
+            return Vec::new();
+        }
+        let (Some(database_id), Some(namespace), Some(manifest), Some(database_epoch)) = (
+            response["databaseId"].as_str(),
+            response["namespace"].as_str(),
+            response["manifest"].as_str(),
+            response["databaseEpoch"].as_str(),
+        ) else {
+            return Vec::new();
+        };
+        self.committed_replacement_messages(
+            &crate::server::query::CommittedRevision {
+                database_epoch: database_epoch.into(),
+                revision,
+            },
+            database_id,
+            namespace,
+            manifest,
+            recipients,
+        )
+    }
+
+    pub fn committed_replacement_messages(
+        &self,
+        commit: &crate::server::query::CommittedRevision,
+        database_id: &str,
+        namespace: &str,
+        manifest: &str,
+        recipients: &HashMap<String, SyncFence>,
+    ) -> Vec<SessionReplacementMessage> {
+        let revision = commit.revision;
+        let mut messages = Vec::new();
+        for (session_id, fence) in recipients {
+            if fence.instance.is_empty()
+                || fence.database_epoch.is_empty()
+                || database_id != fence.database_id
+                || commit.database_epoch != fence.database_epoch
+                || namespace != fence.namespace
+                || manifest != fence.manifest
+            {
+                continue;
+            }
+            let mut message =
+                serde_json::to_value(fence).expect("SyncFence serialization is infallible");
+            message["type"] = JsonValue::from("syncRequired");
+            message["serverRevision"] = JsonValue::from(revision);
+            message["reconciliation"] = serde_json::json!({
+                "kind": "replaceRequired", "atLeast": revision,
+                "invalidate": true, "minimumSafeRevision": revision
+            });
+            messages.push(SessionReplacementMessage {
                 session_id: session_id.clone(),
-                message: message.clone(),
-            })
-            .collect::<Vec<_>>();
+                message,
+            });
+        }
         messages.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         messages
     }
@@ -130,6 +347,38 @@ impl<'a> SyncServer<'a> {
         )
         .await
     }
+
+    /// Legacy delta wire shape, using execution's committed revision rather than
+    /// allocating a second one during postcommit publication.
+    pub fn calculate_committed_deltas(
+        &self,
+        query_result: &mut QueryResult,
+        connected_sessions: &ConnectedSessions,
+        database_id: &str,
+        origin_session_id: Option<&str>,
+        commit: &crate::server::query::CommittedRevision,
+    ) -> Result<Vec<SessionDeltaMessage>, Error> {
+        let messages = build_delta_messages_for_database(
+            self.context,
+            &query_result.affected_rows,
+            &sessions_without_origin(connected_sessions, origin_session_id),
+            database_id,
+        )?;
+        let origin_message = build_origin_delta_message(
+            self.context,
+            &query_result.affected_rows,
+            connected_sessions,
+            database_id,
+            origin_session_id,
+        )?;
+        stamp_messages_and_response(
+            messages,
+            query_result,
+            origin_message,
+            &commit.database_epoch,
+            commit.revision,
+        )
+    }
 }
 
 fn sessions_without_origin(
@@ -180,6 +429,8 @@ pub struct DeltaMessage {
     pub database_epoch: Option<String>,
     #[serde(rename = "databaseId", skip_serializing_if = "Option::is_none")]
     pub database_id: Option<DatabaseId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data: Vec<AffectedRowTableGroup>,
 }
@@ -191,6 +442,7 @@ impl DeltaMessage {
             server_revision: None,
             database_epoch: None,
             database_id: None,
+            reconciliation: None,
             data,
         }
     }
@@ -207,6 +459,7 @@ impl DeltaMessage {
                 database_id::require_database_id(database_id).map_err(Error::DatabaseId)?,
             ),
             data,
+            reconciliation: None,
         })
     }
 
@@ -216,6 +469,7 @@ impl DeltaMessage {
             server_revision: None,
             database_epoch: None,
             database_id: None,
+            reconciliation: None,
             data: Vec::new(),
         }
     }
@@ -229,6 +483,7 @@ impl DeltaMessage {
                 database_id::require_database_id(database_id).map_err(Error::DatabaseId)?,
             ),
             data: Vec::new(),
+            reconciliation: None,
         })
     }
 }
@@ -424,22 +679,49 @@ pub async fn rotate_database_epoch(conn: &libsql::Connection) -> Result<String, 
 
 async fn stamp_messages_and_response_with_next_server_revision(
     conn: &libsql::Connection,
-    mut messages: Vec<SessionDeltaMessage>,
+    messages: Vec<SessionDeltaMessage>,
     query_result: &mut QueryResult,
-    mut origin_message: Option<DeltaMessage>,
+    origin_message: Option<DeltaMessage>,
 ) -> Result<Vec<SessionDeltaMessage>, Error> {
-    if query_result.affected_rows.is_empty() {
+    if query_result.affected_rows.is_empty() && messages.is_empty() && origin_message.is_none() {
         return Ok(messages);
     }
 
     let (database_epoch, server_revision) = next_server_revision(conn).await?;
+    stamp_messages_and_response(
+        messages,
+        query_result,
+        origin_message,
+        &database_epoch,
+        server_revision,
+    )
+}
+
+fn stamp_messages_and_response(
+    mut messages: Vec<SessionDeltaMessage>,
+    query_result: &mut QueryResult,
+    mut origin_message: Option<DeltaMessage>,
+    database_epoch: &str,
+    server_revision: i64,
+) -> Result<Vec<SessionDeltaMessage>, Error> {
+    if query_result.affected_rows.is_empty() && messages.is_empty() && origin_message.is_none() {
+        return Ok(messages);
+    }
     for message in &mut messages {
         message.message.server_revision = Some(server_revision);
-        message.message.database_epoch = Some(database_epoch.clone());
+        message.message.database_epoch = Some(database_epoch.to_string());
+        if let Some(reconciliation) = &mut message.message.reconciliation {
+            reconciliation["atLeast"] = JsonValue::from(server_revision);
+            reconciliation["minimumSafeRevision"] = JsonValue::from(server_revision);
+        }
     }
     if let Some(origin_message) = &mut origin_message {
         origin_message.server_revision = Some(server_revision);
-        origin_message.database_epoch = Some(database_epoch.clone());
+        origin_message.database_epoch = Some(database_epoch.to_string());
+        if let Some(reconciliation) = &mut origin_message.reconciliation {
+            reconciliation["atLeast"] = JsonValue::from(server_revision);
+            reconciliation["minimumSafeRevision"] = JsonValue::from(server_revision);
+        }
     }
 
     let mut envelope = serde_json::Map::new();
@@ -481,7 +763,26 @@ fn build_delta_messages(
     connected_sessions: &ConnectedSessions,
     database_id: Option<DatabaseId>,
 ) -> Result<Vec<SessionDeltaMessage>, Error> {
-    if affected_row_groups.is_empty() || connected_sessions.is_empty() {
+    if connected_sessions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if sync::requires_replacement(context) {
+        let mut message = DeltaMessage::sync_required();
+        message.database_id = database_id;
+        message.reconciliation =
+            Some(serde_json::json!({"kind":"replaceRequired", "invalidate":true}));
+        let mut messages = connected_sessions
+            .keys()
+            .map(|session_id| SessionDeltaMessage {
+                session_id: session_id.clone(),
+                message: message.clone(),
+            })
+            .collect::<Vec<_>>();
+        messages.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        return Ok(messages);
+    }
+    if affected_row_groups.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -660,6 +961,9 @@ fn json_to_i64(value: &JsonValue) -> Option<i64> {
 
 #[derive(Debug)]
 pub enum Error {
+    InvalidFence,
+    InvalidSession,
+    TargetNotReached,
     Database(libsql::Error),
     DatabaseId(database_id::DatabaseIdError),
     InvalidPageSize,
@@ -672,6 +976,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::InvalidFence => write!(f, "InvalidFence"),
+            Error::InvalidSession => write!(f, "InvalidSession"),
+            Error::TargetNotReached => write!(f, "TargetNotReached"),
             Error::Database(error) => write!(f, "database error: {}", error),
             Error::DatabaseId(error) => write!(f, "database id error: {}", error),
             Error::InvalidPageSize => write!(f, "page_size must be greater than zero"),

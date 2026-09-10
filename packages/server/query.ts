@@ -72,7 +72,7 @@ export interface QueryResult {
     };
     /**
      * Broadcast sync deltas to connected clients.
-     * Always present, but will be a no-op if there are no affected rows or no connected sessions.
+     * Always present. Revisioned named mutations also publish catchup hints for zero-row writes.
      * 
      * @param sendToSession - Callback to send a message to a specific session
      * @example
@@ -98,11 +98,14 @@ export type SyncDeltasFn = (
     affectedRowGroups: any[],
     connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
     sendToSession: (sessionId: string, message: any) => void,
-    originSessionId?: string
+    originSessionId?: string,
+    committedRevision?: SyncResult,
 ) => Promise<SyncResult | void>;
 
 export interface RunOptions {
     mode?: "normal" | "sync";
+    /** Named mutation sync revisions must commit atomically with their writes. */
+    commitSyncRevision?: boolean;
 }
 
 export const MAX_BATCH_OPERATIONS = 100;
@@ -113,6 +116,8 @@ export interface BatchManifest {
     version: 1;
     /** Trusted fingerprint emitted alongside the compiled queries. */
     manifestVersion: string;
+    /** Compiler-owned schema/session/permission digest. Required for replacement. */
+    compiledContract?: string;
     queries: QueryMap;
     SessionValidator: Validator<any>;
 }
@@ -527,7 +532,25 @@ export async function run(
     const sqlStatements = toSqlStatements(activeSql, validArgs);
 
     // Execute query
-    const resultSets = await executeStatements(db, sqlStatements);
+    let resultSets;
+    let committedRevision: SyncResult | undefined;
+    if (options.commitSyncRevision) {
+        if (db.protocol === "file") {
+            const databases = await db.execute("pragma database_list");
+            if (!databases.rows.find(row => row.name === "main")?.file) throw new Error("Unsupported in-memory transaction");
+        }
+        const tx = await db.transaction("write");
+        try {
+            resultSets = await executeStatements({ execute: tx.execute.bind(tx) }, sqlStatements);
+            committedRevision = await nextLiveSyncRevision(tx);
+            await tx.commit();
+        } catch (error) {
+            try { await tx.rollback(); } catch { /* Preserve the execution/commit failure. */ }
+            throw error;
+        } finally { try { tx.close(); } catch { /* Closing cannot erase a committed revision. */ } }
+    } else {
+        resultSets = await executeStatements(db, sqlStatements);
+    }
     const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
     const response = formatResultData(activeSql, resultSets);
 
@@ -556,7 +579,7 @@ export async function run(
      */
     async function sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
         // Early return if nothing to sync
-        if (affectedRowGroups.length === 0) {
+        if (affectedRowGroups.length === 0 && !committedRevision) {
             return {};
         }
 
@@ -564,13 +587,13 @@ export async function run(
             return {};
         }
 
-        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId) ?? {};
+        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId, committedRevision) ?? {};
         if (typeof syncResult.serverRevision === "number") {
             queryResult.response = {
                 ...(syncResult.databaseEpoch === undefined ? {} : { databaseEpoch: syncResult.databaseEpoch }),
                 serverRevision: syncResult.serverRevision,
                 ...(syncResult.originMessage === undefined ? {} : { sync: syncResult.originMessage }),
-                result: queryResult.response,
+                result: response,
             };
         }
 
