@@ -1205,6 +1205,7 @@ fn parse_transaction_details(input: Text) -> ParseResult<ast::QueryDef> {
     let (input, _) = opt(newline)(input)?;
 
     let mut query = ast::Query {
+        generated_crud: false,
         interface_hash: String::new(),
         full_hash: String::new(),
         operation: ast::QueryOperation::Transaction,
@@ -1280,6 +1281,7 @@ fn parse_query_details(input: Text) -> ParseResult<ast::QueryDef> {
     let (input, _) = opt(newline)(input)?;
 
     let mut query = ast::Query {
+        generated_crud: false,
         interface_hash: "".to_string(),
         full_hash: "".to_string(),
         operation: op,

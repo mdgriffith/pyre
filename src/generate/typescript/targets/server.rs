@@ -66,8 +66,8 @@ fn generate_seed(
 }
 
 pub fn generate_queries(
-    _context: &typecheck::Context,
-    _all_query_info: &HashMap<String, typecheck::QueryInfo>,
+    context: &typecheck::Context,
+    all_query_info: &HashMap<String, typecheck::QueryInfo>,
     query_list: &ast::QueryList,
     base_out_dir: &Path,
     files: &mut Vec<filesystem::GeneratedFile<String>>,
@@ -78,6 +78,15 @@ pub fn generate_queries(
     content.push_str("import type { QueryMap, QueryMetadata } from '@pyre/server/query';\n\n");
     content.push_str("export { databases } from './databases';\n\n");
     content.push_str("export * from './seed';\n\n");
+    content.push_str(&format!(
+        "export const manifestVersion = {};\n\n",
+        serde_json::to_string(&crate::generate::manifest::fingerprint(
+            context,
+            query_list,
+            all_query_info
+        ))
+        .expect("manifest version")
+    ));
 
     for operation in &query_list.queries {
         if let ast::QueryDef::Query(q) = operation {

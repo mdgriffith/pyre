@@ -5,6 +5,27 @@ use crate::typecheck;
 
 use std::collections::HashSet;
 
+/// Recognize compiler-created CRUD, never a handwritten command by its name.
+pub fn generated_edit<'a>(
+    query: &ast::Query,
+    table: &'a typecheck::Table,
+) -> Option<(&'static str, &'a ast::Column, Vec<String>)> {
+    if !query.generated_crud {
+        return None;
+    }
+    let (kind, columns) = match query.operation {
+        ast::QueryOperation::Insert => ("create", writable_create_columns(table)),
+        ast::QueryOperation::Update => ("update", writable_update_columns(table)),
+        ast::QueryOperation::Delete => ("delete", Vec::new()),
+        _ => return None,
+    };
+    Some((
+        kind,
+        primary_key_column(table)?,
+        columns.into_iter().map(|c| c.name.clone()).collect(),
+    ))
+}
+
 pub fn validate_generated_crud_name_collisions(
     query_list: &ast::QueryList,
     context: &typecheck::Context,
@@ -259,6 +280,7 @@ fn build_query(
     table_field: ast::TopLevelQueryField,
 ) -> ast::Query {
     let mut query = ast::Query {
+        generated_crud: true,
         interface_hash: String::new(),
         full_hash: String::new(),
         operation,
@@ -348,6 +370,7 @@ fn writable_create_columns(table: &typecheck::Table) -> Vec<&ast::Column> {
         .into_iter()
         .filter(|column| !ast::is_integer_primary_key(column))
         .filter(|column| !ast::is_managed_timestamp(column))
+        .filter(|column| column.name != "updatedAt" || column.start.is_some())
         .collect()
 }
 
@@ -356,6 +379,7 @@ fn writable_update_columns(table: &typecheck::Table) -> Vec<&ast::Column> {
         .into_iter()
         .filter(|column| !ast::is_primary_key(column))
         .filter(|column| !ast::is_managed_timestamp(column))
+        .filter(|column| column.name != "updatedAt" || column.start.is_some())
         .filter(|column| !ast::is_immutable(column))
         .collect()
 }

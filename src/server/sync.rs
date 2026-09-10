@@ -24,6 +24,43 @@ impl<'a> SyncServer<'a> {
         Self { context }
     }
 
+    /// Infallible postcommit hints: never allocate a second revision or reinterpret a commit.
+    /// Hosts may retry publication independently; the accepted response already requires replacement.
+    pub fn batch_messages(
+        &self,
+        result: &crate::server::query::BatchResult,
+        connected_sessions: &ConnectedSessions,
+    ) -> Vec<SessionDeltaMessage> {
+        let Some(revision) = result
+            .response
+            .get("commitRevision")
+            .and_then(JsonValue::as_i64)
+        else {
+            return Vec::new();
+        };
+        let mut message = DeltaMessage::sync_required();
+        message.server_revision = Some(revision);
+        message.database_epoch = result
+            .response
+            .get("databaseEpoch")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        message.database_id = result
+            .response
+            .get("databaseId")
+            .and_then(JsonValue::as_str)
+            .and_then(|id| database_id::require_database_id(id).ok());
+        let mut messages = connected_sessions
+            .keys()
+            .map(|session_id| SessionDeltaMessage {
+                session_id: session_id.clone(),
+                message: message.clone(),
+            })
+            .collect::<Vec<_>>();
+        messages.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        messages
+    }
+
     pub async fn catchup(
         &self,
         conn: &libsql::Connection,
@@ -345,7 +382,9 @@ pub async fn catchup(
     Ok(result)
 }
 
-async fn next_server_revision(conn: &libsql::Connection) -> Result<(String, i64), Error> {
+pub(crate) async fn next_server_revision(
+    conn: &libsql::Connection,
+) -> Result<(String, i64), Error> {
     let mut rows = conn
         .query(
             "UPDATE _pyre_sync SET server_revision = server_revision + 1 WHERE id = 1 RETURNING database_epoch, server_revision",

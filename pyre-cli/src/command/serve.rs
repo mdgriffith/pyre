@@ -1,4 +1,5 @@
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::body::HttpBody;
+use axum::extract::{Path as AxumPath, Query, RawBody, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -8,6 +9,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use pyre::server::manifest::{Manifest, PyreSession};
+use pyre::server::query::{self, BatchBinding, BatchRequest, MAX_BATCH_PAYLOAD_BYTES};
 use pyre::server::schema::{load_schema_from_database, LoadedSchema};
 use pyre::server::sync::{ConnectedSessions, SyncServer};
 use pyre::sync::SyncCursor;
@@ -102,6 +104,17 @@ struct HealthResponse<'a> {
 struct SignedSessionPayload {
     session: JsonValue,
     exp: i64,
+    // Ordinary routes accept legacy {session, exp}. Batch authentication additionally
+    // requires this claim inside the HMAC-signed payload, not in application session data.
+    #[serde(default, rename = "localEdit")]
+    local_edit: Option<LocalEditBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalEditBinding {
+    instance: String,
+    auth_generation: u64,
 }
 
 #[derive(Debug)]
@@ -193,6 +206,7 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
         .route("/health", get(health).options(cors_preflight))
         .route("/sync", post(sync).options(cors_preflight))
         .route("/sync/events", get(sync_events).options(cors_preflight))
+        .route("/db", post(run_batch).options(cors_preflight))
         .route("/db/:query_id", post(run_query).options(cors_preflight))
         .with_state(state);
 
@@ -374,6 +388,149 @@ async fn sync_events(
     Ok(with_cors(&state, &headers, response))
 }
 
+async fn run_batch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawBody(mut body): RawBody,
+) -> Response {
+    // Bound actual streamed bytes, not Content-Length or reserialized JSON.
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return with_cors(
+                    &state,
+                    &headers,
+                    batch_failure(None, StatusCode::BAD_REQUEST, "InvalidRequest", None),
+                )
+            }
+        };
+        if chunk.len() > MAX_BATCH_PAYLOAD_BYTES - bytes.len() {
+            return with_cors(
+                &state,
+                &headers,
+                batch_failure(None, StatusCode::PAYLOAD_TOO_LARGE, "InvalidRequest", None),
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let request: BatchRequest = match serde_json::from_slice(&bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            return with_cors(
+                &state,
+                &headers,
+                batch_failure(None, StatusCode::BAD_REQUEST, "InvalidRequest", None),
+            )
+        }
+    };
+    let result = async {
+        let (session, local_edit) = effective_session_from_request(&state, &headers)
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "InvalidSession", None))?;
+        let signed = matches!(
+            &state.session_source,
+            SessionSource::Header {
+                secret: Some(_),
+                ..
+            }
+        );
+        // Empty, fixed dev, and explicitly enabled unsigned sessions are development
+        // bindings: generation is always zero; instance is correlation, not authority.
+        let (instance, auth_generation) = match local_edit.as_ref() {
+            Some(binding) => (binding.instance.as_str(), binding.auth_generation),
+            None if !signed => (request.instance.as_str(), 0),
+            None => return Err((StatusCode::UNAUTHORIZED, "InvalidSession", None)),
+        };
+        let context = state
+            .loaded_schema
+            .context()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "TransactionFailed", None))?;
+        let schema = state
+            .loaded_schema
+            .schema()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "TransactionFailed", None))?;
+        if !context.valid_namespaces.contains(&schema.namespace) {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "TransactionFailed", None));
+        }
+        let fingerprint = state.manifest.fingerprint();
+        let binding = BatchBinding {
+            database_id: &state.database_id,
+            namespace: &schema.namespace,
+            manifest: &fingerprint,
+            instance,
+            auth_generation,
+        };
+        let conn = state
+            .db
+            .connect()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "TransactionFailed", None))?;
+        // Also fence empty batches; the executor rechecks nonempty batches in its transaction.
+        let epoch = async {
+            let mut rows = conn
+                .query("SELECT database_epoch FROM _pyre_sync WHERE id = 1", ())
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| row.get::<String>(0))
+                .transpose()
+        }
+        .await
+        .map_err(|_: libsql::Error| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "TransactionFailed", None)
+        })?;
+        if epoch.as_deref() != Some(request.database_epoch.as_str()) {
+            return Err((StatusCode::BAD_REQUEST, "InvalidRequest", None));
+        }
+        query::run_batch(&conn, &state.manifest, &binding, &request, &session)
+            .await
+            .map_err(|error| {
+                (
+                    if error.code() == "OutcomeUnknown" {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    error.code(),
+                    error.operation_index(),
+                )
+            })
+    }
+    .await;
+    let response = match result {
+        // Legacy SSE connections have no local-edit fence. Do not broadcast origin
+        // fences to them; full fenced transport publication belongs to MEC-109.
+        Ok(result) => Json(result.response).into_response(),
+        Err((status, code, index)) => batch_failure(Some(&request), status, code, index),
+    };
+    with_cors(&state, &headers, response)
+}
+
+fn batch_failure(
+    request: Option<&BatchRequest>,
+    status: StatusCode,
+    code: &str,
+    index: Option<usize>,
+) -> Response {
+    let mut body = json!({
+        "status": if code == "OutcomeUnknown" { "outcomeUnknown" } else { "rejected" },
+        "code": code,
+    });
+    if let Some(request) = request {
+        body["requestId"] = json!(request.request_id);
+        body["databaseId"] = json!(request.database_id);
+        body["instance"] = json!(request.instance);
+        body["authGeneration"] = json!(request.auth_generation);
+        body["databaseEpoch"] = json!(request.database_epoch);
+        body["namespace"] = json!(request.namespace);
+        body["manifest"] = json!(request.manifest);
+    }
+    if let Some(index) = index {
+        body["operationIndex"] = json!(index);
+    }
+    (status, Json(body)).into_response()
+}
+
 async fn run_query(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -461,9 +618,16 @@ fn pyre_session_from_request(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<PyreSession, ServeError> {
-    let value = match &state.session_source {
-        SessionSource::Empty => JsonValue::Object(serde_json::Map::new()),
-        SessionSource::Dev(value) => value.clone(),
+    effective_session_from_request(state, headers).map(|(session, _)| session)
+}
+
+fn effective_session_from_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(PyreSession, Option<LocalEditBinding>), ServeError> {
+    let (value, binding) = match &state.session_source {
+        SessionSource::Empty => (json!({}), None),
+        SessionSource::Dev(value) => (value.clone(), None),
         SessionSource::Header { name, secret } => {
             let raw = headers
                 .get(name)
@@ -471,14 +635,16 @@ fn pyre_session_from_request(
                 .to_str()
                 .map_err(|_| ServeError::Unauthorized(format!("invalid {} header", name)))?;
             if let Some(secret) = secret {
-                decode_signed_session(raw, secret)?
+                let payload = decode_signed_session(raw, secret)?;
+                (payload.session, payload.local_edit)
             } else {
-                decode_unsigned_session(raw)?
+                (decode_unsigned_session(raw)?, None)
             }
         }
     };
 
     PyreSession::new(value, &state.manifest.session_schema)
+        .map(|session| (session, binding))
         .map_err(|error| ServeError::Unauthorized(format!("invalid Pyre session: {}", error)))
 }
 
@@ -490,7 +656,7 @@ fn decode_unsigned_session(raw: &str) -> Result<JsonValue, ServeError> {
         .map_err(|_| ServeError::Unauthorized("invalid session header JSON".to_string()))
 }
 
-fn decode_signed_session(raw: &str, secret: &str) -> Result<JsonValue, ServeError> {
+fn decode_signed_session(raw: &str, secret: &str) -> Result<SignedSessionPayload, ServeError> {
     let Some((payload, signature)) = raw.split_once('.') else {
         return Err(ServeError::Unauthorized(
             "signed session header must contain payload and signature".to_string(),
@@ -519,7 +685,7 @@ fn decode_signed_session(raw: &str, secret: &str) -> Result<JsonValue, ServeErro
             "session header is expired".to_string(),
         ));
     }
-    Ok(payload.session)
+    Ok(payload)
 }
 
 fn ensure_database_id(state: &AppState, value: Option<&str>) -> Result<(), ServeError> {
@@ -581,20 +747,421 @@ fn with_cors(state: &AppState, request_headers: &HeaderMap, mut response: Respon
         header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("GET, POST, OPTIONS"),
     );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("content-type, x-pyre-session"),
-    );
+    let session_header = match &state.session_source {
+        SessionSource::Header { name, .. } => name.as_str(),
+        _ => DEFAULT_SESSION_HEADER,
+    };
+    if let Ok(value) = HeaderValue::from_str(&format!("content-type, {session_header}")) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
+    }
     response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
     use pyre::server::manifest::FieldSchema;
+
+    async fn batch_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = libsql::Builder::new_local(dir.path().join("batch.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        pyre::server::schema::ensure_database(
+            &conn,
+            pyre::ast::DEFAULT_SCHEMANAME,
+            "record Item {\n id Id.Int @id\n name String\n @public\n}\n",
+        )
+        .await
+        .unwrap();
+        let loaded_schema = load_schema_from_database(&conn).await.unwrap();
+        let namespace = loaded_schema.schema().unwrap().namespace.clone();
+        let manifest = serde_json::from_value(json!({
+            "version": 1, "session_schema": {}, "queries": {
+                "create": {
+                    "id": "create", "operation": "insert", "primary_db": namespace,
+                    "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
+                    "sql": [{"include": false, "params": [], "sql": "INSERT INTO items (name) VALUES ('private value')"}]
+                },
+                "fail": {
+                    "id": "fail", "operation": "insert", "primary_db": namespace,
+                    "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
+                    "sql": [{"include": false, "params": [], "sql": "INSERT INTO private_missing_table VALUES ('secret')"}]
+                }
+            }
+        })).unwrap();
+        let state = Arc::new(AppState {
+            db,
+            manifest,
+            loaded_schema,
+            database_id: "server-db".into(),
+            session_source: SessionSource::Empty,
+            page_size: 100,
+            connections: Mutex::new(HashMap::new()),
+            cors_origins: vec!["http://localhost:5173".into()],
+        });
+        (dir, state)
+    }
+
+    async fn batch_body(state: &AppState) -> JsonValue {
+        let conn = state.db.connect().unwrap();
+        let mut rows = conn
+            .query("SELECT database_epoch FROM _pyre_sync WHERE id = 1", ())
+            .await
+            .unwrap();
+        let epoch: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        json!({"version": 1, "databaseId": state.database_id,
+            "namespace": state.loaded_schema.schema().unwrap().namespace,
+            "manifest": state.manifest.fingerprint(), "instance": "tab", "authGeneration": 0,
+            "databaseEpoch": epoch, "requestId": "r1", "sequence": 1,
+            "operations": [{"operation": "create", "input": {}}]})
+    }
+
+    fn origin_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:5173"),
+        );
+        headers
+    }
+
+    async fn response_json(mut response: Response) -> JsonValue {
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "http://localhost:5173"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.body_mut().data().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn submit(state: Arc<AppState>, body: JsonValue, headers: HeaderMap) -> Response {
+        run_batch(State(state), headers, RawBody(Body::from(body.to_string()))).await
+    }
+
+    #[tokio::test]
+    async fn batch_route_accepts_and_rolls_back_without_private_errors_or_prefix() {
+        let (_dir, state) = batch_state().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        state.connections.lock().await.insert(
+            "legacy".into(),
+            Connection {
+                session: HashMap::new(),
+                sender,
+            },
+        );
+        let body = batch_body(&state).await;
+        let response = submit(state.clone(), body.clone(), origin_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted = response_json(response).await;
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(accepted["results"].as_array().unwrap().len(), 1);
+        assert_eq!(accepted["reconciliation"]["kind"], "replaceRequired");
+        let mut failed = body;
+        failed["operations"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"operation": "fail", "input": {}}));
+        let response = submit(state.clone(), failed, origin_headers()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rejected = response_json(response).await;
+        assert_eq!(rejected["status"], "rejected");
+        assert_eq!(rejected["code"], "TransactionFailed");
+        assert_eq!(rejected["operationIndex"], 1);
+        assert!(rejected.get("results").is_none());
+        assert!(!rejected.to_string().contains("private"));
+        assert!(!rejected.to_string().contains("secret"));
+        let conn = state.db.connect().unwrap();
+        let mut rows = conn.query("SELECT count(*) FROM items", ()).await.unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            1
+        );
+        let mut rows = conn
+            .query("SELECT server_revision FROM _pyre_sync WHERE id = 1", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            accepted["commitRevision"].as_i64().unwrap()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_route_uses_trusted_fences() {
+        let (_dir, state) = batch_state().await;
+        let body = batch_body(&state).await;
+        for (key, value) in [
+            ("databaseId", json!("other")),
+            ("namespace", json!("other")),
+            ("manifest", json!("other")),
+            ("authGeneration", json!(8)),
+            ("databaseEpoch", json!("other")),
+        ] {
+            let mut wrong = body.clone();
+            wrong[key] = value;
+            let response = submit(state.clone(), wrong, origin_headers()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
+            assert_eq!(response_json(response).await["code"], "InvalidRequest");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_requires_complete_envelope_and_fences_empty_batches() {
+        let (_dir, state) = batch_state().await;
+        let mut body = batch_body(&state).await;
+        for key in body.as_object().unwrap().keys() {
+            let mut incomplete = body.clone();
+            incomplete.as_object_mut().unwrap().remove(key);
+            let response = submit(state.clone(), incomplete, origin_headers()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
+            assert_eq!(
+                response_json(response).await,
+                json!({"status": "rejected", "code": "InvalidRequest"})
+            );
+        }
+        body["operations"] = json!([]);
+        let response = submit(state.clone(), body.clone(), origin_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let confirmed = response_json(response).await;
+        assert_eq!(confirmed["status"], "confirmed");
+        assert_eq!(confirmed["results"], json!([]));
+        assert!(confirmed.get("commitRevision").is_none());
+        body["databaseEpoch"] = json!("stale");
+        let response = submit(state, body, origin_headers()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["code"], "InvalidRequest");
+    }
+
+    fn signed_header(payload: JsonValue) -> HeaderValue {
+        let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
+        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+        mac.update(payload.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        HeaderValue::from_str(&format!("{payload}.{signature}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn batch_signed_auth_requires_claim_and_never_uses_body_generation() {
+        let (_dir, mut state) = batch_state().await;
+        Arc::get_mut(&mut state).unwrap().session_source = SessionSource::Header {
+            name: DEFAULT_SESSION_HEADER.into(),
+            secret: Some("secret".into()),
+        };
+        let mut body = batch_body(&state).await;
+        let mut headers = origin_headers();
+        headers.insert(
+            DEFAULT_SESSION_HEADER,
+            signed_header(json!({"session": {}, "exp": 4102444800_i64})),
+        );
+        assert!(pyre_session_from_request(&state, &headers).is_ok());
+        let response = submit(state.clone(), body.clone(), headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(response).await["code"], "InvalidSession");
+        headers.insert(
+            DEFAULT_SESSION_HEADER,
+            signed_header(json!({"session": {}, "exp": 4102444800_i64,
+            "localEdit": {"instance": "tab", "authGeneration": 7}})),
+        );
+        let response = submit(state.clone(), body.clone(), headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        body["authGeneration"] = json!(7);
+        body["instance"] = json!("wrong-tab");
+        assert_eq!(
+            submit(state.clone(), body.clone(), headers.clone())
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        body["instance"] = json!("tab");
+        let response = submit(state, body, headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["authGeneration"], 7);
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_tampered_signed_claims_with_sanitized_auth_error() {
+        let (_dir, mut state) = batch_state().await;
+        Arc::get_mut(&mut state).unwrap().session_source = SessionSource::Header {
+            name: DEFAULT_SESSION_HEADER.into(),
+            secret: Some("secret".into()),
+        };
+        let mut body = batch_body(&state).await;
+        body["authGeneration"] = json!(9);
+        let original = signed_header(json!({"session": {}, "exp": 4102444800_i64,
+            "localEdit": {"instance": "tab", "authGeneration": 7}}));
+        let (_, signature) = original.to_str().unwrap().split_once('.').unwrap();
+        let forged = URL_SAFE_NO_PAD.encode(
+            json!({"session": {}, "exp": 4102444800_i64,
+            "localEdit": {"instance": "tab", "authGeneration": 9}})
+            .to_string(),
+        );
+        let mut headers = origin_headers();
+        headers.insert(
+            DEFAULT_SESSION_HEADER,
+            HeaderValue::from_str(&format!("{forged}.{signature}")).unwrap(),
+        );
+        let response = submit(state, body.clone(), headers).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let rejected = response_json(response).await;
+        assert_eq!(rejected["status"], "rejected");
+        assert_eq!(rejected["code"], "InvalidSession");
+        assert!(rejected.get("results").is_none());
+        assert!(rejected.get("error").is_none());
+        for key in [
+            "requestId",
+            "databaseId",
+            "instance",
+            "authGeneration",
+            "databaseEpoch",
+            "namespace",
+            "manifest",
+        ] {
+            assert_eq!(rejected[key], body[key], "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_raw_body_bound_and_malformed_errors_have_cors() {
+        let (_dir, state) = batch_state().await;
+        let mut valid = batch_body(&state).await.to_string().into_bytes();
+        valid.resize(MAX_BATCH_PAYLOAD_BYTES, b' ');
+        let response = run_batch(
+            State(state.clone()),
+            origin_headers(),
+            RawBody(Body::from(valid)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["status"], "accepted");
+        for (size, expected) in [
+            (MAX_BATCH_PAYLOAD_BYTES, StatusCode::BAD_REQUEST),
+            (MAX_BATCH_PAYLOAD_BYTES + 1, StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let response = run_batch(
+                State(state.clone()),
+                origin_headers(),
+                RawBody(Body::from(vec![b' '; size])),
+            )
+            .await;
+            assert_eq!(response.status(), expected);
+            assert_eq!(
+                response_json(response).await,
+                json!({"status": "rejected", "code": "InvalidRequest"})
+            );
+        }
+        let stream = async_stream::stream! {
+            yield Ok::<_, Infallible>(vec![b' '; MAX_BATCH_PAYLOAD_BYTES]);
+            yield Ok::<_, Infallible>(vec![b' '; 1]);
+        };
+        let response = run_batch(
+            State(state),
+            origin_headers(),
+            RawBody(Body::wrap_stream(stream)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response_json(response).await["code"], "InvalidRequest");
+    }
+
+    #[tokio::test]
+    async fn batch_stream_failure_is_sanitized_and_custom_header_preflight_works() {
+        let (_dir, mut state) = batch_state().await;
+        Arc::get_mut(&mut state).unwrap().session_source = SessionSource::Header {
+            name: "x-custom-session".into(),
+            secret: Some("secret".into()),
+        };
+        let preflight = cors_preflight(State(state.clone()), origin_headers()).await;
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "content-type, x-custom-session"
+        );
+        let stream = async_stream::stream! {
+            yield Err::<Vec<u8>, _>(io::Error::new(io::ErrorKind::UnexpectedEof, "private transport detail"));
+        };
+        let response = run_batch(
+            State(state.clone()),
+            origin_headers(),
+            RawBody(Body::wrap_stream(stream)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({"status": "rejected", "code": "InvalidRequest"})
+        );
+        let mut denied = HeaderMap::new();
+        denied.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let response = run_batch(State(state), denied, RawBody(Body::from("invalid JSON"))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_failure_is_unknown_not_rejected() {
+        let response = batch_failure(
+            None,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            query::Error::OutcomeUnknown.code(),
+            None,
+        );
+        let (_dir, state) = batch_state().await;
+        let value = response_json(with_cors(&state, &origin_headers(), response)).await;
+        assert_eq!(
+            value,
+            json!({"status": "outcomeUnknown", "code": "OutcomeUnknown"})
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_and_unsigned_batches_use_fixed_generation_zero() {
+        for source in [
+            SessionSource::Dev(json!({})),
+            SessionSource::Header {
+                name: DEFAULT_SESSION_HEADER.into(),
+                secret: None,
+            },
+        ] {
+            let (_dir, mut state) = batch_state().await;
+            Arc::get_mut(&mut state).unwrap().session_source = source;
+            let mut headers = origin_headers();
+            headers.insert(
+                DEFAULT_SESSION_HEADER,
+                HeaderValue::from_str(&URL_SAFE_NO_PAD.encode("{}")).unwrap(),
+            );
+            let mut body = batch_body(&state).await;
+            body["authGeneration"] = json!(7);
+            assert_eq!(
+                submit(state.clone(), body.clone(), headers.clone())
+                    .await
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            body["authGeneration"] = json!(0);
+            assert_eq!(submit(state, body, headers).await.status(), StatusCode::OK);
+        }
+    }
 
     fn manifest_with_session() -> Manifest {
         Manifest {
+            compiled_contract: String::new(),
             version: 1,
             session_schema: HashMap::from([(
                 "userId".to_string(),
@@ -658,8 +1225,11 @@ mod tests {
 
         let session = decode_signed_session(&raw, "secret").expect("decoded session");
 
-        assert_eq!(session["userId"], json!(123));
+        assert_eq!(session.session["userId"], json!(123));
+        assert!(session.local_edit.is_none());
         assert!(decode_signed_session(&raw, "wrong-secret").is_err());
+        let expired = signed_header(json!({"session": {"userId": 123}, "exp": 1}));
+        assert!(decode_signed_session(expired.to_str().unwrap(), "secret").is_err());
     }
 
     #[test]

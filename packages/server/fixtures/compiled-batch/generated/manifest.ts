@@ -1,0 +1,1 @@
+export const manifestVersion = "sha256:c5d77b41e64a573a8243a344812025aba268c919f138458b291f6b22e161756b";

@@ -4,6 +4,49 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 impl Manifest {
+    /// Content identity of this compiled allowlist, independent of HashMap insertion order.
+    /// `version` is the manifest format version; this fingerprint is the request fence.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        fn hash_value(value: &JsonValue, hasher: &mut Sha256) {
+            match value {
+                JsonValue::Object(object) => {
+                    hasher.update(b"{");
+                    for (index, (key, value)) in object
+                        .iter()
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if index != 0 {
+                            hasher.update(b",");
+                        }
+                        hasher.update(serde_json::to_vec(key).expect("JSON key"));
+                        hasher.update(b":");
+                        hash_value(value, hasher);
+                    }
+                    hasher.update(b"}");
+                }
+                JsonValue::Array(values) => {
+                    hasher.update(b"[");
+                    for (index, value) in values.iter().enumerate() {
+                        if index != 0 {
+                            hasher.update(b",");
+                        }
+                        hash_value(value, hasher);
+                    }
+                    hasher.update(b"]");
+                }
+                _ => hasher.update(serde_json::to_vec(value).expect("JSON value")),
+            }
+        }
+        let mut hasher = Sha256::new();
+        hash_value(
+            &serde_json::to_value(self).expect("manifest is JSON serializable"),
+            &mut hasher,
+        );
+        format!("sha256:{:x}", hasher.finalize())
+    }
     /// Load a generated `manifest.json` from disk.
     ///
     /// This is the manifest produced by `pyre generate` and consumed by the
@@ -17,6 +60,9 @@ impl Manifest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Manifest {
+    /// Compiler-owned schema/session contract, including permissions outside the query projections.
+    #[serde(default, rename = "compiledContract")]
+    pub compiled_contract: String,
     pub version: u32,
     pub session_schema: HashMap<String, FieldSchema>,
     pub queries: HashMap<String, QueryManifest>,
@@ -24,6 +70,9 @@ pub struct Manifest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QueryManifest {
+    /// Compiler digest of schema permissions/defaults and input/result/session codecs.
+    #[serde(default, rename = "compiledContract")]
+    pub compiled_contract: String,
     pub id: String,
     pub operation: String,
     #[serde(default)]
@@ -37,6 +86,23 @@ pub struct QueryManifest {
     pub sql: Vec<SqlInfo>,
     #[serde(default, rename = "syncSql")]
     pub sync_sql: Option<Vec<SqlInfo>>,
+    #[serde(
+        default,
+        rename = "generatedEdit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub generated_edit: Option<GeneratedEdit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedEdit {
+    pub kind: String,
+    /// Zero-based indices in both `sql` and `syncSql`. Each is a direct target DML
+    /// statement returning the raw authorized identity as `_pyreEditId`.
+    pub write_statement_indices: Vec<usize>,
+    /// Writable input names; updates exclude identity and managed/immutable fields.
+    pub writable_inputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -64,6 +130,7 @@ pub struct SqlInfo {
 
 #[derive(Clone, Debug)]
 pub struct PyreSession {
+    value: JsonValue,
     logical: HashMap<String, sync::SessionValue>,
     sql_args: HashMap<String, JsonValue>,
 }
@@ -76,7 +143,7 @@ impl PyreSession {
     /// logical values for sync permission checks and `session_<name>` SQL args
     /// for query execution.
     pub fn new(value: JsonValue, schema: &HashMap<String, FieldSchema>) -> Result<Self, Error> {
-        let JsonValue::Object(object) = value else {
+        let JsonValue::Object(ref object) = value else {
             return Err(Error::ExpectedObject);
         };
 
@@ -85,12 +152,20 @@ impl PyreSession {
 
         for (name, field_schema) in schema {
             let value = object.get(name).unwrap_or(&JsonValue::Null);
-            if value.is_null() && !field_schema.nullable && !field_schema.omittable {
+            if value.is_null()
+                && !field_schema.nullable
+                && !field_schema.omittable
+                && (!object.contains_key(name)
+                    || validate_field_inner(name, value, field_schema, true).is_err())
+            {
                 return Err(if object.contains_key(name) {
                     Error::UnexpectedNull(name.clone())
                 } else {
                     Error::MissingField(name.clone())
                 });
+            }
+            if object.contains_key(name) {
+                validate_field_inner(name, value, field_schema, true)?;
             }
             prepare_field(
                 name,
@@ -103,7 +178,15 @@ impl PyreSession {
             )?;
         }
 
-        Ok(Self { logical, sql_args })
+        Ok(Self {
+            value,
+            logical,
+            sql_args,
+        })
+    }
+
+    pub fn revalidate(&self, schema: &HashMap<String, FieldSchema>) -> Result<Self, Error> {
+        Self::new(self.value.clone(), schema)
     }
 
     pub fn logical(&self) -> &HashMap<String, sync::SessionValue> {
@@ -112,6 +195,138 @@ impl PyreSession {
 
     pub fn sql_args(&self) -> &HashMap<String, JsonValue> {
         &self.sql_args
+    }
+}
+
+/// Validate structured values before either SQL serialization or session flattening.
+pub(crate) fn validate_field(
+    name: &str,
+    value: &JsonValue,
+    schema: &FieldSchema,
+) -> Result<(), Error> {
+    validate_field_inner(name, value, schema, false)
+}
+
+fn validate_field_inner(
+    name: &str,
+    value: &JsonValue,
+    schema: &FieldSchema,
+    session: bool,
+) -> Result<(), Error> {
+    fn check(
+        value: &JsonValue,
+        type_: &crate::ast::ColumnType,
+        definitions: &HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
+        depth: usize,
+        session: bool,
+    ) -> bool {
+        use crate::ast::ColumnType as T;
+        if depth > 64 {
+            return false;
+        }
+        match type_ {
+            T::Nullable(inner) => {
+                value.is_null() || check(value, inner, definitions, depth + 1, session)
+            }
+            T::Json => !value.is_null(),
+            T::JsonTyped(inner) => check(value, inner, definitions, depth + 1, session),
+            T::List(inner) => value.as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .all(|v| check(v, inner, definitions, depth + 1, session))
+            }),
+            T::Dict(inner) => value.as_object().is_some_and(|items| {
+                items
+                    .values()
+                    .all(|v| check(v, inner, definitions, depth + 1, session))
+            }),
+            T::String | T::IdUuid { .. } => value.is_string(),
+            T::Int | T::IdInt { .. } => integer_value(value).is_some(),
+            T::Float => value.is_number(),
+            T::Bool => {
+                value.is_boolean() || (session && matches!(integer_value(value), Some(0 | 1)))
+            }
+            T::DateTime => datetime_to_epoch_seconds(value).is_some(),
+            T::Date => value.is_string(),
+            T::Custom(name) => {
+                let Some(variants) = definitions.get(name) else {
+                    return false;
+                };
+                let tag = value
+                    .as_str()
+                    .or_else(|| value.get("_type").and_then(JsonValue::as_str));
+                let Some(fields) = tag.and_then(|tag| variants.get(tag)) else {
+                    return false;
+                };
+                if value.is_string() {
+                    return variants.values().all(HashMap::is_empty);
+                }
+                let Some(object) = value.as_object() else {
+                    return false;
+                };
+                (session
+                    || object
+                        .keys()
+                        .all(|key| key == "_type" || fields.contains_key(key)))
+                    && fields.iter().all(|(name, field)| match object.get(name) {
+                        None => field.omittable || (session && field.nullable),
+                        Some(v) if v.is_null() => {
+                            field.nullable
+                                || check(
+                                    v,
+                                    &T::from_str(&field.type_),
+                                    definitions,
+                                    depth + 1,
+                                    session,
+                                )
+                        }
+                        Some(v) => check(
+                            v,
+                            &crate::ast::ColumnType::from_str(&field.type_),
+                            definitions,
+                            depth + 1,
+                            session,
+                        ),
+                    })
+            }
+            T::ForeignKey { .. } => false,
+        }
+    }
+    let valid = if value.is_null() {
+        schema.nullable
+            || check(
+                value,
+                &crate::ast::ColumnType::from_str(&schema.type_),
+                &HashMap::new(),
+                0,
+                session,
+            )
+    } else if schema.is_enum {
+        let tag = value
+            .as_str()
+            .or_else(|| value.get("_type").and_then(JsonValue::as_str));
+        tag.is_some_and(|tag| schema.enum_variants.iter().any(|v| v == tag))
+            && (session || value.as_object().is_none_or(|object| object.len() == 1))
+    } else {
+        let mut definitions = schema.tagged_union_types.clone();
+        if !schema.tagged_union_variants.is_empty() {
+            definitions.insert(schema.type_.clone(), schema.tagged_union_variants.clone());
+        }
+        check(
+            value,
+            &crate::ast::ColumnType::from_str(&schema.type_),
+            &definitions,
+            0,
+            session,
+        )
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidFieldType {
+            field: name.into(),
+            expected: schema.type_.clone(),
+        })
     }
 }
 
@@ -147,7 +362,7 @@ fn prepare_field(
     } else {
         Some(&schema.tagged_union_variants)
     };
-    if let Some(tagged_union_variants) = tagged_union_variants {
+    if let Some(tagged_union_variants) = tagged_union_variants.filter(|_| !schema.is_enum) {
         let tag = value
             .get("_type")
             .and_then(JsonValue::as_str)
@@ -184,7 +399,12 @@ fn prepare_field(
             let nested_display_name = format!("{}.{}.{}", display_name, tag, name);
             let nested_physical_name = format!("{}__{}", physical_name, name);
             let field_value = object.get(name).unwrap_or(&JsonValue::Null);
-            if field_value.is_null() && !field_schema.nullable && !field_schema.omittable {
+            if field_value.is_null()
+                && !field_schema.nullable
+                && !field_schema.omittable
+                && (!object.contains_key(name)
+                    || validate_field_inner(name, field_value, field_schema, true).is_err())
+            {
                 return Err(if object.contains_key(name) {
                     Error::UnexpectedNull(nested_display_name)
                 } else {
@@ -205,7 +425,11 @@ fn prepare_field(
     }
 
     validate_value(display_name, value, schema)?;
-    let sql_value = normalize_sql_value(value, schema);
+    let sql_value = if schema.type_.starts_with("Json") {
+        JsonValue::String(normalize_json_value_inner(value, schema, false).to_string())
+    } else {
+        normalize_sql_value(value, schema)
+    };
     let logical_value = json_to_session_value(&sql_value, schema)?;
     insert_prepared(physical_name, logical_value, sql_value, logical, sql_args);
     Ok(())
@@ -294,12 +518,10 @@ fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result
         match schema.type_.as_str() {
             "String" => value.is_string(),
             "DateTime" => datetime_to_epoch_seconds(value).is_some(),
-            "Int" => value.as_i64().is_some(),
+            "Int" => integer_value(value).is_some(),
             "Float" => value.is_number(),
-            "Bool" => {
-                value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false)
-            }
-            type_ if type_.starts_with("Id.Int") => value.as_i64().is_some(),
+            "Bool" => value.is_boolean() || matches!(integer_value(value), Some(0 | 1)),
+            type_ if type_.starts_with("Id.Int") => integer_value(value).is_some(),
             type_ if type_.starts_with("Id.Uuid") => value.is_string(),
             type_ if type_.starts_with("Json") => true,
             _ => true,
@@ -397,7 +619,123 @@ fn json_to_session_value(
     }
 }
 
-fn normalize_sql_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
+/// Normalize typed JSON recursively without treating it as a partial read projection.
+pub(crate) fn normalize_json_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
+    normalize_json_value_inner(value, schema, true)
+}
+
+fn normalize_json_value_inner(
+    value: &JsonValue,
+    schema: &FieldSchema,
+    write_input: bool,
+) -> JsonValue {
+    fn normalize(
+        value: &JsonValue,
+        type_: &crate::ast::ColumnType,
+        definitions: &HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
+        write_input: bool,
+    ) -> JsonValue {
+        use crate::ast::ColumnType as T;
+        if value.is_null() {
+            return JsonValue::Null;
+        }
+        match type_ {
+            T::Nullable(inner) | T::JsonTyped(inner) => {
+                normalize(value, inner, definitions, write_input)
+            }
+            T::Int | T::IdInt { .. } => integer_value(value)
+                .map(JsonValue::from)
+                .unwrap_or_else(|| value.clone()),
+            T::DateTime => datetime_to_epoch_seconds(value)
+                .map(JsonValue::from)
+                .unwrap_or_else(|| value.clone()),
+            T::List(inner) => JsonValue::Array(
+                value
+                    .as_array()
+                    .expect("validated list")
+                    .iter()
+                    .map(|v| normalize(v, inner, definitions, write_input))
+                    .collect(),
+            ),
+            T::Dict(inner) => JsonValue::Object(
+                value
+                    .as_object()
+                    .expect("validated dict")
+                    .iter()
+                    .map(|(key, v)| (key.clone(), normalize(v, inner, definitions, write_input)))
+                    .collect(),
+            ),
+            T::Bool if !write_input => {
+                JsonValue::Bool(value == &JsonValue::Bool(true) || integer_value(value) == Some(1))
+            }
+            T::Custom(name) => {
+                let Some(variants) = definitions.get(name) else {
+                    return value.clone();
+                };
+                let tag = value
+                    .as_str()
+                    .or_else(|| value.get("_type").and_then(JsonValue::as_str))
+                    .expect("validated tag");
+                if variants.values().all(HashMap::is_empty) {
+                    // Typed JSON uses the stored tag object in both write and session bindings.
+                    // Scalar enum bindings are handled separately by normalize_sql_value.
+                    return serde_json::json!({"_type": tag});
+                }
+                let fields = &variants[tag];
+                JsonValue::Object(
+                    value
+                        .as_object()
+                        .expect("validated variant")
+                        .iter()
+                        .filter(|(key, _)| {
+                            write_input || key.as_str() == "_type" || fields.contains_key(*key)
+                        })
+                        .map(|(key, v)| {
+                            (
+                                key.clone(),
+                                fields
+                                    .get(key)
+                                    .map(|field| {
+                                        normalize(
+                                            v,
+                                            &T::from_str(&field.type_),
+                                            definitions,
+                                            write_input,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| v.clone()),
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            _ => value.clone(),
+        }
+    }
+    let mut definitions = schema.tagged_union_types.clone();
+    if !schema.tagged_union_variants.is_empty() {
+        definitions.insert(schema.type_.clone(), schema.tagged_union_variants.clone());
+    }
+    if schema.is_enum {
+        return value.get("_type").cloned().unwrap_or_else(|| value.clone());
+    }
+    normalize(
+        value,
+        &crate::ast::ColumnType::from_str(&schema.type_),
+        &definitions,
+        write_input,
+    )
+}
+
+pub(crate) fn normalize_sql_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
+    if value.is_null() {
+        return JsonValue::Null;
+    }
+    if schema.type_ == "Int" || schema.type_.starts_with("Id.Int") {
+        if let Some(integer) = integer_value(value) {
+            return JsonValue::from(integer);
+        }
+    }
     if schema.is_enum {
         if let Some(tag) = value.get("_type").and_then(JsonValue::as_str) {
             return JsonValue::String(tag.to_string());
@@ -406,7 +744,7 @@ fn normalize_sql_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
 
     if schema.type_ == "Bool" {
         return JsonValue::from(
-            if value == &JsonValue::Bool(true) || value.as_i64() == Some(1) {
+            if value == &JsonValue::Bool(true) || integer_value(value) == Some(1) {
                 1
             } else {
                 0
@@ -420,19 +758,29 @@ fn normalize_sql_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
         }
     }
 
-    value.clone()
+    normalize_json_value(value, schema)
+}
+
+fn integer_value(value: &JsonValue) -> Option<i64> {
+    let number = value.as_f64()?;
+    (number.fract() == 0.0 && number.abs() <= 9_007_199_254_740_991.0).then_some(number as i64)
 }
 
 fn datetime_to_epoch_seconds(value: &JsonValue) -> Option<i64> {
-    if let Some(seconds) = value.as_i64() {
-        return Some(seconds);
+    // Match generated CoercedDate's whole seconds and JavaScript Date range.
+    const MAX_SECONDS: i64 = 8_640_000_000_000;
+    if let Some(seconds) = integer_value(value) {
+        return (seconds.abs() <= MAX_SECONDS).then_some(seconds);
     }
 
     let raw = value.as_str()?.trim();
     if let Ok(seconds) = raw.parse::<i64>() {
-        return Some(seconds);
+        return (seconds >= -MAX_SECONDS && seconds <= MAX_SECONDS).then_some(seconds);
     }
 
+    if raw.as_bytes().get(17..19) == Some(b"60") {
+        return None;
+    }
     chrono::DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|datetime| datetime.timestamp())

@@ -46,6 +46,100 @@ fn query_result(affected_rows: Vec<AffectedRowTableGroup>) -> QueryResult {
 }
 
 #[tokio::test]
+async fn batch_publication_uses_committed_revision_without_origin_registration(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::{manifest::Manifest, query};
+    let db =
+        TestDatabase::new("record Item {\n    id Id.Int @id\n    name String\n    @public\n}\n")
+            .await?;
+    let conn = db.db.connect()?;
+    let mut queries = pyre::ast::QueryList {
+        queries: Vec::new(),
+    };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &db.context);
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|f| f.path == std::path::Path::new("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|q| q.operation == "insert")
+        .unwrap();
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let mut rows = conn
+        .query("SELECT database_epoch FROM _pyre_sync WHERE id=1", ())
+        .await?;
+    let epoch = rows.next().await?.unwrap().get::<String>(0)?;
+    drop(rows);
+    let fingerprint = manifest.fingerprint();
+    let binding = query::BatchBinding {
+        database_id: "main",
+        namespace: &create.primary_db,
+        manifest: &fingerprint,
+        instance: "test",
+        auth_generation: 1,
+    };
+    let request = query::BatchRequest {
+        version: 1,
+        database_id: "main".into(),
+        namespace: create.primary_db.clone(),
+        manifest: fingerprint.clone(),
+        instance: "test".into(),
+        auth_generation: 1,
+        database_epoch: epoch.clone(),
+        request_id: "r1".into(),
+        sequence: 1,
+        operations: vec![query::BatchOperation {
+            operation: create.id.clone(),
+            input: json!({"name":"committed"}),
+        }],
+    };
+    let result = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let server = SyncServer::new(&db.context);
+    assert_eq!(result.response["commitRevision"], 1);
+    assert_eq!(result.response["reconciliation"]["atLeast"], 1);
+    assert!(server
+        .batch_messages(&result, &ConnectedSessions::new())
+        .is_empty());
+    let sessions = ConnectedSessions::from([("subscriber".into(), SyncSession::new())]);
+    for _ in 0..2 {
+        let messages = server.batch_messages(&result, &sessions);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message.type_, "syncRequired");
+        assert_eq!(messages[0].message.server_revision, Some(1));
+        assert_eq!(
+            messages[0].message.database_epoch.as_deref(),
+            Some(epoch.as_str())
+        );
+    }
+    // Failure to allocate the next revision must roll back the write, not just its acknowledgement.
+    conn.execute("CREATE TRIGGER fail_revision BEFORE UPDATE ON _pyre_sync BEGIN SELECT RAISE(ABORT, 'revision unavailable'); END", ()).await?;
+    assert!(
+        query::run_batch(&conn, &manifest, &binding, &request, &session)
+            .await
+            .is_err()
+    );
+    let mut rows = conn
+        .query(
+            "SELECT (SELECT count(*) FROM items), server_revision FROM _pyre_sync WHERE id=1",
+            (),
+        )
+        .await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<i64>(0)?, 1);
+    assert_eq!(row.get::<i64>(1)?, 1);
+    assert_eq!(result.response["status"], "accepted");
+    Ok(())
+}
+
+#[tokio::test]
 async fn qualified_union_permission_has_query_catchup_and_live_delta_parity(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(UNION_PREDICATE_PARITY_SCHEMA).await?;

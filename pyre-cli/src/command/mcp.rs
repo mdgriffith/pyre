@@ -1,5 +1,5 @@
 use serde_json::{json, Value as JsonValue};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
@@ -8,7 +8,7 @@ use std::process::Command;
 use super::docs::{find_doc, DocResource, DOC_RESOURCES};
 use super::shared::Options;
 use crate::db;
-use pyre::server::manifest::{FieldSchema, Manifest, PyreSession, QueryManifest, SqlInfo};
+use pyre::server::manifest::{Manifest, PyreSession, QueryManifest, SqlInfo};
 use pyre::{ast, format, generate, parser, typecheck};
 
 const SERVER_NAME: &str = "pyre";
@@ -884,8 +884,10 @@ fn dynamic_manifest(
     }
 
     Ok(Manifest {
+        compiled_contract: String::new(),
         version: 1,
-        session_schema: session_schema(context),
+        session_schema: serde_json::from_value(json!(generate::manifest::session_schema(context)))
+            .map_err(|error| error.to_string())?,
         queries,
     })
 }
@@ -920,11 +922,14 @@ fn dynamic_query_manifest(
     let mut attached_dbs: Vec<String> = query_info.attached_dbs.iter().cloned().collect();
     attached_dbs.sort();
     Ok(QueryManifest {
+        compiled_contract: String::new(),
+        generated_edit: None,
         id: query.name.clone(),
         operation: format!("{:?}", query.operation).to_lowercase(),
         primary_db: query_info.primary_db.clone(),
         attached_dbs,
-        input_schema: input_schema(context, query_info),
+        input_schema: serde_json::from_value(json!(generate::manifest::input_schema(context, query)))
+            .map_err(|error| error.to_string())?,
         session_args: session_args(query_info),
         optional_input_args: query
             .args
@@ -945,232 +950,6 @@ fn dynamic_query_manifest(
         sql,
         sync_sql: None,
     })
-}
-
-fn input_schema(
-    context: &pyre::typecheck::Context,
-    query_info: &pyre::typecheck::QueryInfo,
-) -> HashMap<String, FieldSchema> {
-    let mut schema = HashMap::new();
-    for param in query_info.variables.values() {
-        if let pyre::typecheck::ParamInfo::Defined {
-            raw_variable_name,
-            type_,
-            nullable,
-            from_session,
-            ..
-        } = param
-        {
-            if *from_session {
-                continue;
-            }
-            let resolved_type = type_
-                .as_deref()
-                .map(|type_| pyre::typecheck::resolve_query_param_type(context, type_))
-                .unwrap_or_else(|| "Json".to_string());
-            schema.insert(
-                raw_variable_name.clone(),
-                FieldSchema {
-                    type_: resolved_type.clone(),
-                    is_enum: is_enum_type(context, &resolved_type),
-                    enum_variants: enum_variants(context, Some(&resolved_type)),
-                    tagged_union_variants: HashMap::new(),
-                    tagged_union_types: HashMap::new(),
-                    nullable: *nullable,
-                    omittable: false,
-                },
-            );
-        }
-    }
-    schema
-}
-
-fn session_schema(context: &pyre::typecheck::Context) -> HashMap<String, FieldSchema> {
-    let session = context
-        .session
-        .clone()
-        .unwrap_or_else(ast::default_session_details);
-    let mut schema = HashMap::new();
-    for field in session.fields {
-        if let ast::Field::Column(column) = field {
-            schema.insert(column.name.clone(), session_field_schema(context, &column));
-        }
-    }
-    schema
-}
-
-fn session_field_schema(context: &pyre::typecheck::Context, column: &ast::Column) -> FieldSchema {
-    let mut schema = session_field_schema_inner(context, column, &mut HashSet::new());
-    collect_session_tagged_union_types(
-        context,
-        &column.type_,
-        &mut HashSet::new(),
-        &mut schema.tagged_union_types,
-    );
-    schema
-}
-
-fn session_field_schema_inner(
-    context: &pyre::typecheck::Context,
-    column: &ast::Column,
-    visiting: &mut HashSet<String>,
-) -> FieldSchema {
-    let type_ = column.type_.query_type_string();
-    let tagged_union_variants = column
-        .type_
-        .get_custom_type_name()
-        .and_then(|type_name| {
-            if !visiting.insert(type_name.to_string()) {
-                return None;
-            }
-            let result = context
-                .types
-                .get(type_name)
-                .and_then(|(_, type_)| match type_ {
-                    pyre::typecheck::Type::OneOf { variants }
-                        if variants.iter().any(|variant| variant.fields.is_some()) =>
-                    {
-                        Some(
-                            variants
-                                .iter()
-                                .map(|variant| {
-                                    let fields = variant
-                                        .fields
-                                        .as_ref()
-                                        .map(|fields| {
-                                            fields
-                                                .iter()
-                                                .filter_map(|field| match field {
-                                                    ast::Field::Column(column) => Some((
-                                                        column.name.clone(),
-                                                        session_field_schema_inner(
-                                                            context, column, visiting,
-                                                        ),
-                                                    )),
-                                                    _ => None,
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    (variant.name.clone(), fields)
-                                })
-                                .collect(),
-                        )
-                    }
-                    _ => None,
-                });
-            visiting.remove(type_name);
-            result
-        })
-        .unwrap_or_default();
-
-    FieldSchema {
-        type_: type_.clone(),
-        is_enum: is_enum_type(context, &type_),
-        enum_variants: enum_variants(context, Some(&type_)),
-        tagged_union_variants,
-        tagged_union_types: HashMap::new(),
-        nullable: column.nullable,
-        omittable: false,
-    }
-}
-
-fn collect_session_tagged_union_types(
-    context: &pyre::typecheck::Context,
-    type_: &ast::ColumnType,
-    visited: &mut HashSet<String>,
-    definitions: &mut HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
-) {
-    let Some(type_name) = type_.get_custom_type_name() else {
-        return;
-    };
-    if !visited.insert(type_name.to_string()) {
-        return;
-    }
-    let Some((_, pyre::typecheck::Type::OneOf { variants })) = context.types.get(type_name) else {
-        return;
-    };
-    if variants.iter().all(|variant| variant.fields.is_none()) {
-        return;
-    }
-
-    let variant_schemas = variants
-        .iter()
-        .map(|variant| {
-            let fields = variant
-                .fields
-                .as_ref()
-                .map(|fields| {
-                    fields
-                        .iter()
-                        .filter_map(|field| match field {
-                            ast::Field::Column(column) => Some((
-                                column.name.clone(),
-                                session_field_schema_reference(context, column),
-                            )),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            (variant.name.clone(), fields)
-        })
-        .collect();
-    definitions.insert(type_name.to_string(), variant_schemas);
-
-    for variant in variants {
-        if let Some(fields) = &variant.fields {
-            for field in fields {
-                if let ast::Field::Column(column) = field {
-                    collect_session_tagged_union_types(
-                        context,
-                        &column.type_,
-                        visited,
-                        definitions,
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn session_field_schema_reference(
-    context: &pyre::typecheck::Context,
-    column: &ast::Column,
-) -> FieldSchema {
-    let type_ = column.type_.query_type_string();
-    let enum_variants = enum_variants(context, Some(&type_));
-    FieldSchema {
-        type_,
-        is_enum: !enum_variants.is_empty(),
-        enum_variants,
-        tagged_union_variants: HashMap::new(),
-        tagged_union_types: HashMap::new(),
-        nullable: column.nullable,
-        omittable: false,
-    }
-}
-
-fn is_enum_type(context: &pyre::typecheck::Context, type_: &str) -> bool {
-    matches!(
-        context.types.get(type_),
-        Some((pyre::error::DefInfo::Def(_), pyre::typecheck::Type::OneOf { variants }))
-            if variants.iter().all(|variant| variant.fields.is_none())
-    )
-}
-
-fn enum_variants(context: &pyre::typecheck::Context, type_: Option<&str>) -> Vec<String> {
-    match type_.and_then(|type_| context.types.get(type_)) {
-        Some((pyre::error::DefInfo::Def(_), pyre::typecheck::Type::OneOf { variants }))
-            if variants.iter().all(|variant| variant.fields.is_none()) =>
-        {
-            variants
-                .iter()
-                .map(|variant| variant.name.clone())
-                .collect()
-        }
-        _ => Vec::new(),
-    }
 }
 
 fn query_param_names(query: &ast::Query, query_info: &pyre::typecheck::QueryInfo) -> Vec<String> {
@@ -1429,4 +1208,159 @@ fn write_message<W: Write>(writer: &mut W, message: &JsonValue) -> io::Result<()
     writer.write_all(&body)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn structured_project(session: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        fs::write(
+            dir.path().join("schema.pyre"),
+            r#"
+type Status = Active | Inactive
+type Details
+    = Details {
+        label String,
+        children Json<List<Details>>,
+        states Json<Dict<Status>>
+    }
+
+record Entry {
+    id Id.Int @id
+    details Details
+    payload Json<Details>
+    @public
+}
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("session.pyre"), session).unwrap();
+        let options = Options {
+            in_dir: dir.path(),
+            enable_color: false,
+        };
+        let (schema, context, _) = current_schema_context(&options, &json!({})).unwrap();
+        let introspection = pyre::db::introspect::Introspection {
+            tables: vec![],
+            migration_state: pyre::db::introspect::MigrationState::NoMigrationTable,
+            schema: pyre::db::introspect::SchemaResult::Success {
+                schema: ast::Schema::default(),
+                context: typecheck::empty_context(),
+            },
+        };
+        let diff = pyre::db::diff::diff(&context, &schema.schemas[0], &introspection);
+        let database = dir
+            .path()
+            .join("test.db")
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap()
+            .display()
+            .to_string();
+        let db = db::connect(&database, &None).await.unwrap();
+        let conn = db.connect().unwrap();
+        for statement in pyre::db::diff::to_sql::to_sql(&diff) {
+            match statement {
+                generate::sql::to_sql::SqlAndParams::Sql(sql) => {
+                    conn.execute_batch(&sql).await.unwrap();
+                }
+                generate::sql::to_sql::SqlAndParams::SqlWithParams { sql, args } => {
+                    conn.execute(&sql, args).await.unwrap();
+                }
+            }
+        }
+        (dir, database)
+    }
+
+    #[tokio::test]
+    async fn structured_inputs_execute_and_explain() {
+        let (dir, database) = structured_project("session {}\n").await;
+        let options = Options {
+            in_dir: dir.path(),
+            enable_color: false,
+        };
+        let details = json!({
+            "_type": "Details", "label": "parent",
+            "children": [{"_type": "Details", "label": "child", "children": [], "states": {}}],
+            "states": {"current": {"_type": "Active"}}
+        });
+        let arguments = json!({
+            "database": database,
+            "query": "insert CreateEntry($details: Details, $payload: Json<Details>) { entry { details = $details payload = $payload } }",
+            "params": {"details": details, "payload": details}
+        });
+        let explained = explain_dynamic_query(&options, &arguments).await.unwrap();
+        assert_eq!(explained["ok"], true);
+        let statements = explained["results"][0]["statements"].as_array().unwrap();
+        assert!(!statements.is_empty());
+        assert!(statements
+            .iter()
+            .all(|statement| statement["error"].is_null()));
+        let executed = dynamic_query(&options, &arguments).await.unwrap();
+        assert_eq!(executed["ok"], true);
+        assert_eq!(
+            executed["results"][0]["response"]["entry"][0]["details"],
+            details
+        );
+        assert_eq!(
+            executed["results"][0]["response"]["entry"][0]["payload"],
+            details
+        );
+
+        for param in ["details", "payload"] {
+            let mut invalid = arguments.clone();
+            invalid["params"][param]["children"][0]["label"] = json!(42);
+            assert!(dynamic_query(&options, &invalid).await.is_err());
+            assert!(explain_dynamic_query(&options, &invalid).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_session_types_execute_and_explain() {
+        let (dir, database) = structured_project(
+            "session {\n    details Json<List<Details>>\n    statuses Json<Dict<Status>>\n}\n",
+        )
+        .await;
+        let options = Options {
+            in_dir: dir.path(),
+            enable_color: false,
+        };
+        let arguments = json!({
+            "database": database,
+            "query": "query Entries { entry { id } }",
+            "session": {
+                "details": [{"_type": "Details", "label": "parent", "states": {}, "children": [
+                    {"_type": "Details", "label": "child", "children": [], "states": {"current": {"_type": "Active"}}}
+                ]}],
+                "statuses": {"current": {"_type": "Inactive"}}
+            }
+        });
+        let (_, manifest) = dynamic_query_plan(&options, &arguments).unwrap();
+        let definitions = &manifest.session_schema["details"].tagged_union_types;
+        assert!(definitions.contains_key("Details"));
+        assert!(definitions.contains_key("Status"));
+        assert!(manifest.session_schema["statuses"]
+            .tagged_union_types
+            .contains_key("Status"));
+        let explained = explain_dynamic_query(&options, &arguments).await.unwrap();
+        assert_eq!(explained["ok"], true);
+        assert!(explained["results"][0]["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|statement| statement["error"].is_null()));
+        let executed = dynamic_query(&options, &arguments).await.unwrap();
+        assert_eq!(executed["results"][0]["response"], json!({"entry": []}));
+
+        let mut invalid = arguments.clone();
+        invalid["session"]["details"][0]["children"][0]["states"]["current"]["_type"] =
+            json!("Unknown");
+        assert!(dynamic_query(&options, &invalid).await.is_err());
+        assert!(explain_dynamic_query(&options, &invalid).await.is_err());
+        invalid = arguments;
+        invalid["session"]["statuses"]["current"]["_type"] = json!("Unknown");
+        assert!(dynamic_query(&options, &invalid).await.is_err());
+        assert!(explain_dynamic_query(&options, &invalid).await.is_err());
+    }
 }

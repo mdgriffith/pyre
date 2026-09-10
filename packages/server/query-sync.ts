@@ -5,6 +5,12 @@ import { requireDatabaseId, type DatabaseId } from "./database-id";
 import { activateSchemaForDatabase } from "./schema";
 import {
   run,
+  runBatch,
+  nextLiveSyncRevision,
+  type BatchAuthority,
+  type BatchManifest,
+  type BatchRequest,
+  type BatchResult,
   type QueryMap,
   type QueryResult,
   type Session,
@@ -16,16 +22,28 @@ export const MAX_LIVE_SYNC_DELTA_ROWS = 5000;
 export const MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES = 1024 * 1024;
 export const MAX_LIVE_SYNC_FANOUT_RECIPIENTS = 1000;
 
-async function nextLiveSyncRevision(db: Client): Promise<{ databaseEpoch: string; serverRevision: number }> {
-  const result = await db.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
-  const databaseEpoch = result.rows[0]?.database_epoch;
-  const value = result.rows[0]?.server_revision;
-
-  if (typeof databaseEpoch !== "string" || (typeof value !== "number" && typeof value !== "bigint")) {
-    throw new Error("Failed to allocate Pyre sync server revision");
-  }
-
-  return { databaseEpoch, serverRevision: Number(value) };
+/** Batch acceptance never depends on origin registration or successful SSE delivery. */
+export function runBatchWithSync(
+  db: Client,
+  manifest: BatchManifest,
+  authority: BatchAuthority,
+  request: BatchRequest,
+  executingSession: Session,
+  connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }> = new Map(),
+  sendToSession: (sessionId: string, message: unknown) => void = () => {},
+): Promise<BatchResult> {
+  const recipients = Array.from(connectedSessions.keys());
+  return runBatch(db, manifest, authority, request, executingSession, result => {
+    const response = result.response;
+    const message = {
+      type: "syncRequired", databaseId: response.databaseId, databaseEpoch: response.databaseEpoch,
+      namespace: response.namespace, manifest: response.manifest,
+      serverRevision: response.commitRevision, reconciliation: response.reconciliation,
+    };
+    for (const sessionId of recipients) {
+      try { sendToSession(sessionId, message); } catch { /* A failed recipient must not suppress the others. */ }
+    }
+  });
 }
 
 function countRows(tableGroups: unknown): number {

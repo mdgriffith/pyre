@@ -8,6 +8,8 @@ use std::path::Path;
 
 #[derive(Serialize)]
 struct Manifest {
+    #[serde(rename = "compiledContract")]
+    compiled_contract: String,
     version: u32,
     session_schema: BTreeMap<String, FieldSchema>,
     queries: BTreeMap<String, QueryManifest>,
@@ -15,6 +17,8 @@ struct Manifest {
 
 #[derive(Serialize)]
 struct QueryManifest {
+    #[serde(rename = "compiledContract")]
+    compiled_contract: String,
     id: String,
     operation: String,
     primary_db: String,
@@ -26,10 +30,12 @@ struct QueryManifest {
     sql: Vec<SqlInfo>,
     #[serde(rename = "syncSql", skip_serializing_if = "Option::is_none")]
     sync_sql: Option<Vec<SqlInfo>>,
+    #[serde(rename = "generatedEdit", skip_serializing_if = "Option::is_none")]
+    generated_edit: Option<crate::server::manifest::GeneratedEdit>,
 }
 
 #[derive(Serialize)]
-struct FieldSchema {
+pub struct FieldSchema {
     #[serde(rename = "type")]
     type_: String,
     is_enum: bool,
@@ -82,6 +88,7 @@ fn write_manifest(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let manifest = Manifest {
+        compiled_contract: compiled_contract(context, None),
         version: 1,
         session_schema: session_schema(context),
         queries: queries
@@ -101,7 +108,9 @@ fn query_manifest(
     query_info: &typecheck::QueryInfo,
 ) -> QueryManifest {
     QueryManifest {
+        compiled_contract: compiled_contract(context, Some(query)),
         id: query.interface_hash.clone(),
+        generated_edit: generated_edit_metadata(context, query, query_info),
         operation: operation_to_string(&query.operation),
         primary_db: query_info.primary_db.clone(),
         attached_dbs: sorted_strings(&query_info.attached_dbs),
@@ -135,13 +144,114 @@ fn query_manifest(
     }
 }
 
+/// Compile the same artifact used by Rust before exporting its identity to other runtimes.
+pub fn fingerprint(
+    context: &typecheck::Context,
+    queries: &ast::QueryList,
+    info: &HashMap<String, typecheck::QueryInfo>,
+) -> String {
+    let mut files = Vec::new();
+    generate_queries(context, queries, info, &mut files);
+    let manifest: crate::server::manifest::Manifest =
+        serde_json::from_str(&files[0].contents).expect("compiled manifest");
+    manifest.fingerprint()
+}
+
+fn compiled_contract(context: &typecheck::Context, query: Option<&ast::Query>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut definitions = BTreeMap::new();
+    for (name, (_, type_)) in &context.types {
+        if let typecheck::Type::OneOf { variants } = type_ {
+            definitions.insert(
+                name.clone(),
+                ast::Definition::Tagged {
+                    name: name.clone(),
+                    variants: variants.clone(),
+                    start: None,
+                    end: None,
+                },
+            );
+        }
+    }
+    let codec_database = ast::Database {
+        schemas: vec![ast::Schema {
+            files: vec![ast::SchemaFile {
+                path: String::new(),
+                definitions: definitions.into_values().collect(),
+            }],
+            session: context.session.clone(),
+            ..ast::Schema::default()
+        }],
+    };
+    let mut schemas = BTreeMap::new();
+    for (name, table) in &context.tables {
+        let file = ast::SchemaFile {
+            path: String::new(),
+            definitions: vec![ast::Definition::Record {
+                name: table.record.name.clone(),
+                fields: table.record.fields.clone(),
+                start: None,
+                end: None,
+                start_name: None,
+                end_name: None,
+            }],
+        };
+        schemas.insert(
+            format!("{}/{}", table.schema, name),
+            crate::generate::to_string::schemafile_to_string(&table.schema, &file),
+        );
+    }
+    let sync_modes = context
+        .namespace_sync_modes
+        .iter()
+        .map(|(name, mode)| (name, mode.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let contract = serde_json::json!({
+        "schema": schemas,
+        "syncModes": sync_modes,
+        "codecs": crate::generate::typescript::core::compiled_codec_contract(context, query, &codec_database),
+        "runtimeContract": 1
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&contract).expect("compiled contract"))
+    )
+}
+
+pub fn generated_edit_metadata(
+    context: &typecheck::Context,
+    query: &ast::Query,
+    info: &typecheck::QueryInfo,
+) -> Option<crate::server::manifest::GeneratedEdit> {
+    let table = query.fields.iter().find_map(|field| match field {
+        ast::TopLevelQueryField::Field(field) => context.tables.get(&field.name),
+        _ => None,
+    })?;
+    let (kind, _, writable_inputs) = crate::generated_queries::generated_edit(query, table)?;
+    let sql = query_sql(context, query, info, false);
+    let write_statement_indices = sql
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            let sql = statement.sql.trim_start().to_ascii_lowercase();
+            (sql.starts_with("insert ") || sql.starts_with("update ") || sql.starts_with("delete "))
+                .then_some(index)
+        })
+        .collect();
+    Some(crate::server::manifest::GeneratedEdit {
+        kind: kind.to_string(),
+        write_statement_indices,
+        writable_inputs,
+    })
+}
+
 fn sorted_strings(values: &std::collections::HashSet<String>) -> Vec<String> {
     let mut result: Vec<String> = values.iter().cloned().collect();
     result.sort();
     result
 }
 
-fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<String, FieldSchema> {
+pub fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<String, FieldSchema> {
     query
         .args
         .iter()
@@ -152,13 +262,20 @@ fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<St
                 .map(|type_| typecheck::resolve_query_param_type(context, type_))
                 .unwrap_or_else(|| "Json".to_string());
             let enum_variants = enum_variants(context, &type_);
+            let mut definitions = BTreeMap::new();
+            collect_session_tagged_union_types(
+                context,
+                &ast::ColumnType::from_str(&type_),
+                &mut HashSet::new(),
+                &mut definitions,
+            );
             (
                 arg.name.clone(),
                 FieldSchema {
                     is_enum: !enum_variants.is_empty(),
                     enum_variants,
                     tagged_union_variants: BTreeMap::new(),
-                    tagged_union_types: BTreeMap::new(),
+                    tagged_union_types: definitions,
                     type_,
                     nullable: arg.nullable,
                     omittable: arg.omittable,
@@ -168,7 +285,7 @@ fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<St
         .collect()
 }
 
-fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSchema> {
+pub fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSchema> {
     context
         .session
         .as_ref()
@@ -270,6 +387,16 @@ fn collect_session_tagged_union_types(
     visited: &mut HashSet<String>,
     definitions: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, FieldSchema>>>,
 ) {
+    match type_ {
+        ast::ColumnType::List(inner)
+        | ast::ColumnType::Dict(inner)
+        | ast::ColumnType::JsonTyped(inner)
+        | ast::ColumnType::Nullable(inner) => {
+            collect_session_tagged_union_types(context, inner, visited, definitions);
+            return;
+        }
+        _ => {}
+    }
     let Some(type_name) = type_.get_custom_type_name() else {
         return;
     };
@@ -279,10 +406,6 @@ fn collect_session_tagged_union_types(
     let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(type_name) else {
         return;
     };
-    if variants.iter().all(|variant| variant.fields.is_none()) {
-        return;
-    }
-
     let variant_schemas = variants
         .iter()
         .map(|variant| {

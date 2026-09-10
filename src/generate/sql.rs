@@ -129,7 +129,7 @@ pub fn to_string_with_affected_rows(
     include_affected_rows: bool,
 ) -> Vec<to_sql::Prepared> {
     let operation = ast::query_field_operation(query, table_field);
-    match operation {
+    let mut statements = match operation {
         ast::QueryOperation::Query => {
             json::select::select_to_string(context, query, query_info, table, table_field)
         }
@@ -168,5 +168,21 @@ pub fn to_string_with_affected_rows(
             include_affected_rows,
         ),
         ast::QueryOperation::Transaction => unreachable!("transaction fields have an operation"),
+    };
+    if let Some((_, identity, _)) = crate::generated_queries::generated_edit(query, table) {
+        for statement in &mut statements {
+            let sql = statement.sql.trim_start().to_ascii_lowercase();
+            if sql.starts_with("insert ")
+                || sql.starts_with("update ")
+                || sql.starts_with("delete ")
+            {
+                // An identity result is authorized by the generated write contract, not read visibility.
+                statement.sql.push_str(&format!(
+                    ", {} as _pyreEditId",
+                    crate::ext::string::quote(&identity.name)
+                ));
+            }
+        }
     }
+    statements
 }

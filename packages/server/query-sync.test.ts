@@ -1,6 +1,10 @@
 // @ts-nocheck
 import { beforeEach, expect, mock, test } from "bun:test";
 import { z } from "zod";
+import { createClient } from "@libsql/client";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let introspectionResult = { schema_source: "test schema" };
 let sessionIds = ["s1"];
@@ -54,15 +58,84 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   ]),
 }));
 
-const { runWithSync } = await import("./query-sync");
+const { runWithSync, runBatchWithSync } = await import("./query-sync");
 const { MAX_LIVE_SYNC_DELTA_ROWS, MAX_LIVE_SYNC_FANOUT_RECIPIENTS, MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES } = await import("./query-sync");
 const { loadSchemaFromDatabase } = await import("./schema");
+
+test("batch sync publishes only after atomic commit and needs no registered origin", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pyre-batch-sync-"));
+  const db = createClient({ url: `file:${join(directory, "test.db")}` });
+  try {
+    await db.execute("create table notes(id integer primary key)");
+    await db.execute("create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer)");
+    await db.execute("insert into _pyre_sync values(1,'e1',0)");
+    const manifest = { version: 1, manifestVersion: "m1", SessionValidator: z.object({ userId: z.number() }), queries: {
+      create: { id: "create", operation: "insert", primary_db: "Main", InputValidator: z.object({}), SessionValidator: z.object({ userId: z.number() }),
+        generatedEdit: { kind: "create", writableInputs: [], writeStatementIndices: [0] },
+        session_args: [], optional_input_args: [], json_input_args: [],
+        sql: [{ include: true, params: [], sql: "insert into notes default values returning id as _pyreEditId" }],
+      },
+    } };
+    const authority = { databaseId: "tenant-1", namespace: "Main", manifest: "m1", instance: "tab-1", authGeneration: 2 };
+    const request = { version: 1, ...authority, databaseEpoch: "e1", requestId: "request-1", sequence: 1, operations: [{ operation: "create", input: {} }] };
+    const sent = [];
+    const observedAtPublication = [];
+    const result = await runBatchWithSync(db, manifest, authority, request, { userId: 7 }, new Map([
+      ["broken", { session: {} }], ["subscriber", { session: {} }],
+    ]), (id, message) => {
+      if (id === "broken") throw Error("disconnected");
+      observedAtPublication.push(db.execute("select server_revision, (select count(*) from notes) as n from _pyre_sync"));
+      sent.push([id, message]);
+    });
+    expect(result).toEqual({ kind: "success", response: {
+      ...authority, databaseEpoch: "e1", requestId: "request-1", status: "accepted", commitRevision: 1,
+      results: [{ index: 0, operation: "create", value: { id: 1 } }],
+      reconciliation: { kind: "replaceRequired", atLeast: 1, invalidate: true, minimumSafeRevision: 1 },
+    } });
+    expect(sent).toEqual([["subscriber", {
+      type: "syncRequired", databaseId: "tenant-1", databaseEpoch: "e1", namespace: "Main", manifest: "m1", serverRevision: 1,
+      reconciliation: { kind: "replaceRequired", atLeast: 1, invalidate: true, minimumSafeRevision: 1 },
+    }]]);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
+    expect((await observedAtPublication[0]).rows[0]).toEqual({ server_revision: 1, n: 1 });
+    const withoutOrigin = await runBatchWithSync(db, manifest, authority, request, { userId: 7 });
+    expect(withoutOrigin).toMatchObject({ kind: "success", response: { commitRevision: 2 } });
+  } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
 
 beforeEach(() => {
   introspectionResult = { schema_source: "test schema" };
   sessionIds = ["s1"];
   reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]];
   deltaError = undefined;
+});
+
+test("memory batch sync rejects without detaching or publishing, while empty batches confirm", async () => {
+  const db = createClient({ url: "file::memory:" });
+  try {
+    await db.execute("create table notes(id integer primary key)");
+    await db.execute("insert into notes values(1)");
+    await db.execute("create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer)");
+    await db.execute("insert into _pyre_sync values(1,'e1',0)");
+    const manifest = { version: 1, manifestVersion: "m1", SessionValidator: z.object({}), queries: {
+      create: { id: "create", operation: "insert", primary_db: "Main", InputValidator: z.object({}), SessionValidator: z.object({}),
+        generatedEdit: { kind: "create", writableInputs: [], writeStatementIndices: [0] },
+        session_args: [], optional_input_args: [], json_input_args: [],
+        sql: [{ include: true, params: [], sql: "insert into notes default values returning id as _pyreEditId" }],
+      },
+    } };
+    const authority = { databaseId: "memory-sync", namespace: "Main", manifest: "m1", instance: "tab-1", authGeneration: 2 };
+    const request = { version: 1, ...authority, databaseEpoch: "e1", requestId: "request-1", sequence: 1, operations: [{ operation: "create", input: {} }] };
+    const send = mock(() => {});
+    const recipients = new Map([["subscriber", { session: {} }]]);
+    expect(await runBatchWithSync(db, manifest, authority, request, {}, recipients, send))
+      .toEqual({ kind: "error", error: { errorType: "TransactionFailed", message: "TransactionFailed" } });
+    expect(await runBatchWithSync(db, manifest, authority, { ...request, operations: [] }, {}, recipients, send))
+      .toMatchObject({ kind: "success", response: { status: "confirmed", results: [] } });
+    expect(send).not.toHaveBeenCalled();
+    expect((await db.execute("select * from notes")).rows).toEqual([{ id: 1 }]);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(0);
+  } finally { db.close(); }
 });
 
 function withoutServerRevision(message: unknown): unknown {

@@ -106,6 +106,8 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
             variants,
             recursive_types.contains(&name),
         ));
+        result.push_str(&common::generate_input_tagged_union(&name, variants, false));
+        result.push_str(&common::generate_input_tagged_union(&name, variants, true));
     }
 
     // Get session definition
@@ -141,7 +143,7 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 ast::ColumnType::ForeignKey { .. } => "number".to_string(),
                 ast::ColumnType::Bool => "boolean".to_string(),
                 ast::ColumnType::DateTime => "Date | string | number".to_string(),
-                other => other.to_string(),
+                other => common::column_type_to_ts_type(other, false),
             };
             let (optional, nullable) = if col.nullable {
                 ("?", " | null")
@@ -157,7 +159,21 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
     result.push_str("}\n\n");
     result.push_str(&session_validation_helpers(context, &session));
 
-    result.push_str("export const SessionValidator = z.object({\n");
+    // Validate before legacy projection decoding so unrelated prefixed claims cannot override fields.
+    result.push_str("const EffectiveSessionValidator = z.object({\n");
+    for field in &session.fields {
+        if let ast::Field::Column(col) = field {
+            result.push_str(&format!(
+                "  {}: {}{},\n",
+                col.name,
+                common::session_column_validator(&col.type_),
+                if col.nullable { ".nullish()" } else { "" }
+            ));
+        }
+    }
+    result.push_str(
+        "});\n\nexport const SessionValidator = z.preprocess((value, ctx) => {\n  const parsed = EffectiveSessionValidator.safeParse(value);\n  if (!parsed.success) {\n    for (const issue of parsed.error.issues) ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message });\n    return z.NEVER;\n  }\n  return parsed.data;\n}, z.object({\n",
+    );
     for field in &session.fields {
         if let ast::Field::Column(col) = field {
             let validator = match &col.type_ {
@@ -192,7 +208,7 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
                 ast::ColumnType::Bool => "CoercedBool".to_string(),
                 ast::ColumnType::DateTime => "CoercedDate".to_string(),
-                other => format!("z.any() /* {} */", other),
+                other => common::column_type_to_zod_validator(other),
             };
             let validator = if col.nullable {
                 format!("{}.nullish()", validator)
@@ -202,7 +218,7 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
             result.push_str(&format!("  {}: {},\n", col.name, validator));
         }
     }
-    result.push_str("});\n\n");
+    result.push_str("}));\n\n");
 
     result
 }
@@ -424,7 +440,7 @@ fn to_query_metadata_file(
     };
 
     let session_args = match query_info {
-        Some(info) => get_session_args(&info.variables),
+        Some(info) => get_session_args(&info.variables, false),
         None => "[]".to_string(),
     };
     let omittable_args = format!(
@@ -459,6 +475,16 @@ fn to_query_metadata_file(
     meta_block.push_str("export const meta = {\n");
     meta_block.push_str(&format!("  id: \"{}\",\n", &query.interface_hash));
     if let Some(info) = query_info {
+        if let Some(metadata) =
+            crate::generate::manifest::generated_edit_metadata(context, query, info)
+        {
+            meta_block.push_str(&format!(
+                "  generatedEdit: {{ kind: {} as const, writeStatementIndices: {}, writableInputs: {} }},\n",
+                serde_json::to_string(&metadata.kind).expect("generated edit kind"),
+                serde_json::to_string(&metadata.write_statement_indices).expect("generated write indices"),
+                serde_json::to_string(&metadata.writable_inputs).expect("generated writable inputs")
+            ));
+        }
         meta_block.push_str(&format!(
             "  primary_db: {},\n",
             string::quote(&info.primary_db)
@@ -485,6 +511,39 @@ fn to_query_metadata_file(
         }
     ));
     meta_block.push_str(&format!("  session_args: {},\n", session_args));
+    meta_block.push_str(&format!(
+        "  json_session_args: {},\n",
+        query_info
+            .map(|info| get_session_args(&info.variables, true))
+            .unwrap_or_else(|| "[]".into())
+    ));
+    let mut json_session_validators = Vec::new();
+    if let Some(info) = query_info {
+        for param in info.variables.values() {
+            if let typecheck::ParamInfo::Defined {
+                from_session: true,
+                used: true,
+                session_name: Some(name),
+                type_: Some(type_),
+                ..
+            } = param
+            {
+                let type_ = ast::ColumnType::from_str(type_);
+                if matches!(type_, ast::ColumnType::Json | ast::ColumnType::JsonTyped(_)) {
+                    json_session_validators.push((
+                        name,
+                        common::session_json_column_validator(&type_, "Decode."),
+                    ));
+                }
+            }
+        }
+    }
+    json_session_validators.sort_by_key(|(name, _)| *name);
+    meta_block.push_str("  json_session_validators: {\n");
+    for (name, validator) in json_session_validators {
+        meta_block.push_str(&format!("    {}: {},\n", string::quote(name), validator));
+    }
+    meta_block.push_str("  },\n");
     meta_block.push_str(&format!("  optional_input_args: {},\n", omittable_args));
     meta_block.push_str(&format!("  json_input_args: {},\n", json_input_args));
     meta_block.push_str("  InputValidator,\n");
@@ -516,6 +575,19 @@ fn to_query_metadata_file(
     blocks.push(meta_block.trim_end().to_string());
 
     format!("{}\n", blocks.join("\n\n"))
+}
+
+pub(crate) fn compiled_codec_contract(
+    context: &typecheck::Context,
+    query: Option<&ast::Query>,
+    database: &ast::Database,
+) -> String {
+    let mut result = generate_decode_file(context, database);
+    if let Some(query) = query {
+        result.push_str(&to_param_type_alias(context, &query.args));
+        typealias::return_data_aliases(context, query, &mut result, &to_metadata_formatter());
+    }
+    result
 }
 
 fn to_query_sql_file(
@@ -655,7 +727,7 @@ fn bool_to_ts_bool(bool: bool) -> String {
     "false".to_string()
 }
 
-fn get_session_args(params: &HashMap<String, typecheck::ParamInfo>) -> String {
+fn get_session_args(params: &HashMap<String, typecheck::ParamInfo>, json_only: bool) -> String {
     let mut session_args: Vec<String> = Vec::new();
 
     for (_name, info) in params {
@@ -664,9 +736,19 @@ fn get_session_args(params: &HashMap<String, typecheck::ParamInfo>) -> String {
                 from_session,
                 used,
                 session_name,
+                type_,
                 ..
             } => {
-                if *from_session && *used {
+                if *from_session
+                    && *used
+                    && (!json_only
+                        || type_.as_ref().is_some_and(|name| {
+                            matches!(
+                                ast::ColumnType::from_str(name),
+                                ast::ColumnType::Json | ast::ColumnType::JsonTyped(_)
+                            )
+                        }))
+                {
                     match session_name {
                         None => continue,
                         Some(session_name_string) => {
@@ -1361,12 +1443,15 @@ fn to_input_decoder_zod_type(type_: &str) -> String {
 fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float => "z.number()".to_string(),
+        ast::ColumnType::Int => "z.number().int()".to_string(),
+        ast::ColumnType::Float => "z.number()".to_string(),
         ast::ColumnType::Bool => "z.boolean()".to_string(),
         ast::ColumnType::DateTime => "z.union([z.date(), z.string(), z.number()])".to_string(),
         ast::ColumnType::Date => "z.string()".to_string(),
-        ast::ColumnType::Json => "z.unknown()".to_string(),
-        ast::ColumnType::JsonTyped(inner) => output_zod_type_for_column_type(inner),
+        ast::ColumnType::Json => {
+            "z.json().refine(value => value !== null).nonoptional()".to_string()
+        }
+        ast::ColumnType::JsonTyped(inner) => json_input_decoder_zod_type(inner),
         ast::ColumnType::List(inner) => {
             format!("z.array({})", input_zod_type_for_column_type(inner))
         }
@@ -1379,11 +1464,26 @@ fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", input_zod_type_for_column_type(inner))
         }
-        ast::ColumnType::IdInt { .. } | ast::ColumnType::ForeignKey { .. } => {
-            "z.number()".to_string()
-        }
+        ast::ColumnType::IdInt { .. } => "z.number().int()".to_string(),
+        ast::ColumnType::ForeignKey { .. } => common::input_column_validator(type_),
         ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
-        ast::ColumnType::Custom(name) => format!("Decode.{}", name),
+        ast::ColumnType::Custom(name) => format!("Decode.{}Write", name),
+    }
+}
+
+fn json_input_decoder_zod_type(type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::Custom(name) => format!("Decode.{}JsonInput", name),
+        ast::ColumnType::JsonTyped(inner) => json_input_decoder_zod_type(inner),
+        ast::ColumnType::List(inner) => format!("z.array({})", json_input_decoder_zod_type(inner)),
+        ast::ColumnType::Dict(inner) => format!(
+            "z.record(z.string(), {})",
+            json_input_decoder_zod_type(inner)
+        ),
+        ast::ColumnType::Nullable(inner) => {
+            format!("{}.nullable()", json_input_decoder_zod_type(inner))
+        }
+        _ => input_decoder_zod_type_for_column_type(type_),
     }
 }
 

@@ -50,6 +50,134 @@ call whenever a database is opened: introspection, planning, DDL, and migration
 recording happen in one write transaction. Pyre rejects non-empty databases
 that do not already contain Pyre migration metadata.
 
+## Compiled Batches
+
+`runBatch` from `@pyre/server/query` is the server execution boundary for an
+ordered list of allowlisted compiled operations. It also supports server seed
+submissions with an explicit validated session, without the permission-bypassing
+legacy seed helper. It does not implement client builders or transport routing.
+
+```ts
+const result = await runBatch(database, {
+  version: 1, manifestVersion, queries, SessionValidator: Decode.SessionValidator,
+}, {
+  databaseId: "tenant-1", namespace: "Main", manifest: manifestVersion,
+  instance: "tab-1", authGeneration: 2,
+}, {
+  version: 1, instance: "tab-1", authGeneration: 2, requestId: "request-1", sequence: 1,
+  databaseId: "tenant-1", namespace: "Main", manifest: manifestVersion, databaseEpoch: epoch,
+  operations: [{ operation: compiledOperationId, input }],
+}, effectiveSession);
+```
+
+The manifest and authority arguments are trusted server configuration. Resolve
+the actual connection, database ID, namespace, manifest fingerprint, client
+instance and auth generation independently of the request. The manifest's
+`version: 1` is its format version, not the fingerprint in the authority/request
+`manifest` field. Supply the compiler-emitted `manifestVersion` alongside its
+queries; it must equal the trusted binding's `manifest`. The stored epoch is
+checked inside the transaction.
+Database IDs must uniquely identify databases in
+this process; batch execution is queued by that ID. The queue does not serialize
+legacy runners, other processes, or other writers; SQLite provides transaction
+isolation. The database must already have its `_pyre_sync` metadata.
+Use a file-backed or remote libsql database for nonempty batches. The local
+adapter detaches its connection during `transaction()`, so `runBatch` checks
+the public `Client.protocol` and SQLite's `PRAGMA database_list` before opening
+a local transaction. Local databases without a nonempty `main.file` are rejected
+with sanitized `TransactionFailed`, without detachment, writes, revision allocation,
+or publication. This conservatively includes private/shared in-memory and temporary
+databases; no configuration flag bypasses the check. Empty batches still confirm
+without database I/O. The check is not cached. Remote clients retain their existing
+transaction path. This guard does not protect calls made directly to the adapter's
+`transaction()` outside this executor.
+
+Requests are captured before any await and limited to 100 operations and 1 MiB
+of UTF-8 serialized request data. All request fields are required; unknown
+envelope/member fields and invalid types reject. Numeric fences must be safe
+JavaScript integers (`authGeneration >= 0`, `sequence > 0`). The manifest's full
+`SessionValidator` validates the effective session once, including empty batches.
+Generated `Decode.SessionValidator` includes fields unused by a particular query;
+do not substitute a per-query session projection. Application claims outside
+declared session fields are ignored, including extra structured claims; they
+cannot override declared fields via read-projection prefixes. Existing session
+compatibility is retained for `0`/`1` booleans and omitted nullable fields.
+Declared nested session fields are validated recursively before projection decoding.
+Each member validates input,
+including rejection of fields removed by strip-mode codecs. Canonical tag-only
+enum objects are allowed to decode to strings, but extra fields still reject.
+A query's `primary_db` must equal the trusted `namespace`; attachments are rejected.
+Only compiled `insert`, `update`, `delete`, or `transaction` operations are allowed.
+An empty batch returns an empty result without I/O or publication.
+
+Compiler metadata uses:
+
+```ts
+generatedEdit?: {
+  kind: "create" | "update" | "delete";
+  writeStatementIndices: number[]; // exactly one zero-based index in sql, include: true
+  writableInputs: string[];       // update setters, excluding identity/managed fields
+}
+json_session_args?: string[];     // session bindings serialized as whole JSON, not union tags
+json_session_validators?: Record<string, ZodType>; // canonical typed-JSON session binding codecs
+```
+
+The nominated compiler statement returns the raw authorized identity as
+`_pyreEditId`. Its direct affected count
+must be exactly one. Generated results are `{ id }`, independent of read
+visibility and the legacy named `ReturnData` codec. Named results retain their
+declared wire shape and validate with `ReturnData` when provided, without
+replacing wire timestamps or enum objects with TypeScript codec transformations.
+The local libsql adapter
+reports zero `rowsAffected` for result-producing statements; the shared executor
+captures SQLite `changes()` immediately after nominated returning writes to
+recover the direct count, excluding triggers/cascades. Other writes use the
+adapter's `rowsAffected` directly. No returned-row count authorizes a write.
+
+Success returns `{ kind: "success", response }`. `response` matches the Rust
+wire payload exactly: `{ requestId, databaseId, instance, authGeneration,
+databaseEpoch, namespace, manifest, status, results: [{ index, operation, value }],
+commitRevision, reconciliation }`. `status` is `accepted` for a nonempty batch;
+an empty batch is `confirmed` with `results: []` and no revision/reconciliation.
+Neither `version` nor `sequence` is echoed in responses.
+Every nonempty committed batch allocates one revision in the
+write transaction, even named no-ops. Reconciliation conservatively requests a
+full replacement with `invalidate: true` and `minimumSafeRevision` equal to the
+commit revision. Errors return `{ kind: "error", error: { errorType, message,
+index? } }`, with zero-based member index when known and both strings set to
+the sanitized Rust `Error::code()` equivalent: `InvalidRequest`, `InvalidSession`,
+`InvalidEdit`, `TargetNotWritable`, or `TransactionFailed`. Session failures are
+batch-level, without a member index. No failure contains successful prefixes.
+A failed commit acknowledgement returns
+`kind: "unknown"`, not a definitive rejection.
+
+An optional final `publish` callback runs after commit and cannot turn commit
+evidence into rejection. `runBatchWithSync` from `@pyre/server/query-sync` sends
+postcommit replacement hints without allocating another revision or requiring
+origin registration. Routing must authenticate the trusted instance/auth binding,
+bound the raw body before JSON decoding, wrap errors with the request fence,
+and supply only authorized recipients for
+the bound database. Existing named-single `run`, `toRunner`, and `runWithSync`
+contracts are unchanged.
+
+Actual compiler fixtures live under `fixtures/compiled-batch`; regenerate them
+with `bun packages/server/fixtures/compiled-batch/regenerate.ts` after building
+the compiler. Regeneration also compiles the generated server module and verifies
+its `manifestVersion` export. Rust and TS tests execute the same fixture schema.
+
+Write codecs are separate from permissive read-projection codecs. Both runtimes
+require safe integers, canonical boolean inputs, and complete structured variants
+with explicit nullable fields. Unknown structured write fields reject rather than
+being silently discarded. Typed JSON is normalized recursively: nested dates
+become Unix seconds, nested enums retain their tagged-object representation, and
+list/dictionary members and nulls are preserved. UUID codecs intentionally accept
+strings without UUID syntax validation in both runtimes.
+
+Regenerated query metadata includes `json_session_validators` for typed-JSON
+session arguments. These codecs run when binding SQL, after ordinary session
+decoding, so nested enum tags have the same object representation as stored
+writes. Scalar enum session arguments outside JSON still bind as strings.
+
 ## Seed Data
 
 Generated server output includes a schema-bound `seed` helper for server-side fixtures and imports:

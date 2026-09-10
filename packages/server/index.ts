@@ -5,7 +5,7 @@
  * mutation handling, and permission-aware syncing.
  */
 
-export { run, seed } from "./query";
+export { run, runBatch, seed, MAX_BATCH_OPERATIONS, MAX_BATCH_PAYLOAD_BYTES } from "./query";
 export { ensureDatabase } from "./schema";
 export { databaseIdFromUrl, requireDatabaseId, withDatabaseId } from "./database-id";
 
@@ -17,6 +17,11 @@ export type {
     QueryResult,
     QueryMap,
     QueryMetadata,
+    BatchAuthority,
+    BatchManifest,
+    BatchRequest,
+    BatchResult,
+    BatchResponse,
     SeedInput,
     SeedOptions,
     SeedResult,
