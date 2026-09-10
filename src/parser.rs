@@ -2037,9 +2037,10 @@ fn parse_union_variant_fields(input: Text) -> ParseResult<Vec<(String, ast::Quer
 fn parse_typed_value(input: Text) -> ParseResult<ast::QueryValue> {
     let (input, start_pos) = position(input)?;
     let (input, variant_name) = parse_typename(input)?;
-    let (input, _) = multispace0(input)?;
     // Parse optional fields in braces (e.g., Create { name = $name, description = $description })
-    let (input, fields) = opt(parse_union_variant_fields)(input)?;
+    // Only consume whitespace if a payload follows: otherwise a newline may separate
+    // this enum value from the next predicate or assignment.
+    let (input, fields) = opt(preceded(multispace0, parse_union_variant_fields))(input)?;
     let (input, end_pos) = position(input)?;
     let range = ast::Range {
         start: to_location(&start_pos),

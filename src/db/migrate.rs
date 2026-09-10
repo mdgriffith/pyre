@@ -314,6 +314,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stored_schema_round_trips_relational_permissions_and_branded_ids() {
+        let mut schema = ast::Schema::default();
+        parser::run(
+            "schema.pyre",
+            r#"
+@syncable(false)
+
+session {
+    principalId Principal.id?
+    isAdmin Bool
+}
+
+type MemberRole = GM | GamePlayer | Observer
+type MemberAdmission = Pending | Admitted | Removed
+type GameDatabaseDestination
+    = LocalDestination { key String }
+    | TursoDestination { organization String, group String, name String }
+
+record Principal {
+    @allow(*) { Session.isAdmin == True }
+    @timestamps
+    id Id.Uuid @id
+    members @link(Member.principalId)
+}
+
+record Game {
+    @allow(*) { Session.isAdmin == True }
+    @timestamps
+    id Id.Uuid @id
+    destination GameDatabaseDestination @immutable
+    members @link(Member.gameId)
+}
+
+record Member {
+    @allow(query) {
+        Or(principalId == Session.principalId, Session.isAdmin == True,)
+    }
+    @allow(insert, delete) { Session.isAdmin == True }
+    @allow(update) {
+        And(
+            Session.isAdmin == True,
+            Or(
+                Session.principalId == null,
+                exists game.members {
+                    And(principalId == Session.principalId, role == GM, admission == Admitted,)
+                },
+            ),
+        )
+    }
+    @timestamps
+    @unique(gameId asc, principalId asc)
+    @index(gameId asc, joinedAt desc)
+    id Id.Int @id
+    gameId Game.id @immutable
+    principalId Principal.id @immutable
+    role MemberRole
+    admission MemberAdmission
+    joinedAt DateTime @default(now)
+    principal @link(principalId, Principal.id)
+    game @link(gameId, Game.id)
+}
+"#,
+            &mut schema,
+        )
+        .expect("source schema should parse");
+        let mut database = ast::Database {
+            schemas: vec![schema],
+        };
+        ast::resolve_id_brands(&mut database);
+        let context = typecheck::check_schema(&database).expect("source schema should typecheck");
+        let source = schema_to_storage_string(&context, &database.schemas[0]);
+        let introspection = introspect::from_raw(introspect::IntrospectionRaw {
+            tables: vec![],
+            migration_state: introspect::MigrationState::MigrationTable { migrations: vec![] },
+            schema_source: source.clone(),
+            links: vec![],
+        });
+        match introspection.schema {
+            introspect::SchemaResult::Success { schema, context } => {
+                assert_eq!(schema.sync_mode, ast::SyncMode::QueryOnly);
+                assert_eq!(schema_to_storage_string(&context, &schema), source);
+            }
+            other => panic!("stored schema should reload: {other:?}\n{source}"),
+        }
+    }
+
+    #[test]
     fn stored_schema_uses_resolved_type_for_external_foreign_key() {
         let mut app = ast::Schema {
             namespace: "App".to_string(),
