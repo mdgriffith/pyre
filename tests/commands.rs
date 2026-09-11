@@ -434,7 +434,7 @@ record Event {
     std::fs::write(
         ctx.workspace_path.join("pyre/queries.pyre"),
         r#"
-insert SeedEvent($payload: Json) {
+insert SeedEvent($payload: Json?) {
     event {
         payload = $payload
     }
@@ -851,12 +851,6 @@ fn build_payload_union_verify_script(seed_calls: &[&str], expected_rows: &[&str]
     script.push_str("    throw new Error(`Expected ${label} to be a valid Date, got: ${JSON.stringify(value)}`);\n");
     script.push_str("  }\n");
     script.push_str("}\n\n");
-    script.push_str("function assertMaybeDate(label, value) {\n");
-    script.push_str("  if (value === null || value === undefined) {\n");
-    script.push_str("    return;\n");
-    script.push_str("  }\n\n");
-    script.push_str("  assertDate(label, value);\n");
-    script.push_str("}\n\n");
     script.push_str("const byId = new Map(result.aiSession.map((row) => [row.id, row]));\n\n");
     script.push_str("const expected = {\n");
 
@@ -886,24 +880,16 @@ fn build_payload_union_verify_script(seed_calls: &[&str], expected_rows: &[&str]
     script.push_str("    throw new Error(`Expected row ${id} lifecycle._type ${shape.lifecycleType}, got: ${JSON.stringify(row.lifecycle._type)}`);\n");
     script.push_str("  }\n\n");
     script.push_str("  if (shape.reason !== undefined) {\n");
-    script.push_str(
-        "    if (row.lifecycle.reason !== undefined && row.lifecycle.reason !== shape.reason) {\n",
-    );
-    script.push_str("      throw new Error(`Expected row ${id} optional reason ${shape.reason} when present, got: ${JSON.stringify(row.lifecycle.reason)}`);\n");
+    script.push_str("    if (row.lifecycle.reason !== shape.reason) {\n");
+    script.push_str("      throw new Error(`Expected row ${id} reason ${shape.reason}, got: ${JSON.stringify(row.lifecycle.reason)}`);\n");
     script.push_str("    }\n");
     script.push_str("  }\n\n");
     script.push_str("  if (shape.endedAt === \"date\") {\n");
     script.push_str("    assertDate(`row ${id}.lifecycle.endedAt`, row.lifecycle.endedAt);\n");
-    script.push_str("  } else if (shape.endedAt === \"optional-date\") {\n");
-    script.push_str("    assertMaybeDate(`row ${id}.lifecycle.endedAt`, row.lifecycle.endedAt);\n");
-    script.push_str("  } else if (shape.endedAt === \"nullish\") {\n");
-    script.push_str(
-        "    if (row.lifecycle.endedAt !== null && row.lifecycle.endedAt !== undefined) {\n",
-    );
-    script.push_str("      throw new Error(`Expected row ${id} endedAt to be null or undefined, got: ${JSON.stringify(row.lifecycle.endedAt)}`);\n");
+    script.push_str("  } else if (shape.endedAt === \"null\") {\n");
+    script.push_str("    if (row.lifecycle.endedAt !== null) {\n");
+    script.push_str("      throw new Error(`Expected row ${id} endedAt to be null, got: ${JSON.stringify(row.lifecycle.endedAt)}`);\n");
     script.push_str("    }\n");
-    script.push_str("  } else {\n");
-    script.push_str("    assertMaybeDate(`row ${id}.lifecycle.endedAt`, row.lifecycle.endedAt);\n");
     script.push_str("  }\n");
     script.push_str("}\n\n");
     script.push_str("const nodes = await GetNodes(db, {});\n");
@@ -2337,17 +2323,17 @@ async fn test_generated_typescript_runner_decodes_payload_unions_and_datetime_st
         "SeedFinishedTimeout(db, { endedAt: new Date(1735776000 * 1000) })",
         "SeedFinishedStringSeconds(db, { endedAt: \"1735948800\" })",
         "SeedRunningIdle(db, {})",
-        "SeedLifecycle(db, { lifecycle: { _type: \"Finished\", reason: \"direct\" } })",
+        "SeedLifecycle(db, { lifecycle: { _type: \"Finished\", reason: \"direct\", endedAt: null } })",
         "UpdateFinishedSession(db, { id: 2, updatedAt: \"2026-02-02T00:00:00.000Z\", endedAt: \"1736035200\" })",
         "UpdateFinishedSession(db, { id: 3, updatedAt: 1736121600, endedAt: 1736208000 })",
     ];
     let expected_rows = [
         "1: { status: \"Active\", lifecycleType: \"Running\" },",
-        "2: { status: \"Completed\", lifecycleType: \"Finished\", reason: \"updated-done\", endedAt: \"optional-date\" },",
-        "3: { status: \"Failed\", lifecycleType: \"Finished\", reason: \"updated-done\", endedAt: \"optional-date\" },",
-        "4: { status: \"Completed\", lifecycleType: \"Finished\", reason: \"string-seconds\", endedAt: \"optional-date\" },",
+        "2: { status: \"Completed\", lifecycleType: \"Finished\", reason: \"updated-done\", endedAt: \"date\" },",
+        "3: { status: \"Failed\", lifecycleType: \"Finished\", reason: \"updated-done\", endedAt: \"date\" },",
+        "4: { status: \"Completed\", lifecycleType: \"Finished\", reason: \"string-seconds\", endedAt: \"date\" },",
         "5: { status: \"Idle\", lifecycleType: \"Running\" },",
-        "6: { status: \"Completed\", lifecycleType: \"Finished\", reason: \"direct\", endedAt: \"nullish\" },",
+        "6: { status: \"Completed\", lifecycleType: \"Finished\", reason: \"direct\", endedAt: \"null\" },",
     ];
     let verify_script = build_payload_union_verify_script(&seed_calls, &expected_rows);
 
