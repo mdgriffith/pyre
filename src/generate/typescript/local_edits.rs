@@ -129,7 +129,9 @@ pub fn generate(
                         })
                         .and_then(|(t, c)| match &c.type_ {
                             ast::ColumnType::Int if ast::is_primary_key(&c) => Some(format!(
-                                "{}Id{}", t.record.name, if arg.nullable { " | null" } else { "" }
+                                "{}Id{}",
+                                t.record.name,
+                                if arg.nullable { " | null" } else { "" }
                             )),
                             ast::ColumnType::IdInt { table }
                             | ast::ColumnType::IdUuid { table } => Some(format!(

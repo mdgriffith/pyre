@@ -202,8 +202,7 @@ fn concrete_session_value(
             .as_str()
             .filter(|value| crate::server::manifest::is_uuid(value))
             .map(|value| SessionValue::Text(value.to_string())),
-        ast::ConcreteSerializationType::Text
-        | ast::ConcreteSerializationType::Date => value
+        ast::ConcreteSerializationType::Text | ast::ConcreteSerializationType::Date => value
             .as_str()
             .map(|value| SessionValue::Text(value.to_string())),
         ast::ConcreteSerializationType::DateTime => {
@@ -405,7 +404,10 @@ mod tests {
         );
         let uuid = "ABCDEFAB-CDEF-0123-4567-ABCDEFABCDEF";
         assert_eq!(
-            concrete_session_value(&ast::ConcreteSerializationType::IdUuid, &serde_json::json!(uuid)),
+            concrete_session_value(
+                &ast::ConcreteSerializationType::IdUuid,
+                &serde_json::json!(uuid)
+            ),
             Some(SessionValue::Text(uuid.to_string()))
         );
     }

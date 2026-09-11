@@ -598,8 +598,7 @@ async fn execute_generated_sql(
                     .and_then(|set| set.rows.first())
                     .and_then(|row| row.get("_pyreEditId"))
                     .filter(|id| {
-                        id.as_i64().is_some()
-                            || id.as_str().is_some_and(super::manifest::is_uuid)
+                        id.as_i64().is_some() || id.as_str().is_some_and(super::manifest::is_uuid)
                     })
                     .cloned();
                 if identity.is_none() {

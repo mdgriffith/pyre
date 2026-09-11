@@ -89,7 +89,10 @@ async fn typed_json_session_enums_match_compiled_bundle_writes(
     let request = batch_request(&conn, &binding, vec![query::BatchOperation { operation:create.id.clone(), input:json!({"id":"00000000-0000-4000-8000-000000000001","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":"Member","details":details}) }]).await;
     query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
     let row = conn
-        .query("select json(details) from entries where id = '00000000-0000-4000-8000-000000000001'", ())
+        .query(
+            "select json(details) from entries where id = '00000000-0000-4000-8000-000000000001'",
+            (),
+        )
         .await?
         .next()
         .await?
@@ -108,7 +111,10 @@ async fn typed_json_session_enums_match_compiled_bundle_writes(
             stored
         );
         let found = query::run(&conn, &manifest, &lookup.id, json!({}), &session).await?;
-        assert_eq!(found.response, json!({"entry":[{"id":"00000000-0000-4000-8000-000000000001"}]}));
+        assert_eq!(
+            found.response,
+            json!({"entry":[{"id":"00000000-0000-4000-8000-000000000001"}]})
+        );
     }
     session_value["context"]["role"] = json!("Admin");
     let different = PyreSession::new(session_value, &manifest.session_schema)?;

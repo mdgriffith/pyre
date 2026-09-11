@@ -929,8 +929,10 @@ fn dynamic_query_manifest(
         operation: format!("{:?}", query.operation).to_lowercase(),
         primary_db: query_info.primary_db.clone(),
         attached_dbs,
-        input_schema: serde_json::from_value(json!(generate::manifest::input_schema(context, query)))
-            .map_err(|error| error.to_string())?,
+        input_schema: serde_json::from_value(json!(generate::manifest::input_schema(
+            context, query
+        )))
+        .map_err(|error| error.to_string())?,
         session_args: session_args(query_info),
         optional_input_args: query
             .args

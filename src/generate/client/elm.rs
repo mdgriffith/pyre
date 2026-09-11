@@ -1367,8 +1367,18 @@ fn to_json_type_decoder(database: &ast::Database, type_: &ast::ColumnType) -> St
                 to_json_type_decoder(database, inner)
             )
         }
-        ast::ColumnType::IdInt { table } => if table.is_empty() { "Decode.int" } else { "Db.Id.decodeInt" }.to_string(),
-        ast::ColumnType::IdUuid { table } => if table.is_empty() { "Db.Id.decodeUuidString" } else { "Db.Id.decodeUuid" }.to_string(),
+        ast::ColumnType::IdInt { table } => if table.is_empty() {
+            "Decode.int"
+        } else {
+            "Db.Id.decodeInt"
+        }
+        .to_string(),
+        ast::ColumnType::IdUuid { table } => if table.is_empty() {
+            "Db.Id.decodeUuidString"
+        } else {
+            "Db.Id.decodeUuid"
+        }
+        .to_string(),
         ast::ColumnType::ForeignKey { table, field, .. } => {
             database_column_type(database, table, field)
                 .map(|target| to_json_type_decoder(database, &target))

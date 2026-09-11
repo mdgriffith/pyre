@@ -1107,7 +1107,12 @@ mod tests {
             mutable.manifest.compiled_contract = pyre::generate::manifest::compiled_schema_contract(
                 mutable.loaded_schema.context().unwrap(),
             );
-            mutable.manifest.replacement_contracts = pyre::generate::manifest::replacement_contracts(mutable.loaded_schema.context().unwrap()).into_iter().collect();
+            mutable.manifest.replacement_contracts =
+                pyre::generate::manifest::replacement_contracts(
+                    mutable.loaded_schema.context().unwrap(),
+                )
+                .into_iter()
+                .collect();
             let namespace = mutable.loaded_schema.schema().unwrap().namespace.clone();
             for (id, operation, sql, affected) in [
                 (

@@ -126,8 +126,14 @@ fn typed_non_id_references_match_primary_key_kind() {
         }
         assert!(!table.contains("idIn :"), "{table}");
         let stream = content(&files, "Db/Stream.elm");
-        assert!(stream.contains(&format!("{record}Row {module}.Row")), "{stream}");
-        assert!(stream.contains(&format!("decodeRow {record}Row {module}.decodeRow row")), "{stream}");
+        assert!(
+            stream.contains(&format!("{record}Row {module}.Row")),
+            "{stream}"
+        );
+        assert!(
+            stream.contains(&format!("decodeRow {record}Row {module}.decodeRow row")),
+            "{stream}"
+        );
     }
 }
 

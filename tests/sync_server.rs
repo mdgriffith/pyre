@@ -288,7 +288,8 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     assert_eq!(row.get::<i64>(1)?, 1);
     assert_eq!(result.response["status"], "accepted");
     drop(rows);
-    conn.execute("UPDATE items SET updatedAt = 'invalid'", ()).await?;
+    conn.execute("UPDATE items SET updatedAt = 'invalid'", ())
+        .await?;
     assert!(
         matches!(server.replacement(&conn, &manifest, &binding, &replacement_request, &session).await,
         Err(pyre::server::sync::Error::Sync(pyre::sync::SyncError::SqlGenerationError(message))) if message == "InvalidReplacementTable")

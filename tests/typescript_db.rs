@@ -506,15 +506,19 @@ record IntRecord {
         .expect("generated decode file");
     assert!(decode.contents.contains("uuidRecordId?: string | null;"));
     assert!(decode.contents.contains("intRecordId?: number | null;"));
-    assert!(decode
-        .contents
-        .contains(&format!("uuidRecordId: {}.nullish(),", pyre::generate::typescript::common::UUID_VALIDATOR)));
+    assert!(decode.contents.contains(&format!(
+        "uuidRecordId: {}.nullish(),",
+        pyre::generate::typescript::common::UUID_VALIDATOR
+    )));
     assert!(decode
         .contents
         .contains("intRecordId: z.number().int().nullish(),"));
 
     let env = typescript::to_env(&context, &database).expect("env should generate");
-    assert!(env.contains(&format!("uuidRecordId: {}.optional(),", pyre::generate::typescript::common::UUID_VALIDATOR)));
+    assert!(env.contains(&format!(
+        "uuidRecordId: {}.optional(),",
+        pyre::generate::typescript::common::UUID_VALIDATOR
+    )));
     assert!(env.contains("intRecordId: z.number().optional(),"));
 
     let temp_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
