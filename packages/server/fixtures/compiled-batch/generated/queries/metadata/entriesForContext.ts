@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { GeneratedQueryShape } from '@pyre/core';
 import * as Decode from '../../decode';
 
-const RawInputValidator = z.object({
+export const RawInputValidator = z.object({
 });
 const InputValidator = z.object({
 });
@@ -12,7 +12,7 @@ const queryShape: GeneratedQueryShape = { "$error": "Local queries cannot refere
 
 // The Return Data!
 const Entry = z.object({
-  id: z.string()
+  id: z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
 });
 
 

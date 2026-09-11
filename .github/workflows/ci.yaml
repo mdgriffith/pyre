@@ -48,6 +48,9 @@ jobs:
       - name: Typecheck TypeScript packages
         run: bun run typecheck
 
+      - name: Build compiler for server fixtures
+        run: cargo build --locked --bin pyre
+
       - name: Test server package
         run: bun run --cwd packages/server test
 

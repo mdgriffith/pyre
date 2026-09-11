@@ -390,7 +390,7 @@ test("named sync executes actual generated SQL, retains declared rows, and never
   await replacementDatabase(async ({ db, authority }) => {
     await db.execute("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer)");
     const query = { ...compiledCreate, sql: compiledCreateSql, syncSql: compiledCreateSyncSql };
-    const input = { id: "generated", release: "release", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
+    const input = { id: "00000000-0000-4000-8000-000000000001", release: "release", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
     const fence = { ...authority, namespace: query.primary_db, databaseEpoch: "e1", instance: "other-tab", authGeneration: 8 };
     const result = await runWithSync(db, { [query.id]: query }, query.id, input,
       { userId: 7, role: { _type: "Member" }, unrelated: "required" },

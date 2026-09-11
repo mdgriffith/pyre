@@ -2,8 +2,8 @@ import { z } from 'zod';
 import { CoercedBool, CoercedDate } from '../../decode';
 import * as Decode from '../../decode';
 
-const RawInputValidator = z.object({
-  id: z.string(),
+export const RawInputValidator = z.object({
+  id: z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i),
   release: z.string(),
   enabled: z.boolean(),
   count: z.number().int(),
@@ -11,7 +11,7 @@ const RawInputValidator = z.object({
   details: Decode.DetailsJsonInput
 });
 const InputValidator = z.object({
-  id: z.string(),
+  id: z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i),
   release: z.string(),
   enabled: z.boolean(),
   count: z.number().int(),
@@ -22,7 +22,7 @@ export type Input = z.infer<typeof RawInputValidator>;
 
 // The Return Data!
 const Entry = z.object({
-  id: z.string(),
+  id: z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i),
   release: z.string(),
   enabled: CoercedBool,
   count: z.number(),

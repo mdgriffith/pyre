@@ -11,7 +11,7 @@ import { catchupReplacement, runWithSync } from "../query-sync";
 import { runBatch, type BatchManifest } from "../query";
 import { catchup } from "../sync";
 import { databases } from "./compiled-batch/generated/databases";
-import { compiledContract, manifestVersion } from "./compiled-batch/generated/manifest";
+import { compiledContract, manifestVersion, replacementContracts } from "./compiled-batch/generated/manifest";
 import { SessionValidator } from "./compiled-batch/generated/decode";
 import { meta } from "./compiled-batch/generated/queries/metadata/entryCreate";
 import { sql, syncSql } from "./compiled-batch/generated/queries/sql/entryCreate";
@@ -22,8 +22,8 @@ const db = createClient({ url: `file:${join(directory, "test.db")}` });
 try {
   await ensureDatabase(db, "_default", databases._default.schemaSource);
   await loadSchemaFromDatabase("real", db);
-  assert.equal(wasm.get_schema_compiled_contract(), compiledContract);
-  const manifest: BatchManifest = { version: 1, manifestVersion, compiledContract, replacementContracts: { _default: compiledContract }, SessionValidator,
+  assert.equal(wasm.get_schema_compiled_contract(), replacementContracts._default);
+  const manifest: BatchManifest = { version: 1, manifestVersion, compiledContract, replacementContracts, SessionValidator,
     queries: { [meta.id]: { ...meta, sql, syncSql } } };
   const authority = { databaseId: "real", namespace: "_default", manifest: manifestVersion, instance: "tab", authGeneration: 1 };
   const epoch = (await db.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch as string;
