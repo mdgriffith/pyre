@@ -61,6 +61,39 @@ fn namespace_contracts_are_isolated_but_share_the_allowlist_fingerprint() {
 }
 
 #[test]
+fn stored_session_retains_local_uuid_brand_for_permissions() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "session {\n principalId Principal.id?\n}\nrecord Principal {\n @public\n id Id.Uuid @id\n}\nrecord Member {\n @allow(*) { principalId == Session.principalId }\n id Id.Int @id\n principalId Principal.id\n}\n",
+        &mut schema,
+    )
+    .unwrap();
+    let mut database = ast::Database {
+        schemas: vec![schema],
+    };
+    ast::resolve_id_brands(&mut database);
+    let context = typecheck::check_schema(&database).unwrap();
+    let source = pyre::db::migrate::schema_to_storage_string(&context, &database.schemas[0]);
+    let loaded = pyre::db::introspect::from_raw(pyre::db::introspect::IntrospectionRaw {
+        tables: vec![],
+        migration_state: pyre::db::introspect::MigrationState::NoMigrationTable,
+        schema_source: source,
+        links: vec![],
+    });
+    let pyre::db::introspect::SchemaResult::Success {
+        context: restored, ..
+    } = loaded.schema
+    else {
+        panic!("stored local session should typecheck: {:?}", loaded.schema);
+    };
+    assert_eq!(
+        generate::manifest::replacement_contract(&context, ast::DEFAULT_SCHEMANAME),
+        generate::manifest::replacement_contract(&restored, ast::DEFAULT_SCHEMANAME),
+    );
+}
+
+#[test]
 fn namespace_contracts_survive_standalone_storage_and_dynamic_migration() {
     let mut main = ast::Schema {
         namespace: "Main".into(),
