@@ -25,6 +25,8 @@ export interface ColumnInfo {
 
 export interface TableMetadata {
   name: string;
+  // Unsupported schema keys are explicit so clients fail instead of guessing identity.
+  primaryKey: { name: string; kind: 'int' | 'uuid' | 'unsupported' };
   namespace?: string;
   sync?: 'synced' | 'query-only';
   columns?: ColumnInfo[];

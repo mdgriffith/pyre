@@ -547,11 +547,7 @@ fn entity_stream_column_is_id_like(database: &ast::Database, column: &ast::Colum
     match &column.type_ {
         ast::ColumnType::IdInt { .. } | ast::ColumnType::IdUuid { .. } => true,
         ast::ColumnType::ForeignKey { table, field, .. } => {
-            if database_column_type(database, table, field).is_some() {
-                true
-            } else {
-                field == "id"
-            }
+            database_column_type(database, table, field).is_some()
         }
         ast::ColumnType::JsonTyped(inner) | ast::ColumnType::Nullable(inner) => {
             entity_stream_column_is_id_like(
@@ -585,8 +581,6 @@ fn entity_stream_elm_type(database: &ast::Database, type_: &ast::ColumnType) -> 
         ast::ColumnType::ForeignKey { table, field, .. } => {
             if let Some(column_type) = database_column_type(database, table, field) {
                 entity_stream_elm_type(database, &column_type)
-            } else if field == "id" {
-                format!("Db.Id.{}", table)
             } else {
                 "String".to_string()
             }
@@ -599,7 +593,7 @@ fn entity_stream_elm_type(database: &ast::Database, type_: &ast::ColumnType) -> 
         ast::ColumnType::Nullable(inner) => {
             format!("Maybe {}", entity_stream_elm_type(database, inner))
         }
-        _ => elm_type_from_column_type(type_, true),
+        _ => elm_type_from_column_type(database, type_, true),
     }
 }
 
@@ -618,12 +612,6 @@ fn entity_stream_encoder(database: &ast::Database, type_: &ast::ColumnType) -> O
         ast::ColumnType::ForeignKey { table, field, .. } => {
             if let Some(column_type) = database_column_type(database, table, field) {
                 entity_stream_encoder(database, &column_type)
-            } else if field == "id" {
-                match id_kind_for_brand(database, table) {
-                    Some(IdKind::Int) => Some("Db.Id.encodeInt".to_string()),
-                    Some(IdKind::Uuid) => Some("Db.Id.encodeUuid".to_string()),
-                    None => Some("Encode.string".to_string()),
-                }
             } else {
                 Some("Encode.string".to_string())
             }
@@ -656,12 +644,6 @@ fn entity_stream_decoder(database: &ast::Database, type_: &ast::ColumnType) -> S
         ast::ColumnType::ForeignKey { table, field, .. } => {
             if let Some(column_type) = database_column_type(database, table, field) {
                 entity_stream_decoder(database, &column_type)
-            } else if field == "id" {
-                match id_kind_for_brand(database, table) {
-                    Some(IdKind::Int) => "Db.Id.decodeInt".to_string(),
-                    Some(IdKind::Uuid) => "Db.Id.decodeUuid".to_string(),
-                    None => "Decode.string".to_string(),
-                }
             } else {
                 "Decode.string".to_string()
             }
@@ -712,7 +694,7 @@ fn database_column_type(
 fn entity_stream_id_type(fields: &Vec<ast::Field>) -> Option<(String, &'static str)> {
     for field in fields {
         if let ast::Field::Column(column) = field {
-            if column.name != "id" {
+            if !ast::is_primary_key(column) {
                 continue;
             }
 
@@ -868,6 +850,7 @@ fn to_schema_ids(database: &ast::Database) -> String {
     result.push_str("int =\n");
     result.push_str("    Integer\n\n\n");
 
+    result.push_str("{-| Wrap an already allocated UUID. This function does not generate randomness.\nReceive the UUID through your application's normal command/message flow before\nconstructing an input or edit, then wrap it with `uuid`.\n-}\n");
     result.push_str("uuid : String -> Uuid guard\n");
     result.push_str("uuid =\n");
     result.push_str("    Uuid\n\n\n");
@@ -941,65 +924,33 @@ fn collect_id_brands(database: &ast::Database) -> Vec<(String, IdKind)> {
     out
 }
 
-fn split_foreign_key_type(type_: &str) -> Option<(&str, &str)> {
-    let mut parts = type_.split('.');
-    let table = parts.next()?;
-    let field = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((table, field))
-}
-
 fn find_table<'a>(lookup: &'a ElmLookup, table_name: &str) -> Option<&'a ast::RecordDetails> {
     lookup.records_by_name.get(&table_name.to_ascii_lowercase())
 }
 
-fn get_id_kind_for_brand(lookup: &ElmLookup, brand: &str) -> Option<IdKind> {
-    let table = find_table(lookup, brand)?;
-
-    for field in &table.fields {
-        if let ast::Field::Column(column) = field {
-            if column.name == "id" {
-                return match &column.type_ {
-                    ast::ColumnType::IdInt { .. } => Some(IdKind::Int),
-                    ast::ColumnType::IdUuid { .. } => Some(IdKind::Uuid),
-                    _ => None,
-                };
-            }
-        }
-    }
-
-    None
-}
-
-fn resolve_foreign_key_column_type(lookup: &ElmLookup, type_: &str) -> Option<ast::ColumnType> {
-    let (table_name, field_name) = split_foreign_key_type(type_)?;
+fn resolve_foreign_key_column_type(
+    lookup: &ElmLookup,
+    type_: &ast::ColumnType,
+) -> Option<ast::ColumnType> {
+    let ast::ColumnType::ForeignKey {
+        table: table_name,
+        field: field_name,
+        ..
+    } = type_
+    else {
+        return None;
+    };
     let table = find_table(lookup, table_name)?;
 
     for field in &table.fields {
         if let ast::Field::Column(column) = field {
-            if column.name == field_name {
+            if column.name == *field_name {
                 return Some(column.type_.clone());
             }
         }
     }
 
     None
-}
-
-fn id_encoder(kind: IdKind) -> &'static str {
-    match kind {
-        IdKind::Int => "Db.Id.encodeInt",
-        IdKind::Uuid => "Db.Id.encodeUuid",
-    }
-}
-
-fn id_decoder(kind: IdKind) -> &'static str {
-    match kind {
-        IdKind::Int => "Db.Id.decodeInt",
-        IdKind::Uuid => "Db.Id.decodeUuid",
-    }
 }
 
 pub fn write_schema(database: &ast::Database) -> String {
@@ -1015,7 +966,7 @@ pub fn write_schema(database: &ast::Database) -> String {
         for file in &schema.files {
             for definition in &file.definitions {
                 if let ast::Definition::Tagged { .. } = definition {
-                    result.push_str(&to_string_definition(definition));
+                    result.push_str(&to_string_definition(database, definition));
                 }
             }
         }
@@ -1024,7 +975,7 @@ pub fn write_schema(database: &ast::Database) -> String {
     result
 }
 
-fn to_string_definition(definition: &ast::Definition) -> String {
+fn to_string_definition(database: &ast::Database, definition: &ast::Definition) -> String {
     match definition {
         ast::Definition::Lines { count } => {
             if *count > 2 {
@@ -1040,17 +991,17 @@ fn to_string_definition(definition: &ast::Definition) -> String {
             let mut result = format!("type {}\n", name);
             let mut is_first = true;
             for variant in variants {
-                result.push_str(&to_string_variant(is_first, 4, variant));
+                result.push_str(&to_string_variant(database, is_first, 4, variant));
                 is_first = false;
             }
             result.push('\n');
             result
         }
-        ast::Definition::Record { name, fields, .. } => to_type_alias(name, fields),
+        ast::Definition::Record { name, fields, .. } => to_type_alias(database, name, fields),
     }
 }
 
-fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
+fn to_type_alias(database: &ast::Database, name: &str, fields: &Vec<ast::Field>) -> String {
     let mut result = format!("type alias {} =\n", name);
 
     let mut is_first = true;
@@ -1062,7 +1013,7 @@ fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
             continue;
         }
 
-        result.push_str(&to_string_field(is_first, 4, &field));
+        result.push_str(&to_string_field(database, is_first, 4, &field));
 
         if is_first & ast::is_column(field) {
             is_first = false;
@@ -1072,7 +1023,12 @@ fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
     result
 }
 
-fn to_string_variant(is_first: bool, indent_size: usize, variant: &ast::Variant) -> String {
+fn to_string_variant(
+    database: &ast::Database,
+    is_first: bool,
+    indent_size: usize,
+    variant: &ast::Variant,
+) -> String {
     let prefix = if is_first { " = " } else { " | " };
 
     match &variant.fields {
@@ -1082,7 +1038,7 @@ fn to_string_variant(is_first: bool, indent_size: usize, variant: &ast::Variant)
 
             let mut is_first_field = true;
             for field in fields {
-                result.push_str(&to_string_field(is_first_field, 6, &field));
+                result.push_str(&to_string_field(database, is_first_field, 6, &field));
                 if ast::is_column(field) {
                     is_first_field = false;
                 }
@@ -1094,7 +1050,12 @@ fn to_string_variant(is_first: bool, indent_size: usize, variant: &ast::Variant)
     }
 }
 
-fn to_string_field(is_first: bool, indent: usize, field: &ast::Field) -> String {
+fn to_string_field(
+    database: &ast::Database,
+    is_first: bool,
+    indent: usize,
+    field: &ast::Field,
+) -> String {
     match field {
         ast::Field::ColumnLines { count } => {
             if *count > 2 {
@@ -1103,15 +1064,20 @@ fn to_string_field(is_first: bool, indent: usize, field: &ast::Field) -> String 
                 "\n".repeat(*count as usize)
             }
         }
-        ast::Field::Column(column) => to_string_column(is_first, indent, column),
+        ast::Field::Column(column) => to_string_column(database, is_first, indent, column),
         ast::Field::ColumnComment { .. } => "".to_string(),
         ast::Field::FieldDirective(_) => "".to_string(),
     }
 }
 
-fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> String {
+fn to_string_column(
+    database: &ast::Database,
+    is_first: bool,
+    indent: usize,
+    column: &ast::Column,
+) -> String {
     let maybe = if column.nullable { "Maybe " } else { "" };
-    let type_str = column_to_elm_type(column);
+    let type_str = elm_type_from_column_type(database, &column.type_, false);
 
     if is_first {
         return format!("{} : {}{}\n", column.name, maybe, type_str);
@@ -1123,11 +1089,11 @@ fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> Stri
 
 /// Convert a column to its Elm type representation
 /// For ID types with brands, generates branded types like `UserId` or `Uuid User`
-fn column_to_elm_type(column: &ast::Column) -> String {
-    elm_type_from_column_type(&column.type_, false)
-}
-
-fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) -> String {
+fn elm_type_from_column_type(
+    database: &ast::Database,
+    type_: &ast::ColumnType,
+    qualify_db_types: bool,
+) -> String {
     match type_ {
         ast::ColumnType::String => "String".to_string(),
         ast::ColumnType::Int => "Int".to_string(),
@@ -1142,23 +1108,25 @@ fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) ->
                 "Json".to_string()
             }
         }
-        ast::ColumnType::JsonTyped(inner) => elm_type_from_column_type(inner, qualify_db_types),
+        ast::ColumnType::JsonTyped(inner) => {
+            elm_type_from_column_type(database, inner, qualify_db_types)
+        }
         ast::ColumnType::List(inner) => {
             format!(
                 "List {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                elm_type_from_column_type(database, inner, qualify_db_types)
             )
         }
         ast::ColumnType::Dict(inner) => {
             format!(
                 "Dict String {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                elm_type_from_column_type(database, inner, qualify_db_types)
             )
         }
         ast::ColumnType::Nullable(inner) => {
             format!(
                 "Maybe {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                elm_type_from_column_type(database, inner, qualify_db_types)
             )
         }
         ast::ColumnType::IdInt { table } => {
@@ -1176,11 +1144,9 @@ fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) ->
             }
         }
         ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                format!("Db.Id.{}", table)
-            } else {
-                "String".to_string()
-            }
+            database_column_type(database, table, field)
+                .map(|target| elm_type_from_column_type(database, &target, qualify_db_types))
+                .unwrap_or_else(|| "String".to_string())
         }
         ast::ColumnType::Custom(name) => {
             if qualify_db_types {
@@ -1283,6 +1249,7 @@ fn to_decoder_definition(
                 match &variant.fields {
                     Some(fields) => {
                         result.push_str(&to_type_alias(
+                            database,
                             &format!("{}_{}", name, variant.name),
                             fields,
                         ));
@@ -1377,34 +1344,6 @@ fn to_variant_field_json_decoder(
     }
 }
 
-fn id_kind_for_brand(database: &ast::Database, brand: &str) -> Option<IdKind> {
-    for schema in &database.schemas {
-        for file in &schema.files {
-            for definition in &file.definitions {
-                if let ast::Definition::Record { name, fields, .. } = definition {
-                    if !name.eq_ignore_ascii_case(brand) {
-                        continue;
-                    }
-
-                    for field in fields {
-                        if let ast::Field::Column(column) = field {
-                            if column.name == "id" {
-                                return match &column.type_ {
-                                    ast::ColumnType::IdInt { .. } => Some(IdKind::Int),
-                                    ast::ColumnType::IdUuid { .. } => Some(IdKind::Uuid),
-                                    _ => None,
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
 fn to_json_type_decoder(database: &ast::Database, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "Decode.string".to_string(),
@@ -1429,12 +1368,10 @@ fn to_json_type_decoder(database: &ast::Database, type_: &ast::ColumnType) -> St
         }
         ast::ColumnType::IdInt { .. } => "Db.Id.decodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.decodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } if field == "id" => {
-            match id_kind_for_brand(database, table) {
-                Some(IdKind::Int) => "Db.Id.decodeInt".to_string(),
-                Some(IdKind::Uuid) => "Db.Id.decodeUuid".to_string(),
-                None => "Db.Id.decodeUuid".to_string(),
-            }
+        ast::ColumnType::ForeignKey { table, field, .. } => {
+            database_column_type(database, table, field)
+                .map(|target| to_json_type_decoder(database, &target))
+                .unwrap_or_else(|| "Decode.string".to_string())
         }
         _ => crate::ext::string::decapitalize(&type_.to_string()).to_string(),
     }
@@ -1571,13 +1508,9 @@ fn to_type_encoder(database: &ast::Database, type_: &ast::ColumnType) -> String 
         ),
         ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.encodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } if field == "id" => {
-            match id_kind_for_brand(database, table) {
-                Some(IdKind::Int) => "Db.Id.encodeInt".to_string(),
-                Some(IdKind::Uuid) => "Db.Id.encodeUuid".to_string(),
-                None => "Db.Id.encodeUuid".to_string(),
-            }
-        }
+        ast::ColumnType::ForeignKey { table, field, .. } => database_column_type(database, table, field)
+            .map(|target| to_type_encoder(database, &target))
+            .unwrap_or_else(|| "Encode.string".to_string()),
         _ => string::decapitalize(&type_.to_string()),
     }
 }
@@ -1607,14 +1540,8 @@ fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
         ),
         ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.encodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(kind) = get_id_kind_for_brand(lookup, table) {
-                    return id_encoder(kind).to_string();
-                }
-            }
-
-            if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
+        ast::ColumnType::ForeignKey { .. } => {
+            if let Some(col_type) = resolve_foreign_key_column_type(lookup, type_) {
                 return to_elm_encoder(lookup, &col_type);
             }
 
@@ -2153,15 +2080,8 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
                 "String".to_string()
             }
         }
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(table_def) = find_table(lookup, table) {
-                    return format!("Db.Id.{}", table_def.name);
-                }
-                return format!("Db.Id.{}", table);
-            }
-
-            if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
+        ast::ColumnType::ForeignKey { .. } => {
+            if let Some(col_type) = resolve_foreign_key_column_type(lookup, type_) {
                 return to_elm_type_from_column_type(lookup, &col_type);
             }
 
@@ -2209,14 +2129,8 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
         }
         ast::ColumnType::IdInt { .. } => "Db.Id.decodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.decodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(kind) = get_id_kind_for_brand(lookup, table) {
-                    return id_decoder(kind).to_string();
-                }
-            }
-
-            if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
+        ast::ColumnType::ForeignKey { .. } => {
+            if let Some(col_type) = resolve_foreign_key_column_type(lookup, type_) {
                 return to_elm_decoder_from_column_type(lookup, &col_type);
             }
 

@@ -11,8 +11,23 @@ transactional response with flat fences, `type: "replacement"`, `serverRevision`
 `scope: "database"`, `complete: true`, and `tables[name].rows`. It echoes the
 captured `requestId` and `target`; row-free live hints use `type: "syncRequired"`
 and the accepted response's reconciliation shape. Libraries remain route-independent.
-Client identity, authoritative installation/replay, typed builders and seed APIs
-remain downstream; the reference model is not a substitute for those implementations.
+Client storage, tracking, entity streams and persistence now use schema-declared
+integer/UUID identity, including non-`id` keys. Authoritative installation/replay,
+typed edit builders and seed APIs remain downstream; the reference model is not a
+substitute for those implementations.
+
+Client metadata must be regenerated with the required `primaryKey` name/kind.
+Unsupported primary-key types fail explicitly rather than being treated as UUIDs.
+Browser cache version 3 resets prior rows, cursors, revision and epoch together;
+it does not migrate old flattened `id` caches. Invalid current-version caches
+fail initialization. Query publication conservatively sends changed full results,
+not identity-based diffs inferred from arbitrary projections. Typed Elm/TS schema
+IDs are generated; TS query codecs retain their primitive result representation.
+Rejected-create/no-ghost and delete lifecycle conformance require MEC-111/MEC-112.
+Client UUID ingestion requires hyphenated hexadecimal strings; existing server
+codecs still accept arbitrary strings for UUID fields. Noncanonical stored values
+fail client ingestion explicitly and require correction before rollout; validator
+alignment remains a release-gate check, not a silent identity coercion.
 
 ## Boundary
 

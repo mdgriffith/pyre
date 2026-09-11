@@ -10,9 +10,9 @@ use std::path::Path;
 const DB_ENGINE: &str = include_str!("./static/typescript/db.ts");
 
 /// Collect all unique brands from ID columns in the database
-fn collect_brands(database: &ast::Database) -> Vec<String> {
-    use std::collections::HashSet;
-    let mut brands = HashSet::new();
+fn collect_brands(database: &ast::Database) -> Vec<(String, &'static str)> {
+    use std::collections::BTreeMap;
+    let mut brands = BTreeMap::new();
 
     for schema in &database.schemas {
         for file in &schema.files {
@@ -20,9 +20,14 @@ fn collect_brands(database: &ast::Database) -> Vec<String> {
                 if let ast::Definition::Record { fields, .. } = definition {
                     for field in fields {
                         if let ast::Field::Column(column) = field {
-                            // Check if this is an ID type with a brand (non-empty table name)
-                            if let Some(brand) = column.type_.table_name() {
-                                brands.insert(brand.to_string());
+                            match &column.type_ {
+                                ast::ColumnType::IdInt { table } if !table.is_empty() => {
+                                    brands.insert(table.clone(), "number");
+                                }
+                                ast::ColumnType::IdUuid { table } if !table.is_empty() => {
+                                    brands.insert(table.clone(), "string");
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -31,15 +36,21 @@ fn collect_brands(database: &ast::Database) -> Vec<String> {
         }
     }
 
-    let mut brands_vec: Vec<String> = brands.into_iter().collect();
-    brands_vec.sort();
-    brands_vec
+    brands.into_iter().collect()
 }
 
 /// Convert a column to its TypeScript type representation
-/// For ID types with brands, generates branded types like `UserId` or `string & Post`
-fn column_to_ts_type(column: &ast::Column) -> String {
-    match &column.type_ {
+/// ID columns and references share the target's branded alias.
+fn column_to_ts_type(database: &ast::Database, type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner) => column_to_ts_type(database, inner),
+        ast::ColumnType::List(inner) => format!("Array<{}>", column_to_ts_type(database, inner)),
+        ast::ColumnType::Dict(inner) => {
+            format!("Record<string, {}>", column_to_ts_type(database, inner))
+        }
+        ast::ColumnType::Nullable(inner) => {
+            format!("{} | null", column_to_ts_type(database, inner))
+        }
         ast::ColumnType::IdInt { table } => {
             if !table.is_empty() {
                 format!("{}Id", table)
@@ -49,12 +60,32 @@ fn column_to_ts_type(column: &ast::Column) -> String {
         }
         ast::ColumnType::IdUuid { table } => {
             if !table.is_empty() {
-                format!("string & {}", table)
+                format!("{}Id", table)
             } else {
                 "string".to_string()
             }
         }
-        _ => to_ts_typename(false, &column.type_.to_string()),
+        ast::ColumnType::ForeignKey { table, field, .. } => {
+            for schema in &database.schemas {
+                for file in &schema.files {
+                    for definition in &file.definitions {
+                        if let ast::Definition::Record { name, fields, .. } = definition {
+                            if name.eq_ignore_ascii_case(table) {
+                                for target in fields {
+                                    if let ast::Field::Column(target) = target {
+                                        if target.name == *field {
+                                            return column_to_ts_type(database, &target.type_);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            common::column_type_to_ts_type(type_, false)
+        }
+        _ => common::column_type_to_ts_type(type_, false),
     }
 }
 
@@ -100,34 +131,27 @@ pub fn schema(database: &ast::Database) -> String {
     // Generate phantom type definitions using the brand pattern
     if !brands.is_empty() {
         result.push_str("// Branded ID types using intersection types\n");
-        for brand in &brands {
+        for (brand, primitive) in &brands {
             result.push_str(&format!(
-                "type {} = {{ readonly __brand: '{}' }}\n",
-                brand, brand
+                "export type {}Id = {} & {{ readonly __brand: '{}' }};\n",
+                brand, primitive, brand
             ));
         }
         result.push_str("\n");
-
-        // Generate type aliases for each brand
-        result.push_str("// ID type aliases\n");
-        for brand in &brands {
-            result.push_str(&format!("type {}Id = number & {}\n", brand, brand));
-        }
-        result.push_str("\n\n");
     }
 
     for schema in &database.schemas {
         result.push_str("\n\n");
         for file in &schema.files {
             for definition in &file.definitions {
-                result.push_str(&to_string_definition(definition));
+                result.push_str(&to_string_definition(database, definition));
             }
         }
     }
     result
 }
 
-fn to_string_definition(definition: &ast::Definition) -> String {
+fn to_string_definition(database: &ast::Database, definition: &ast::Definition) -> String {
     match definition {
         ast::Definition::Lines { count } => {
             if *count > 2 {
@@ -140,21 +164,21 @@ fn to_string_definition(definition: &ast::Definition) -> String {
         ast::Definition::SyncMode(_) => "".to_string(),
         ast::Definition::Session(_) => "".to_string(),
         ast::Definition::Tagged { name, variants, .. } => {
-            let mut result = format!("type {} =", name);
+            let mut result = format!("export type {} =", name);
 
             for variant in variants {
                 result.push_str("\n");
-                result.push_str(&to_string_variant(2, variant));
+                result.push_str(&to_string_variant(database, 2, variant));
             }
             result.push_str(";\n\n");
             result
         }
-        ast::Definition::Record { name, fields, .. } => to_type_alias(name, fields),
+        ast::Definition::Record { name, fields, .. } => to_type_alias(database, name, fields),
     }
 }
 
-fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
-    let mut result = format!("type {} = {{\n  ", name);
+fn to_type_alias(database: &ast::Database, name: &str, fields: &Vec<ast::Field>) -> String {
+    let mut result = format!("export type {} = {{\n  ", name);
 
     let mut is_first = true;
     for field in fields {
@@ -162,7 +186,7 @@ fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
             continue;
         }
 
-        result.push_str(&to_string_field(is_first, 2, &field));
+        result.push_str(&to_string_field(database, is_first, 2, &field));
 
         if is_first & ast::is_column(field) {
             is_first = false;
@@ -172,7 +196,11 @@ fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
     result
 }
 
-fn to_string_variant(indent_size: usize, variant: &ast::Variant) -> String {
+fn to_string_variant(
+    database: &ast::Database,
+    indent_size: usize,
+    variant: &ast::Variant,
+) -> String {
     let prefix = " | ";
 
     match &variant.fields {
@@ -189,7 +217,12 @@ fn to_string_variant(indent_size: usize, variant: &ast::Variant) -> String {
 
             let mut is_first_field = true;
             for field in fields {
-                result.push_str(&to_string_field(is_first_field, indent_size + 4, &field));
+                result.push_str(&to_string_field(
+                    database,
+                    is_first_field,
+                    indent_size + 4,
+                    &field,
+                ));
                 is_first_field = false
             }
             result.push_str("    }");
@@ -203,7 +236,12 @@ fn to_string_variant(indent_size: usize, variant: &ast::Variant) -> String {
     }
 }
 
-fn to_string_field(is_first: bool, indent: usize, field: &ast::Field) -> String {
+fn to_string_field(
+    database: &ast::Database,
+    is_first: bool,
+    indent: usize,
+    field: &ast::Field,
+) -> String {
     match field {
         ast::Field::ColumnLines { count } => {
             if *count > 2 {
@@ -212,14 +250,22 @@ fn to_string_field(is_first: bool, indent: usize, field: &ast::Field) -> String 
                 "\n".repeat(*count as usize)
             }
         }
-        ast::Field::Column(column) => to_string_column(is_first, indent, column),
+        ast::Field::Column(column) => to_string_column(database, is_first, indent, column),
         ast::Field::ColumnComment { .. } => "".to_string(),
         ast::Field::FieldDirective(_) => "".to_string(),
     }
 }
 
-fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> String {
-    let type_str = column_to_ts_type(column);
+fn to_string_column(
+    database: &ast::Database,
+    is_first: bool,
+    indent: usize,
+    column: &ast::Column,
+) -> String {
+    let mut type_str = column_to_ts_type(database, &column.type_);
+    if column.nullable {
+        type_str.push_str(" | null");
+    }
     if is_first {
         return format!(
             "{}: {};\n",
@@ -296,10 +342,6 @@ fn to_decoder_definition(definition: &ast::Definition) -> String {
 
 pub fn literal_quote(s: &str) -> String {
     format!("`{}`", s)
-}
-
-fn to_ts_typename(qualified: bool, type_: &str) -> String {
-    common::column_type_to_ts_type(&ast::ColumnType::from_str(type_), qualified)
 }
 
 pub fn to_env(context: &typecheck::Context, database: &ast::Database) -> Option<String> {

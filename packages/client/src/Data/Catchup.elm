@@ -1,6 +1,7 @@
 module Data.Catchup exposing (Model, Msg(..), ServerConfig, Status(..), UpdateResult, databaseEpoch, databaseId, init, pendingDatabaseEpoch, status, update)
 
 import Data.Delta
+import Data.Identity exposing (Key)
 import Data.IndexedDb
 import Data.LiveSync as LiveSync
 import Data.Value
@@ -244,6 +245,41 @@ startCatchupIfReady model =
 handleCatchupResponse : Result Http.Error CatchupResponse -> Model -> Db.Db -> UpdateResult
 handleCatchupResponse result model db =
     case result of
+        Ok (CatchupPageReceived response) ->
+            let
+                rows =
+                    Dict.map (\_ table -> table.rows) response.tables
+
+                consistentColumns =
+                    Dict.values rows
+                        |> List.all
+                            (\tableRows ->
+                                case tableRows of
+                                    [] ->
+                                        True
+
+                                    first :: rest ->
+                                        List.all (\row -> Dict.keys row == Dict.keys first) rest
+                            )
+            in
+            if not consistentColumns then
+                failedUpdate "Inconsistent catchup row columns" model db
+
+            else
+                case Db.fromInitialData db.schema { tables = rows, cursor = Dict.empty, lastAppliedServerRevision = Nothing, databaseEpoch = Nothing } of
+                    Err error ->
+                        failedUpdate error model db
+
+                    Ok _ ->
+                        handleValidatedCatchupResponse result model db
+
+        _ ->
+            handleValidatedCatchupResponse result model db
+
+
+handleValidatedCatchupResponse : Result Http.Error CatchupResponse -> Model -> Db.Db -> UpdateResult
+handleValidatedCatchupResponse result model db =
+    case result of
         Ok (DatabaseResetReceived reset) ->
             case validateResponseDatabaseId model.server.databaseId reset.databaseId of
                 Just message ->
@@ -265,7 +301,7 @@ handleCatchupResponse result model db =
                             , inProgress = True
                             , tablesSynced = 0
                         }
-                    , db = Db.init
+                    , db = Db.init db.schema
                     , cmd = Cmd.none
                     , dbCmds = [ Data.IndexedDb.resetForDatabaseEpoch reset.databaseEpoch ]
                     , delta = Nothing
@@ -612,13 +648,13 @@ resetCursorIfRowsAreMissing tableName entry cursor =
             cursor
 
 
-computeMaxCursor : Dict Int (Dict String Data.Value.Value) -> Maybe ( Float, Data.Value.Value )
+computeMaxCursor : Dict Key (Dict String Data.Value.Value) -> Maybe ( Float, Data.Value.Value )
 computeMaxCursor tableData =
     Dict.toList tableData
         |> List.foldl updateMaxCursor Nothing
 
 
-updateMaxCursor : ( Int, Dict String Data.Value.Value ) -> Maybe ( Float, Data.Value.Value ) -> Maybe ( Float, Data.Value.Value )
+updateMaxCursor : ( Key, Dict String Data.Value.Value ) -> Maybe ( Float, Data.Value.Value ) -> Maybe ( Float, Data.Value.Value )
 updateMaxCursor ( rowId, row ) currentMax =
     case Dict.get "updatedAt" row of
         Just value ->
@@ -626,11 +662,12 @@ updateMaxCursor ( rowId, row ) currentMax =
                 Just timestamp ->
                     let
                         candidate =
-                            ( timestamp, Data.Value.IntValue rowId )
+                            ( timestamp, Data.Identity.toValue rowId )
                     in
                     case currentMax of
-                        Just ( existingTimestamp, existingPrimaryKey ) ->
-                            if timestamp > existingTimestamp || (timestamp == existingTimestamp && rowId > primaryKeyToInt existingPrimaryKey) then
+                        Just ( existingTimestamp, _ ) ->
+                            -- Dict.toList visits typed keys in ascending order.
+                            if timestamp >= existingTimestamp then
                                 Just candidate
 
                             else
@@ -644,16 +681,6 @@ updateMaxCursor ( rowId, row ) currentMax =
 
         Nothing ->
             currentMax
-
-
-primaryKeyToInt : Data.Value.Value -> Int
-primaryKeyToInt value =
-    case value of
-        Data.Value.IntValue primaryKey ->
-            primaryKey
-
-        _ ->
-            -2147483648
 
 
 valueToTimestamp : Data.Value.Value -> Maybe Float

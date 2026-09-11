@@ -98,7 +98,7 @@ type SyncControlMessage
 init : Flags -> ( Model, Cmd Msg )
 init flags =
     ( { schema = flags.schema
-      , db = Db.init
+      , db = Db.init flags.schema
       , queryManager = QueryManager.init
       , catchup = Catchup.init flags.server
       , syncStatus = SyncState.NotStarted
@@ -138,20 +138,13 @@ update msg model =
     case msg of
         IndexedDbReceived incoming ->
             case incoming of
-                IndexedDb.InitialDataReceived _ ->
-                    let
-                        ( updatedDb, dbCmd ) =
-                            Db.update (Db.FromIndexedDb model.schema incoming) model.db
+                IndexedDb.InitialDataReceived initialData ->
+                    case Db.fromInitialData model.schema initialData of
+                        Ok db ->
+                            handleIndexedDbIncoming incoming { model | db = db }
 
-                        baseModel =
-                            { model | db = updatedDb }
-
-                        ( updatedModel, indexedDbCmd ) =
-                            handleIndexedDbIncoming incoming baseModel
-                    in
-                    ( updatedModel
-                    , Cmd.batch [ Cmd.map DbMsg dbCmd, indexedDbCmd ]
-                    )
+                        Err error ->
+                            ( { model | syncError = Just error }, Data.Error.sendError error )
 
                 IndexedDb.DatabaseEpochResetCompleted databaseEpoch ->
                     applyCatchupUpdate
@@ -265,6 +258,21 @@ handleIndexedDbIncoming incoming model =
 
 handleLiveSyncIncoming : LiveSync.Incoming -> Model -> ( Model, Cmd Msg )
 handleLiveSyncIncoming incoming model =
+    case incoming of
+        LiveSync.DeltaReceived _ _ _ delta ->
+            case Data.Delta.validate model.schema delta of
+                Err error ->
+                    ( { model | syncError = Just error }, Data.Error.sendError error )
+
+                Ok _ ->
+                    handleValidatedLiveSyncIncoming incoming model
+
+        _ ->
+            handleValidatedLiveSyncIncoming incoming model
+
+
+handleValidatedLiveSyncIncoming : LiveSync.Incoming -> Model -> ( Model, Cmd Msg )
+handleValidatedLiveSyncIncoming incoming model =
     case incoming of
         LiveSync.DeltaReceived messageDatabaseId messageEpoch serverRevision delta ->
             case validateLiveSyncDatabaseId model messageDatabaseId "delta" of
@@ -640,7 +648,16 @@ applyOptimisticMutation requestId maybeOptimistic input model =
                                         |> List.filter
                                             (\row -> Dict.get optimistic.where_.field row == Just whereValue)
                             in
-                            if List.isEmpty setValues || List.isEmpty matchingRows then
+                            if
+                                List.isEmpty setValues
+                                    || List.isEmpty matchingRows
+                                    || List.length setValues
+                                    /= List.length optimistic.set
+                                    || (Dict.get tableName model.schema.tables
+                                            |> Maybe.map (\metadata -> List.any (\( field, _ ) -> field == metadata.primaryKey.name) setValues)
+                                            |> Maybe.withDefault True
+                                       )
+                            then
                                 ( model, [] )
 
                             else
@@ -706,15 +723,23 @@ settleSuccessfulMutation requestId mutationId response model =
     let
         serverRevision =
             extractServerRevision response
-
-        maybeSyncMessage =
-            extractMutationSyncMessage response
     in
-    if Dict.member requestId model.inFlightOptimistic && missingAuthoritativeMutationEnvelope serverRevision maybeSyncMessage then
-        rollbackOptimisticMutation requestId mutationId "Optimistic mutation response missing authoritative sync envelope" model
+    case extractMutationSyncMessage response of
+        Err decodeError ->
+            let
+                error =
+                    "Invalid mutation sync envelope: " ++ Decode.errorToString decodeError
+            in
+            ( { model | syncError = Just error }
+            , Cmd.batch [ Data.Error.sendError error, QueryManager.mutationResult requestId mutationId (Err error) ]
+            )
 
-    else
-        settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevision maybeSyncMessage model
+        Ok maybeSyncMessage ->
+            if Dict.member requestId model.inFlightOptimistic && missingAuthoritativeMutationEnvelope serverRevision maybeSyncMessage then
+                rollbackOptimisticMutation requestId mutationId "Optimistic mutation response missing authoritative sync envelope" model
+
+            else
+                settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevision maybeSyncMessage model
 
 
 missingAuthoritativeMutationEnvelope : Maybe Int -> Maybe MutationSyncMessage -> Bool
@@ -729,6 +754,18 @@ missingAuthoritativeMutationEnvelope serverRevision maybeSyncMessage =
 
 settleSuccessfulMutationWithEnvelope : String -> String -> Encode.Value -> Maybe Int -> Maybe MutationSyncMessage -> Model -> ( Model, Cmd Msg )
 settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevision maybeSyncMessage model =
+    case maybeSyncMessage |> Maybe.andThen .delta |> Maybe.map (Data.Delta.validate model.schema) |> Maybe.withDefault (Ok Dict.empty) of
+        Err error ->
+            ( { model | syncError = Just error }
+            , Cmd.batch [ Data.Error.sendError error, QueryManager.mutationResult requestId mutationId (Err error) ]
+            )
+
+        Ok _ ->
+            settleValidatedMutationWithEnvelope requestId mutationId response serverRevision maybeSyncMessage model
+
+
+settleValidatedMutationWithEnvelope : String -> String -> Encode.Value -> Maybe Int -> Maybe MutationSyncMessage -> Model -> ( Model, Cmd Msg )
+settleValidatedMutationWithEnvelope requestId mutationId response serverRevision maybeSyncMessage model =
     let
         shouldApplyAuthoritative =
             not (isStaleServerRevision serverRevision model.lastAppliedServerRevision)
@@ -905,14 +942,20 @@ extractServerRevision value =
             Nothing
 
 
-extractMutationSyncMessage : Encode.Value -> Maybe MutationSyncMessage
+extractMutationSyncMessage : Encode.Value -> Result Decode.Error (Maybe MutationSyncMessage)
 extractMutationSyncMessage value =
-    case Decode.decodeValue (Decode.field "sync" decodeMutationSyncMessage) value of
-        Ok syncMessage ->
-            Just syncMessage
+    Decode.decodeValue
+        (Decode.dict Decode.value
+            |> Decode.andThen
+                (\fields ->
+                    if Dict.member "sync" fields then
+                        Decode.field "sync" decodeMutationSyncMessage |> Decode.map Just
 
-        Err _ ->
-            Nothing
+                    else
+                        Decode.succeed Nothing
+                )
+        )
+        value
 
 
 decodeMutationSyncMessage : Decode.Decoder MutationSyncMessage

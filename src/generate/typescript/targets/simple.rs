@@ -7,10 +7,14 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub fn generate_schema(
-    _database: &ast::Database,
-    _base_out_dir: &Path,
-    _files: &mut Vec<filesystem::GeneratedFile<String>>,
+    database: &ast::Database,
+    base_out_dir: &Path,
+    files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
+    files.push(generate_text_file(
+        base_out_dir.join("types.ts"),
+        crate::generate::server::typescript::schema(database),
+    ));
 }
 
 pub fn generate_queries(

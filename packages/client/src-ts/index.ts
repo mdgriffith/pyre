@@ -441,8 +441,8 @@ class SingleDatabasePyreClient {
       throw new Error(`[PyreClient ctor] Elm.Main.init failed: ${message}`);
     }
 
-    this.storage = new IndexedDBStorage(dbName);
-    this.entityStream = new EntityStreamService();
+    this.storage = new IndexedDBStorage(dbName, config.schema);
+    this.entityStream = new EntityStreamService(config.schema);
     this.indexedDbService = new IndexedDbService(this.storage, this.logDebug, (tableGroups, source) => {
       this.entityStream.handleTableDelta(tableGroups, source, this.databaseId);
     }, () => {
@@ -537,7 +537,12 @@ class SingleDatabasePyreClient {
   static async create(config: SingleDatabasePyreClientCreateConfig): Promise<SingleDatabasePyreClient> {
     const resolvedConfig = await resolveCreateConfig(config);
     const client = new SingleDatabasePyreClient(resolvedConfig);
-    await client.init();
+    try {
+      await client.init();
+    } catch (error) {
+      client.disconnect();
+      throw error;
+    }
     if (resolvedConfig.elm) {
       client.bridgeCleanup = client.attachElmBridge(resolvedConfig.elm);
     }
@@ -545,9 +550,9 @@ class SingleDatabasePyreClient {
   }
 
   async init(): Promise<void> {
-    await this.storage.init();
-    this.lastAppliedServerRevision = await this.storage.getServerRevision();
-    this.databaseEpoch = await this.storage.getDatabaseEpoch();
+    const initial = await this.indexedDbService.initialize();
+    this.lastAppliedServerRevision = initial.lastAppliedServerRevision;
+    this.databaseEpoch = initial.databaseEpoch;
   }
 
   startSync(): void {
@@ -847,6 +852,17 @@ class SingleDatabasePyreClient {
 
     if (message.type === 'delta' && this.shouldAcceptLiveDelta(message)) {
       const tableGroups = message.data as ServerTableGroup[];
+      try {
+        this.entityStream.handleTableDelta(
+          tableGroups,
+          this.lastSyncState.status === 'live' ? 'live' : 'catchup',
+          this.databaseId
+        );
+      } catch (error) {
+        // Let the transport still forward the message to Elm for its validation.
+        console.error('[PyreClient] Rejected live sync delta:', error);
+        return;
+      }
       this.logDebug('[PyreClient] Live sync delta accepted', {
         databaseId: this.databaseId,
         source: this.lastSyncState.status === 'live' ? 'live' : 'catchup',
@@ -855,11 +871,6 @@ class SingleDatabasePyreClient {
         rowCount: tableGroups.reduce((sum, group) => sum + group.rows.length, 0),
       });
       this.noteAppliedServerRevision(message.serverRevision);
-      this.entityStream.handleTableDelta(
-        tableGroups,
-        this.lastSyncState.status === 'live' ? 'live' : 'catchup',
-        this.databaseId
-      );
     }
 
     if (message.type === 'connected') {
@@ -945,11 +956,7 @@ class SingleDatabasePyreClient {
       .filter(isRecord)
       .filter((row) => row[optimistic.where.field] === whereValue)
       .map((row) => ({ ...row, ...setValues }));
-    const optimisticRows = matchingRows.length > 0
-      ? matchingRows
-      : [{ [optimistic.where.field]: whereValue, ...setValues }];
-
-    return tableGroupsFromRows(tableName, optimisticRows);
+    return tableGroupsFromRows(tableName, matchingRows);
   }
 
   private notifyEntityStreamFromMutationResult(result: unknown): void {
@@ -1539,6 +1546,8 @@ export class PyreClient {
     this.clients.set(targetDatabaseId, created);
     void created.then((client) => {
       this.watchInternalClient(targetDatabaseId, generation, client);
+    }, () => {
+      if (this.clients.get(targetDatabaseId) === created) this.clients.delete(targetDatabaseId);
     });
     return created;
   }

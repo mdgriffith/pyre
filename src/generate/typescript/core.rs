@@ -1197,6 +1197,35 @@ fn to_schema_metadata(context: &typecheck::Context) -> String {
 
         result.push_str(&format!("    {}: {{\n", string::quote(&table_name)));
         result.push_str(&format!("      name: {},\n", string::quote(&table_name)));
+        let primary_key = table
+            .record
+            .fields
+            .iter()
+            .find_map(|field| match field {
+                ast::Field::Column(column) if ast::is_primary_key(column) => Some(column),
+                _ => None,
+            })
+            .expect("checked records require a primary key");
+        let primary_key_kind = match &primary_key.type_ {
+            ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => "int",
+            ast::ColumnType::IdUuid { .. } => "uuid",
+            ast::ColumnType::ForeignKey {
+                serialization_type: Some(kind),
+                ..
+            } => match kind {
+                ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt => {
+                    "int"
+                }
+                ast::ConcreteSerializationType::IdUuid => "uuid",
+                _ => "unsupported",
+            },
+            _ => "unsupported",
+        };
+        result.push_str(&format!(
+            "      primaryKey: {{ name: {}, kind: {} }},\n",
+            string::quote(&primary_key.name),
+            string::quote(primary_key_kind)
+        ));
         result.push_str(&format!(
             "      namespace: {},\n",
             string::quote(&table.schema)
