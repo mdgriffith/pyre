@@ -9,6 +9,9 @@ import {
 } from './service/entity-stream';
 import { QueryClientService, resolveLocalQuerySource } from './service/query-client';
 import { QueryManagerService, type MutationResult } from './service/query-manager';
+import { LocalEditsRuntime, capture } from './service/local-edits';
+export { LocalEditsRuntime, edit, batch } from './service/local-edits';
+export type { EditFence, EditOperation, EditPlan, EditPrediction, EditState, EditOutcome, EditLifecycle, EditFailure, LocalEditsFailure, EditReceipt, EditRequest, ReplacementRequest, PreparedEditTransport, LocalEditsConfig, LocalEditsPublication, LocalEditsHost, VisibleTables } from './service/local-edits';
 import { SSEManager, type LiveSyncMessage } from './service/sse';
 import { WebSocketManager } from './service/websocket';
 import {
@@ -317,7 +320,7 @@ interface SingleDatabasePyreClientCreateConfig {
   elm?: PyreElmConfig;
 }
 
-export type PyreInternalClient = Pick<SingleDatabasePyreClient, 'run' | 'disconnect' | 'getDevtoolsSnapshot' | 'inspectDevtoolsTablePage' | 'startSync' | 'onSyncState' | 'onEntityChanges' | 'onDevtoolsEvent'>;
+export type PyreInternalClient = Pick<SingleDatabasePyreClient, 'run' | 'disconnect' | 'getDevtoolsSnapshot' | 'inspectDevtoolsTablePage' | 'startSync' | 'onSyncState' | 'onEntityChanges' | 'onDevtoolsEvent'> & { getLocalEdits?(): LocalEditsRuntime };
 
 type PyreInternalClientFactory = (config: SingleDatabasePyreClientCreateConfig & {
   databaseId: DatabaseId;
@@ -370,6 +373,7 @@ class SingleDatabasePyreClient {
   private lastAppliedServerRevision: number | null = null;
   private databaseEpoch: string | null = null;
   private queryManager: QueryManagerService;
+  private edits?: LocalEditsRuntime;
   private queryClient: QueryClientService;
   private entityStream: EntityStreamService;
   private bridgeCleanup: (() => void) | null = null;
@@ -432,7 +436,7 @@ class SingleDatabasePyreClient {
             transport: liveSyncTransport,
           },
           sync: {
-            autoStart: config.autoStartSync ?? true,
+            autoStart: config.server.localEdits ? false : config.autoStartSync ?? true,
           },
         },
       });
@@ -473,13 +477,39 @@ class SingleDatabasePyreClient {
     this.queryClient.setOnQueryResult(this.handleQueryResult);
     this.queryClient.setOnQueryUnregister(this.handleQueryUnregister);
 
-    this.indexedDbService.attachPorts(this.elmApp);
+    if (!config.server.localEdits) this.indexedDbService.attachPorts(this.elmApp);
     this.sseManager.setOnMessage(this.handleLiveSyncMessage);
     this.webSocketManager.setOnMessage(this.handleLiveSyncMessage);
-    this.sseManager.attachPorts(this.elmApp);
-    this.webSocketManager.attachPorts(this.elmApp);
+    if (!config.server.localEdits) {
+      this.sseManager.attachPorts(this.elmApp);
+      this.webSocketManager.attachPorts(this.elmApp);
+    }
     this.queryManager.attachPorts(this.elmApp);
     this.queryClient.attachPorts(this.elmApp);
+
+    if (config.server.localEdits) {
+      const options = config.server.localEdits(requireDatabaseId(config.databaseId));
+      if (options.fence.databaseId !== config.databaseId) throw new Error('Local edit database fence mismatch');
+      this.edits = new LocalEditsRuntime(options, {
+        send: message => this.queryManager.sendLocalEdits(message),
+        install: (publication, queries) => {
+          const notifyQueries = this.queryClient.installPublication(queries);
+          const notifyManagerQueries = this.queryManager.installPublication(queries);
+          const notifyEntities = this.entityStream.installVisible(publication.tables, this.databaseId);
+          return () => { notifyQueries(); notifyManagerQueries(); notifyEntities(); };
+        },
+        persist: (tables, revision, fence) => this.storage.replaceAuthoritative(tables, revision, fence),
+        end: () => {
+          this.bridgeCleanup?.();
+          this.bridgeCleanup = null;
+          this.queryClient.detach(); this.entityStream.clear(); this.queryManager.detach();
+        },
+        syncState: status => this.updateSyncState({ status, tables: Object.fromEntries(
+          Object.keys(this.schema.tables).map(table => [table, status === 'live' ? 'live' : 'catching_up'])
+        ) }),
+      });
+      this.queryManager.setLocalEdits(this.edits);
+    }
 
     if (this.elmApp.ports.debugOut) {
       this.elmApp.ports.debugOut.subscribe((message) => {
@@ -550,12 +580,19 @@ class SingleDatabasePyreClient {
   }
 
   async init(): Promise<void> {
+    if (this.edits) {
+      await this.storage.init();
+      await this.storage.beginLocalEdits(this.edits.fence);
+      this.edits.start();
+      return;
+    }
     const initial = await this.indexedDbService.initialize();
     this.lastAppliedServerRevision = initial.lastAppliedServerRevision;
     this.databaseEpoch = initial.databaseEpoch;
   }
 
   startSync(): void {
+    if (this.edits) { this.edits.retryCatchup(); return; }
     this.elmApp.ports.receiveSyncControlMessage?.send({ type: 'startSync' });
   }
 
@@ -588,6 +625,7 @@ class SingleDatabasePyreClient {
   }
 
   async onEntityChanges(subscription: EntitySubscription, callback: (batch: EntityChangeBatch) => void): Promise<() => void> {
+    if (this.edits) return this.entityStream.subscribeVisible(subscription, callback, this.databaseId);
     validateEntitySubscription(subscription);
     const initialSequence = this.entityStream.reserveSequence();
     const pendingBatches: EntityChangeBatch[] = [];
@@ -694,7 +732,7 @@ class SingleDatabasePyreClient {
   }
 
   async getDevtoolsSnapshot(): Promise<PyreDevtoolsSnapshot> {
-    const cursor = await this.storage.getSyncCursor();
+    const cursor = this.edits ? { tables: {} } : await this.storage.getSyncCursor();
 
     const tableNames = new Set([
       ...Object.keys(this.schema.tables),
@@ -705,7 +743,7 @@ class SingleDatabasePyreClient {
     await Promise.all(Array.from(tableNames).sort().map(async (tableName) => {
       snapshots[tableName] = {
         name: tableName,
-        count: await this.storage.countRows(tableName),
+        count: this.edits ? (this.entityStream.getVisibleTables()[tableName]?.length ?? 0) : await this.storage.countRows(tableName),
         sync: this.lastSyncState.tables[tableName],
         cursor: cursor.tables[tableName],
       };
@@ -733,7 +771,9 @@ class SingleDatabasePyreClient {
   async inspectDevtoolsTablePage(request: Omit<PyreDevtoolsTablePageRequest, 'instanceId' | 'databaseId'>): Promise<PyreDevtoolsTablePage> {
     const offset = Math.max(0, Math.floor(request.offset ?? 0));
     const limit = Math.max(1, Math.min(500, Math.floor(request.limit ?? 100)));
-    const page = await this.storage.getRowsPage(request.tableName, offset, limit);
+    const visible = this.edits ? this.entityStream.getVisibleTables()[request.tableName] ?? [] : null;
+    const page = visible ? { rows: visible.slice(offset, offset + limit), hasMore: visible.length > offset + limit }
+      : await this.storage.getRowsPage(request.tableName, offset, limit);
     return {
       rows: page.rows,
       offset,
@@ -830,8 +870,11 @@ class SingleDatabasePyreClient {
   }
 
   disconnect(): void {
-    this.bridgeCleanup?.();
-    this.bridgeCleanup = null;
+    this.edits?.dispose();
+    if (!this.edits) {
+      this.bridgeCleanup?.();
+      this.bridgeCleanup = null;
+    }
     this.sseManager.disconnect();
     this.webSocketManager.disconnect();
     this.connectionId = null;
@@ -848,6 +891,7 @@ class SingleDatabasePyreClient {
   }
 
   private handleLiveSyncMessage = (message: LiveSyncMessage): void => {
+    if (this.edits) { this.edits.receiveHint(message); return; }
     this.emitDevtoolsEvent(`sync:${message.type}`, message);
 
     if (message.type === 'delta' && this.shouldAcceptLiveDelta(message)) {
@@ -912,52 +956,6 @@ class SingleDatabasePyreClient {
       this.handleRawSyncState(nextState);
     }
   };
-
-  private async notifyEntityStreamFromOptimisticMutation(optimistic: unknown, input: unknown): Promise<void> {
-    const metadata = parseOptimisticMutation(optimistic);
-    if (!metadata) {
-      return;
-    }
-
-    try {
-      const tableGroups = await this.buildOptimisticTableGroups(metadata, input);
-      this.entityStream.handleTableDelta(tableGroups, 'optimistic', this.databaseId);
-    } catch (error) {
-      console.error('[PyreClient] Failed to notify optimistic entity stream:', error);
-    }
-  }
-
-  private async buildOptimisticTableGroups(
-    optimistic: OptimisticMutationMetadata,
-    input: unknown
-  ): Promise<ServerTableGroup[]> {
-    if (!isRecord(input)) {
-      return [];
-    }
-
-    const whereValue = input[optimistic.where.input];
-    if (whereValue === undefined) {
-      return [];
-    }
-
-    const tableName = this.schema.queryFieldToTable?.[optimistic.queryField] ?? optimistic.queryField;
-    const setValues = Object.fromEntries(
-      optimistic.set
-        .filter((field) => input[field.input] !== undefined)
-        .map((field) => [field.field, input[field.input]])
-    );
-
-    if (Object.keys(setValues).length === 0) {
-      return [];
-    }
-
-    const rows = await this.storage.getAllRows(tableName);
-    const matchingRows = rows
-      .filter(isRecord)
-      .filter((row) => row[optimistic.where.field] === whereValue)
-      .map((row) => ({ ...row, ...setValues }));
-    return tableGroupsFromRows(tableName, matchingRows);
-  }
 
   private notifyEntityStreamFromMutationResult(result: unknown): void {
     const envelope = mutationResultEnvelope(result);
@@ -1366,6 +1364,14 @@ class SingleDatabasePyreClient {
       throw new Error('Mutation module is missing id');
     }
 
+    if (this.edits) {
+      const receipt = this.edits.submitNamed(mutationId, input ?? {});
+      void receipt.confirmed.then(outcome => callback(outcome.kind === 'confirmed'
+        ? { ok: true, value: outcome.result }
+        : { ok: false, error: outcome.kind, outcome }));
+      return;
+    }
+
     const requestId = `mutation_${this.mutationCounter}_${Date.now()}`;
     this.mutationCounter += 1;
     const payload = input ?? {};
@@ -1379,7 +1385,6 @@ class SingleDatabasePyreClient {
     });
     this.emitDevtoolsEvent('mutation:request', { requestId, mutationId, databaseId, input: payload, optimistic });
     void (async () => {
-      await this.notifyEntityStreamFromOptimisticMutation(optimistic, payload);
       this.queryManager.sendMutation(
         requestId,
         mutationId,
@@ -1404,6 +1409,15 @@ class SingleDatabasePyreClient {
     message: ElmBridgeMutationMessage,
     mutationResultPort?: ElmBridgePort
   ): void {
+    if (this.edits) {
+      const receipt = this.edits.submitNamed(message.mutationId, message.mutationInput ?? {});
+      void receipt.confirmed.then(outcome => mutationResultPort?.send?.({
+        type: 'mutation-result', requestId: message.requestId, mutationId: message.mutationId,
+        mutationName: message.mutationName ?? null,
+        result: outcome.kind === 'confirmed' ? { ok: true, value: outcome.result } : { ok: false, error: outcome.kind, outcome },
+      }));
+      return;
+    }
     const baseUrl = resolveEndpointUrl(this.server.baseUrl, this.endpoints.query, {
       databaseId: message.databaseId,
       sync: 'true',
@@ -1418,7 +1432,6 @@ class SingleDatabasePyreClient {
       optimistic: message.optimistic,
     });
     void (async () => {
-      await this.notifyEntityStreamFromOptimisticMutation(message.optimistic, message.mutationInput ?? {});
       this.queryManager.sendMutation(
         message.requestId,
         message.mutationId,
@@ -1448,6 +1461,11 @@ class SingleDatabasePyreClient {
         this.server.withCredentials === true
       );
     })();
+  }
+
+  getLocalEdits(): LocalEditsRuntime {
+    if (!this.edits) throw new Error('Configure server.localEdits before binding a database');
+    return this.edits;
   }
 
   private emitDevtoolsEvent(type: string, payload?: unknown): void {
@@ -1482,6 +1500,8 @@ export class PyreClient {
   private static readonly devtoolsEventLimit = 200;
   private config: ResolvedPyreClientConfig;
   private clients: Map<DatabaseId, Promise<PyreInternalClient>> = new Map();
+  private editRuntimes = new Map<DatabaseId, LocalEditsRuntime>();
+  private initializingEditSubmissions = new Map<DatabaseId, Array<(runtime: LocalEditsRuntime) => void>>();
   private clientGenerations: Map<DatabaseId, number> = new Map();
   private knownDatabaseIds: DatabaseId[] = [];
   private syncedDatabaseIds: DatabaseId[] = [];
@@ -1514,6 +1534,13 @@ export class PyreClient {
       throw error;
     }
     return client;
+  }
+
+  /** Bind once, then submit synchronously on this database's ordered lifetime. */
+  async localEdits(databaseId: DatabaseId): Promise<LocalEditsRuntime> {
+    const client = await this.getOrCreateClient(databaseId);
+    if (!client.getLocalEdits) throw new Error('Internal client does not support local edits');
+    return client.getLocalEdits();
   }
 
   run<Input = unknown>(
@@ -1972,15 +1999,24 @@ export class PyreClient {
 
   disconnect(): void {
     unregisterPyreDevtoolsClient(this.instanceId);
-    this.bridgeCleanup?.();
+    const cleanup = this.bridgeCleanup;
     this.bridgeCleanup = null;
+    this.editRuntimes.forEach(runtime => { void runtime.dispose(); });
+    if (this.config.server.localEdits) {
+      void Promise.allSettled([...this.clients.values()].map(async promise => {
+        const client = await promise;
+        await client.getLocalEdits?.().ended;
+      })).then(() => cleanup?.());
+    } else cleanup?.();
     this.clients.forEach((clientPromise) => {
       void clientPromise.then((client) => {
         client.disconnect();
       });
     });
     this.clients.clear();
-    this.clientGenerations.clear();
+    this.editRuntimes.clear();
+    this.initializingEditSubmissions.clear();
+    this.clientGenerations.forEach((generation, databaseId) => this.clientGenerations.set(databaseId, generation + 1));
     this.knownDatabaseIds = [];
     this.syncedDatabaseIds = [];
     this.syncingDatabaseId = null;
@@ -2032,6 +2068,41 @@ export class PyreClient {
     if (!mutationId) {
       throw new Error('Mutation module is missing id');
     }
+    if (this.config.server.localEdits) {
+      // Capture before lazy binding; never retain mutable input after a failed capture.
+      let capturedInput: unknown;
+      try { capturedInput = capture(input ?? {}); }
+      catch {
+        // Undefined is invalid JSON, preserving failure for the runtime's observable rejection.
+        capturedInput = undefined;
+      }
+      const submit = (runtime: LocalEditsRuntime) => {
+        const receipt = runtime.submitNamed(mutationId, capturedInput);
+        void receipt.confirmed.then(outcome => callback(outcome.kind === 'confirmed'
+          ? { ok: true, value: outcome.result } : { ok: false, error: outcome.kind, outcome }));
+      };
+      const runtime = this.editRuntimes.get(targetDatabaseId);
+      if (runtime) { submit(runtime); return; }
+      const queue = this.initializingEditSubmissions.get(targetDatabaseId) ?? [];
+      this.initializingEditSubmissions.set(targetDatabaseId, queue);
+      queue.push(submit);
+      try {
+        const initializing = this.getOrCreateClient(targetDatabaseId);
+        const generation = this.clientGenerations.get(targetDatabaseId);
+        const client = await initializing;
+        if (queue.includes(submit)) {
+          // Retirement during initialization must close the old lifetime before enqueue.
+          if (this.clientGenerations.get(targetDatabaseId) !== generation) client.disconnect();
+          if (!client.getLocalEdits) throw new Error('Internal client does not support local edits');
+          submit(client.getLocalEdits());
+        }
+      } finally {
+        const index = queue.indexOf(submit);
+        if (index !== -1) queue.splice(index, 1);
+        if (!queue.length && this.initializingEditSubmissions.get(targetDatabaseId) === queue) this.initializingEditSubmissions.delete(targetDatabaseId);
+      }
+      return;
+    }
 
     const startedAt = Date.now();
     const eventPayload = {
@@ -2065,6 +2136,15 @@ export class PyreClient {
   }
 
   private watchInternalClient(databaseId: DatabaseId, generation: number, client: PyreInternalClient): void {
+    if (this.clientGenerations.get(databaseId) !== generation) return;
+    if (this.config.server.localEdits && client.getLocalEdits) {
+      const runtime = client.getLocalEdits();
+      const queue = this.initializingEditSubmissions.get(databaseId);
+      // Drain before exposing the runtime or invoking reentrant application observers.
+      while (queue?.length) queue.shift()!(runtime);
+      this.initializingEditSubmissions.delete(databaseId);
+      this.editRuntimes.set(databaseId, runtime);
+    }
     this.markKnownDatabase(databaseId);
     this.internalDevtoolsUnsubscribers.get(databaseId)?.();
     const unsubscribeDevtools = client.onDevtoolsEvent((event) => {
@@ -2110,6 +2190,9 @@ export class PyreClient {
   }
 
   private disconnectInternalClient(databaseId: DatabaseId): void {
+    void this.editRuntimes.get(databaseId)?.dispose();
+    this.editRuntimes.delete(databaseId);
+    this.initializingEditSubmissions.delete(databaseId);
     const clientPromise = this.clients.get(databaseId);
     this.clients.delete(databaseId);
     this.latestSyncStates.delete(databaseId);
@@ -2189,10 +2272,13 @@ export class PyreClient {
     const targetDatabaseId = requireDatabaseId(databaseId);
     if (!this.knownDatabaseIds.includes(targetDatabaseId)) {
       this.knownDatabaseIds.push(targetDatabaseId);
-      this.emitDevtoolsEvent('database.known', {
+      const emit = () => this.emitDevtoolsEvent('database.known', {
         instanceId: this.instanceId,
         databaseId: targetDatabaseId,
       });
+      // Fenced calls capture/reserve before invoking application observers.
+      if (this.config.server.localEdits) queueMicrotask(emit);
+      else emit();
     }
   }
 
@@ -2334,65 +2420,6 @@ function hasServerHeaders(server: ServerConfig): boolean {
   return Boolean(server.headers);
 }
 
-interface OptimisticMutationMetadata {
-  queryField: string;
-  where: {
-    field: string;
-    input: string;
-  };
-  set: Array<{
-    field: string;
-    input: string;
-  }>;
-}
-
-function parseOptimisticMutation(value: unknown): OptimisticMutationMetadata | null {
-  if (!isRecord(value) || typeof value.queryField !== 'string' || !isRecord(value.where) || !Array.isArray(value.set)) {
-    return null;
-  }
-
-  if (typeof value.where.field !== 'string' || typeof value.where.input !== 'string') {
-    return null;
-  }
-
-  const set = value.set.filter((field): field is { field: string; input: string } => (
-    isRecord(field) && typeof field.field === 'string' && typeof field.input === 'string'
-  ));
-  if (set.length === 0) {
-    return null;
-  }
-
-  return {
-    queryField: value.queryField,
-    where: {
-      field: value.where.field,
-      input: value.where.input,
-    },
-    set,
-  };
-}
-
-function tableGroupsFromRows(tableName: string, rows: Array<Record<string, unknown>>): ServerTableGroup[] {
-  if (rows.length === 0) {
-    return [];
-  }
-
-  const headers = rows.reduce<string[]>((acc, row) => {
-    Object.keys(row).forEach((field) => {
-      if (!acc.includes(field)) {
-        acc.push(field);
-      }
-    });
-    return acc;
-  }, []);
-
-  return [{
-    table_name: tableName,
-    headers,
-    rows: rows.map((row) => headers.map((header) => row[header] ?? null)),
-  }];
-}
-
 function mutationResultEnvelope(result: unknown): unknown {
   if (!isRecord(result) || result.ok !== true || !('value' in result)) {
     return result;
@@ -2513,7 +2540,7 @@ async function resolveCreateConfig(config: SingleDatabasePyreClientCreateConfig)
 
   const databaseId = connected?.databaseId ?? config.databaseId;
   const cacheNamespace = connected?.cacheNamespace ?? config.cacheNamespace;
-  const resolvedHeaders = await resolveServerHeaders(server);
+  const resolvedHeaders = server.localEdits ? {} : await resolveServerHeaders(server);
 
   return {
     schema: config.schema,

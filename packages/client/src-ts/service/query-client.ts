@@ -65,6 +65,7 @@ export class QueryClientService {
   private elmApp: ElmApp | null = null;
   private queryStates: Map<string, QueryState> = new Map();
   private hasPorts = false;
+  private portListener?: (message: unknown) => void;
   private logger: (payload: ErrorPayload) => void;
   private debugLog: (...args: unknown[]) => void;
   private onQueryResult: ((queryId: string) => void) | null = null;
@@ -87,15 +88,23 @@ export class QueryClientService {
     );
 
     if (elmApp.ports.queryClientOut) {
-      elmApp.ports.queryClientOut.subscribe((message) => {
+      this.portListener = (message) => {
         this.handleMessage(message).catch((error) => {
           this.logError({
             message: 'Failed to handle QueryDelta message',
             details: error instanceof Error ? error.message : String(error),
           });
         });
-      });
+      };
+      elmApp.ports.queryClientOut.subscribe(this.portListener);
     }
+  }
+
+  detach(): void {
+    if (this.portListener) this.elmApp?.ports.queryClientOut?.unsubscribe?.(this.portListener);
+    this.elmApp = null;
+    this.hasPorts = false;
+    this.queryStates.clear();
   }
 
   isAvailable(): boolean {
@@ -112,6 +121,22 @@ export class QueryClientService {
 
   getRegisteredQueryIds(): string[] {
     return Array.from(this.queryStates.keys());
+  }
+
+  /** Install every query before any observer sees this worker transition. */
+  installPublication(updates: QueryUpdate[]): () => void {
+    const notifications: Array<() => void> = [];
+    for (const update of updates) {
+      const state = this.queryStates.get(update.queryId);
+      if (!state || update.revision <= state.revision) continue;
+      state.result = update.result;
+      state.revision = update.revision;
+      notifications.push(() => {
+        try { state.callback(update); } catch (error) { console.error('[PyreClient] Query listener failed', error); }
+        try { this.onQueryResult?.(update.queryId); } catch (error) { console.error('[PyreClient] Query observer failed', error); }
+      });
+    }
+    return () => notifications.forEach(notify => notify());
   }
 
   refreshQuery(queryId: string): void {

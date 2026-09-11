@@ -3,6 +3,7 @@ import type { SchemaMetadata } from '@pyre/core';
 import { primaryKeyForTable, rowIdentity } from './identity';
 import { expandTableGroups } from './entity-stream';
 import type { EntityChangeBatchSource, ServerTableGroup } from './entity-stream';
+import type { EditFence, VisibleTables } from './local-edits';
 
 export interface TableGroup {
   table_name: string;
@@ -330,6 +331,53 @@ export class IndexedDBStorage {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(new Error(`Failed to reset database epoch: ${tx.error}`));
       tx.onabort = () => reject(new Error(`Database epoch reset aborted: ${tx.error}`));
+    });
+  }
+
+  /** Claim this cache for a new lifetime before starting the worker. Never restore old-auth rows. */
+  async beginLocalEdits(fence: EditFence): Promise<void> {
+    return this.replaceAuthoritative(null, null, fence, true);
+  }
+
+  /** One transaction replaces or evicts rows, legacy cursors, coverage and the full fence. */
+  async replaceAuthoritative(tables: VisibleTables | null, revision: number | null, fence: EditFence, claim = false): Promise<void> {
+    if (tables && (Object.keys(tables).sort().join('\0') !== Object.keys(this.schema.tables).sort().join('\0')
+      || !Number.isSafeInteger(revision) || revision! < 0)) throw new Error('Invalid complete replacement');
+    const rows = Object.entries(tables ?? {}).flatMap(([tableName, values]) => {
+      const ids = new Set<string | number>();
+      return values.map(row => {
+        const identity = rowIdentity(this.schema, tableName, row);
+        if (ids.has(identity)) throw new Error('Duplicate replacement identity');
+        ids.add(identity);
+        return { tableName, identity, updatedAt: row.updatedAt, row };
+      });
+    });
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['tables', 'syncCursor', 'meta'], 'readwrite');
+      tx.oncomplete = () => resolve();
+      tx.onerror = tx.onabort = () => reject(new Error('Authoritative persistence failed'));
+      const owner = JSON.stringify([fence.databaseId, fence.instance, fence.authGeneration, fence.namespace, fence.manifest, fence.databaseEpoch]);
+      const write = () => { try {
+        const store = tx.objectStore('tables');
+        store.clear();
+        tx.objectStore('syncCursor').clear();
+        const meta = tx.objectStore('meta');
+        meta.clear();
+        meta.put(owner, 'localEditsOwner');
+        if (tables) {
+          for (const row of rows) store.put(row);
+          meta.put(revision, 'lastAppliedServerRevision');
+          meta.put(fence.databaseEpoch, 'databaseEpoch');
+          meta.put(fence, 'localEditsFence');
+        }
+      } catch (error) { tx.abort(); reject(error); } };
+      if (claim) write();
+      else {
+        // A retired worker's delayed persistence must not evict or overwrite a newer lifetime.
+        const request = tx.objectStore('meta').get('localEditsOwner');
+        request.onsuccess = () => { if (request.result === owner) write(); };
+      }
     });
   }
 

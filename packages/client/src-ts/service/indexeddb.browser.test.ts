@@ -105,6 +105,30 @@ test.skipIf(!playwrightModule)('native IndexedDB identity persistence, reload, v
     }, { schema });
     expect(reset).toEqual({ tables: {}, cursor: { tables: {} }, revision: null, epoch: 'e2', other: 1 });
 
+    const replacement = await page.evaluate(async ({ schema, row }) => {
+      const { IndexedDBStorage } = await import('/storage.js');
+      const storage = new IndexedDBStorage('main', schema);
+      const fence = { databaseId: 'main', instance: 'first', authGeneration: 1, namespace: 'Main', manifest: 'm1', databaseEpoch: 'e1' };
+      const newer = { ...fence, instance: 'second', authGeneration: 2 };
+      await storage.beginLocalEdits(fence);
+      await storage.replaceAuthoritative({ issues: [row], other: [], audits: [{ sequence: 42 }] }, 10, fence);
+      const initial = { tables: await storage.getAllTables(), revision: await storage.getServerRevision(), epoch: await storage.getDatabaseEpoch(), cursor: await storage.getSyncCursor() };
+      await storage.replaceAuthoritative({ issues: [], other: [], audits: [] }, 11, fence);
+      const empty = { tables: await storage.getAllTables(), revision: await storage.getServerRevision() };
+      await storage.beginLocalEdits(newer);
+      await storage.replaceAuthoritative({ issues: [], other: [], audits: [{ sequence: 99 }] }, 12, newer);
+      await storage.replaceAuthoritative(null, null, fence);
+      await storage.replaceAuthoritative({ issues: [row], other: [], audits: [] }, 100, fence);
+      const protectedCache = { tables: await storage.getAllTables(), revision: await storage.getServerRevision() };
+      await storage.replaceAuthoritative(null, null, newer);
+      const evicted = { tables: await storage.getAllTables(), revision: await storage.getServerRevision(), epoch: await storage.getDatabaseEpoch(), cursor: await storage.getSyncCursor() };
+      return { initial, empty, protectedCache, evicted };
+    }, { schema, row });
+    expect(replacement.initial).toEqual({ tables: { issues: [row], audits: [{ sequence: 42 }] }, revision: 10, epoch: 'e1', cursor: { tables: {} } });
+    expect(replacement.empty).toEqual({ tables: {}, revision: 11 });
+    expect(replacement.protectedCache).toEqual({ tables: { audits: [{ sequence: 99 }] }, revision: 12 });
+    expect(replacement.evicted).toEqual({ tables: {}, revision: null, epoch: null, cursor: { tables: {} } });
+
     for (const version of [1, 2]) {
       const upgraded = await page.evaluate(async ({ schema, version, row }) => {
         const name = `legacy-${version}`;

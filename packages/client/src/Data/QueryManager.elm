@@ -1,4 +1,4 @@
-port module Data.QueryManager exposing (Incoming(..), Model, Msg(..), OptimisticMutation, OptimisticSetField, OptimisticWhere, QueryClientIncoming(..), QueryDeltaOp(..), QuerySubscription, ReExecuteDecision(..), decodeIncoming, decodeQueryClientIncoming, doesChangeAffectWhereClause, extractChangedRowIds, extractWhereClauseFields, init, mutationResult, notifyTablesChanged, queryClientDelta, queryClientFull, receiveIncoming, receiveQueryClientIncoming, shouldReExecuteQuery, update)
+port module Data.QueryManager exposing (Incoming(..), Model, Msg(..), OptimisticMutation, OptimisticSetField, OptimisticWhere, QueryClientIncoming(..), QueryDeltaOp(..), QuerySubscription, ReExecuteDecision(..), decodeIncoming, decodeQueryClientIncoming, doesChangeAffectWhereClause, extractChangedRowIds, extractWhereClauseFields, init, localEditsEvents, mutationResult, notifyTablesChanged, queryClientDelta, queryClientFull, receiveIncoming, receiveQueryClientIncoming, shouldReExecuteQuery, update)
 
 import Data.Delta
 import Data.Error
@@ -34,6 +34,7 @@ type Msg
 
 type Incoming
     = SendMutation String String String (List ( String, String )) String Bool Encode.Value (Maybe OptimisticMutation)
+    | LocalEdits Encode.Value
 
 
 type alias OptimisticMutation =
@@ -210,6 +211,15 @@ doesChangeAffectWhereClause whereClause oldRow newRow =
 port queryManagerOut : Encode.Value -> Cmd msg
 
 
+localEditsEvents : List Encode.Value -> List Encode.Value -> Cmd msg
+localEditsEvents events queries =
+    if List.isEmpty events && List.isEmpty queries then
+        Cmd.none
+
+    else
+        queryManagerOut (Encode.object [ ( "type", Encode.string "localEdits" ), ( "queries", Encode.list identity queries ), ( "events", Encode.list identity events ) ])
+
+
 port receiveQueryManagerMessage : (Decode.Value -> msg) -> Sub msg
 
 
@@ -225,6 +235,9 @@ decodeIncoming =
         |> Decode.andThen
             (\type_ ->
                 case type_ of
+                    "localEdits" ->
+                        Decode.map LocalEdits (Decode.field "message" Decode.value)
+
                     "sendMutation" ->
                         Decode.map8 SendMutation
                             (Decode.field "requestId" Decode.string)

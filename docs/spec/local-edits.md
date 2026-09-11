@@ -12,9 +12,11 @@ transactional response with flat fences, `type: "replacement"`, `serverRevision`
 captured `requestId` and `target`; row-free live hints use `type: "syncRequired"`
 and the accepted response's reconciliation shape. Libraries remain route-independent.
 Client storage, tracking, entity streams and persistence now use schema-declared
-integer/UUID identity, including non-`id` keys. Authoritative installation/replay,
-typed edit builders and seed APIs remain downstream; the reference model is not a
-substitute for those implementations.
+integer/UUID identity, including non-`id` keys. The opt-in browser runtime installs
+fenced replacement and replays ordered pending intent, with receipts, quarantine,
+observable failures and atomic query/entity publication. Schema-branded builders,
+the public Elm model/effect edit API and typed seed binding remain downstream.
+The reference model is not a substitute for production conformance.
 
 Client metadata must be regenerated with the required `primaryKey` name/kind.
 Unsupported primary-key types fail explicitly rather than being treated as UUIDs.
@@ -23,7 +25,8 @@ it does not migrate old flattened `id` caches. Invalid current-version caches
 fail initialization. Query publication conservatively sends changed full results,
 not identity-based diffs inferred from arbitrary projections. Typed Elm/TS schema
 IDs are generated; TS query codecs retain their primitive result representation.
-Rejected-create/no-ghost and delete lifecycle conformance require MEC-111/MEC-112.
+Production worker/service tests cover rejected-create/no-ghost and delete lifecycle
+transitions; generated surfaces remain subject to MEC-119 release conformance.
 Client UUID ingestion requires hyphenated hexadecimal strings; existing server
 codecs still accept arbitrary strings for UUID fields. Noncanonical stored values
 fail client ingestion explicitly and require correction before rollout; validator
@@ -364,7 +367,8 @@ network scheduling, pagination, generated TS/Elm compilation, or permission
 inference. Downstream runtime tests must cover those, immutable async capture,
 effect ordering, failure subscriptions, typed result codecs and transaction races.
 
-Reverified source: `src/generated_queries.rs` (CRUD and writable-field filtering),
+Original source audit (superseded by the implementation checkpoint above):
+`src/generated_queries.rs` (CRUD and writable-field filtering),
 `src/server/sync.rs` (origin registration dependency, result envelope preserved,
 revision stamping separate from execution), `packages/client/src/Main.elm`
 (whole-row forward/inverse optimism and global high-water check),

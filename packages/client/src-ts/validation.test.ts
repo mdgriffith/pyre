@@ -75,3 +75,44 @@ test('invalid cache rejects production initialization without loading independen
     mocks.forEach((mock) => mock.mockRestore());
   }
 });
+
+test.each(['public', 'bridge'])('legacy %s named calls never publish independent optimistic entity rows', async path => {
+  const mocks = [
+    spyOn(IndexedDBStorage.prototype, 'init').mockResolvedValue(undefined),
+    spyOn(IndexedDBStorage.prototype, 'getAllTables').mockResolvedValue({}),
+    spyOn(IndexedDBStorage.prototype, 'getAllRows').mockResolvedValue([{ id: 1, name: 'base' }]),
+    spyOn(IndexedDBStorage.prototype, 'getSyncCursor').mockResolvedValue({ tables: {} }),
+    spyOn(IndexedDBStorage.prototype, 'getServerRevision').mockResolvedValue(null),
+    spyOn(IndexedDBStorage.prototype, 'getDatabaseEpoch').mockResolvedValue(null),
+    spyOn(IndexedDBStorage.prototype, 'putServerRevision').mockResolvedValue(undefined),
+  ];
+  const client = await PyreClient.create({ schema, server: { baseUrl: 'http://example.test' }, cacheNamespace: 'legacy' });
+  try {
+    const internal = await client.getOrCreateClient('main');
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const batches = [], outcomes = [], pending = [];
+    internal.entityStream.subscribe({ tables: [{ tableName: 'maps' }] }, batch => batches.push(batch));
+    mocks.push(spyOn(internal.queryManager, 'sendMutation').mockImplementation((...args) => pending.push(args[5])));
+    const optimistic = { queryField: 'maps', where: { field: 'id', input: 'id' }, set: [{ field: 'name', input: 'name' }] };
+    const invoke = async () => {
+      if (path === 'public') await client.run('main', { operation: 'mutation', id: 'rename', optimistic }, { id: 1, name: 'local' }, result => outcomes.push(result));
+      else internal.runBridgeMutation({ databaseId: 'main', requestId: 'bridge', mutationId: 'rename', mutationInput: { id: 1, name: 'local' }, optimistic }, { send: message => outcomes.push(message.result) });
+      await new Promise(resolve => setTimeout(resolve, 10));
+    };
+    await invoke();
+    expect(pending).toHaveLength(1);
+    expect(batches).toEqual([]);
+    pending.shift()({ ok: false, error: 'TargetNotWritable' });
+    expect(batches).toEqual([]);
+    expect(outcomes[0]).toEqual({ ok: false, error: 'TargetNotWritable' });
+    await invoke();
+    expect(batches).toEqual([]);
+    pending.shift()({ ok: true, value: { serverRevision: 1, sync: { type: 'delta', databaseId: 'main', data: [{ table_name: 'maps', headers: ['id', 'name'], rows: [[1, 'server']] }] } } });
+    expect(batches).toHaveLength(1);
+    expect(batches[0].source).toBe('mutation-response');
+    expect(batches[0].changes[0].row).toEqual({ id: 1, name: 'server' });
+  } finally {
+    client.disconnect();
+    mocks.forEach(mock => mock.mockRestore());
+  }
+});

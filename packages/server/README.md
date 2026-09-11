@@ -197,8 +197,9 @@ the instance and auth generation as they do for POST `/db`.
 
 Replacement currently materializes a complete scope in memory, not pinned pages.
 TypeScript rejects payloads above 64 MiB rather than returning partial coverage;
-remote libSQL remains unverified. Client installation, pending-intent replay,
-and receipt settlement are downstream of this server protocol.
+remote libSQL remains unverified. The opt-in [browser local-edit runtime](../../docs/usage/local-edits.md)
+implements client installation, pending-intent replay and receipt settlement through
+configured transport adapters. Schema-branded builders and typed seed binding remain downstream.
 
 Build WASM before running the production-boundary fixture:
 

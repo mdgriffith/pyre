@@ -5,6 +5,7 @@ import Data.Delta
 import Data.Error
 import Data.IndexedDb as IndexedDb exposing (Incoming(..))
 import Data.LiveSync as LiveSync exposing (Incoming(..))
+import Data.LocalEdits as LocalEdits
 import Data.QueryManager as QueryManager exposing (Incoming(..), Msg(..))
 import Data.Schema
 import Data.SyncState as SyncState
@@ -43,6 +44,8 @@ type alias SyncConfig =
 type alias Model =
     { schema : Data.Schema.SchemaMetadata
     , db : Db.Db
+    , localEdits : LocalEdits.Model
+    , fencedEdits : Bool
     , queryManager : QueryManager.Model
     , catchup : Catchup.Model
     , syncStatus : SyncState.SyncStatus
@@ -51,16 +54,7 @@ type alias Model =
     , liveSyncStarted : Bool
     , liveSyncTransport : LiveSync.Transport
     , syncRequested : Bool
-    , inFlightOptimistic : Dict String OptimisticInFlight
-    , optimisticOrder : List String
     , lastAppliedServerRevision : Maybe Int
-    }
-
-
-type alias OptimisticInFlight =
-    { forward : Data.Delta.Delta
-    , inverse : Data.Delta.Delta
-    , acknowledgedServerRevision : Maybe Int
     }
 
 
@@ -99,6 +93,8 @@ init : Flags -> ( Model, Cmd Msg )
 init flags =
     ( { schema = flags.schema
       , db = Db.init flags.schema
+      , localEdits = LocalEdits.init flags.schema
+      , fencedEdits = False
       , queryManager = QueryManager.init
       , catchup = Catchup.init flags.server
       , syncStatus = SyncState.NotStarted
@@ -107,8 +103,6 @@ init flags =
       , liveSyncStarted = False
       , liveSyncTransport = flags.liveSync.transport
       , syncRequested = flags.sync.autoStart
-      , inFlightOptimistic = Dict.empty
-      , optimisticOrder = []
       , lastAppliedServerRevision = Nothing
       }
     , Cmd.batch
@@ -137,37 +131,45 @@ update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
         IndexedDbReceived incoming ->
-            case incoming of
-                IndexedDb.InitialDataReceived initialData ->
-                    case Db.fromInitialData model.schema initialData of
-                        Ok db ->
-                            handleIndexedDbIncoming incoming { model | db = db }
+            if model.fencedEdits then
+                ( model, Cmd.none )
 
-                        Err error ->
-                            ( { model | syncError = Just error }, Data.Error.sendError error )
+            else
+                case incoming of
+                    IndexedDb.InitialDataReceived initialData ->
+                        case Db.fromInitialData model.schema initialData of
+                            Ok db ->
+                                handleIndexedDbIncoming incoming { model | db = db }
 
-                IndexedDb.DatabaseEpochResetCompleted databaseEpoch ->
-                    applyCatchupUpdate
-                        (Catchup.update (Catchup.DatabaseEpochResetCompleted databaseEpoch) model.catchup model.db)
-                        model
+                            Err error ->
+                                ( { model | syncError = Just error }, Data.Error.sendError error )
 
-                IndexedDb.DatabaseEpochResetFailed databaseEpoch message ->
-                    applyCatchupUpdate
-                        (Catchup.update (Catchup.DatabaseEpochResetFailed databaseEpoch message) model.catchup model.db)
-                        model
+                    IndexedDb.DatabaseEpochResetCompleted databaseEpoch ->
+                        applyCatchupUpdate
+                            (Catchup.update (Catchup.DatabaseEpochResetCompleted databaseEpoch) model.catchup model.db)
+                            model
+
+                    IndexedDb.DatabaseEpochResetFailed databaseEpoch message ->
+                        applyCatchupUpdate
+                            (Catchup.update (Catchup.DatabaseEpochResetFailed databaseEpoch message) model.catchup model.db)
+                            model
 
         LiveSyncReceived incoming ->
-            let
-                ( updatedModel, cmd ) =
-                    handleLiveSyncIncoming incoming model
-            in
-            ( updatedModel
-            , Cmd.batch
-                [ debugCmd "live-sync-received"
-                    [ ( "messageType", Encode.string (liveSyncIncomingToString incoming) ) ]
-                , cmd
-                ]
-            )
+            if model.fencedEdits then
+                ( model, Cmd.none )
+
+            else
+                let
+                    ( updatedModel, cmd ) =
+                        handleLiveSyncIncoming incoming model
+                in
+                ( updatedModel
+                , Cmd.batch
+                    [ debugCmd "live-sync-received"
+                        [ ( "messageType", Encode.string (liveSyncIncomingToString incoming) ) ]
+                    , cmd
+                    ]
+                )
 
         QueryManagerReceived incoming ->
             let
@@ -191,12 +193,16 @@ update msg model =
             )
 
         MutationRequest requestId mutationId _ _ result ->
-            case result of
-                Ok response ->
-                    settleSuccessfulMutation requestId mutationId response model
+            if model.fencedEdits then
+                ( model, QueryManager.mutationResult requestId mutationId (Result.mapError httpErrorToString result) )
 
-                Err error ->
-                    rollbackOptimisticMutation requestId mutationId (httpErrorToString error) model
+            else
+                case result of
+                    Ok response ->
+                        settleSuccessfulMutation requestId mutationId response model
+
+                    Err error ->
+                        ( model, QueryManager.mutationResult requestId mutationId (Err (httpErrorToString error)) )
 
         Error errorMessage ->
             ( model
@@ -204,10 +210,14 @@ update msg model =
             )
 
         CatchupMsg catchupMsg ->
-            applyCatchupUpdate (Catchup.update catchupMsg model.catchup model.db) model
+            if model.fencedEdits then
+                ( model, Cmd.none )
+
+            else
+                applyCatchupUpdate (Catchup.update catchupMsg model.catchup model.db) model
 
         SyncControlReceived StartSync ->
-            if model.syncRequested then
+            if model.syncRequested || model.fencedEdits then
                 ( model, Cmd.none )
 
             else
@@ -219,13 +229,17 @@ update msg model =
                 )
 
         DbMsg dbMsg ->
-            let
-                ( updatedDb, dbCmd ) =
-                    Db.update dbMsg model.db
-            in
-            ( { model | db = updatedDb }
-            , Cmd.map DbMsg dbCmd
-            )
+            if model.fencedEdits then
+                ( model, Cmd.none )
+
+            else
+                let
+                    ( updatedDb, dbCmd ) =
+                        Db.update dbMsg model.db
+                in
+                ( { model | db = updatedDb }
+                , Cmd.map DbMsg dbCmd
+                )
 
 
 handleIndexedDbIncoming : IndexedDb.Incoming -> Model -> ( Model, Cmd Msg )
@@ -420,12 +434,57 @@ validateLiveSyncDatabaseId model actual eventName =
 handleQueryManagerIncoming : QueryManager.Incoming -> Model -> ( Model, List (Cmd Msg) )
 handleQueryManagerIncoming incoming model =
     case incoming of
-        QueryManager.SendMutation requestId mutationId baseUrl headers credentials withCredentials input optimistic ->
-            -- Mutations are handled via HTTP request
+        QueryManager.LocalEdits message ->
             let
-                ( optimisticModel, optimisticCmds ) =
-                    applyOptimisticMutation requestId optimistic input model
+                ( edits, events ) =
+                    LocalEdits.receive message model.localEdits
 
+                activated =
+                    model.fencedEdits || edits.fence /= Nothing
+
+                db =
+                    if activated then
+                        LocalEdits.visible edits
+
+                    else
+                        model.db
+
+                ( manager, _ ) =
+                    if db.tables /= model.db.tables then
+                        reExecuteAllQueries model.schema db model.queryManager
+
+                    else
+                        ( model.queryManager, [] )
+
+                finalManager =
+                    if model.localEdits.fence /= Nothing && edits.fence /= model.localEdits.fence then
+                        QueryManager.init
+
+                    else
+                        manager
+
+                queries =
+                    Dict.values manager.subscriptions
+                        |> List.filter (\subscription -> (Dict.get subscription.queryId model.queryManager.subscriptions |> Maybe.map .revision) /= Just subscription.revision)
+                        |> List.map
+                            (\subscription ->
+                                Encode.object
+                                    [ ( "type", Encode.string "full" )
+                                    , ( "queryId", Encode.string subscription.queryId )
+                                    , ( "revision", Encode.int subscription.revision )
+                                    , ( "result", encodeQueryResult (Maybe.withDefault Dict.empty subscription.lastResult) )
+                                    ]
+                            )
+            in
+            ( { model | localEdits = edits, fencedEdits = activated, db = db, queryManager = finalManager }
+            , [ QueryManager.localEditsEvents events queries ]
+            )
+
+        QueryManager.SendMutation requestId mutationId baseUrl headers credentials withCredentials input _ ->
+            -- Retain the legacy named API without inferred optimism. A fenced
+            -- host routes compiled named operations through the submit bridge;
+            -- this legacy HTTP path cannot establish fenced revision coverage.
+            let
                 url =
                     buildMutationUrl baseUrl mutationId
 
@@ -463,14 +522,16 @@ handleQueryManagerIncoming incoming model =
                     , tracker = Nothing
                     }
             in
-            ( optimisticModel
-            , optimisticCmds
-                ++ [ if credentials == "include" || withCredentials then
-                        Http.riskyRequest request
+            ( model
+            , [ if model.fencedEdits then
+                    QueryManager.mutationResult requestId mutationId (Err "Fenced mutations must use the local edit queue")
 
-                     else
-                        Http.request request
-                   ]
+                else if credentials == "include" || withCredentials then
+                    Http.riskyRequest request
+
+                else
+                    Http.request request
+              ]
             )
 
 
@@ -611,113 +672,6 @@ buildMutationUrl baseUrl id =
             baseUrl ++ "/" ++ id
 
 
-applyOptimisticMutation : String -> Maybe QueryManager.OptimisticMutation -> Encode.Value -> Model -> ( Model, List (Cmd Msg) )
-applyOptimisticMutation requestId maybeOptimistic input model =
-    case maybeOptimistic of
-        Nothing ->
-            ( model, [] )
-
-        Just optimistic ->
-            case Decode.decodeValue (Decode.dict Data.Value.decodeValue) input of
-                Err _ ->
-                    ( model, [] )
-
-                Ok inputValues ->
-                    case Dict.get optimistic.where_.input inputValues of
-                        Nothing ->
-                            ( model, [] )
-
-                        Just whereValue ->
-                            let
-                                tableName =
-                                    Dict.get optimistic.queryField model.schema.queryFieldToTable
-                                        |> Maybe.withDefault optimistic.queryField
-
-                                setValues =
-                                    optimistic.set
-                                        |> List.filterMap
-                                            (\setField ->
-                                                Dict.get setField.input inputValues
-                                                    |> Maybe.map (\value -> ( setField.field, value ))
-                                            )
-
-                                matchingRows =
-                                    Dict.get tableName model.db.tables
-                                        |> Maybe.withDefault Dict.empty
-                                        |> Dict.values
-                                        |> List.filter
-                                            (\row -> Dict.get optimistic.where_.field row == Just whereValue)
-                            in
-                            if
-                                List.isEmpty setValues
-                                    || List.isEmpty matchingRows
-                                    || List.length setValues
-                                    /= List.length optimistic.set
-                                    || (Dict.get tableName model.schema.tables
-                                            |> Maybe.map (\metadata -> List.any (\( field, _ ) -> field == metadata.primaryKey.name) setValues)
-                                            |> Maybe.withDefault True
-                                       )
-                            then
-                                ( model, [] )
-
-                            else
-                                let
-                                    updatedRows =
-                                        List.map (applySetValues setValues) matchingRows
-
-                                    forward =
-                                        deltaFromRows tableName updatedRows
-
-                                    inverse =
-                                        deltaFromRows tableName matchingRows
-
-                                    ( updatedDb, dbCmd ) =
-                                        Db.update (Db.LocalDeltaReceived forward) model.db
-
-                                    ( updatedQueryManager, triggerCmds ) =
-                                        QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager forward
-                                in
-                                ( { model
-                                    | db = updatedDb
-                                    , queryManager = updatedQueryManager
-                                    , inFlightOptimistic = Dict.insert requestId { forward = forward, inverse = inverse, acknowledgedServerRevision = Nothing } model.inFlightOptimistic
-                                    , optimisticOrder = appendUnique requestId model.optimisticOrder
-                                  }
-                                , Cmd.map DbMsg dbCmd :: triggerCmds
-                                )
-
-
-rollbackOptimisticMutation : String -> String -> String -> Model -> ( Model, Cmd Msg )
-rollbackOptimisticMutation requestId mutationId error model =
-    case Dict.get requestId model.inFlightOptimistic of
-        Nothing ->
-            ( removeOptimisticMutation requestId model
-            , QueryManager.mutationResult requestId mutationId (Err error)
-            )
-
-        Just optimistic ->
-            let
-                ( updatedDb, dbCmd ) =
-                    Db.update (Db.LocalDeltaReceived optimistic.inverse) model.db
-
-                ( updatedQueryManager, triggerCmds ) =
-                    QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager optimistic.inverse
-
-                cleanedModel =
-                    removeOptimisticMutation requestId model
-            in
-            ( { cleanedModel
-                | db = updatedDb
-                , queryManager = updatedQueryManager
-              }
-            , Cmd.batch
-                (QueryManager.mutationResult requestId mutationId (Err error)
-                    :: Cmd.map DbMsg dbCmd
-                    :: triggerCmds
-                )
-            )
-
-
 settleSuccessfulMutation : String -> String -> Encode.Value -> Model -> ( Model, Cmd Msg )
 settleSuccessfulMutation requestId mutationId response model =
     let
@@ -735,21 +689,7 @@ settleSuccessfulMutation requestId mutationId response model =
             )
 
         Ok maybeSyncMessage ->
-            if Dict.member requestId model.inFlightOptimistic && missingAuthoritativeMutationEnvelope serverRevision maybeSyncMessage then
-                rollbackOptimisticMutation requestId mutationId "Optimistic mutation response missing authoritative sync envelope" model
-
-            else
-                settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevision maybeSyncMessage model
-
-
-missingAuthoritativeMutationEnvelope : Maybe Int -> Maybe MutationSyncMessage -> Bool
-missingAuthoritativeMutationEnvelope serverRevision maybeSyncMessage =
-    case ( serverRevision, maybeSyncMessage ) of
-        ( Just _, Just _ ) ->
-            False
-
-        _ ->
-            True
+            settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevision maybeSyncMessage model
 
 
 settleSuccessfulMutationWithEnvelope : String -> String -> Encode.Value -> Maybe Int -> Maybe MutationSyncMessage -> Model -> ( Model, Cmd Msg )
@@ -795,15 +735,7 @@ settleValidatedMutationWithEnvelope requestId mutationId response serverRevision
                     ( model, [], [] )
 
         updatedModel =
-            case serverRevision of
-                Nothing ->
-                    removeOptimisticMutation requestId authoritativeModel
-
-                Just revision ->
-                    authoritativeModel
-                        |> acknowledgeOptimisticMutation requestId revision
-                        |> updateModelLastAppliedServerRevision serverRevision
-                        |> pruneAcknowledgedOptimisticPrefix
+            updateModelLastAppliedServerRevision serverRevision authoritativeModel
 
         ( finalModel, catchupCmd ) =
             case maybeSyncMessage of
@@ -828,83 +760,14 @@ settleValidatedMutationWithEnvelope requestId mutationId response serverRevision
     )
 
 
-acknowledgeOptimisticMutation : String -> Int -> Model -> Model
-acknowledgeOptimisticMutation requestId serverRevision model =
-    { model
-        | inFlightOptimistic =
-            Dict.update requestId
-                (Maybe.map (\optimistic -> { optimistic | acknowledgedServerRevision = Just serverRevision }))
-                model.inFlightOptimistic
-    }
-
-
 updateModelLastAppliedServerRevision : Maybe Int -> Model -> Model
 updateModelLastAppliedServerRevision serverRevision model =
     { model | lastAppliedServerRevision = updateLastAppliedServerRevision serverRevision model.lastAppliedServerRevision }
 
 
-pruneAcknowledgedOptimisticPrefix : Model -> Model
-pruneAcknowledgedOptimisticPrefix model =
-    case model.optimisticOrder of
-        [] ->
-            model
-
-        requestId :: rest ->
-            case Dict.get requestId model.inFlightOptimistic of
-                Just optimistic ->
-                    case optimistic.acknowledgedServerRevision of
-                        Just _ ->
-                            pruneAcknowledgedOptimisticPrefix
-                                { model
-                                    | inFlightOptimistic = Dict.remove requestId model.inFlightOptimistic
-                                    , optimisticOrder = rest
-                                }
-
-                        Nothing ->
-                            model
-
-                Nothing ->
-                    pruneAcknowledgedOptimisticPrefix { model | optimisticOrder = rest }
-
-
 applyAuthoritativeDelta : Data.Delta.Delta -> Model -> ( Db.Db, List (Cmd Db.Msg) )
 applyAuthoritativeDelta delta model =
-    let
-        ( authoritativeDb, authoritativeCmd ) =
-            Db.update (Db.DeltaReceived delta) model.db
-
-        ( replayedDb, replayCmds ) =
-            replayOptimisticMutations model authoritativeDb
-    in
-    ( replayedDb, authoritativeCmd :: replayCmds )
-
-
-replayOptimisticMutations : Model -> Db.Db -> ( Db.Db, List (Cmd Db.Msg) )
-replayOptimisticMutations model db =
-    model.optimisticOrder
-        |> List.foldl
-            (\requestId ( currentDb, cmds ) ->
-                case Dict.get requestId model.inFlightOptimistic of
-                    Nothing ->
-                        ( currentDb, cmds )
-
-                    Just optimistic ->
-                        let
-                            ( nextDb, cmd ) =
-                                Db.update (Db.LocalDeltaReceived optimistic.forward) currentDb
-                        in
-                        ( nextDb, cmd :: cmds )
-            )
-            ( db, [] )
-        |> Tuple.mapSecond List.reverse
-
-
-removeOptimisticMutation : String -> Model -> Model
-removeOptimisticMutation requestId model =
-    { model
-        | inFlightOptimistic = Dict.remove requestId model.inFlightOptimistic
-        , optimisticOrder = List.filter ((/=) requestId) model.optimisticOrder
-    }
+    Db.update (Db.DeltaReceived delta) model.db |> Tuple.mapSecond List.singleton
 
 
 isStaleServerRevision : Maybe Int -> Maybe Int -> Bool
@@ -1010,58 +873,6 @@ writeServerRevisionCmd serverRevision =
             IndexedDb.writeServerRevision revision
 
 
-appendUnique : String -> List String -> List String
-appendUnique value values =
-    if List.member value values then
-        values
-
-    else
-        values ++ [ value ]
-
-
-applySetValues : List ( String, Data.Value.Value ) -> Dict String Data.Value.Value -> Dict String Data.Value.Value
-applySetValues setValues row =
-    List.foldl
-        (\( field, value ) acc -> Dict.insert field value acc)
-        row
-        setValues
-
-
-deltaFromRows : String -> List (Dict String Data.Value.Value) -> Data.Delta.Delta
-deltaFromRows tableName rows =
-    let
-        headers =
-            rows
-                |> List.concatMap Dict.keys
-                |> uniqueStrings
-
-        rowValues row =
-            List.map (\header -> Dict.get header row |> Maybe.withDefault Data.Value.NullValue) headers
-    in
-    { tableGroups =
-        [ { tableName = tableName
-          , headers = headers
-          , rows = List.map rowValues rows
-          }
-        ]
-    }
-
-
-uniqueStrings : List String -> List String
-uniqueStrings values =
-    values
-        |> List.foldl
-            (\value acc ->
-                if List.member value acc then
-                    acc
-
-                else
-                    value :: acc
-            )
-            []
-        |> List.reverse
-
-
 applyCatchupUpdate : Catchup.UpdateResult -> Model -> ( Model, Cmd Msg )
 applyCatchupUpdate result model =
     let
@@ -1080,16 +891,7 @@ applyCatchupUpdate result model =
                     SyncState.markAllTablesLive model.tableSyncStatuses
 
         ( replayedDb, replayDbCmds ) =
-            if result.destructiveReset then
-                ( result.db, [] )
-
-            else
-                case result.delta of
-                    Just _ ->
-                        replayOptimisticMutations model result.db
-
-                    Nothing ->
-                        ( result.db, [] )
+            ( result.db, [] )
 
         updatedModel =
             { model
@@ -1103,18 +905,6 @@ applyCatchupUpdate result model =
 
                     else
                         updateLastAppliedServerRevision result.serverRevision model.lastAppliedServerRevision
-                , inFlightOptimistic =
-                    if result.destructiveReset then
-                        Dict.empty
-
-                    else
-                        model.inFlightOptimistic
-                , optimisticOrder =
-                    if result.destructiveReset then
-                        []
-
-                    else
-                        model.optimisticOrder
                 , syncError =
                     case result.error of
                         Just message ->
@@ -1519,7 +1309,13 @@ reExecuteAllQueries schema db queryManager =
                     encodeQueryResult executionResult.results
 
                 nextRevision =
-                    subscription.revision + 1
+                    subscription.revision
+                        + (if subscription.lastResult /= Just executionResult.results then
+                            1
+
+                           else
+                            0
+                          )
 
                 updatedSubscription =
                     { subscription
@@ -1535,7 +1331,11 @@ reExecuteAllQueries schema db queryManager =
                     { accModel | subscriptions = updatedSubscriptions }
             in
             ( updatedModel
-            , QueryManager.queryClientFull subscription.queryId nextRevision resultJson :: accCmds
+            , if subscription.lastResult /= Just executionResult.results then
+                QueryManager.queryClientFull subscription.queryId nextRevision resultJson :: accCmds
+
+              else
+                accCmds
             )
         )
         ( queryManager, [] )

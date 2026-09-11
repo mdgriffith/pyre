@@ -28,14 +28,14 @@ export interface EntitySubscription {
   tables: EntityTableSubscription[];
 }
 
-export interface EntityChange {
+export type EntityChange = {
   tableName: string;
   id: string | number;
   op: 'row';
   row: Record<string, unknown>;
-}
+} | { tableName: string; id: string | number; op: 'remove' };
 
-export type EntityChangeBatchSource = 'indexeddb-initial' | 'catchup' | 'live' | 'optimistic' | 'mutation-response';
+export type EntityChangeBatchSource = 'indexeddb-initial' | 'catchup' | 'live' | 'optimistic' | 'mutation-response' | 'local-edits';
 
 export interface EntityChangeBatch {
   type: 'entity-change-batch';
@@ -55,8 +55,48 @@ interface EntityStreamRegistration {
 export class EntityStreamService {
   private registrations: Set<EntityStreamRegistration> = new Set();
   private sequence = 0;
+  private visible = new Map<string, Array<Record<string, unknown>>>();
 
   constructor(private readonly schema: SchemaMetadata) {}
+
+  clear(): void { this.visible.clear(); this.registrations.clear(); }
+
+  getVisibleTables(): Record<string, Array<Record<string, unknown>>> { return Object.fromEntries(this.visible); }
+
+  subscribeVisible(subscription: EntitySubscription, callback: EntityChangeCallback, databaseId?: string): () => void {
+    const unsubscribe = this.subscribe(subscription, callback);
+    callback(this.createBatchFromRows(subscription, this.visible, 'local-edits', databaseId) ?? {
+      type: 'entity-change-batch', databaseId, sequence: this.sequence, source: 'local-edits', changes: [],
+    });
+    return unsubscribe;
+  }
+
+  /** Complete visible scope, including filter exits and absent identities. No persistence. */
+  installVisible(tables: Record<string, Array<Record<string, unknown>>>, databaseId?: string): () => void {
+    const next = new Map(Object.entries(tables));
+    for (const [table, rows] of next) {
+      const ids = rows.map(row => rowIdentity(this.schema, table, row));
+      if (new Set(ids).size !== ids.length) throw new Error(`Duplicate entity identity for table ${table}`);
+    }
+    const sequence = this.reserveSequence();
+    const notifications = [...this.registrations].map(registration => {
+      const old = collectChanges(this.schema, registration.subscription, this.visible);
+      const current = collectChanges(this.schema, registration.subscription, next);
+      const key = (change: EntityChange) => JSON.stringify([change.tableName, change.id]);
+      const keys = new Set(current.map(key));
+      const changes: EntityChange[] = [
+        ...old.filter(change => !keys.has(key(change))).map(change => ({ tableName: change.tableName, id: change.id, op: 'remove' as const })),
+        ...current,
+      ];
+      return () => {
+        if (!this.registrations.has(registration)) return;
+        try { registration.callback({ type: 'entity-change-batch', databaseId, sequence, source: 'local-edits', changes }); }
+        catch (error) { console.error('[PyreClient] Entity listener failed', error); }
+      };
+    });
+    this.visible = next;
+    return () => notifications.forEach(notify => notify());
+  }
 
   subscribe(subscription: EntitySubscription, callback: EntityChangeCallback): () => void {
     validateEntitySubscription(subscription);
