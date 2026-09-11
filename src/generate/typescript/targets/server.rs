@@ -93,6 +93,7 @@ pub fn generate_queries(
         serde_json::to_string(&crate::generate::manifest::compiled_schema_contract(context))
             .expect("compiled schema contract")
     ));
+    content.push_str(&format!("export const replacementContracts = {};\n\n", serde_json::to_string(&crate::generate::manifest::replacement_contracts(context)).expect("replacement contracts")));
 
     for operation in &query_list.queries {
         if let ast::QueryDef::Query(q) = operation {
@@ -135,7 +136,7 @@ pub fn generate_queries(
     }
     content.push_str("\n};\n\n");
 
-    content.push_str("export const manifest: BatchManifest = { version: 1, manifestVersion, compiledContract, queries, SessionValidator };\n");
+    content.push_str("export const manifest: BatchManifest = { version: 1, manifestVersion, compiledContract, replacementContracts, queries, SessionValidator };\n");
 
     files.push(generate_text_file(base_out_dir.join("server.ts"), content));
 }
@@ -194,7 +195,7 @@ fn seed_column_validator(type_: &ast::ColumnType, context: &typecheck::Context) 
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", seed_column_validator(inner, context))
         }
-        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::IdUuid { .. } => common::UUID_VALIDATOR.to_string(),
         ast::ColumnType::Custom(name) => {
             if context.types.contains_key(name) {
                 format!("z.lazy(() => Db.{})", name)

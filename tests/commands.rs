@@ -977,7 +977,7 @@ record IntRecord {
     .unwrap();
     assert!(decode.contains("uuidRecordId?: string | null;"));
     assert!(decode.contains("intRecordId?: number | null;"));
-    assert!(decode.contains("uuidRecordId: z.string().nullish(),"));
+    assert!(decode.contains(&format!("uuidRecordId: {}.nullish(),", pyre::generate::typescript::common::UUID_VALIDATOR)));
     assert!(decode.contains("intRecordId: z.number().int().nullish(),"));
 }
 

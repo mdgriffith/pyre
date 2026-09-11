@@ -8,6 +8,8 @@ use std::path::Path;
 
 #[derive(Serialize)]
 struct Manifest {
+    #[serde(rename = "replacementContracts")]
+    replacement_contracts: BTreeMap<String, String>,
     #[serde(rename = "compiledContract")]
     compiled_contract: String,
     version: u32,
@@ -88,6 +90,7 @@ fn write_manifest(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let manifest = Manifest {
+        replacement_contracts: replacement_contracts(context),
         compiled_contract: compiled_contract(context, None),
         version: 1,
         session_schema: session_schema(context),
@@ -162,10 +165,73 @@ pub fn compiled_schema_contract(context: &typecheck::Context) -> String {
     compiled_contract(context, None)
 }
 
+pub fn replacement_contracts(context: &typecheck::Context) -> BTreeMap<String, String> {
+    context
+        .valid_namespaces
+        .iter()
+        .map(|namespace| {
+            (
+                namespace.clone(),
+                replacement_contract(context, namespace).expect("known namespace"),
+            )
+        })
+        .collect()
+}
+
+/// Only the selected database's tables, transitive codecs and effective session
+/// authorize replacement. The manifest fingerprint still covers every namespace.
+pub fn replacement_contract(context: &typecheck::Context, namespace: &str) -> Option<String> {
+    if !context.valid_namespaces.contains(namespace) {
+        return None;
+    }
+    Some(schema_contract(context, None, Some(namespace)))
+}
+
 fn compiled_contract(context: &typecheck::Context, query: Option<&ast::Query>) -> String {
+    schema_contract(context, query, None)
+}
+
+fn schema_contract(
+    context: &typecheck::Context,
+    query: Option<&ast::Query>,
+    namespace: Option<&str>,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut definitions = BTreeMap::new();
+    let mut required = Vec::new();
+    for table in context
+        .tables
+        .values()
+        .filter(|table| namespace.is_none_or(|ns| table.schema == ns))
+    {
+        for column in ast::collect_columns(&table.record.fields) {
+            column.type_.collect_custom_type_names(&mut required);
+        }
+    }
+    if let Some(session) = &context.session {
+        for column in ast::collect_columns(&session.fields) {
+            column.type_.collect_custom_type_names(&mut required);
+        }
+    }
+    let mut reachable = HashSet::new();
+    while let Some(name) = required.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        if let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(&name) {
+            for variant in variants {
+                if let Some(fields) = &variant.fields {
+                    for column in ast::collect_columns(fields) {
+                        column.type_.collect_custom_type_names(&mut required);
+                    }
+                }
+            }
+        }
+    }
     for (name, (_, type_)) in &context.types {
+        if namespace.is_some() && !reachable.contains(name) {
+            continue;
+        }
         if let typecheck::Type::OneOf { variants } = type_ {
             definitions.insert(
                 name.clone(),
@@ -190,6 +256,9 @@ fn compiled_contract(context: &typecheck::Context, query: Option<&ast::Query>) -
     };
     let mut schemas = BTreeMap::new();
     for (name, table) in &context.tables {
+        if namespace.is_some_and(|ns| table.schema != ns) {
+            continue;
+        }
         let file = ast::SchemaFile {
             path: String::new(),
             definitions: vec![ast::Definition::Record {
@@ -209,6 +278,7 @@ fn compiled_contract(context: &typecheck::Context, query: Option<&ast::Query>) -
     let sync_modes = context
         .namespace_sync_modes
         .iter()
+        .filter(|(name, _)| namespace.is_none_or(|ns| name.as_str() == ns))
         .map(|(name, mode)| (name, mode.as_str()))
         .collect::<BTreeMap<_, _>>();
     let contract = serde_json::json!({

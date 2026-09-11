@@ -88,7 +88,7 @@ mod codec_parity_tests {
             .await
             .unwrap();
         assert_eq!(context_result.response, json!({"entry":[{"id":"note"}]}));
-        let input = json!({"id":"uuid-is-a-string-codec","release":"release","enabled":true,"count":1,"role":{"_type":"Member"},"details":details});
+        let input = json!({"id":"00000000-0000-4000-8000-000000000001","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":{"_type":"Member"},"details":details});
         let mut request = BatchRequest {
             version: 1,
             database_id: "tenant-1".into(),
@@ -123,14 +123,14 @@ mod codec_parity_tests {
         assert_eq!(stored, expected);
         let raw = json!({"_type":"Raw","data":{"arbitrary":[null,true,{"_type":"Uninterpreted","extra":"retain"}]},"values":[1,null,2],"scalar":null});
         let mut raw_input = input.clone();
-        raw_input["id"] = json!("raw");
+        raw_input["id"] = json!("00000000-0000-4000-8000-000000000003");
         raw_input["details"] = raw.clone();
         request.operations[0].input = raw_input;
         run_batch(&conn, &manifest, &binding, &request, &session)
             .await
             .unwrap();
         let row = conn
-            .query("select json(details) from entries where id = 'raw'", ())
+            .query("select json(details) from entries where id = '00000000-0000-4000-8000-000000000003'", ())
             .await
             .unwrap()
             .next()
@@ -597,7 +597,10 @@ async fn execute_generated_sql(
                     .last()
                     .and_then(|set| set.rows.first())
                     .and_then(|row| row.get("_pyreEditId"))
-                    .filter(|id| !id.is_null())
+                    .filter(|id| {
+                        id.as_i64().is_some()
+                            || id.as_str().is_some_and(super::manifest::is_uuid)
+                    })
                     .cloned();
                 if identity.is_none() {
                     return Err(Error::TargetNotWritable);

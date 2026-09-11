@@ -29,14 +29,23 @@ pub fn process_introspection(introspection: JsValue) -> Result<JsValue, JsValue>
     cache::process_introspection(introspection)
 }
 
-/// Compare this with the trusted manifest.compiledContract after restoring the
+/// Compare this with the trusted manifest.replacementContracts[namespace] after restoring the
 /// request's captured introspection, without an await before SQL/codec use.
 #[wasm_bindgen]
 pub fn get_schema_compiled_contract() -> Result<String, JsValue> {
     let introspection = cache::get().ok_or_else(|| JsValue::from_str("InvalidSchema"))?;
     match &introspection.schema {
         pyre::db::introspect::SchemaResult::Success { context, .. } => {
-            Ok(pyre::generate::manifest::compiled_schema_contract(context))
+            if context.valid_namespaces.len() != 1 {
+                return Err(JsValue::from_str(
+                    "Replacement requires one database namespace",
+                ));
+            }
+            pyre::generate::manifest::replacement_contract(
+                context,
+                context.valid_namespaces.iter().next().unwrap(),
+            )
+            .ok_or_else(|| JsValue::from_str("InvalidSchema"))
         }
         _ => Err(JsValue::from_str("InvalidSchema")),
     }

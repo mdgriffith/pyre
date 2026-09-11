@@ -26,9 +26,10 @@ try {
   const fingerprint = generatedServer.match(/^export const manifestVersion = "sha256:[a-f0-9]{64}";$/m)?.[0];
   if (!fingerprint) throw new Error("Missing valid compiler manifest fingerprint export");
   const contract = generatedServer.match(/^export const compiledContract = "[a-f0-9]{64}";$/m)?.[0];
-  if (!contract || !generatedServer.includes("export const manifest: BatchManifest = { version: 1, manifestVersion, compiledContract, queries, SessionValidator };"))
+  const replacementContracts = generatedServer.match(/^export const replacementContracts = .*;$/m)?.[0];
+  if (!contract || !replacementContracts || !generatedServer.includes("export const manifest: BatchManifest = { version: 1, manifestVersion, compiledContract, replacementContracts, queries, SessionValidator };"))
     throw new Error("Missing compiled contract in generated BatchManifest");
-  writeFileSync(join(fixture, "generated/manifest.ts"), `${fingerprint}\n${contract}\n`);
+  writeFileSync(join(fixture, "generated/manifest.ts"), `${fingerprint}\n${contract}\n${replacementContracts}\n`);
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

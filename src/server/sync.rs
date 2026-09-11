@@ -88,7 +88,9 @@ impl<'a> SyncServer<'a> {
         let fence = &request.fence;
         if request.version != 1
             || manifest.version != 1
-            || !manifest.matches_context(self.context)
+            || manifest.replacement_contracts.get(binding.namespace) !=
+                crate::generate::manifest::replacement_contract(self.context, binding.namespace).as_ref()
+            || !manifest.replacement_contracts.contains_key(binding.namespace)
             || request.request_id.is_empty()
             || request.target < 0
             || fence.database_id != binding.database_id

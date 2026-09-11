@@ -605,7 +605,13 @@ pub fn from_raw(mut raw: IntrospectionRaw) -> Introspection {
     }
 
     let mut schema = ast::Schema {
-        namespace: ast::DEFAULT_SCHEMANAME.to_string(),
+        namespace: raw
+            .schema_source
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("// @pyre.namespace "))
+            .unwrap_or(ast::DEFAULT_SCHEMANAME)
+            .to_string(),
         sync_mode: ast::SyncMode::Synced,
         session: None,
         files: vec![],

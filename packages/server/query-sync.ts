@@ -69,7 +69,7 @@ export async function catchupReplacement(
     const decoded = manifest.SessionValidator.safeParse(structuredClone(executingSession));
     if (!decoded.success) return failure("InvalidSession");
     session = decoded.data;
-    restoreSchema = captureReplacementSchema(captured.databaseId, manifest.compiledContract!);
+    restoreSchema = captureReplacementSchema(captured.databaseId, manifest.replacementContracts?.[authority.namespace]!);
   } catch { return failure("InvalidRequest"); }
 
   let tx: Awaited<ReturnType<Client["transaction"]>> | undefined;
@@ -111,6 +111,8 @@ export function runBatchWithSync(
   executingSession: Session,
   connectedSessions: Map<string, BatchSyncRecipient> = new Map(),
   sendToSession: (sessionId: string, message: unknown) => void | Promise<void> = () => {},
+  /** In-process binding only; network requests must retain their epoch fence. */
+  captureDatabaseEpoch = false,
 ): Promise<BatchResult> {
   return runBatch(db, manifest, authority, request, executingSession, result => {
     const response = result.response;
@@ -126,7 +128,7 @@ export function runBatchWithSync(
         .catch(() => { /* Async delivery cannot delay or reject the origin response. */ });
       } catch { /* A failed recipient must not suppress the others. */ }
     }
-  });
+  }, captureDatabaseEpoch);
 }
 
 function countRows(tableGroups: unknown): number {

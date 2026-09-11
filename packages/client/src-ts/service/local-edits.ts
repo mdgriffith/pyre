@@ -1,4 +1,8 @@
 import type { QueryUpdate } from './query-client';
+import { capture, planKey } from '@pyre/core/local-edits';
+import type { EditOperation, EditPlan, EditPrediction, Namespace, Edit, Batch } from '@pyre/core/local-edits';
+export { capture, edit, batch } from '@pyre/core/local-edits';
+export type { EditOperation, EditPlan, EditPrediction, Namespace, Edit, Batch } from '@pyre/core/local-edits';
 
 export interface EditFence {
   databaseId: string;
@@ -9,38 +13,9 @@ export interface EditFence {
   databaseEpoch: string;
 }
 export type VisibleTables = Record<string, Array<Record<string, unknown>>>;
-export interface EditPrediction {
-  safe: true;
-  kind: 'create' | 'update' | 'delete';
-  table: string;
-  id: string | number;
-  fields?: Record<string, unknown>;
-  writableFields?: string[];
-  materializedFields?: string[];
-}
-/** Trusted generated manifest entry. Codecs throw on invalid values. Named commands omit predict. */
-export interface EditOperation<I = any, R = any> {
-  id: string;
-  parseInput(input: unknown): I;
-  decodeResult(value: unknown): R;
-  predict?(input: I): EditPrediction | null;
-}
-const planKey = Symbol('Pyre edit');
-export interface EditPlan<R> {
-  readonly [planKey]: { operations: readonly { definition: EditOperation; input: unknown; named?: true }[]; result: (values: unknown[]) => R };
-}
-export function edit<I, R>(definition: EditOperation<I, R>, input: I): EditPlan<R> {
-  return Object.freeze({ [planKey]: Object.freeze({
-    operations: Object.freeze([Object.freeze({ definition: Object.freeze({ ...definition }), input: capture(input) })]),
-    result: (values: unknown[]) => values[0] as R,
-  }) });
-}
-export function batch<const E extends readonly EditPlan<unknown>[]>(edits: E): EditPlan<{ readonly [K in keyof E]: E[K] extends EditPlan<infer R> ? R : never }> {
-  const plans = [...edits].map(e => e[planKey]);
-  return { [planKey]: { operations: plans.flatMap(p => [...p.operations]), result: values => {
-    let offset = 0;
-    return plans.map(p => { const result = p.result(values.slice(offset, offset + p.operations.length)); offset += p.operations.length; return result; }) as any;
-  } } };
+export interface Database<N> {
+  submit<R>(plan: Edit<N, R> | Batch<N, R>): EditReceipt<R>;
+  onEditFailure(callback: (event: LocalEditsFailure) => void): () => void;
 }
 export type EditState = 'queued' | 'locallyApplied' | 'sent' | 'accepted' | 'confirmed' | 'rejected' | 'outcomeUnknown' | 'acceptedUnreconciled';
 export type EditOutcome<R> = { kind: 'confirmed'; result: R; commitRevision?: number }
@@ -52,6 +27,8 @@ export interface EditLifecycle<R = unknown> extends EditFence {
   sequence?: number;
   commitRevision?: number;
   result?: R;
+  /** Validated wire values for bridges with their own result codecs (not TS Dates). */
+  results?: readonly { index: number; operation: string; value: unknown }[];
   code?: string;
   quarantined?: boolean;
 }
@@ -161,6 +138,9 @@ export class LocalEditsRuntime {
   private consuming = false;
   private manifest: Map<string, EditOperation>;
 
+  /** The captured descriptors used to validate submissions on this lifetime. */
+  get operations(): readonly EditOperation[] { return [...this.manifest.values()]; }
+
   constructor(private config: LocalEditsConfig, private host: LocalEditsHost) {
     this.config = { ...config };
     this.fence = capture(Object.fromEntries(['databaseId', 'instance', 'authGeneration', 'namespace', 'manifest', 'databaseEpoch']
@@ -169,7 +149,7 @@ export class LocalEditsRuntime {
       if (key === 'authGeneration' ? !revision(value) : typeof value !== 'string' || !value) throw new Error('Invalid edit fence');
     }
     if (!revision(config.minimumSafeRevision) || (config.timeoutMs !== undefined && (!Number.isFinite(config.timeoutMs) || config.timeoutMs <= 0 || config.timeoutMs > 2147483647))) throw new Error('Invalid edit configuration');
-    this.manifest = new Map(config.operations.map(op => [op.id, { ...op }]));
+    this.manifest = new Map(config.operations.map(op => [op.id, Object.freeze({ ...op })]));
     if (this.manifest.size !== config.operations.length || config.operations.some(op => !op.id || typeof op.parseInput !== 'function' || typeof op.decodeResult !== 'function')) throw new Error('Invalid edit manifest');
     this.connected = config.connected ?? (typeof navigator === 'undefined' || navigator.onLine !== false);
   }
@@ -189,6 +169,16 @@ export class LocalEditsRuntime {
   private offline = () => this.setConnected(false);
   onEditFailure(callback: (event: LocalEditsFailure) => void): () => void { this.failures.add(callback); return () => { this.failures.delete(callback); }; }
   onLifecycle(callback: (event: EditLifecycle) => void): () => void { this.lifecycle.add(callback); return () => { this.lifecycle.delete(callback); }; }
+  bind<N>(scope: Namespace<N>): Database<N> {
+    if (scope.name !== this.fence.namespace || scope.manifest !== this.fence.manifest) throw new Error('Namespace mismatch');
+    return Object.freeze({
+      submit: <R>(plan: Edit<N, R> | Batch<N, R>) => {
+        if (!plan[planKey]?.namespace) throw new Error('Namespace mismatch');
+        return this.submit(plan);
+      },
+      onEditFailure: (callback: (event: LocalEditsFailure) => void) => this.onEditFailure(callback),
+    });
+  }
   submit<R>(plan: EditPlan<R>): EditReceipt<R> {
     const requestId = `${this.fence.instance}:edit:${++this.counter}`;
     let resolve!: (outcome: EditOutcome<any>) => void;
@@ -203,6 +193,7 @@ export class LocalEditsRuntime {
     try {
       if (!this.started || !this.active || this.closing) throw new Error('Disposed');
       const data = plan[planKey];
+      if (data.namespace && (data.namespace.name !== this.fence.namespace || data.namespace.manifest !== this.fence.manifest)) throw new Error('Namespace mismatch');
       pending.result = data.result;
       pending.operations = data.operations.map(({ definition, input, named }) => {
         const op = this.manifest.get(definition.id);
@@ -375,14 +366,14 @@ export class LocalEditsRuntime {
       try { this.host.send({ type: 'localEdits', message: capture(response) }); } catch { failed(); }
     }, failed);
   }
-  private publishLifecycle(event: EditLifecycle & { results?: Array<{ value: unknown }> }): void {
+  private publishLifecycle(event: EditLifecycle): void {
     const pending = this.pending.get(event.requestId);
     if (!pending) return;
     const hasResult = ['accepted', 'confirmed', 'acceptedUnreconciled'].includes(event.state);
     // Decode the worker's accepted evidence, not a mutable host-side last-response slot.
-    const result = hasResult ? capture(pending.result((event.results ?? []).map((item, index) =>
-      this.manifest.get(pending.operations[index].operation)!.decodeResult(item.value)))) : undefined;
-    const published: EditLifecycle = Object.freeze({ ...this.fence, requestId: event.requestId, state: event.state, sequence: event.sequence, commitRevision: event.commitRevision, code: event.code, ...(event.quarantined ? { quarantined: true } : {}), ...(hasResult ? { result } : {}) });
+    const result = hasResult ? pending.result((event.results ?? []).map((item, index) =>
+      this.manifest.get(pending.operations[index].operation)!.decodeResult(item.value))) : undefined;
+    const published: EditLifecycle = Object.freeze({ ...this.fence, requestId: event.requestId, state: event.state, sequence: event.sequence, commitRevision: event.commitRevision, code: event.code, ...(event.quarantined ? { quarantined: true } : {}), ...(hasResult ? { result, results: capture(event.results ?? []) } : {}) });
     pending.latest = published;
     if (event.state === 'confirmed') pending.resolve({ kind: 'confirmed', result, commitRevision: event.commitRevision });
     if (event.state === 'acceptedUnreconciled') pending.resolve({ kind: 'acceptedUnreconciled', result, commitRevision: event.commitRevision! });
@@ -440,18 +431,3 @@ export class LocalEditsRuntime {
 function record(value: unknown): value is Record<string, any> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function revision(value: unknown): boolean { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0; }
 function notify(callback: () => void): void { try { callback(); } catch (error) { console.error('[PyreClient] Local edit listener failed', error); } }
-/** Strict JSON snapshot: do not silently erase undefined, nonfinite numbers, or class instances. */
-export function capture<T>(value: T): T {
-  const seen = new Set<object>();
-  const copy = (v: any): any => {
-    if (v === null || typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) return v;
-    if (typeof v !== 'object' || seen.has(v)) throw new Error('Invalid JSON input');
-    const prototype = Object.getPrototypeOf(v);
-    if (!Array.isArray(v) && prototype !== null && (Object.getPrototypeOf(prototype) !== null || prototype.constructor?.name !== 'Object')) throw new Error('Invalid JSON input');
-    seen.add(v);
-    const result = Array.isArray(v) ? Array.from(v, copy) : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, copy(x)]));
-    seen.delete(v);
-    return Object.freeze(result);
-  };
-  return copy(value);
-}

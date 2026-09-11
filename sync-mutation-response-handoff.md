@@ -1,5 +1,12 @@
 # Sync mutation responses are not typed mutation responses
 
+> Historical investigation, not the current runtime contract. The discarded-result
+> behavior described below has been fixed: synchronized named mutations preserve
+> their declared result, independently of sync publication. Local Edit batches
+> return operation-indexed results and reconcile through complete replacement.
+> See [Local Edits](docs/usage/local-edits.md) and the
+> [current implementation notes](docs/dev/sync-mutation-response-handoff.md).
+
 ## Part 1: Problem and original implementation reasoning
 
 ### Context
@@ -46,9 +53,9 @@ That interpretation appeared reasonable for several reasons:
 
 5. A generated Rust output type still exists for the mutation, so it was natural to expect synchronized execution to remain compatible with that output type.
 
-### Actual behavior
+### Historical behavior (Fixed)
 
-The Rust runtime deliberately discards the formatted mutation response in sync mode:
+At the time of this investigation, the Rust runtime discarded the formatted mutation response in sync mode:
 
 ```rust
 Ok(QueryResult {

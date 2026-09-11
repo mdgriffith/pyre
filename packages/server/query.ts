@@ -116,8 +116,10 @@ export interface BatchManifest {
     version: 1;
     /** Trusted fingerprint emitted alongside the compiled queries. */
     manifestVersion: string;
-    /** Compiler-owned schema/session/permission digest. Required for replacement. */
+    /** Compiler-owned global schema/session/permission digest. */
     compiledContract?: string;
+    /** Namespace-scoped permission/schema digests. Missing entries cannot replace. */
+    replacementContracts?: Readonly<Record<string, string>>;
     queries: QueryMap;
     SessionValidator: Validator<any>;
 }
@@ -200,6 +202,9 @@ export function runBatch(
     request: BatchRequest,
     executingSession: Session,
     publish?: (result: Extract<BatchResult, { kind: "success" }>) => void | Promise<void>,
+    /** Trusted in-process submissions capture their epoch inside the queued transaction.
+     * Never enable this for a client-supplied request. */
+    captureDatabaseEpoch = false,
 ): Promise<BatchResult> {
     let prepared: { operation: string; query: QueryMetadata; statements: ReturnType<typeof toSqlStatements> }[];
     let capturedAuthority: BatchAuthority;
@@ -285,7 +290,12 @@ export function runBatch(
             const databases = await tx.execute("pragma database_list");
             if (databases.rows.some(row => row.name !== "main" && row.name !== "temp")) throw new BatchError("InvalidInput");
             const epoch = await tx.execute("select database_epoch from _pyre_sync where id = 1");
-            if (epoch.rows[0]?.database_epoch !== captured.databaseEpoch) throw new BatchError("InvalidInput");
+            const databaseEpoch = epoch.rows[0]?.database_epoch;
+            if (typeof databaseEpoch !== "string" || !databaseEpoch) throw new BatchError("InvalidInput");
+            if (captureDatabaseEpoch) {
+                captured.databaseEpoch = databaseEpoch;
+                response.databaseEpoch = databaseEpoch;
+            } else if (databaseEpoch !== captured.databaseEpoch) throw new BatchError("InvalidInput");
             for (index = 0; index < prepared.length; index++) {
                 const { operation, query, statements } = prepared[index];
                 // Pass only execute, even though libsql Transaction also exposes batch.
@@ -297,7 +307,9 @@ export function runBatch(
                     const rows = writes.filter(set => set.rowsAffected === 1).flatMap(set => set.rows);
                     const rawId = rows[0]?._pyreEditId;
                     const id = typeof rawId === "bigint" ? Number(rawId) : rawId;
-                    if (rows.length !== 1 || (typeof id !== "string" && (typeof id !== "number" || !Number.isSafeInteger(id))))
+                    if (rows.length !== 1 || (typeof id === "string"
+                        ? id.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+                        : typeof id !== "number" || !Number.isSafeInteger(id)))
                         throw new BatchError("TargetNotWritable", index);
                     value = { id };
                 }

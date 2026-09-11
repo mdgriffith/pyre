@@ -37,6 +37,7 @@ pub fn generate_queries(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let formatter = to_metadata_formatter();
+    super::local_edits::generate(context, all_query_info, query_list, base_out_dir, files);
 
     for operation in &query_list.queries {
         match operation {
@@ -185,11 +186,14 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 ast::ColumnType::Float => "z.number()".to_string(),
                 ast::ColumnType::IdUuid { .. }
                 | ast::ColumnType::ForeignKey {
+                    serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+                    ..
+                } => common::UUID_VALIDATOR.to_string(),
+                ast::ColumnType::ForeignKey {
                     serialization_type:
                         Some(
                             ast::ConcreteSerializationType::Text
-                            | ast::ConcreteSerializationType::Date
-                            | ast::ConcreteSerializationType::IdUuid,
+                            | ast::ConcreteSerializationType::Date,
                         ),
                     ..
                 } => "z.string()".to_string(),
@@ -343,7 +347,9 @@ fn to_metadata_formatter() -> typealias::TypeFormatter {
                         ast::ColumnType::Bool => ("z.boolean()".to_string(), true, true),
                         ast::ColumnType::DateTime => ("z.date()".to_string(), true, true),
                         ast::ColumnType::IdInt { .. } => ("z.number()".to_string(), true, false),
-                        ast::ColumnType::IdUuid { .. } => ("z.string()".to_string(), true, false),
+                        ast::ColumnType::IdUuid { .. } => {
+                            (common::UUID_VALIDATOR.to_string(), true, false)
+                        }
                         ast::ColumnType::ForeignKey { .. } => {
                             ("z.number()".to_string(), true, false)
                         }
@@ -1173,13 +1179,33 @@ fn to_filter_operator_key(operator: &ast::Operator) -> &'static str {
 }
 
 fn to_schema_metadata(context: &typecheck::Context) -> String {
-    let mut result = String::new();
-    result.push_str("import type { SchemaMetadata } from '@pyre/core';\n\n");
+    let scopes = context
+        .valid_namespaces
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|namespace| {
+            format!(
+                "  {}: {}",
+                string::quote(namespace),
+                schema_metadata_value(context, Some(namespace))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("import type {{ SchemaMetadata }} from '@pyre/core';\n\nexport const schemaMetadataByNamespace: Record<string, SchemaMetadata> = {{\n{}\n}};\n\nexport const schemaMetadata: SchemaMetadata = {{ ...{}, namespaces: schemaMetadataByNamespace }};\n", scopes, schema_metadata_value(context, None))
+}
 
-    result.push_str("export const schemaMetadata: SchemaMetadata = {\n");
+fn schema_metadata_value(context: &typecheck::Context, namespace: Option<&str>) -> String {
+    let mut result = String::new();
+    result.push_str("{\n");
     result.push_str("  tables: {\n");
 
-    let mut tables: Vec<&typecheck::Table> = context.tables.values().collect();
+    let mut tables: Vec<&typecheck::Table> = context
+        .tables
+        .values()
+        .filter(|table| namespace.is_none_or(|ns| table.schema == ns))
+        .collect();
     tables.sort_by(|a, b| {
         let a_table_name = ast::get_tablename(&a.record.name, &a.record.fields);
         let b_table_name = ast::get_tablename(&b.record.name, &b.record.fields);
@@ -1448,7 +1474,7 @@ fn to_schema_metadata(context: &typecheck::Context) -> String {
     }
 
     result.push_str("\n  }\n");
-    result.push_str("};\n");
+    result.push_str("}");
     result
 }
 
@@ -1495,7 +1521,7 @@ fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         }
         ast::ColumnType::IdInt { .. } => "z.number().int()".to_string(),
         ast::ColumnType::ForeignKey { .. } => common::input_column_validator(type_),
-        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::IdUuid { .. } => common::UUID_VALIDATOR.to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}Write", name),
     }
 }
@@ -1560,7 +1586,7 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::IdInt { .. } | ast::ColumnType::ForeignKey { .. } => {
             "z.number()".to_string()
         }
-        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::IdUuid { .. } => common::UUID_VALIDATOR.to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}", name),
     }
 }
@@ -1569,7 +1595,7 @@ fn to_param_type_alias(
     context: &typecheck::Context,
     args: &Vec<ast::QueryParamDefinition>,
 ) -> String {
-    let mut result = "const RawInputValidator = z.object({".to_string();
+    let mut result = "export const RawInputValidator = z.object({".to_string();
     let mut is_first = true;
     for arg in args {
         let type_name = arg

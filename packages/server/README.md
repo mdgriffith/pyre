@@ -165,6 +165,106 @@ with `bun packages/server/fixtures/compiled-batch/regenerate.ts` after building
 the compiler. Regeneration also compiles the generated server module and verifies
 its `manifestVersion` export. Rust and TS tests execute the same fixture schema.
 
+### Typed Server Edits
+
+`localEdits` is available from `@pyre/server` or `@pyre/server/local-edits`.
+It consumes the same namespace-branded core descriptors as the client, without a
+browser, worker, local cache, route, SSE connection, or active subscriber:
+
+```ts
+import { localEdits } from "@pyre/server/local-edits";
+import { Main, Audit, Commands, batch } from "./generated/typescript/edits";
+import { manifest } from "./generated/typescript/server";
+
+// Resolve/authorize database and databaseId in trusted application code first.
+const edits = localEdits.bind({
+  database, databaseId, namespace: Main, manifest,
+  session: actualSession,
+  // Optional: your existing live Map<string, BatchSyncRecipient> and sender.
+  connectedSessions, sendToSession,
+});
+const outcome = await edits.submit(batch([
+  Audit.create({ message: "Seeded" }),
+  Commands.namedAudit({ message: "Named command in the same transaction" }),
+]));
+if (outcome.kind === "confirmed") {
+  const [created, namedResult] = outcome.result; // readonly, inferred tuple
+  console.log(created.id, namedResult);
+}
+```
+
+The binding is a trusted server capability, not an authentication mechanism.
+The host must authorize the actual connection/database ID and session together
+(for example inside `context.run`), and rebind when that authority changes.
+Do not expose `bind` options to request data. No administrator or session is
+synthesized: even sessionless schemas require an explicit `{}`. Invalid binding
+configuration or a session rejected by the full compiled `SessionValidator`
+throws synchronously. Unrecognized application claims confer no permissions.
+
+Binding captures session and compiled execution metadata. Submission captures
+inputs, operation IDs, decoders, and result assembly before its first await.
+Nonempty submissions then read the database epoch and call `runBatchWithSync`. The executor checks the
+epoch again inside the write transaction, enforces the compiled namespace and
+manifest allowlist, and rejects attachments. A nonempty batch uses exactly one
+atomic write transaction, including its sync revision. Generated CRUD requires
+exactly one authorized direct write per operation; named commands retain their
+compiled semantics. The permission-bypassing legacy `seed` helpers are not used.
+
+`submit(Edit<N, R> | Batch<N, R>): Promise<Outcome<R>>` returns:
+
+- `{ kind: "confirmed", result: R, commitRevision?: number }`: committed and
+  authoritative typed results materialized in this execution. Nonempty submissions
+  include `commitRevision`. Results must match the captured manifest operation IDs,
+  count, indices and codecs, including branded UUID/integer IDs and named commands.
+- `{ kind: "rejected", code: string, index?: number }`: definitive noncommit,
+  including validation, permission/cardinality, transaction, or pre-execution epoch
+  read failure. There is no successful prefix; `index` is zero-based when known.
+- `{ kind: "outcomeUnknown", code: "OutcomeUnknown" }`: lost commit acknowledgement,
+  malformed commit evidence, or an unexpected throw/rejection from the executor.
+  Execution may have committed; the submission promise resolves rather than rejects.
+- `{ kind: "acceptedUnreconciled", code: "InvalidResult", commitRevision: number,
+  index?: number }`: valid commit evidence exists, but result decoding or assembly
+  failed. This outcome deliberately contains no `result`, partial results, or raw
+  executor response. Never replay it as a rejected write.
+
+Empty batches return exactly `{ kind: "confirmed", result: [] }` after local
+scope validation, without calling the executor, reading the database epoch, doing
+any database I/O or transport, allocating a revision, or publishing state.
+
+Server-specific edge limitation: `acceptedUnreconciled` here denotes committed
+writes whose typed result could not be materialized, not browser-cache catchup.
+Unlike a browser disposal outcome that already has a validated result, this branch
+cannot expose `R`. The binding has no receipt, late-settlement stream, or automatic
+typed-result recovery. Applications must investigate the committed data/codec
+failure explicitly; a snapshot alone cannot settle an `outcomeUnknown` request.
+The internal `runBatchWithSync` success/error/unknown API is unchanged. A throw
+after entering that API is conservatively unknown even if it happened before a
+write: without a returned definitive outcome the binding cannot prove noncommit.
+
+There are no automatic write retries. Publication uses the existing postcommit
+`syncRequired` replacement protocol and the current matching authenticated
+registrations. Delivery failures cannot turn a known commit into rejection or
+suppress other recipients. A subscriber is never required for execution.
+
+The runnable [seed example](fixtures/local-edits/seed.ts) creates linked UUID
+records, retrieves a generated integer ID, and mixes a named command into the
+same transaction. Its fresh file-backed SQLite database is removed afterward.
+From the repository root:
+
+```sh
+cargo build --bin pyre
+bun run --cwd packages/server seed:local-edits
+bun run --cwd packages/server test:local-edits
+TMPDIR="$PWD/target/tmp" bun test packages/server/query.test.ts packages/server/query-sync.test.ts
+bun run --cwd packages/server typecheck
+bun run --cwd packages/server typecheck:local-edits
+```
+
+Fixture generation uses the current compiler, with all output under `target/`.
+The typed binding supports the executor's existing file-backed SQLite/libSQL
+contract; remote libSQL is not covered by these tests. In-memory local databases
+are unsupported because that adapter detaches transaction connections.
+
 ### Authoritative Replacement
 
 `catchupReplacement` from `@pyre/server/query-sync` takes a database connection,
@@ -199,7 +299,7 @@ Replacement currently materializes a complete scope in memory, not pinned pages.
 TypeScript rejects payloads above 64 MiB rather than returning partial coverage;
 remote libSQL remains unverified. The opt-in [browser local-edit runtime](../../docs/usage/local-edits.md)
 implements client installation, pending-intent replay and receipt settlement through
-configured transport adapters. Schema-branded builders and typed seed binding remain downstream.
+configured transport adapters. Typed server seeding is described above.
 
 Build WASM before running the production-boundary fixture:
 

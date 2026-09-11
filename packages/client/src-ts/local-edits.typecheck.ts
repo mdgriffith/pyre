@@ -1,4 +1,21 @@
 import { batch, edit, type EditOperation, type EditPlan, type EditReceipt, type LocalEditsRuntime } from './index';
+import type { PyreClient, Namespace, Database, Edit, Batch } from './index';
+
+export async function checkNamespaceHandle(
+  client: PyreClient,
+  scope: Namespace<'Main'>,
+  plan: Edit<'Main', { id: string }>,
+  plans: Batch<'Main', readonly [{ id: string }, string]>,
+  other: Edit<'Other', { id: string }>,
+) {
+  const db: Database<'Main'> = await client.localEdits('main', scope);
+  const one: EditReceipt<{ id: string }> = db.submit(plan);
+  const many: EditReceipt<readonly [{ id: string }, string]> = db.submit(plans);
+  // @ts-expect-error A database handle cannot submit another namespace's plan.
+  db.submit(other);
+  const runtime: LocalEditsRuntime = await client.localEdits('main');
+  return { one, many, runtime };
+}
 
 // Generated adapters preserve heterogeneous tuples without widening to a union array.
 export function checkLocalEditTypes(db: LocalEditsRuntime) {

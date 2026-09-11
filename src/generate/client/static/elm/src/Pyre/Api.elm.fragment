@@ -1,0 +1,48 @@
+type alias Receipt a =
+    LocalEdits.Receipt a
+
+
+type alias Outcome a =
+    LocalEdits.Outcome a
+
+
+type alias EditFailure =
+    LocalEdits.EditFailure
+
+
+type alias Lifecycle =
+    LocalEdits.Lifecycle
+
+
+lifecycle : Receipt a -> Model -> Maybe Lifecycle
+lifecycle receipt model =
+    LocalEdits.lifecycle receipt model.localEdits
+
+
+submit : DatabaseId n -> Edit.Edit n a -> Model -> ( Model, Effect, Receipt a )
+submit database edit model =
+    batch database (EditInternal.single edit) model
+
+
+batch : DatabaseId n -> Batch.Batch n a -> Model -> ( Model, Effect, Receipt a )
+batch database plan model =
+    let
+        ( edits, effect, receipt ) =
+            LocalEdits.submit database plan model.localEdits
+    in
+    ( { model | localEdits = edits }, Maybe.map Send effect |> Maybe.withDefault NoEffect, receipt )
+
+
+outcome : Receipt a -> Model -> Maybe (Outcome a)
+outcome receipt model =
+    LocalEdits.outcome receipt model.localEdits
+
+
+editState : Receipt a -> Model -> Maybe String
+editState receipt model =
+    LocalEdits.state receipt model.localEdits
+
+
+failures : Model -> List EditFailure
+failures model =
+    LocalEdits.failures model.localEdits

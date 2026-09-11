@@ -413,7 +413,7 @@ test("generated edits require exactly one nominated included statement", async (
 });
 
 const compiledInput = {
-  id: "uuid-is-a-string-codec", release: "release", enabled: true, count: 1,
+  id: "00000000-0000-4000-8000-000000000001", release: "00000000-0000-4000-8000-000000000002", enabled: true, count: 1,
   role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: true },
 };
 
@@ -434,7 +434,7 @@ test("actual generated metadata executes release identifier and full unused sess
       reconciliation: { kind: "replaceRequired", atLeast: 1, invalidate: true, minimumSafeRevision: 1 },
     } });
     expect((await db.execute("select release, enabled, count, role, json(details) as details from entries")).rows).toEqual([
-      { release: "release", enabled: 1, count: 1, role: "Member", details: '{"_type":"Note","count":2,"enabled":true}' },
+      { release: compiledInput.release, enabled: 1, count: 1, role: "Member", details: '{"_type":"Note","count":2,"enabled":true}' },
     ]);
     expect(compiledContextQuery.json_session_args).toEqual(["context"]);
     const contextResult = await run(db, { [compiledContextQuery.id]: { ...compiledContextQuery, sql: compiledContextSql } }, compiledContextQuery.id, {}, {
@@ -518,8 +518,8 @@ test("compiled recursive JSON preserves nested enums, dates, nulls, lists and di
     });
     expect(different.response).toEqual({ entry: [] });
     const raw = { _type: "Raw", data: { arbitrary: [null, true, { _type: "Uninterpreted", extra: "retain" }] }, values: [1, null, 2], scalar: null };
-    expect((await runBatch(db, manifest, authority, { ...request, operations: [{ operation: compiledCreate.id, input: { ...compiledInput, id: "raw", details: raw } }] }, session)).kind).toBe("success");
-    expect(JSON.parse((await db.execute("select json(details) as details from entries where id = 'raw'")).rows[0].details as string)).toEqual(raw);
+    expect((await runBatch(db, manifest, authority, { ...request, operations: [{ operation: compiledCreate.id, input: { ...compiledInput, id: "00000000-0000-4000-8000-000000000003", details: raw } }] }, session)).kind).toBe("success");
+    expect(JSON.parse((await db.execute("select json(details) as details from entries where id = '00000000-0000-4000-8000-000000000003'")).rows[0].details as string)).toEqual(raw);
     expect(compiledCreate.InputValidator.safeParse({ ...compiledInput, details: { ...raw, data: undefined } }).success).toBe(false);
     expect(compiledCreate.InputValidator.safeParse({ ...compiledInput, details: { ...raw, data: null } }).success).toBe(false);
     for (const data of [{ lost: undefined }, { lossy: NaN }, { lossy: Infinity }]) {

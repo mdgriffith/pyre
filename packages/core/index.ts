@@ -35,6 +35,8 @@ export interface TableMetadata {
 }
 
 export interface SchemaMetadata {
+  /** Generated per-database scopes, selected before worker/cache initialization. */
+  namespaces?: Record<string, SchemaMetadata>;
   tables: Record<string, TableMetadata>;
   queryFieldToTable: Record<string, string>;
 }

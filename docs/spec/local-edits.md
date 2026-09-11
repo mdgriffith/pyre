@@ -1,7 +1,7 @@
 # Local Edit Contract (MEC-107)
 
 Status: Implementation contract for the approved Local Edit API in MEC-106.
-The protocol details below define target behavior, not a completed public API.
+The protocol details below define required behavior, not a release-conformance claim.
 `tests/fixtures/local-edits/protocol.json` and `tests/local_edit_contract.rs`
 execute a bounded reference model. They do not test production conformance.
 
@@ -14,9 +14,16 @@ and the accepted response's reconciliation shape. Libraries remain route-indepen
 Client storage, tracking, entity streams and persistence now use schema-declared
 integer/UUID identity, including non-`id` keys. The opt-in browser runtime installs
 fenced replacement and replays ordered pending intent, with receipts, quarantine,
-observable failures and atomic query/entity publication. Schema-branded builders,
-the public Elm model/effect edit API and typed seed binding remain downstream.
-The reference model is not a substitute for production conformance.
+observable failures and atomic query/entity publication. Schema-branded TypeScript
+builders, generated Elm opaque patches and model/effect/receipt APIs, and the
+TypeScript explicit-session server binding are implemented. See the
+[usage guide](../usage/local-edits.md) for current imports and fixture-backed examples.
+Production conformance now exercises generated TS and compiled Elm submissions
+through both SQLite executors, including namespace-isolated replacement. The
+optional native Chromium suite additionally exercises the built client, IndexedDB
+and EventSource against the TypeScript executor. See the
+[conformance fixture](../../tests/fixtures/elm-local-edits/README.md) for commands
+and coverage boundaries; the reference model remains a separate bounded check.
 
 Client metadata must be regenerated with the required `primaryKey` name/kind.
 Unsupported primary-key types fail explicitly rather than being treated as UUIDs.
@@ -25,12 +32,13 @@ it does not migrate old flattened `id` caches. Invalid current-version caches
 fail initialization. Query publication conservatively sends changed full results,
 not identity-based diffs inferred from arbitrary projections. Typed Elm/TS schema
 IDs are generated; TS query codecs retain their primitive result representation.
-Production worker/service tests cover rejected-create/no-ghost and delete lifecycle
-transitions; generated surfaces remain subject to MEC-119 release conformance.
-Client UUID ingestion requires hyphenated hexadecimal strings; existing server
-codecs still accept arbitrary strings for UUID fields. Noncanonical stored values
-fail client ingestion explicitly and require correction before rollout; validator
-alignment remains a release-gate check, not a silent identity coercion.
+Production worker/service and generated-surface conformance tests cover
+rejected-create/no-ghost and delete lifecycle transitions.
+UUID inputs, sessions, generated result codecs and replacement ingestion require
+36-character hyphenated hexadecimal strings, preserving case without imposing a
+UUID version. Symbolic IDs previously accepted by server string codecs are now
+rejected. Noncanonical stored values require correction before rollout; validators
+do not coerce or rewrite existing identities.
 
 ## Boundary
 
@@ -55,8 +63,9 @@ setters. Handwritten commands can change a primary key under existing rules.
 
 Elm duplicate setters resolve left to right, last setter wins (also for null). Omission
 means unchanged on update, default/nullable omission on create. Empty updates reject
-as `InvalidEdit`; they do not become reads. Empty batches confirm with `[]`, no
-transport, revision, or state publication. Invalid members reject the entire batch.
+as `InvalidEdit`; they do not become reads. Empty batches confirm with `[]` in
+TypeScript or the applicative `Batch.succeed` value in Elm, with no transport,
+revision, or row-state publication. Invalid members reject the entire batch.
 TypeScript edit and batch builders are pure and capture inputs (including nested
 JSON and the operation array) by value, not by reference; submission also
 validates and takes an immutable transport snapshot. Mutation of an input after a
@@ -64,33 +73,34 @@ builder or submission must not alter its intent. Elm values are already immutabl
 
 ## Public Surface
 
-These are normative target signatures/examples, not imports available today.
-`Main` is a generated namespace; `IssueId` below is a client UUID and `AuditId` a
-server integer. Generated `Edit<N, R>`/Elm `Edit namespace result` constructors
-are private. Elm patch constructors likewise remain private.
+These signatures reflect the implemented generated surface. The TypeScript example
+uses the User/Audit schema in `src/generate/typescript/local_edits.rs`; `UserId` is
+a client UUID and `AuditId` a server integer. Generated edits/batches are opaque
+and namespace-scoped; application code does not construct their internals.
 
 ```ts
-import { Issue, Audit, Commands, batch } from "./generated/edits";
+import { Main, User, Audit, Commands, batch, type UserId, type AuditId }
+  from "./generated/typescript/edits/Main";
 
-const rename = Issue.update(issueId, { title: "final", assigneeId: null });
-const unlink = Issue.update(issueId, { assigneeId: null });
-const create = Issue.create({ id: crypto.randomUUID(), title: "New", assigneeId: null });
-const remove = Issue.delete(issueId);
-// db: Database<Main>; selecting a different instance is explicit.
+declare const userId: UserId;
+const rename = User.update(userId, { name: "final", note: null });
+const create = User.create({ key: crypto.randomUUID(), name: "New", fixed: "x" });
+const remove = User.delete(userId);
+const db = await client.localEdits("main", Main); // Database<Main>
 db.onEditFailure(event => showWriteError(event)); // install once, independent of receipts
-const receipt = db.submit(rename); // Receipt<Updated<IssueId>>; no await needed
+const receipt = db.submit(rename); // EditReceipt<Updated<UserId>>; no await needed
 const plan = batch([create, Audit.create({ message: "created" }),
-  Commands.closeSprint({ sprintId })] as const);
+  Commands.rename({ key: userId, name: "final" })] as const);
 const batchReceipt = db.submit(plan); // construction alone does not submit
 const outcome = await batchReceipt.confirmed; // resolves, never an unhandled rejection
 if (outcome.kind === "confirmed") {
-  const issueId: IssueId = outcome.result[0].id;
+  const createdId: UserId = outcome.result[0].id;
   const auditId: AuditId = outcome.result[1].id;
-  const closed = outcome.result[2]; // declared closeSprint result
+  const renamed = outcome.result[2]; // declared Rename result
 }
 ```
 
-`submit<R>(Edit<N,R> | Batch<N,R>): Receipt<R>` is the explicit database execution
+`submit<R>(Edit<N,R> | Batch<N,R>): EditReceipt<R>` is the explicit database execution
 boundary for both single edits and batch plans. The generated namespace-scoped
 `batch` helper preserves the readonly input tuple's operation order and result
 types, not a union array:
@@ -105,9 +115,9 @@ declare function batch<const E extends readonly Edit<Main, unknown>[]>(
 `batch([])` builds an empty plan; only `db.submit(plan)` creates its confirmed
 receipt. Neither edit nor batch construction selects a database, reserves order,
 publishes state, or starts I/O. TypeScript object updates have one captured value
-per property, not an API of ordered setters. `Receipt.confirmed` resolves once to
-`Confirmed<R> | Rejected | OutcomeUnknown | AcceptedUnreconciled`
-(the last case terminates an accepted receipt on disposal).
+per property, not an API of ordered setters. `EditReceipt<R>.confirmed` resolves
+once to `EditOutcome<R>`: `confirmed`, `rejected`, `outcomeUnknown`, or
+`acceptedUnreconciled` (the last case terminates an accepted receipt on disposal).
 `Created<Id>`, `Updated<Id>`, `Deleted<Id>` contain `id`, not a mandatory readable
 row. The generated successful-write result contract authorizes returning the
 affected identity, including server integers, independently of read visibility.
@@ -120,25 +130,35 @@ declared codecs. Wire results are `{index, operation, value}` in input order and
 must match the submitted manifest IDs, count, and codecs before typed access.
 
 ```elm
--- Edit.Issue.update : IssueId -> List Issue.Patch -> Edit Main (Updated IssueId)
-rename = Issue.update issueId [ Issue.title "final", Issue.assigneeId Nothing ]
--- Omit assigneeId: unchanged; Nothing: SQL null; Just id: set. No clear builder.
+import Db.Database as Database
+import Db.Default.Edit.Issue as Issue
+import Db.Default.Edit.Audit as Audit
+import Pyre
+import Pyre.Batch as Batch
+
+-- Fixture: tests/fixtures/elm-local-edits/Test.elm
+-- Issue.update : Db.EditIds.DefaultIssue -> List Issue.Patch
+--     -> Edit Database.Default (Updated Db.EditIds.DefaultIssue)
+rename issueId =
+    Issue.update issueId [ Issue.title "final", Issue.assignee Nothing ]
+-- Omit assignee: unchanged; Nothing: SQL null; Just id: set. No clear builder.
 -- Non-nullable setters accept plain values, never Maybe.
 
 -- Pyre.submit : DatabaseId n -> Edit n a -> Pyre.Model
 --     -> ( Pyre.Model, Pyre.Effect, Receipt a )
-( nextPyre, effect, receipt ) = Pyre.submit App.Database.main rename model.pyre
+submitRename issueId pyreModel =
+    Pyre.submit (Database.fromString "main") (rename issueId) pyreModel
 
 -- Typed applicative batch, internally one ordered heterogeneous operation list:
 -- Batch.succeed : a -> Batch n a
 -- Batch.and : Edit n a -> Batch n (a -> b) -> Batch n b
-plan =
+plan newUuid =
     Batch.succeed (\issue audit -> { issue = issue, audit = audit })
-        |> Batch.and (Issue.create { id = newUuid, title = "New", assigneeId = Nothing })
+        |> Batch.and (Issue.createWith { id = newUuid, title = "New", owner = "me" } [ Issue.withAssignee Nothing ])
         |> Batch.and (Audit.create { message = "created" })
-( batchPyre, batchEffect, batchReceipt ) =
-    Pyre.batch App.Database.main plan model.pyre
--- Pyre.outcome batchReceipt batchPyre : Maybe (Outcome { issue : Created IssueId, audit : Created AuditId })
+submitBatch newUuid pyreModel =
+    Pyre.batch (Database.fromString "main") (plan newUuid) pyreModel
+-- Pyre.outcome batchReceipt batchPyre decodes the typed record result.
 -- Pyre.failures : Pyre.Model -> List EditFailure (delivered with incoming updates)
 ```
 
@@ -153,15 +173,24 @@ The bridge forwards effects in production order; do not use unordered independen
 submission; request IDs prevent duplicate local enqueue, not server idempotency.
 Callbacks/outcome messages arrive through the existing model/effect bridge.
 
+Elm `create` accepts a required-field record; `createWith` adds opaque optional
+`with<Field>` setters. `Batch.succeed value` with no edits confirms `value` without
+an effect (TypeScript's empty tuple result is not an Elm restriction). The compiler's
+`_default` namespace maps to Elm `Database.Default` and TypeScript `Main`; neither
+brand grants database authorization. `DatabaseId namespace` selects an explicit
+instance. Consume `Pyre.failures` after each update; it is not a retained error log.
+
 ```ts
 // Server seeds use the same compiled executor, no cache, worker, or SSE required.
+import { localEdits } from "@pyre/server/local-edits";
+// Main/User/Audit/batch as above; manifest from generated/typescript/server.
 const seeds = localEdits.bind({ database: mainConnection, databaseId: "main",
-  namespace: Main, manifest, session: { userId: seedUserId } });
+  namespace: Main, manifest, session: {} }); // explicit sessionless fixture
 const result = await seeds.submit(batch([
-  Issue.create({ id: knownUuid, title: "Seed", assigneeId: null }),
-  Issue.update(knownUuid, { title: "Ready" }),
+  User.create({ key: crypto.randomUUID(), name: "Seed", fixed: "x" }),
+  Audit.create({ message: "created" }),
 ] as const));
-// Result uses the same typed Outcome tuple; confirmed means committed plus
+// Confirmed carries the typed tuple; confirmed means committed plus
 // authoritative result materialized in this execution (no browser cache to catch up).
 ```
 
@@ -171,6 +200,12 @@ explicit validated effective session; no implicit admin
 or legacy permission-bypassing seed helper. These are inserts, not rerunnable
 upserts. Integer creates have no temporary IDs, result binding, or references to
 earlier operation results. A later submit after confirmation may use the real ID.
+
+Server outcomes are `confirmed`, `rejected`, `outcomeUnknown`, or
+`acceptedUnreconciled`. A committed result-codec failure returns the last with
+`code: "InvalidResult"`, `commitRevision` and optional `index`, but no `result`.
+It must not masquerade as noncommit or invite replay. Invalid bind/session options
+throw synchronously. See the [runnable explicit-session seed](../../packages/server/fixtures/local-edits/seed.ts).
 
 ## Execution And Identity
 
@@ -202,6 +237,11 @@ unsent work as rejected and dispatched unresolved work as unknown, then establis
 new epoch via authenticated replacement, never by silently adopting a response.
 
 ## Optimism
+
+Generated CRUD enforces schema permissions, not checks or side effects implemented
+only by named commands. Choosing CRUD can bypass those domain invariants; keep
+such writes on their named command. MEC-117 tracks the enforcement/discoverability
+follow-up; this API must not imply it is already solved.
 
 | Operation | Capability and fallback |
 | --- | --- |

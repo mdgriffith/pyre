@@ -243,7 +243,7 @@ query GetGameWorld($slug: String) {
     let content = &generated.contents;
 
     assert!(
-        content.contains("module Pyre exposing (DatabaseId, Default, QueryId, Model, QueryModel, Query(..), Msg(..), Effect(..), init, update, decodeIncomingDelta, getResult)"),
+        content.contains("module Pyre exposing (DatabaseId, Default, QueryId, Model, QueryModel, Query(..), Msg(..), Effect(..), init, update, decodeIncomingDelta, getResult,"),
         "Pyre.elm should expose QueryModel and Query constructors. Generated:\n{}",
         content
     );
@@ -274,14 +274,14 @@ query GetGameWorld($slug: String) {
         content
     );
     assert!(
-        content.contains("update msg model =\n    case msg of\n        QueryUpdate query ->\n            updateQuery query model")
+        content.contains("updateHelp msg model =\n    case msg of\n        QueryUpdate query ->\n            updateQuery query model")
             && content.contains("updateQuery : Query -> Model -> ( Model, Effect )\nupdateQuery query model =\n    case query of\n        GetRulebookByName databaseId queryId input ->")
             && content.contains("        GetGameWorld databaseId queryId input ->"),
         "Pyre.elm should delegate QueryUpdate handling to updateQuery. Generated:\n{}",
         content
     );
     assert!(
-        content.contains("incomingDeltaDecoder =\n    Decode.map2 Tuple.pair\n        (Decode.field \"queryName\" Decode.string)\n        (Decode.field \"queryId\" Decode.string)")
+        content.contains("queryDeltaDecoder =\n    Decode.map2 Tuple.pair\n        (Decode.field \"queryName\" Decode.string)\n        (Decode.field \"queryId\" Decode.string)")
             && !content.contains("Decode.field \"querySource\" Decode.string"),
         "Pyre.elm should decode queryName, not querySource, for inbound result routing. Generated:\n{}",
         content
@@ -344,7 +344,7 @@ insert CreatePost($title: String) {
     let content = &generated.contents;
 
     assert!(
-        content.contains("module Query.CreatePost exposing (encode, DatabaseId, Default, RequestId, id, name, mutationRequest, decodeMutationResult, MutationResult, Input, Post, ReturnData)"),
+        content.contains("module Query.CreatePost exposing (encode, DatabaseId, Default, RequestId, id, name, mutationRequest, decodeMutationResult, decodeReturnData, MutationResult, Input, Post, ReturnData)"),
         "Mutation modules should expose bridge metadata helpers. Generated:\n{}",
         content
     );

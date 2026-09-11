@@ -67,6 +67,8 @@ impl Manifest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Manifest {
+    #[serde(default, rename = "replacementContracts")]
+    pub replacement_contracts: HashMap<String, String>,
     /// Compiler-owned schema/session contract, including permissions outside the query projections.
     #[serde(default, rename = "compiledContract")]
     pub compiled_contract: String,
@@ -268,7 +270,8 @@ fn validate_field_mode(
                     .values()
                     .all(|v| check(v, inner, definitions, depth + 1, session, storage))
             }),
-            T::String | T::IdUuid { .. } => value.is_string(),
+            T::String => value.is_string(),
+            T::IdUuid { .. } => value.as_str().is_some_and(is_uuid),
             T::Int | T::IdInt { .. } => integer_value(value).is_some(),
             T::Float => value.is_number(),
             T::Bool => {
@@ -539,6 +542,19 @@ fn fill_tagged_union_descendants_with_null_inner(
     }
 }
 
+// Match client identity ingestion without rewriting case, imposing a UUID
+// version, or coercing legacy stored keys.
+pub(crate) fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result<(), Error> {
     let valid = if schema.is_enum {
         let tag = match value {
@@ -555,7 +571,7 @@ fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result
             "Float" => value.is_number(),
             "Bool" => value.is_boolean() || matches!(integer_value(value), Some(0 | 1)),
             type_ if type_.starts_with("Id.Int") => integer_value(value).is_some(),
-            type_ if type_.starts_with("Id.Uuid") => value.is_string(),
+            type_ if type_.starts_with("Id.Uuid") => value.as_str().is_some_and(is_uuid),
             type_ if type_.starts_with("Json") => true,
             _ => true,
         }

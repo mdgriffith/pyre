@@ -884,6 +884,7 @@ fn dynamic_manifest(
     }
 
     Ok(Manifest {
+        replacement_contracts: Default::default(),
         compiled_contract: String::new(),
         version: 1,
         session_schema: serde_json::from_value(json!(generate::manifest::session_schema(context)))

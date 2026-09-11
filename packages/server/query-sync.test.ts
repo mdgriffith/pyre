@@ -157,7 +157,7 @@ async function replacementDatabase(run: (fixture: any) => Promise<void>) {
     revoke: [z.object({}), "delete from memberships where userId = $session_userId"],
     noop: [z.object({}), "delete from notes where id = 9999"],
   };
-  const manifest = { version: 1, manifestVersion: "m1", compiledContract: "contract-1", SessionValidator: z.object({ userId: z.number().int() }), queries:
+  const manifest = { version: 1, manifestVersion: "m1", compiledContract: "contract-1", replacementContracts: { Main: "contract-1" }, SessionValidator: z.object({ userId: z.number().int() }), queries:
     Object.fromEntries(Object.entries(commands).map(([id, [InputValidator, sql]]) => [id, {
       id, operation: "transaction", primary_db: "Main", InputValidator, session_args: ["userId"],
       SessionValidator: z.object({ userId: z.number().int() }),
@@ -345,8 +345,8 @@ test("replacement requires the manifest contract and restores its captured schem
   await replacementDatabase(async ({ db, manifest, authority, request, replace }) => {
     const transaction = db.transaction.bind(db);
     db.transaction = mock(transaction);
-    for (const compiledContract of [undefined, "", "different-contract"]) {
-      expect(await catchupReplacement(db, { ...manifest, compiledContract }, authority, request, { userId: 7 }))
+    for (const replacementContracts of [undefined, {}, { Main: "" }, { Main: "different-contract" }, { Other: "contract-1" }]) {
+      expect(await catchupReplacement(db, { ...manifest, replacementContracts }, authority, request, { userId: 7 }))
         .toMatchObject({ kind: "error", error: { errorType: "InvalidRequest" } });
     }
     expect(db.transaction).not.toHaveBeenCalled();

@@ -958,7 +958,7 @@ mod tests {
         let loaded_schema = load_schema_from_database(&conn).await.unwrap();
         let namespace = loaded_schema.schema().unwrap().namespace.clone();
         let manifest = serde_json::from_value(json!({
-            "version": 1, "compiledContract": pyre::generate::manifest::compiled_schema_contract(loaded_schema.context().unwrap()), "session_schema": {}, "queries": {
+            "version": 1, "compiledContract": pyre::generate::manifest::compiled_schema_contract(loaded_schema.context().unwrap()), "replacementContracts": pyre::generate::manifest::replacement_contracts(loaded_schema.context().unwrap()), "session_schema": {}, "queries": {
                 "create": {
                     "id": "create", "operation": "insert", "primary_db": namespace,
                     "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
@@ -1107,6 +1107,7 @@ mod tests {
             mutable.manifest.compiled_contract = pyre::generate::manifest::compiled_schema_contract(
                 mutable.loaded_schema.context().unwrap(),
             );
+            mutable.manifest.replacement_contracts = pyre::generate::manifest::replacement_contracts(mutable.loaded_schema.context().unwrap()).into_iter().collect();
             let namespace = mutable.loaded_schema.schema().unwrap().namespace.clone();
             for (id, operation, sql, affected) in [
                 (
@@ -1660,6 +1661,7 @@ mod tests {
 
     fn manifest_with_session() -> Manifest {
         Manifest {
+            replacement_contracts: Default::default(),
             compiled_contract: String::new(),
             version: 1,
             session_schema: HashMap::from([(

@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { afterAll, afterEach, expect, test } from 'bun:test';
+import { afterAll, afterEach, expect, test, spyOn } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import vm from 'node:vm';
@@ -9,6 +9,7 @@ import { QueryClientService } from './query-client';
 import { EntityStreamService } from './entity-stream';
 import { IndexedDBStorage } from './indexeddb';
 import { PyreClient } from '../index';
+import { elmLocalEdits } from './elm-local-edits';
 
 const root = new URL('../../../../', import.meta.url).pathname;
 const temp = mkdtempSync(`${root}target/ts-local-edits-`);
@@ -89,6 +90,134 @@ function harness(options = {}) {
   return h;
 }
 async function ready(options) { const h = harness(options); await until(() => h.reads.length === 1); await h.replace(); return h; }
+
+test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders execute through worker and services', async () => {
+  const { Main, User, Audit, Token, Commands, batch: generatedBatch, operations, manifestVersion } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { planKey } = await import('@pyre/core/local-edits');
+  const complete = Token.create({ key, text: 'known', updatedAt: 0 })[planKey].operations[0];
+  expect(complete.definition.predict(complete.input)).toMatchObject({ safe: true, kind: 'create', id: key });
+  const integer = Audit.create({ message: 'audit' })[planKey].operations[0];
+  expect(integer.definition.predict).toBeUndefined();
+  const serverOwned = User.create({ key, name: 'new', fixed: 'x' })[planKey].operations[0];
+  expect(serverOwned.definition.predict).toBeUndefined();
+  const generatedFence = { ...fence, namespace: Main.name, manifest: manifestVersion };
+  const h = await ready({ fence: generatedFence, operations });
+  const db = h.runtime.bind(Main);
+  const input = { key, name: 'created', fixed: 'x', note: null, status: { _type: 'Closed', reason: 'original' } };
+  const edits = [User.create(input), Audit.create({ message: 'audit' }), User.update(key, { note: null }), Commands.rename({ key, name: 'final' })];
+  const plan = generatedBatch(edits);
+  input.status.reason = 'mutated'; edits.length = 0;
+  const receipt = db.submit(plan);
+  await until(() => h.writes.length === 1);
+  const request = h.writes[0].request;
+  expect(request.operations).toHaveLength(4);
+  expect(request.operations[0].input.status.reason).toBe('original');
+  expect(h.ingress.find(m => m.type === 'submit').operations.every(op => !op.prediction)).toBe(true);
+  const values = [{ id: key }, { id: 7 }, { id: key }, { user: [{ name: 'final' }] }];
+  h.writes[0].resolve({ ...generatedFence, requestId: request.requestId, status: 'accepted', commitRevision: 1,
+    results: request.operations.map((op, index) => ({ index, operation: op.operation, value: values[index] })),
+    reconciliation: { kind: 'replaceRequired', atLeast: 1, invalidate: false } });
+  await until(() => h.reads.length === 2);
+  await h.replace([{ key, name: 'final', note: null }], 1);
+  expect((await receipt.confirmed).kind).toBe('confirmed');
+  expect((await receipt.confirmed).result[1]).toEqual({ id: 7 });
+  expect((await db.submit(User.update(key, {})).confirmed).kind).toBe('rejected');
+  expect((await db.submit(User.update(key, { fixed: 'forbidden' })).confirmed).kind).toBe('rejected');
+  expect(() => h.runtime.bind({ ...Main, name: 'Other' })).toThrow('Namespace mismatch');
+  expect(await db.submit(generatedBatch([])).confirmed).toMatchObject({ kind: 'confirmed', result: [] });
+});
+
+test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders use server manifest IDs and result codecs', async () => {
+  const { Main, User, Audit, Commands, batch: generatedBatch, operations, manifestVersion } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { manifest } = await import(process.env.PYRE_GENERATED_EDITS!.replace('edits.ts', 'manifest.ts'));
+  const { createClient } = await import('@libsql/client');
+  const serverModule = '../../../server/query';
+  const { runBatch } = await import(serverModule);
+  const sql = createClient({ url: `file:${temp}/generated.db` });
+  try {
+    await sql.executeMultiple(`create table users(key text primary key, name text, note text, reviewer text, status blob, fixed text, updatedAt integer);
+      create table audits(id integer primary key, message text, label text default 'audit', updatedAt integer);
+      create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer);
+      insert into _pyre_sync values(1,'e1',0);`);
+    const generatedFence = { ...fence, namespace: Main.name, manifest: manifestVersion };
+    const responses = [];
+    const h = await ready({ fence: generatedFence, operations, prepare: async request => ({ dispatch: async () => {
+      const result = await runBatch(sql, manifest, generatedFence, request, {});
+      responses.push(result);
+      if (result.kind !== 'success') throw new Error(JSON.stringify(result));
+      return result.response;
+    } }) });
+    const db = h.runtime.bind(Main);
+    const receipt = db.submit(generatedBatch([User.create({ key, name: 'new', fixed: 'x' }), Audit.create({ message: 'audit' }),
+      User.update(key, { note: null }), Commands.rename({ key, name: 'final' })]));
+    await until(() => responses.length === 1);
+    expect(responses[0].kind).toBe('success');
+    await until(() => h.reads.length === 2);
+    await h.replace([{ key, name: 'final', note: null }], 1);
+    const outcome = await receipt.confirmed;
+    expect(outcome.kind).toBe('confirmed');
+    expect(outcome.result[0]).toEqual({ id: key });
+    expect(outcome.result[1]).toEqual({ id: 1 });
+    expect(outcome.result[3]).toEqual({ user: [{ name: 'final' }] });
+    const removed = db.submit(User.delete(key));
+    await until(() => responses.length === 2);
+    await until(() => h.reads.length === 3);
+    await h.replace([], 2);
+    expect((await removed.confirmed).result).toEqual({ id: key });
+    expect((await sql.execute('select * from users')).rows).toEqual([]);
+  } finally { sql.close(); }
+});
+
+test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders prove prediction and validate server input codecs', async () => {
+  const { Main, Token, NullableToken, DefaultToken, PrivateToken, Clock, Marker, User, Audit, operations } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { planKey } = await import('@pyre/core/local-edits');
+  const descriptor = plan => plan[planKey].operations[0];
+  for (const plan of [PrivateToken.create({ key, text: 'visible', updatedAt: 0 }), PrivateToken.update(key, { text: 'hidden' }), PrivateToken.delete(key),
+    DefaultToken.create({ key, text: 'explicit', updatedAt: 0 }), Clock.create({ key, at: 1700000000 }), Marker.update(key, { text: 'next' })]) {
+    expect(descriptor(plan).definition.predict).toBeUndefined();
+  }
+  const omitted = descriptor(NullableToken.create({ key, updatedAt: 0 }));
+  expect(omitted.definition.predict(omitted.input)).toBeNull();
+  for (const text of [null, 'value']) {
+    const complete = descriptor(NullableToken.create({ key, text, updatedAt: 0 }));
+    expect(complete.definition.predict(complete.input)).toMatchObject({ safe: true, fields: { key, text, updatedAt: 0 } });
+  }
+  const updatePlan = descriptor(Token.update(key, { text: 'next' }));
+  expect(updatePlan.definition.predict(updatePlan.input)).toMatchObject({ kind: 'update', fields: { text: 'next' } });
+  const h = await ready({ fence: { ...fence, namespace: Main.name, manifest: Main.manifest }, operations });
+  const db = h.runtime.bind(Main);
+  for (const invalid of [Clock.create({ key, at: 'not-a-date' }), Clock.create({ key, at: 1.5 }), User.delete('bad-uuid'),
+    User.update(key, { name: null }), Audit.create({ message: 'x', label: null }), Audit.create({ id: 42, message: 'x' })]) {
+    expect((await db.submit(invalid).confirmed).kind).toBe('rejected');
+  }
+  expect(h.ingress.filter(message => message.type === 'submit')).toHaveLength(0);
+  expect(() => User.update(key, { key, name: 'no primary key setter' })).toThrow('InvalidEdit');
+  const { manifest } = await import(process.env.PYRE_GENERATED_EDITS!.replace('edits.ts', 'manifest.ts'));
+  const marker = descriptor(Marker.update(key, { text: 'next' }));
+  expect(manifest.queries[marker.definition.id].sql.some(statement => statement.sql.includes('updatedAt = unixepoch()'))).toBe(true);
+});
+
+test('scoped plans capture namespace values as well as nested operation inputs', async () => {
+  const { scopedEdit, scopedBatch, planKey } = await import('@pyre/core/local-edits');
+  const scope = { name: fence.namespace, manifest: fence.manifest };
+  const builder = scopedBatch(scope);
+  const plan = scopedEdit(scope, command, { nested: ['original'] });
+  scope.name = 'mutated'; scope.manifest = 'mutated';
+  const combined = builder([plan]);
+  expect(combined[planKey].namespace).toEqual({ name: fence.namespace, manifest: fence.manifest });
+  expect(plan[planKey].namespace).toEqual(combined[planKey].namespace);
+});
+
+test('named result codecs retain non-JSON decoded values', async () => {
+  const dated = { ...command, decodeResult: value => new Date(value) };
+  const h = await ready({ operations: [dated] });
+  const receipt = h.runtime.submit(edit(dated, {}));
+  await until(() => h.writes.length === 1);
+  h.accepted(0, 1, ['2026-01-01T00:00:00.000Z']);
+  await until(() => h.reads.length === 2);
+  await h.replace([row], 1);
+  expect((await receipt.confirmed).result).toEqual(new Date('2026-01-01T00:00:00.000Z'));
+});
 
 test('production prepare handshake captures nested inputs and batches before async credentials, preserving order', async () => {
   const preparation = deferred();
@@ -563,4 +692,175 @@ test.each(['bound', 'lazy'])('public %s named calls report capture failures and 
     expect(h.preparations).toHaveLength(1);
     h.rejected(); await until(() => outcomes.length === 2);
   } finally { client.disconnect(); }
+});
+
+function elmEffect(requestId, order = 1, databaseId = 'main') {
+  return { type: 'elm-local-edits', databaseId, requestId,
+    operations: [{ namespace: 'Main', manifest: 'm1', operation: update.id, input: { key, name: String(order) } }] };
+}
+function bridgePorts(throws = false, resultName = 'pyre_receiveQueryDelta') {
+  let receive;
+  const events = [], errors = [];
+  return { events, errors, emit: message => receive?.(message), config: {
+    app: { ports: {
+      pyreStoreOut: { subscribe: cb => { receive = cb; }, unsubscribe: cb => { if (receive === cb) receive = undefined; } },
+      [resultName]: { send: event => { events.push(event); if (throws) throw Error('observer'); } },
+    } }, onError: error => errors.push(error),
+  } };
+}
+function bridgeInternal(h) {
+  return { getLocalEdits: () => h.runtime, disconnect: () => h.runtime.dispose(),
+    onDevtoolsEvent: () => () => {}, onSyncState: cb => { cb({ status: 'not_started', tables: {} }); return () => {}; } };
+}
+
+test.skipIf(!process.env.PYRE_GENERATED_EDITS)('production Elm bridge shares generated descriptors with the typed namespace handle', async () => {
+  const { Main, Audit, Commands, operations } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { planKey } = await import('@pyre/core/local-edits');
+  const generatedFence = { ...fence, namespace: Main.name, manifest: Main.manifest };
+  const h = await ready({ fence: generatedFence, operations }), ports = bridgePorts();
+  const client = await PyreClient.create({ schema, cacheNamespace: 'test', server: { baseUrl: 'https://unused.invalid', localEdits: () => { throw Error('no second config'); } },
+    createInternalClient: async () => bridgeInternal(h) });
+  try {
+    client.attachElmBridge(ports.config);
+    const db = await client.localEdits('main', Main);
+    const plans = [Audit.create({ message: 'audit' }), Commands.rename({ key, name: 'renamed' })];
+    const ops = plans.flatMap(plan => plan[planKey].operations.map(op => ({
+      namespace: Main.name, manifest: Main.manifest, operation: op.definition.id, input: op.input,
+    })));
+    ports.emit({ type: 'elm-local-edits', databaseId: 'main', requestId: 'generated', operations: ops });
+    const typed = db.submit(Commands.rename({ key, name: 'typed' }));
+    await until(() => h.writes.length === 1);
+    h.writes[0].resolve({ ...generatedFence, requestId: h.writes[0].request.requestId, status: 'accepted', commitRevision: 1,
+      results: ops.map((op, index) => ({ index, operation: op.operation, value: index === 0 ? { id: 7 } : { user: [{ name: 'renamed' }] } })),
+      reconciliation: { kind: 'replaceRequired', atLeast: 1, invalidate: false } });
+    await until(() => h.reads.length === 2); await h.replace([row], 1);
+    expect(ports.events.find(e => e.state === 'confirmed')).toMatchObject({ requestId: 'generated', results: [
+      { index: 0, operation: ops[0].operation, value: { id: 7 } },
+      { index: 1, operation: ops[1].operation, value: { user: [{ name: 'renamed' }] } },
+    ] });
+    expect(h.ingress.filter(m => m.type === 'submit').map(m => m.operations.length)).toEqual([2, 1]);
+    client.disconnect(); await typed.confirmed;
+  } finally { client.disconnect(); }
+});
+
+test.each(['bound', 'lazy'])('production Elm bridge preserves mixed %s FIFO, snapshots and effect deduplication', async mode => {
+  const h = await ready(), initialized = deferred(), ports = bridgePorts();
+  const client = await PyreClient.create({ schema, cacheNamespace: 'test',
+    server: { baseUrl: 'https://unused.invalid', localEdits: () => { throw Error('must use runtime descriptors'); } },
+    createInternalClient: () => initialized.promise });
+  client.attachElmBridge(ports.config);
+  if (mode === 'bound') { initialized.resolve(bridgeInternal(h)); await client.localEdits('main'); }
+  const first = elmEffect('elm-1');
+  ports.emit(first); ports.emit(first);
+  ports.emit({ type: 'mutate', databaseId: 'main', requestId: 'named', mutationId: command.id, mutationInput: { order: 2 } });
+  const third = client.run('main', { operation: 'mutation', id: command.id }, { order: 3 }, () => {});
+  ports.emit(elmEffect('elm-4', 4));
+  first.operations[0].input.name = '99';
+  initialized.resolve(bridgeInternal(h)); await third;
+  const submissions = h.ingress.filter(m => m.type === 'submit');
+  expect(submissions.map(m => m.operations[0].input.order ?? Number(m.operations[0].input.name))).toEqual([1, 2, 3, 4]);
+  expect(submissions[0].operations[0].prediction.safe).toBe(true);
+  expect(submissions[1].operations[0]).not.toHaveProperty('prediction');
+  await until(() => ports.events.some(e => e.requestId === 'elm-4' && e.state === 'locallyApplied'));
+  expect(ports.errors).toEqual([]);
+  client.disconnect(); await h.runtime.ended; await tick();
+  expect(ports.events.some(e => e.requestId === 'elm-4' && e.state === 'rejected')).toBe(true);
+  expect(ports.events.some(e => e.requestId === 'elm-4' && e.type === 'failure')).toBe(true);
+});
+
+test('production Elm bridge isolates databases, result-port observers and validation failures', async () => {
+  const a = await ready(), b = await ready({ fence: { ...fence, databaseId: 'other', instance: 'other' } });
+  const ports = bridgePorts(true, 'customResults');
+  const client = await PyreClient.create({ schema, cacheNamespace: 'test', server: { baseUrl: 'https://unused.invalid', localEdits: () => ({}) },
+    createInternalClient: async config => bridgeInternal(config.databaseId === 'main' ? a : b) });
+  client.attachElmBridge({ ...ports.config, queryResultPort: 'customResults' });
+  await client.localEdits('main'); await client.localEdits('other');
+  const invalid = elmEffect('bad'); invalid.operations[0].manifest = 'stale';
+  expect(() => ports.emit(invalid)).not.toThrow();
+  expect(ports.events.filter(e => e.requestId === 'bad').map(e => e.type)).toEqual(['lifecycle', 'failure']);
+  expect(a.failures).toMatchObject([{ phase: 'validation', certainty: 'rejected', code: 'InvalidEdit' }]);
+  ports.emit(elmEffect('same')); ports.emit(elmEffect('same', 2, 'other')); ports.emit(elmEffect('same'));
+  expect(a.ingress.filter(m => m.type === 'submit')).toHaveLength(1);
+  expect(b.ingress.filter(m => m.type === 'submit')).toHaveLength(1);
+  await until(() => a.writes.length === 1);
+  a.accepted(); await until(() => a.reads.length === 2); await a.replace([row], 1);
+  const confirmed = ports.events.find(e => e.databaseId === 'main' && e.state === 'confirmed');
+  expect(confirmed).toMatchObject({ requestId: 'same', results: [{ index: 0, operation: update.id, value: { id: key } }] });
+  expect(ports.events.filter(e => e.databaseId === 'main' && e.requestId === 'same' && e.type === 'lifecycle').map(e => e.state))
+    .toEqual(['locallyApplied', 'sent', 'accepted', 'confirmed']);
+  client.disconnect(); await Promise.all([a.runtime.ended, b.runtime.ended]); await tick();
+  expect(ports.errors).toEqual([]);
+});
+
+test('production Elm bridge handles absent ports and failed lazy initialization without parser errors', async () => {
+  const ports = bridgePorts();
+  const client = await PyreClient.create({ schema, cacheNamespace: 'test', server: { baseUrl: 'https://unused.invalid', localEdits: () => ({}) },
+    createInternalClient: async () => { throw Error('initialization failed'); } });
+  expect(() => client.attachElmBridge({ app: {} })()).not.toThrow();
+  client.attachElmBridge(ports.config); ports.emit(elmEffect('failed')); ports.emit(elmEffect('failed'));
+  await until(() => ports.events.length === 2);
+  expect(ports.events.map(e => e.type)).toEqual(['lifecycle', 'failure']);
+  expect(ports.errors).toEqual([]);
+  delete ports.config.app.ports.pyre_receiveQueryDelta;
+  client.attachElmBridge(ports.config); ports.emit(elmEffect('missing-result'));
+  await tick(); client.disconnect();
+});
+
+test('production Elm bridge fences lazy effects on disconnect and does not submit them to a reopened database', async () => {
+  const old = await ready(), current = await ready({ fence: { ...fence, instance: 'new' } });
+  const initialized = deferred(), ports = bridgePorts(); let creations = 0;
+  const client = await PyreClient.create({ schema, cacheNamespace: 'test', server: { baseUrl: 'https://unused.invalid', localEdits: () => ({}) },
+    createInternalClient: () => ++creations === 1 ? initialized.promise : Promise.resolve(bridgeInternal(current)) });
+  client.attachElmBridge(ports.config); ports.emit(elmEffect('old'));
+  client.disconnect(); ports.emit(elmEffect('after-disconnect'));
+  expect(ports.events.map(event => [event.type, event.code])).toEqual([['lifecycle', 'Disposed'], ['failure', 'Disposed']]);
+  await client.localEdits('main'); initialized.resolve(bridgeInternal(old));
+  await until(() => ports.events.some(e => e.type === 'failure'));
+  expect(ports.events.every(e => e.requestId === 'old')).toBe(true);
+  expect(old.ingress.filter(m => m.type === 'submit')).toEqual([]);
+  expect(current.ingress.filter(m => m.type === 'submit')).toEqual([]);
+  expect(ports.events).toHaveLength(2);
+  client.disconnect();
+});
+
+test('Elm bridge consumes scheduled effects only once and disposal rejects unscheduled work', async () => {
+  const h = await ready(), events = [], delayed = [];
+  const binding = { runtime: h.runtime, operations: all };
+  const bridge = elmLocalEdits(() => binding, event => events.push(event), (_database, submit) => {
+    delayed.push(submit);
+    if (delayed.length === 1) { submit(binding); throw Error('scheduler threw after submitting'); }
+  });
+  bridge.forward(elmEffect('once'));
+  await until(() => events.some(event => event.requestId === 'once'));
+  expect(events.some(event => event.state === 'rejected')).toBe(false);
+  delayed[0](binding);
+  expect(h.ingress.filter(message => message.type === 'submit')).toHaveLength(1);
+  bridge.forward(elmEffect('delayed'));
+  bridge.stop();
+  expect(events.filter(event => event.requestId === 'delayed').map(event => event.type)).toEqual(['lifecycle', 'failure']);
+  delayed[1](binding);
+  await h.runtime.dispose();
+  bridge.dispose();
+  expect(events.filter(event => event.requestId === 'delayed')).toHaveLength(2);
+  expect(h.ingress.filter(message => message.type === 'submit')).toHaveLength(1);
+});
+
+test('single-database production bridge uses its configured descriptors and delivers final disposal events', async () => {
+  const mocks = ['init', 'beginLocalEdits', 'replaceAuthoritative'].map(method => spyOn(IndexedDBStorage.prototype, method).mockResolvedValue(undefined));
+  const ports = bridgePorts(true), preparations = [];
+  const client = await PyreClient.create({ schema, cacheNamespace: 'test', server: { baseUrl: 'https://unused.invalid', localEdits: databaseId => ({
+    fence: { ...fence, databaseId }, minimumSafeRevision: 0, operations: all,
+    replacement: async request => ({ ...request, type: 'replacement', scope: 'database', complete: true, serverRevision: 0, tables: { users: { rows: [row] } } }),
+    prepare: request => { preparations.push(request); return new Promise(() => {}); },
+  }) } });
+  try {
+    const internal = await client.getOrCreateClient('main');
+    internal.attachElmBridge(ports.config);
+    ports.emit(elmEffect('single')); ports.emit(elmEffect('single'));
+    await until(() => preparations.length === 1);
+    internal.disconnect(); await internal.getLocalEdits().ended;
+    expect(ports.events.some(e => e.requestId === 'single' && e.state === 'rejected')).toBe(true);
+    expect(ports.events.some(e => e.requestId === 'single' && e.type === 'failure')).toBe(true);
+    expect(ports.errors).toEqual([]);
+  } finally { client.disconnect(); await tick(); mocks.forEach(mock => mock.mockRestore()); }
 });

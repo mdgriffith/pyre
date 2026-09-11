@@ -21,6 +21,99 @@ fn manifest(context: &typecheck::Context) -> Manifest {
     serde_json::from_str(&files[0].contents).unwrap()
 }
 
+#[test]
+fn namespace_contracts_are_isolated_but_share_the_allowlist_fingerprint() {
+    let compile = |permission: &str, extra_session: &str| {
+        let mut main = ast::Schema {
+            namespace: "Main".into(),
+            ..Default::default()
+        };
+        parser::run("main.pyre", &format!("session {{\n userId Int\n{extra_session}\n}}\ntype Choice\n = Open\n | Closed\nrecord Entry {{\n @public\n id Id.Int @id\n choice Choice\n}}\n"), &mut main).unwrap();
+        let mut archive = ast::Schema {
+            namespace: "Archive".into(),
+            ..Default::default()
+        };
+        parser::run("archive.pyre", &format!("type ArchiveOnly\n = Stored\n | Retired\nrecord Saved {{\n @allow(*) {{ {permission} }}\n id Id.Int @id\n state ArchiveOnly\n}}\n"), &mut archive).unwrap();
+        typecheck::check_schema(&ast::Database {
+            schemas: vec![main, archive],
+        })
+        .unwrap()
+    };
+    let original = manifest(&compile("True", ""));
+    let changed_archive = manifest(&compile("False", ""));
+    assert_eq!(
+        original.replacement_contracts["Main"],
+        changed_archive.replacement_contracts["Main"]
+    );
+    assert_ne!(
+        original.replacement_contracts["Archive"],
+        changed_archive.replacement_contracts["Archive"]
+    );
+    assert_ne!(original.fingerprint(), changed_archive.fingerprint());
+    let changed_session = manifest(&compile("True", " extra String?"));
+    for namespace in ["Main", "Archive"] {
+        assert_ne!(
+            original.replacement_contracts[namespace],
+            changed_session.replacement_contracts[namespace]
+        );
+    }
+    assert!(generate::manifest::replacement_contract(&compile("True", ""), "Unknown").is_none());
+}
+
+#[test]
+fn namespace_contracts_survive_standalone_storage_and_dynamic_migration() {
+    let mut main = ast::Schema {
+        namespace: "Main".into(),
+        ..Default::default()
+    };
+    parser::run("main.pyre", "session {\n owner Main.Entry.id?\n claims Json<Claims>?\n}\ntype Claims\n = Member { owner Main.Entry.id }\ntype Choice\n = Open\n | Closed\nrecord Entry {\n @public\n id Id.Uuid @id\n}\n", &mut main).unwrap();
+    let mut archive = ast::Schema {
+        namespace: "Archive".into(),
+        ..Default::default()
+    };
+    parser::run(
+        "archive.pyre",
+        "record Saved {\n @public\n id Id.Int @id\n choice Choice\n}\n",
+        &mut archive,
+    )
+    .unwrap();
+    let mut database = ast::Database {
+        schemas: vec![main, archive],
+    };
+    ast::resolve_id_brands(&mut database);
+    let context = typecheck::check_schema(&database).unwrap();
+    for schema in &database.schemas {
+        let source = generate::to_string::standalone_schema_to_string(&context, schema);
+        let loaded = pyre::db::introspect::from_raw(pyre::db::introspect::IntrospectionRaw {
+            tables: vec![],
+            migration_state: pyre::db::introspect::MigrationState::NoMigrationTable,
+            schema_source: source.clone(),
+            links: vec![],
+        });
+        let pyre::db::introspect::SchemaResult::Success {
+            schema: restored,
+            context: restored_context,
+        } = &loaded.schema
+        else {
+            panic!(
+                "standalone {} failed: {source}\n{:?}",
+                schema.namespace, loaded.schema
+            );
+        };
+        assert_eq!(restored.namespace, schema.namespace);
+        assert_eq!(
+            generate::manifest::replacement_contract(&context, &schema.namespace),
+            generate::manifest::replacement_contract(restored_context, &schema.namespace),
+            "{}: {source}\noriginal session: {:?}\nrestored session: {:?}",
+            schema.namespace,
+            context.session,
+            restored_context.session
+        );
+        pyre::db::migrate::migrate_dynamic("roundtrip".into(), &loaded, &source, "schema.pyre")
+            .unwrap();
+    }
+}
+
 async fn replacement(
     conn: &libsql::Connection,
     context: &typecheck::Context,
@@ -380,4 +473,48 @@ record Item {
     missing.rows[0].pop();
     assert!(sync::reshape_replacement_table(&context, namespace, &missing).is_err());
     assert!(sync::reshape_replacement_table(&context, "wrong", &group).is_err());
+}
+
+#[test]
+fn replacement_rejects_legacy_uuid_strings_without_coercing_case_or_identity() {
+    let context = context("record Item {\n @public\n key Id.Uuid @id\n parent Item.key?\n references Json<List<Id.Uuid>>\n}\n");
+    let plan =
+        sync::get_replacement_sql(&context, &HashMap::new(), ast::DEFAULT_SCHEMANAME).unwrap();
+    let table = &plan.tables[0];
+    let uuid = "ABCDEFAB-CDEF-0123-4567-ABCDEFABCDEF";
+    let object = json!({"key":uuid,"parent":uuid,"references":[uuid],"updatedAt":0});
+    let group = AffectedRowTableGroup {
+        table_name: table.table_name.clone(),
+        headers: table.headers.clone(),
+        rows: vec![table
+            .headers
+            .iter()
+            .map(|name| object[name].clone())
+            .collect()],
+    };
+    let rows = sync::reshape_replacement_table(&context, ast::DEFAULT_SCHEMANAME, &group).unwrap();
+    assert_eq!(
+        rows.rows[0][rows.headers.iter().position(|name| name == "key").unwrap()],
+        uuid
+    );
+    for invalid in [
+        "symbolic",
+        "abcdefabcdef01234567abcdefabcdef",
+        "ABCDEFAB-CDEF-0123-4567-ABCDEFABCDEF\n",
+    ] {
+        for field in ["key", "parent", "references"] {
+            let mut malformed = group.clone();
+            let index = table.headers.iter().position(|name| name == field).unwrap();
+            malformed.rows[0][index] = if field == "references" {
+                json!([invalid])
+            } else {
+                json!(invalid)
+            };
+            assert!(
+                sync::reshape_replacement_table(&context, ast::DEFAULT_SCHEMANAME, &malformed)
+                    .is_err(),
+                "{field}: {invalid:?}"
+            );
+        }
+    }
 }

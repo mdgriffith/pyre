@@ -2,6 +2,8 @@ use crate::ast;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+pub const UUID_VALIDATOR: &str = "z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)";
+
 fn collect_tagged_types(
     database: &ast::Database,
 ) -> HashMap<String, (Vec<ast::Variant>, HashSet<String>)> {
@@ -216,14 +218,14 @@ pub fn column_type_to_zod_validator(type_: &ast::ColumnType) -> String {
             format!("{}.nullable()", column_type_to_zod_validator(inner))
         }
         ast::ColumnType::IdInt { .. } => "z.number().int()".to_string(),
-        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::IdUuid { .. } => UUID_VALIDATOR.to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+            ..
+        } => UUID_VALIDATOR.to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type:
-                Some(
-                    ast::ConcreteSerializationType::IdUuid
-                    | ast::ConcreteSerializationType::Text
-                    | ast::ConcreteSerializationType::Date,
-                ),
+                Some(ast::ConcreteSerializationType::Text | ast::ConcreteSerializationType::Date),
             ..
         } => "z.string()".to_string(),
         ast::ColumnType::ForeignKey {

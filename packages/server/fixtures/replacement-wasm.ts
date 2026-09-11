@@ -23,13 +23,13 @@ try {
   await ensureDatabase(db, "_default", databases._default.schemaSource);
   await loadSchemaFromDatabase("real", db);
   assert.equal(wasm.get_schema_compiled_contract(), compiledContract);
-  const manifest: BatchManifest = { version: 1, manifestVersion, compiledContract, SessionValidator,
+  const manifest: BatchManifest = { version: 1, manifestVersion, compiledContract, replacementContracts: { _default: compiledContract }, SessionValidator,
     queries: { [meta.id]: { ...meta, sql, syncSql } } };
   const authority = { databaseId: "real", namespace: "_default", manifest: manifestVersion, instance: "tab", authGeneration: 1 };
   const epoch = (await db.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch as string;
   const request = { version: 1 as const, ...authority, databaseEpoch: epoch, requestId: "read", target: 1 };
   const session = { userId: 7, role: { _type: "Member" }, unrelated: "required" };
-  const input = { id: "entry-1", release: "v1", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
+  const input = { id: "00000000-0000-4000-8000-000000000001", release: "00000000-0000-4000-8000-000000000002", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
   const accepted = await runBatch(db, manifest, authority, { version: 1, ...authority, databaseEpoch: epoch,
     requestId: "write", sequence: 1, operations: [{ operation: meta.id, input }] }, session);
   assert.equal(accepted.kind, "success");
@@ -50,7 +50,7 @@ try {
     await db.execute("update entries set role = 'Member', enabled = 1, details = jsonb('{\"_type\":\"Note\",\"count\":2,\"enabled\":false}')");
   }
   assert.equal((await replace()).kind, "success");
-  assert.equal((await catchupReplacement(db, { ...manifest, compiledContract: "wrong" }, authority, request, session)).kind, "error");
+  assert.equal((await catchupReplacement(db, { ...manifest, replacementContracts: { _default: "wrong" } }, authority, request, session)).kind, "error");
 
   const linked = createClient({ url: `file:${join(directory, "linked.db")}` });
   try {
@@ -72,7 +72,7 @@ record Workspace {
 }`;
     await ensureDatabase(linked, "_default", source);
     await loadSchemaFromDatabase("linked", linked);
-    const linkedManifest: BatchManifest = { version: 1, manifestVersion: "linked-manifest", compiledContract: wasm.get_schema_compiled_contract(),
+    const linkedManifest: BatchManifest = { version: 1, manifestVersion: "linked-manifest", replacementContracts: { _default: wasm.get_schema_compiled_contract() },
       SessionValidator: z.object({ userId: z.number().int() }), queries: {} };
     await linked.execute("insert into workspaces(id,updatedAt) values(1,0),(2,0)");
     await linked.execute("insert into memberships(id,workspaceId,userId,updatedAt) values(1,1,7,0),(2,2,8,0)");
@@ -142,7 +142,7 @@ record Workspace {
 }`;
           await ensureDatabase(permissions, "_default", source);
           await loadSchemaFromDatabase(id, permissions);
-          const manifest: BatchManifest = { version: 1, manifestVersion: id, compiledContract: wasm.get_schema_compiled_contract(),
+          const manifest: BatchManifest = { version: 1, manifestVersion: id, replacementContracts: { _default: wasm.get_schema_compiled_contract() },
             SessionValidator: z.object({ value: z.number().int().nullable() }), queries: {} };
           await permissions.execute("insert into workspaces(id) values(1),(2),(3)");
           await permissions.execute("insert into memberships(id,workspaceId,value) values(1,1,jsonb('7')),(2,2,jsonb('8')),(3,3,NULL)");
@@ -177,7 +177,7 @@ record Item {
     @public
 }`);
     await loadSchemaFromDatabase("strings", strings);
-    const manifest: BatchManifest = { version: 1, manifestVersion: "strings", compiledContract: wasm.get_schema_compiled_contract(),
+    const manifest: BatchManifest = { version: 1, manifestVersion: "strings", replacementContracts: { _default: wasm.get_schema_compiled_contract() },
       SessionValidator: z.object({}), queries: {} };
     const values = ["hello", "7", "null", "true", "[1]", '{"x":1}', '"quoted"', "{invalid"];
     for (const [id, value] of values.entries()) {

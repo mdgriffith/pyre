@@ -1,215 +1,97 @@
-# Generated CRUD Mutations Specification
+# Generated CRUD Mutations
 
-## Overview
+Pyre compiles schema-derived `{Table}Create`, `{Table}Update`, and `{Table}Delete`
+operations alongside handwritten mutations. They require no handwritten `.pyre`
+file and generate no read queries. The [local-edit contract](local-edits.md)
+defines batching, cardinality, identity results, prediction and reconciliation;
+the [usage guide](../usage/local-edits.md) shows current TS/Elm imports.
 
-Pyre can generate built-in CRUD mutations for writable tables so applications do not need to author low-value single-table mutation queries by hand.
+## Generation And Permissions
 
-These generated mutations are part of the compiled query surface even though they do not come from a user-authored `.pyre` file.
+The current compiler creates all three operation definitions for each table and
+reserves their names, including for denied operations. Availability of a builder
+is not permission to write. Compiled permission checks and the effective server
+session determine whether execution is allowed; generation does not filter out
+operations based on an individual session's permissions.
 
-The goal is to make the common write path default to schema-derived inputs while preserving handwritten mutation queries for non-default behavior such as nested inserts, derived values, or multi-step business logic.
+User-authored operations cannot override reserved CRUD names. Name collisions
+produce a compiler error identifying the table and operation. Generated operations
+carry compiler metadata; a handwritten command is never recognized as generated
+CRUD merely by its spelling.
 
-## Scope
+## Inputs
 
-This specification covers generated mutation operations only:
+The compiled operations use **flat arguments**, not a nested `$input` object.
+Create arguments are writable column names; update arguments are the actual
+primary-key name followed by optional writable columns; delete takes only that
+primary key. Primary keys need not be named `id`.
 
-- `{Table}Create`
-- `{Table}Update`
-- `{Table}Delete`
+The schema-derived `{Table}.CreateInput` and `{Table}.UpdateInput` concepts describe
+field semantics, not the current generated transport layout. For example, the
+User fixture's `User.update(userId, { note: null })` captures a flat operation
+input `{ key: userId, note: null }`.
 
-It does not define generated read queries.
+| Field rule | Create | Update |
+| --- | --- | --- |
+| Writable, non-nullable, no default | Required | Optional; omit to leave unchanged |
+| Nullable | May omit or explicitly set null | Omit to leave unchanged; null clears |
+| Non-nullable with default | May omit to use default; null is invalid | May omit; null is invalid |
+| Immutable and otherwise insertable | Included | Excluded |
+| Managed/server-owned | Excluded | Excluded |
+| Client UUID primary key | Supplied when required by schema | Target only, never a patch field |
+| Generated integer primary key | Excluded | Target only, never a patch field |
 
-## Generation Rules
+Unknown/protected fields are rejected, not silently ignored. An empty update is
+`InvalidEdit`, not a read or successful no-op. Setting a writable field to its
+existing value is a write targeting one row. JSON and tagged unions replace whole
+values, so concurrent changes to separate members can overwrite each other.
 
-For each table, Pyre evaluates `insert`, `update`, and `delete` independently.
+TypeScript uses partial patch objects. Elm uses opaque record-specific `Patch`
+setters; nullable setters take `Maybe`, while non-nullable setters take plain
+values. Duplicate Elm setters resolve left to right, last wins. Elm creates use a
+required record plus optional opaque `CreateOption` setters through `createWith`.
 
-Pyre generates a built-in mutation for an operation only when that operation is writable for the table under the schema's permission model.
+## Results And Execution
 
-This means:
+Generated CRUD returns `Created<Id>`, `Updated<Id>`, or `Deleted<Id>`, each containing
+`{ id }` with the affected identity, regardless of the schema's primary-key name.
+It does not promise a readable row. Server-generated integer IDs come only from
+authoritative execution, not temporary client IDs.
 
-- generate `{Table}Create` only if the table supports `insert`
-- generate `{Table}Update` only if the table supports `update`
-- generate `{Table}Delete` only if the table supports `delete`
+Every generated operation must affect exactly one row inside the transaction.
+Zero/multiple writable targets reject with non-disclosing `TargetNotWritable` and
+roll back the entire batch; missing and forbidden rows are indistinguishable.
+Read-filtered result counts cannot establish write cardinality. Named mutations
+retain their declared zero/many behavior and result codecs.
 
-If a table supports none of those operations, Pyre generates no built-in mutations for that table.
-
-## Generated Definitions
-
-Built-in mutations are defined as if the following `.pyre` operations existed.
-
-### Create
-
-```pyre
-insert TaskCreate($input: Task.CreateInput) {
-    task {
-        title = $input.title
-        status = $input.status
-        priority = $input.priority
-    }
-}
-```
-
-Rules:
-
-- The mutation name is `{Table}Create`.
-- The input parameter name is always `$input`.
-- The input type is `{Table}.CreateInput`.
-- The mutation body contains exactly one top-level field for the table.
-- The body is generated by expanding writable insert fields into explicit field assignments.
-- Each generated assignment reads from `$input.<fieldName>`.
-
-### Update
-
-```pyre
-update TaskUpdate($id: Task.id, $input: Task.UpdateInput) {
-    task {
-        @where { id == $id }
-        title = $input.title
-        status = $input.status
-        priority = $input.priority
-    }
-}
-```
-
-Rules:
-
-- The mutation name is `{Table}Update`.
-- The parameters are always `$id` and `$input`, in that order.
-- `$id` uses the table's primary key type, written as `{Table}.id`.
-- `$input` uses `{Table}.UpdateInput`.
-- The generated `@where` clause targets exactly one row by primary key.
-- The body is generated by expanding writable update fields into explicit field assignments.
-- Each generated assignment reads from `$input.<fieldName>`.
-- Fields marked `@immutable` are not expanded into update assignments, but may remain in the mutation's return selection.
-
-### Delete
-
-```pyre
-delete TaskDelete($id: Task.id) {
-    task {
-        @where { id == $id }
-        id
-    }
-}
-```
-
-Rules:
-
-- The mutation name is `{Table}Delete`.
-- The only parameter is `$id`.
-- `$id` uses the table's primary key type, written as `{Table}.id`.
-- The generated `@where` clause targets exactly one row by primary key.
-- The selection contains `id` so the mutation is a valid delete definition.
-
-## Input Semantics
-
-Generated mutations rely on schema-derived input types.
-
-For a table with writable fields `title`, `status`, and `priority`, the generated create and update mutations assign those fields explicitly from `$input.title`, `$input.status`, and `$input.priority`.
-
-The generator has complete control over the generated mutation body, so no special query-language directive is required for this expansion.
-
-### `{Table}.CreateInput`
-
-- Includes fields that are writable on insert.
-- Includes `@immutable` fields when they are otherwise writable on insert.
-- Requires fields that are non-nullable and do not have defaults.
-- Excludes fields that are not writable on insert.
-
-### `{Table}.UpdateInput`
-
-- Includes fields that are writable on update.
-- Makes each included field optional.
-- An omitted field means "leave the stored value unchanged".
-- An explicit `Null` clears the field when the schema allows nulls.
-- Excludes fields that are not writable on update.
-- Excludes fields marked `@immutable`.
-
-The exact field set for both input types is determined by the same schema and permission analysis used elsewhere in Pyre.
-
-## Generated Update Semantics
-
-Generated update mutations must preserve the semantics of `{Table}.UpdateInput` even though the generated mutation body uses explicit field assignments.
-
-For each writable update field:
-
-- if `$input.<fieldName>` is omitted, the generated mutation must leave the stored column unchanged
-- if `$input.<fieldName>` is present with a non-null value, the generated mutation must write that value
-- if `$input.<fieldName>` is present with `Null`, the generated mutation must write `NULL` when the column is nullable
-
-This means the generator cannot treat an omitted field and an explicit `Null` as the same case.
-
-Conceptually, generated updates behave as if each assignment were guarded by field presence rather than as a naive direct assignment of every `$input.<fieldName>` expression.
-
-Example intent:
-
-- input `{ "title": "Renamed" }` updates only `title`
-- input `{ "title": null }` clears `title` if nullable
-- input `{}` does not modify any writable field
-
-How that distinction is represented in the internal AST, SQL generation layer, or generated code is an implementation detail. The observable mutation behavior is the normative requirement.
-
-## Naming
-
-Generated mutation names are reserved.
-
-For table `Task`, the reserved names are:
-
-- `TaskCreate`
-- `TaskUpdate`
-- `TaskDelete`
-
-The compiler must treat a user-defined query or mutation with one of those names as a name collision.
-
-Compilation must fail with a clear error explaining:
-
-- the name is reserved by a generated CRUD mutation
-- which table and operation produced the generated name
-- that the user-defined operation must be renamed
-
-There is no override mechanism.
+The server independently validates the manifest, namespace, session, protected
+fields and inputs. A batch executes in order in one transaction and allocates one
+commit revision on success, never exposing a successful prefix on rejection.
+Named commands and generated CRUD share this executor; neither caller-supplied SQL
+nor runtime query compilation is part of the edit protocol.
 
 ## Discoverability
 
-Generated CRUD mutations must be discoverable anywhere handwritten operations are exposed to application code.
+Compiled CRUD participates in generated query metadata, manifests and `Query.*`
+Elm modules. The pure local-edit surface is additionally exposed through
+`typescript/edits/<Namespace>.ts` and `Db.<Namespace>.Edit.<Record>` in Elm.
+Browser fenced execution is opt-in through `ServerConfig.localEdits`; pure builder
+imports do not initialize a database or transport. Regenerate clients and server
+manifests together rather than hand-authoring operation IDs.
 
-At minimum, they participate in the same generated surfaces as user-authored operations:
+## Domain Commands
 
-- generated TypeScript query or mutation metadata
-- generated Elm `Query.*` modules
-- generated client manifests or registries
-- editor or tooling completion based on the compiled query surface
+Use generated CRUD for ordinary writes only when schema rules fully express the
+required constraints. CRUD can bypass invariants or side effects implemented only
+inside a named command. Such writes must keep using that command, including its
+generated `Commands`/Elm `Command.*.run` wrapper when batching. MEC-117 remains the
+enforcement/discoverability follow-up; this documentation does not claim it solved.
 
-Users should not need a separate import path, feature flag, or handwritten `.pyre` file to access them.
+Named commands also remain appropriate for nested inserts, computed values,
+session-derived assignments and custom return shapes. They are nonoptimistic.
+Generated prediction is conservative, and one unpredictable member makes the whole
+batch nonoptimistic. See the local-edit contract for the safety requirements.
 
-## Behavior and Validation
-
-Generated CRUD mutations follow the same rules as handwritten mutations for:
-
-- type checking
-- permission checking
-- SQL generation
-- result decoding
-- sync metadata generation
-
-They are not a second mutation system. They are built-in query definitions derived from schema.
-
-## Intended Usage
-
-Generated CRUD mutations are the default path for ordinary single-table writes.
-
-Handwritten mutation queries remain the preferred path when an application needs behavior that is not well represented by default CRUD, including:
-
-- nested inserts
-- multi-table writes
-- session-derived assignments in the mutation body
-- computed or derived values
-- custom return shapes
-
-## Non-Goals
-
-This specification does not define:
-
-- generated read queries
-- upsert generation
-- user-defined overrides for generated CRUD mutations
-- custom naming schemes for generated CRUD mutations
+Upserts, read-query generation, CRUD name overrides and dependent binding of
+earlier batch results are not part of this surface. Cross-runtime release
+conformance remains subject to verification under MEC-119.

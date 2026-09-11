@@ -10,7 +10,10 @@ import {
 import { QueryClientService, resolveLocalQuerySource } from './service/query-client';
 import { QueryManagerService, type MutationResult } from './service/query-manager';
 import { LocalEditsRuntime, capture } from './service/local-edits';
+import { elmLocalEdits } from './service/elm-local-edits';
 export { LocalEditsRuntime, edit, batch } from './service/local-edits';
+export type { Database } from './service/local-edits';
+export type { Namespace, Edit, Batch, Created, Updated, Deleted } from '@pyre/core/local-edits';
 export type { EditFence, EditOperation, EditPlan, EditPrediction, EditState, EditOutcome, EditLifecycle, EditFailure, LocalEditsFailure, EditReceipt, EditRequest, ReplacementRequest, PreparedEditTransport, LocalEditsConfig, LocalEditsPublication, LocalEditsHost, VisibleTables } from './service/local-edits';
 import { SSEManager, type LiveSyncMessage } from './service/sse';
 import { WebSocketManager } from './service/websocket';
@@ -390,6 +393,12 @@ class SingleDatabasePyreClient {
   private devtoolsEventCallbacks: Set<(event: PyreDevtoolsEvent) => void> = new Set();
 
   constructor(config: SingleDatabasePyreClientConfig) {
+    const editOptions = config.server.localEdits?.(requireDatabaseId(config.databaseId));
+    if (editOptions && config.schema.namespaces) {
+      const schema = config.schema.namespaces[editOptions.fence.namespace];
+      if (!schema) throw new Error('Unknown local edit schema namespace');
+      config = { ...config, schema };
+    }
     const baseIndexedDbName = config.indexedDbName ?? 'pyre-client';
     const dbName = config.cacheNamespace && config.databaseId
       ? deriveIndexedDbName(baseIndexedDbName, config.cacheNamespace, config.databaseId)
@@ -488,7 +497,7 @@ class SingleDatabasePyreClient {
     this.queryClient.attachPorts(this.elmApp);
 
     if (config.server.localEdits) {
-      const options = config.server.localEdits(requireDatabaseId(config.databaseId));
+      const options = editOptions!;
       if (options.fence.databaseId !== config.databaseId) throw new Error('Local edit database fence mismatch');
       this.edits = new LocalEditsRuntime(options, {
         send: message => this.queryManager.sendLocalEdits(message),
@@ -1147,6 +1156,11 @@ class SingleDatabasePyreClient {
     const entityRegistrations = new Map<string, EntityBridgeRegistration>();
     const receivePort = getElmBridgePort(config.app, config.receivePort ?? 'pyreStoreOut');
     const queryResultPort = getElmBridgePort(config.app, config.queryResultPort ?? 'pyre_receiveQueryDelta');
+    const localEdits = elmLocalEdits(
+      databaseId => this.edits && databaseId === this.databaseId
+        ? { runtime: this.edits, operations: this.edits.operations } : undefined,
+      event => queryResultPort?.send?.(event),
+    );
     const entityChangesPort = getElmBridgePort(config.app, config.entityChangesPort ?? 'pyre_receiveEntityChanges');
     const syncStatePort = config.syncStatePort
       ? getElmBridgePort(config.app, config.syncStatePort)
@@ -1168,6 +1182,7 @@ class SingleDatabasePyreClient {
       : () => {};
 
     const unsubscribeAll = () => {
+      localEdits.dispose();
       registrations.forEach((subscription) => {
         subscription.unsubscribe();
       });
@@ -1184,6 +1199,7 @@ class SingleDatabasePyreClient {
     };
 
     const handleIncoming = (incoming: unknown) => {
+      if (localEdits.forward(incoming)) return;
       void (async () => {
         try {
           const message = parseElmBridgeIncomingMessage(incoming);
@@ -1501,6 +1517,7 @@ export class PyreClient {
   private config: ResolvedPyreClientConfig;
   private clients: Map<DatabaseId, Promise<PyreInternalClient>> = new Map();
   private editRuntimes = new Map<DatabaseId, LocalEditsRuntime>();
+  private stopBridgeIncoming: (() => void) | null = null;
   private initializingEditSubmissions = new Map<DatabaseId, Array<(runtime: LocalEditsRuntime) => void>>();
   private clientGenerations: Map<DatabaseId, number> = new Map();
   private knownDatabaseIds: DatabaseId[] = [];
@@ -1537,10 +1554,13 @@ export class PyreClient {
   }
 
   /** Bind once, then submit synchronously on this database's ordered lifetime. */
-  async localEdits(databaseId: DatabaseId): Promise<LocalEditsRuntime> {
+  localEdits(databaseId: DatabaseId): Promise<LocalEditsRuntime>;
+  localEdits<N>(databaseId: DatabaseId, namespace: import('@pyre/core/local-edits').Namespace<N>): Promise<import('./service/local-edits').Database<N>>;
+  async localEdits<N>(databaseId: DatabaseId, namespace?: import('@pyre/core/local-edits').Namespace<N>): Promise<LocalEditsRuntime | import('./service/local-edits').Database<N>> {
     const client = await this.getOrCreateClient(databaseId);
     if (!client.getLocalEdits) throw new Error('Internal client does not support local edits');
-    return client.getLocalEdits();
+    const runtime = client.getLocalEdits();
+    return namespace ? runtime.bind(namespace) : runtime;
   }
 
   run<Input = unknown>(
@@ -1789,6 +1809,19 @@ export class PyreClient {
     const entityRegistrations = new Map<string, EntityBridgeRegistration>();
     const receivePort = getElmBridgePort(config.app, config.receivePort ?? 'pyreStoreOut');
     const queryResultPort = getElmBridgePort(config.app, config.queryResultPort ?? 'pyre_receiveQueryDelta');
+    let acceptingEdits = true;
+    const localEdits = elmLocalEdits(
+      databaseId => {
+        const runtime = this.editRuntimes.get(databaseId);
+        return runtime ? { runtime, operations: runtime.operations } : undefined;
+      },
+      event => queryResultPort?.send?.(event),
+      (databaseId, submit) => {
+        if (!acceptingEdits || !this.config.server.localEdits) { submit(undefined); return; }
+        void this.enqueueEdit(databaseId, runtime => submit({ runtime, operations: runtime.operations }))
+          .catch(() => submit(undefined));
+      },
+    );
     const entityChangesPort = getElmBridgePort(config.app, config.entityChangesPort ?? 'pyre_receiveEntityChanges');
     const syncStatePort = config.syncStatePort
       ? getElmBridgePort(config.app, config.syncStatePort)
@@ -1810,6 +1843,8 @@ export class PyreClient {
       : () => {};
 
     const unsubscribeAll = () => {
+      acceptingEdits = false;
+      localEdits.dispose();
       registrations.forEach((subscriptionPromise) => {
         void subscriptionPromise.then((subscription) => {
           subscription?.unsubscribe();
@@ -1828,6 +1863,8 @@ export class PyreClient {
     };
 
     const handleIncoming = (incoming: unknown) => {
+      if (!acceptingEdits) return;
+      if (localEdits.forward(incoming)) return;
       void (async () => {
         try {
           const message = parseElmBridgeIncomingMessage(incoming);
@@ -1993,12 +2030,19 @@ export class PyreClient {
     };
 
     receivePort?.subscribe?.(handleIncoming);
+    this.stopBridgeIncoming = () => {
+      acceptingEdits = false;
+      receivePort?.unsubscribe?.(handleIncoming);
+      localEdits.stop();
+    };
     this.bridgeCleanup = unsubscribeAll;
     return unsubscribeAll;
   }
 
   disconnect(): void {
     unregisterPyreDevtoolsClient(this.instanceId);
+    this.stopBridgeIncoming?.();
+    this.stopBridgeIncoming = null;
     const cleanup = this.bridgeCleanup;
     this.bridgeCleanup = null;
     this.editRuntimes.forEach(runtime => { void runtime.dispose(); });
@@ -2011,7 +2055,7 @@ export class PyreClient {
     this.clients.forEach((clientPromise) => {
       void clientPromise.then((client) => {
         client.disconnect();
-      });
+      }, () => {});
     });
     this.clients.clear();
     this.editRuntimes.clear();
@@ -2081,26 +2125,7 @@ export class PyreClient {
         void receipt.confirmed.then(outcome => callback(outcome.kind === 'confirmed'
           ? { ok: true, value: outcome.result } : { ok: false, error: outcome.kind, outcome }));
       };
-      const runtime = this.editRuntimes.get(targetDatabaseId);
-      if (runtime) { submit(runtime); return; }
-      const queue = this.initializingEditSubmissions.get(targetDatabaseId) ?? [];
-      this.initializingEditSubmissions.set(targetDatabaseId, queue);
-      queue.push(submit);
-      try {
-        const initializing = this.getOrCreateClient(targetDatabaseId);
-        const generation = this.clientGenerations.get(targetDatabaseId);
-        const client = await initializing;
-        if (queue.includes(submit)) {
-          // Retirement during initialization must close the old lifetime before enqueue.
-          if (this.clientGenerations.get(targetDatabaseId) !== generation) client.disconnect();
-          if (!client.getLocalEdits) throw new Error('Internal client does not support local edits');
-          submit(client.getLocalEdits());
-        }
-      } finally {
-        const index = queue.indexOf(submit);
-        if (index !== -1) queue.splice(index, 1);
-        if (!queue.length && this.initializingEditSubmissions.get(targetDatabaseId) === queue) this.initializingEditSubmissions.delete(targetDatabaseId);
-      }
+      await this.enqueueEdit(targetDatabaseId, submit);
       return;
     }
 
@@ -2133,6 +2158,30 @@ export class PyreClient {
       }
       callback(result);
     });
+  }
+
+  private async enqueueEdit(databaseId: DatabaseId, submit: (runtime: LocalEditsRuntime) => void): Promise<void> {
+    const targetDatabaseId = requireDatabaseId(databaseId);
+    const runtime = this.editRuntimes.get(targetDatabaseId);
+    if (runtime) { submit(runtime); return; }
+    const queue = this.initializingEditSubmissions.get(targetDatabaseId) ?? [];
+    this.initializingEditSubmissions.set(targetDatabaseId, queue);
+    queue.push(submit);
+    try {
+      const initializing = this.getOrCreateClient(targetDatabaseId);
+      const generation = this.clientGenerations.get(targetDatabaseId);
+      const client = await initializing;
+      if (queue.includes(submit)) {
+        // Retirement during initialization must close the old lifetime before enqueue.
+        if (this.clientGenerations.get(targetDatabaseId) !== generation) client.disconnect();
+        if (!client.getLocalEdits) throw new Error('Internal client does not support local edits');
+        submit(client.getLocalEdits());
+      }
+    } finally {
+      const index = queue.indexOf(submit);
+      if (index !== -1) queue.splice(index, 1);
+      if (!queue.length && this.initializingEditSubmissions.get(targetDatabaseId) === queue) this.initializingEditSubmissions.delete(targetDatabaseId);
+    }
   }
 
   private watchInternalClient(databaseId: DatabaseId, generation: number, client: PyreInternalClient): void {

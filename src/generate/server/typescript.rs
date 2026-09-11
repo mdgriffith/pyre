@@ -429,7 +429,7 @@ fn session_validator(context: &typecheck::Context, type_: &ast::ColumnType) -> S
         ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
             "z.number()".to_string()
         }
-        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::IdUuid { .. } => crate::generate::typescript::common::UUID_VALIDATOR.to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type: Some(serialization_type),
             ..
@@ -459,8 +459,8 @@ fn session_validator_for_serialization_type(type_: &ast::ConcreteSerializationTy
         | ast::ConcreteSerializationType::Real
         | ast::ConcreteSerializationType::IdInt => "z.number()".to_string(),
         ast::ConcreteSerializationType::Text
-        | ast::ConcreteSerializationType::Date
-        | ast::ConcreteSerializationType::IdUuid => "z.string()".to_string(),
+        | ast::ConcreteSerializationType::Date => "z.string()".to_string(),
+        ast::ConcreteSerializationType::IdUuid => crate::generate::typescript::common::UUID_VALIDATOR.to_string(),
         ast::ConcreteSerializationType::DateTime => {
             "z.union([z.date(), z.string(), z.number()])".to_string()
         }

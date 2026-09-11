@@ -162,7 +162,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     expected["tables"] = json!({"items":{"rows":snapshot.tables["items"].rows}});
     assert_eq!(serialized, expected);
     let mut mismatched = serde_json::to_value(&manifest)?;
-    mismatched["compiledContract"] = json!("different-schema");
+    mismatched["replacementContracts"][binding.namespace] = json!("different-schema");
     let mismatched: Manifest = serde_json::from_value(mismatched)?;
     let mismatched_fingerprint = mismatched.fingerprint();
     let mismatched_binding = query::BatchBinding {

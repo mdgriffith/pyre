@@ -240,7 +240,7 @@ test('non-id PK streams preserve rows, relationships, table and database scopes'
 test('invalid identities fail before any stream callback, even behind a filter', () => {
   for (const [tableName, field, invalid] of [
     ['audits', 'sequence', [undefined, null, '1', 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]],
-    ['events', 'eventKey', [undefined, null, 1, '1', '', 'not-a-uuid']],
+    ['events', 'eventKey', [undefined, null, 1, '1', '', 'not-a-uuid', `${uuidA}\n`, `${uuidA}\r`]],
   ]) {
     for (const value of invalid) {
       const service = new EntityStreamService(schema);
