@@ -278,23 +278,48 @@ pub fn get_sync_sql_wasm(
         sync::SyncError::InvalidSyncCursor(msg) => "Invalid sync cursor: ".to_string() + &msg,
     })?;
 
-    Ok(SyncSqlResultWasm {
-        tables: result
-            .tables
-            .into_iter()
-            .map(|t| TableSyncSqlWasm {
-                table_name: t.table_name,
-                primary_key: t.primary_key,
-                permission_hash: t.permission_hash,
-                sql: t.sql,
-                params: t
-                    .params
-                    .into_iter()
-                    .map(|params| params.into_iter().map(SessionValueWasm::from).collect())
-                    .collect(),
-                headers: t.headers,
-                json_columns: t.json_columns,
-            })
-            .collect(),
-    })
+    Ok(result.into())
+}
+
+/// Generate the complete permission-filtered scope without a cursor or row limit.
+/// The host must execute these statements and read the revision in one transaction.
+pub fn get_replacement_sql_wasm(
+    session: JsValue,
+    namespace: String,
+) -> Result<SyncSqlResultWasm, String> {
+    let introspection = cache::get().ok_or_else(|| "No schema found".to_string())?;
+    let context = get_schema_context(&introspection)?;
+    let session = prepare_session_wasm(context, session)?;
+    let result = sync::get_replacement_sql(context, &session, &namespace).map_err(|e| match e {
+        sync::SyncError::DatabaseError(msg) => "Database error: ".to_string() + &msg,
+        sync::SyncError::SqlGenerationError(msg) => "SQL generation error: ".to_string() + &msg,
+        sync::SyncError::PermissionError(msg) => "Permission error: ".to_string() + &msg,
+        sync::SyncError::InvalidPageSize => "Invalid page size".to_string(),
+        sync::SyncError::InvalidSyncCursor(msg) => "Invalid sync cursor: ".to_string() + &msg,
+    })?;
+    Ok(result.into())
+}
+
+impl From<sync::SyncSqlResult> for SyncSqlResultWasm {
+    fn from(result: sync::SyncSqlResult) -> Self {
+        Self {
+            tables: result
+                .tables
+                .into_iter()
+                .map(|t| TableSyncSqlWasm {
+                    table_name: t.table_name,
+                    primary_key: t.primary_key,
+                    permission_hash: t.permission_hash,
+                    sql: t.sql,
+                    params: t
+                        .params
+                        .into_iter()
+                        .map(|params| params.into_iter().map(SessionValueWasm::from).collect())
+                        .collect(),
+                    headers: t.headers,
+                    json_columns: t.json_columns,
+                })
+                .collect(),
+        }
+    }
 }

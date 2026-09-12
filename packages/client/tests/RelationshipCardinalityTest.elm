@@ -1,5 +1,6 @@
 module RelationshipCardinalityTest exposing (suite)
 
+import Data.Identity
 import Data.Schema
 import Data.Value exposing (Value)
 import Db
@@ -43,7 +44,7 @@ suite =
                         }
 
                     dbAfterDelta =
-                        Db.update (Db.DeltaReceived gamesOnlyDelta) Db.init
+                        Db.update (Db.DeltaReceived gamesOnlyDelta) (Db.init schema)
                             |> Tuple.first
 
                     result =
@@ -98,6 +99,7 @@ schema =
         Dict.fromList
             [ ( "games"
               , { name = "games"
+                , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                 , links =
                     Dict.fromList
                         [ ( "gameMembers"
@@ -115,6 +117,7 @@ schema =
               )
             , ( "game_members"
               , { name = "game_members"
+                , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                 , links = Dict.empty
                 , indices = []
                 }
@@ -178,7 +181,7 @@ dbWithEmptyRelatedTable =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Data.Identity.int 1
                       , Dict.fromList
                             [ ( "id", Data.Value.IntValue 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
@@ -189,6 +192,7 @@ dbWithEmptyRelatedTable =
             , ( "game_members", Dict.empty )
             ]
     , indices = Dict.empty
+    , schema = schema
     }
 
 
@@ -198,7 +202,7 @@ dbWithoutRelatedTable =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Data.Identity.int 1
                       , Dict.fromList
                             [ ( "id", Data.Value.IntValue 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
@@ -208,6 +212,7 @@ dbWithoutRelatedTable =
               )
             ]
     , indices = Dict.empty
+    , schema = schema
     }
 
 
@@ -217,7 +222,7 @@ dbWithRelatedRows =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Data.Identity.int 1
                       , Dict.fromList
                             [ ( "id", Data.Value.IntValue 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
@@ -227,7 +232,7 @@ dbWithRelatedRows =
               )
             , ( "game_members"
               , Dict.fromList
-                    [ ( 10
+                    [ ( Data.Identity.int 10
                       , Dict.fromList
                             [ ( "id", Data.Value.IntValue 10 )
                             , ( "gameId", Data.Value.IntValue 1 )
@@ -238,6 +243,7 @@ dbWithRelatedRows =
               )
             ]
     , indices = Dict.empty
+    , schema = schema
     }
 
 

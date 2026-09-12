@@ -37,6 +37,22 @@ record Job {
 }
 
 #[test]
+fn replacement_sql_is_complete_and_rejects_unknown_namespace() {
+    let context = union_permission_context();
+    let namespace = context.valid_namespaces.iter().next().unwrap();
+    let result = pyre::sync::get_replacement_sql(&context, &Default::default(), namespace).unwrap();
+    assert_eq!(result.tables.len(), 1);
+    let table = &result.tables[0];
+    assert_eq!(table.table_name, "jobs");
+    assert_eq!(table.primary_key, "id");
+    assert_eq!(table.params.len(), table.sql.len());
+    assert!(table.headers.contains(&"state__reason__code".to_string()));
+    assert!(!table.sql[0].contains("LIMIT"));
+    assert!(table.sql[0].contains("\"jobs\".\"state__reason__code\" is not 'blocked'"));
+    assert!(pyre::sync::get_replacement_sql(&context, &Default::default(), "unknown").is_err());
+}
+
+#[test]
 fn union_permission_path_is_used_by_catch_up_sql() {
     let statement = pyre::sync::get_sync_status_statement(
         &SyncCursor::new(),

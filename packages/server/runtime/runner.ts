@@ -1,11 +1,13 @@
 import type { Client } from "@libsql/client";
 import type { ZodType } from "zod";
-import { buildArgs, formatResultData, toSqlStatements, type SqlInfo } from "./sql";
+import { buildArgs, executeStatements, formatResultData, toSqlStatements, type JsonSessionValidators, type SqlInfo } from "./sql";
 
 type Validator<T> = ZodType<T>;
 
 type RunnerMeta = {
   session_args: string[];
+  json_session_args?: string[];
+  json_session_validators?: JsonSessionValidators;
   optional_input_args: string[];
   json_input_args: string[];
   InputValidator: Validator<any>;
@@ -51,8 +53,10 @@ export function toRunner<Input, Result>(meta: RunnerMeta, sql: SqlInfo[]) {
       meta.session_args,
       meta.optional_input_args,
       meta.json_input_args,
+      meta.json_session_args,
+      meta.json_session_validators,
     );
-    const results = await db.batch(toSqlStatements(sql, args));
+    const results = await executeStatements(db, toSqlStatements(sql, args));
     const data = formatResultData(sql, results);
     return decodeOrThrow(meta.ReturnData, data, "return data");
   };

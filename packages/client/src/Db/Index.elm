@@ -41,6 +41,7 @@ Indices are:
 -}
 
 import Data.Delta exposing (Delta, TableGroup)
+import Data.Identity exposing (Key)
 import Data.Schema exposing (LinkType(..), SchemaMetadata)
 import Data.Value exposing (Value)
 import Dict exposing (Dict)
@@ -52,7 +53,7 @@ Internally, this is a Dict from IndexKey (foreign key value) to a list of RowIds
 
 -}
 type Index
-    = Index (Dict String (List Int))
+    = Index (Dict String (List Key))
 
 
 {-| The foreign key value (e.g., "1", "2" for user\_id values).
@@ -64,7 +65,7 @@ type alias IndexKey =
 {-| Row identifier (corresponds to SQLite rowid).
 -}
 type alias RowId =
-    Int
+    Key
 
 
 {-| Create an empty index.
@@ -172,7 +173,7 @@ lookup key (Index dict) =
 This scans all rows in the table and builds an index on the specified column.
 
 -}
-rebuildFromTable : Dict Int (Dict String Value) -> String -> Index
+rebuildFromTable : Dict Key (Dict String Value) -> String -> Index
 rebuildFromTable tableData columnName =
     Dict.foldl
         (\rowId row acc ->
@@ -203,10 +204,10 @@ valueToIndexKey : Value -> Maybe String
 valueToIndexKey value =
     case value of
         Data.Value.IntValue i ->
-            Just (String.fromInt i)
+            Just ("i:" ++ String.fromInt i)
 
         Data.Value.StringValue s ->
-            Just s
+            Just ("s:" ++ s)
 
         Data.Value.NullValue ->
             Nothing
@@ -224,7 +225,7 @@ for schema-declared indices.
 Returns a Dict keyed by (tableName, columnName).
 
 -}
-buildIndicesFromSchema : SchemaMetadata -> Dict String (Dict Int (Dict String Value)) -> Dict ( String, String ) Index
+buildIndicesFromSchema : SchemaMetadata -> Dict String (Dict Key (Dict String Value)) -> Dict ( String, String ) Index
 buildIndicesFromSchema schema tables =
     Dict.foldl
         (\tableName tableMeta acc ->
@@ -235,19 +236,14 @@ buildIndicesFromSchema schema tables =
                             case linkInfo.type_ of
                                 OneToMany ->
                                     -- Build index on the target table's foreign key column
-                                    case Dict.get linkInfo.to.table tables of
-                                        Just targetTable ->
-                                            let
-                                                index =
-                                                    rebuildFromTable targetTable linkInfo.to.column
+                                    let
+                                        targetTable =
+                                            Dict.get linkInfo.to.table tables |> Maybe.withDefault Dict.empty
 
-                                                indexKey =
-                                                    ( linkInfo.to.table, linkInfo.to.column )
-                                            in
-                                            Dict.insert indexKey index innerAcc
-
-                                        Nothing ->
-                                            innerAcc
+                                        index =
+                                            rebuildFromTable targetTable linkInfo.to.column
+                                    in
+                                    Dict.insert ( linkInfo.to.table, linkInfo.to.column ) index innerAcc
 
                                 _ ->
                                     -- ManyToOne and OneToOne use primary key lookups (already O(1))
@@ -259,19 +255,14 @@ buildIndicesFromSchema schema tables =
                 accWithExplicit =
                     List.foldl
                         (\indexInfo innerAcc ->
-                            case Dict.get tableName tables of
-                                Just tableRows ->
-                                    let
-                                        indexKey =
-                                            ( tableName, indexInfo.field )
+                            let
+                                tableRows =
+                                    Dict.get tableName tables |> Maybe.withDefault Dict.empty
 
-                                        index =
-                                            rebuildFromTable tableRows indexInfo.field
-                                    in
-                                    Dict.insert indexKey index innerAcc
-
-                                Nothing ->
-                                    innerAcc
+                                index =
+                                    rebuildFromTable tableRows indexInfo.field
+                            in
+                            Dict.insert ( tableName, indexInfo.field ) index innerAcc
                         )
                         accWithLinks
                         tableMeta.indices

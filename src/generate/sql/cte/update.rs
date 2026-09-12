@@ -36,7 +36,9 @@ pub fn update_to_string(
         matches!(f, ast::Field::Column(col) if ast::is_updated_at(col))
             || ast::has_fieldname(f, "updatedAt")
     });
-    let updated_at_explicitly_set = all_query_fields.iter().any(|f| f.name == "updatedAt");
+    let updated_at_explicitly_set = all_query_fields
+        .iter()
+        .any(|f| f.name == "updatedAt" && f.set.is_some());
 
     if has_updated_at_field && !updated_at_explicitly_set {
         values.push("updatedAt = unixepoch()".to_string());

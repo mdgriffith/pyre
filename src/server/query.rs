@@ -1,12 +1,386 @@
-use crate::server::manifest::{FieldSchema, Manifest, PyreSession, QueryManifest, SqlInfo};
+use crate::server::manifest::{
+    normalize_sql_value, BoundManifest, Manifest, PyreSession, QueryManifest, SqlInfo,
+};
 use crate::sync_deltas::AffectedRowTableGroup;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
+
+#[cfg(test)]
+mod codec_parity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn compiled_recursive_inputs_are_complete_and_preserve_nested_values() {
+        let source = format!(
+            "{}\n{}",
+            include_str!("../../packages/server/fixtures/compiled-batch/session.pyre"),
+            include_str!("../../packages/server/fixtures/compiled-batch/schema.pyre")
+        );
+        let mut schema = crate::ast::Schema::default();
+        crate::parser::run("schema.pyre", &source, &mut schema).unwrap();
+        let context = crate::typecheck::check_schema(&crate::ast::Database {
+            schemas: vec![schema],
+        })
+        .unwrap();
+        let mut queries = crate::parser::parse_query(
+            "queries.pyre",
+            include_str!("../../packages/server/fixtures/compiled-batch/queries.pyre"),
+        )
+        .unwrap();
+        crate::generated_queries::append_generated_crud_queries(&mut queries, &context);
+        let info = crate::typecheck::check_queries(&queries, &context).unwrap();
+        let mut files = vec![];
+        crate::generate::manifest::generate_queries(&context, &queries, &info, &mut files);
+        let manifest: Manifest = serde_json::from_str(
+            &files
+                .iter()
+                .find(|file| file.path.ends_with("manifest.json"))
+                .unwrap()
+                .contents,
+        )
+        .unwrap();
+        let create = manifest
+            .queries
+            .values()
+            .find(|query| {
+                query
+                    .generated_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.kind == "create")
+            })
+            .unwrap();
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer); create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer); insert into _pyre_sync values(1,'e1',0);").await.unwrap();
+        let fingerprint = manifest.fingerprint();
+        let bound = BoundManifest::new(manifest.clone(), &context).unwrap();
+        let binding = BatchBinding {
+            database_id: "tenant-1",
+            namespace: &create.primary_db,
+            manifest: &fingerprint,
+            instance: "tab-1",
+            auth_generation: 2,
+        };
+        let details = json!({"_type":"Bundle", "when":"2026-01-01T00:00:00Z", "role":"Member", "children":[{"_type":"Note","count":2,"enabled":false}], "byName":{"empty":{"_type":"Empty"}}, "note":null});
+        let session_value = json!({"userId":7,"role":"Member","unrelated":"value","applicationClaim":true,"context":details});
+        let session = PyreSession::new(session_value.clone(), &manifest.session_schema).unwrap();
+        let mut claims = session_value.clone();
+        claims["context"] = json!({"_type":"Note","count":2,"enabled":1,"hostile__count":999});
+        let effective = PyreSession::new(claims.clone(), &manifest.session_schema).unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(
+                effective.sql_args()["session_context"].as_str().unwrap()
+            )
+            .unwrap(),
+            json!({"_type":"Note","count":2,"enabled":true})
+        );
+        claims["context"].as_object_mut().unwrap().remove("count");
+        assert!(PyreSession::new(claims, &manifest.session_schema).is_err());
+        conn.execute("insert into entries(id, details) values ('note', jsonb('{\"_type\":\"Note\",\"count\":2,\"enabled\":true}'))", ()).await.unwrap();
+        let context_query = manifest
+            .queries
+            .values()
+            .find(|query| query.operation == "query")
+            .unwrap();
+        let context_result = run(&conn, &manifest, &context_query.id, json!({}), &effective)
+            .await
+            .unwrap();
+        assert_eq!(context_result.response, json!({"entry":[{"id":"note"}]}));
+        let input = json!({"id":"00000000-0000-4000-8000-000000000001","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":{"_type":"Member"},"details":details});
+        let mut request = BatchRequest {
+            version: 1,
+            database_id: "tenant-1".into(),
+            namespace: create.primary_db.clone(),
+            manifest: fingerprint.clone(),
+            instance: "tab-1".into(),
+            auth_generation: 2,
+            database_epoch: "e1".into(),
+            request_id: "request-1".into(),
+            sequence: 1,
+            operations: vec![BatchOperation {
+                operation: create.id.clone(),
+                input: input.clone(),
+            }],
+        };
+        let result = run_batch(&conn, &bound, &binding, &request, &session)
+            .await
+            .unwrap();
+        assert_eq!(result.response["status"], "accepted");
+        let row = conn
+            .query("select json(details) from entries where id <> 'note'", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        let stored: JsonValue = serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
+        let mut expected = details.clone();
+        expected["when"] = json!(1767225600);
+        expected["role"] = json!({"_type":"Member"});
+        assert_eq!(stored, expected);
+        let raw = json!({"_type":"Raw","data":{"arbitrary":[null,true,{"_type":"Uninterpreted","extra":"retain"}]},"values":[1,null,2],"scalar":null});
+        let mut raw_input = input.clone();
+        raw_input["id"] = json!("00000000-0000-4000-8000-000000000003");
+        raw_input["details"] = raw.clone();
+        request.operations[0].input = raw_input;
+        run_batch(&conn, &bound, &binding, &request, &session)
+            .await
+            .unwrap();
+        let row = conn
+            .query("select json(details) from entries where id = '00000000-0000-4000-8000-000000000003'", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&row.get::<String>(0).unwrap()).unwrap(),
+            raw
+        );
+        for (key, value) in [
+            ("count", json!(1.5)),
+            ("count", json!(9007199254740992_i64)),
+            ("enabled", json!(1)),
+            ("details", json!({"_type":"Note","count":1})),
+            (
+                "details",
+                json!({"_type":"Note","count":1,"enabled":true,"unknown":1}),
+            ),
+            (
+                "details",
+                json!({"_type":"Note","count":null,"enabled":true}),
+            ),
+        ] {
+            let mut invalid = input.clone();
+            invalid[key] = value;
+            request.operations[0].input = invalid;
+            let error = run_batch(&conn, &bound, &binding, &request, &session)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "InvalidRequest");
+            assert_eq!(error.operation_index(), Some(0));
+        }
+        let mut missing_nullable = input.clone();
+        missing_nullable["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("note");
+        request.operations[0].input = missing_nullable;
+        assert_eq!(
+            run_batch(&conn, &bound, &binding, &request, &session)
+                .await
+                .unwrap_err()
+                .code(),
+            "InvalidRequest"
+        );
+        let mut bad_session = session_value;
+        bad_session["context"]["children"] = json!([{"_type":"Note","count":1}]);
+        assert!(PyreSession::new(bad_session, &manifest.session_schema).is_err());
+    }
+}
+
+pub const MAX_BATCH_OPERATIONS: usize = 100;
+pub const MAX_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchOperation {
+    pub operation: String,
+    pub input: JsonValue,
+}
+
+/// Trusted server binding, selected after authentication and database authorization.
+pub struct BatchBinding<'a> {
+    pub database_id: &'a str,
+    pub namespace: &'a str,
+    pub manifest: &'a str,
+    pub instance: &'a str,
+    pub auth_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BatchRequest {
+    pub version: u32,
+    pub database_id: String,
+    pub namespace: String,
+    pub manifest: String,
+    pub instance: String,
+    pub auth_generation: u64,
+    pub database_epoch: String,
+    pub request_id: String,
+    pub sequence: u64,
+    pub operations: Vec<BatchOperation>,
+}
+
+#[derive(Debug)]
+pub struct BatchResult {
+    pub response: JsonValue,
+    pub affected_rows: Vec<AffectedRowTableGroup>,
+}
+
+/// Execute an allowlisted ordered batch. No callbacks or publication run before commit.
+/// Hosts must bound the raw HTTP body too, before decoding it into this request.
+pub async fn run_batch(
+    conn: &libsql::Connection,
+    manifest: &BoundManifest,
+    binding: &BatchBinding<'_>,
+    request: &BatchRequest,
+    session: &PyreSession,
+) -> Result<BatchResult, Error> {
+    if request.version != 1
+        || manifest.version != 1
+        || request.database_id != binding.database_id
+        || request.namespace != binding.namespace
+        || request.manifest != binding.manifest
+        || binding.manifest != manifest.fingerprint()
+        || !manifest.authorizes_namespace(binding.namespace)
+        || request.instance != binding.instance
+        || request.auth_generation != binding.auth_generation
+        || request.request_id.is_empty()
+        || request.instance.is_empty()
+        || request.sequence == 0
+        || binding.namespace.is_empty()
+        || binding.manifest.is_empty()
+    {
+        return Err(Error::InvalidInput("request fence mismatch".into()));
+    }
+    crate::server::database_id::require_database_id(binding.database_id)
+        .map_err(|_| Error::InvalidInput("invalid database identity".into()))?;
+    if request.operations.len() > MAX_BATCH_OPERATIONS
+        || serde_json::to_vec(request).map_err(Error::Json)?.len() > MAX_BATCH_PAYLOAD_BYTES
+    {
+        return Err(Error::InvalidInput("batch limit exceeded".into()));
+    }
+    let session = session
+        .revalidate(&manifest.session_schema)
+        .map_err(|error| Error::InvalidSession(error.to_string()))?;
+    let mut prepared = Vec::new();
+    for (index, operation) in request.operations.iter().enumerate() {
+        let prepare = || {
+            let query = manifest
+                .queries
+                .get(&operation.operation)
+                .ok_or_else(|| Error::UnknownQuery(operation.operation.clone()))?;
+            if query.id != operation.operation
+                || query.primary_db != binding.namespace
+                || !query.attached_dbs.is_empty()
+                || !matches!(
+                    query.operation.as_str(),
+                    "insert" | "update" | "delete" | "transaction"
+                )
+            {
+                return Err(Error::InvalidInput(
+                    "operation is outside authorized mutation scope".into(),
+                ));
+            }
+            if let Some(edit) = &query.generated_edit {
+                if !matches!(edit.kind.as_str(), "create" | "update" | "delete")
+                    || edit.write_statement_indices.len() != 1
+                    || edit.write_statement_indices[0] >= query.sql.len()
+                    || !query.sql[edit.write_statement_indices[0]].include
+                {
+                    return Err(Error::InvalidInput(
+                        "invalid generated edit metadata".into(),
+                    ));
+                }
+                if edit.kind == "update"
+                    && !edit
+                        .writable_inputs
+                        .iter()
+                        .any(|key| operation.input.get(key).is_some())
+                {
+                    return Err(Error::InvalidEdit);
+                }
+            }
+            Ok((query, build_args(query, operation.input.clone(), &session)?))
+        };
+        prepared.push(prepare().map_err(|error| error.operation(index))?);
+    }
+    let mut response = serde_json::json!({
+        "requestId": request.request_id, "databaseId": request.database_id,
+        "instance": request.instance, "authGeneration": request.auth_generation,
+        "databaseEpoch": request.database_epoch, "namespace": request.namespace,
+        "manifest": request.manifest, "status": "confirmed", "results": []
+    });
+    if prepared.is_empty() {
+        return Ok(BatchResult {
+            response,
+            affected_rows: Vec::new(),
+        });
+    }
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .map_err(Error::Database)?;
+    let execution = async {
+        let mut databases = tx.query("PRAGMA database_list", ()).await.map_err(Error::Database)?;
+        while let Some(database) = databases.next().await.map_err(Error::Database)? {
+            let name = database.get::<String>(1).map_err(Error::Database)?;
+            if name != "main" && name != "temp" {
+                return Err(Error::InvalidInput("attached databases are not supported in batches".into()));
+            }
+        }
+        drop(databases);
+        let mut epoch = tx.query("SELECT database_epoch FROM _pyre_sync WHERE id = 1", ()).await.map_err(Error::Database)?;
+        let epoch = epoch.next().await.map_err(Error::Database)?.ok_or_else(|| Error::InvalidInput("missing database epoch".into()))?
+            .get::<String>(0).map_err(Error::Database)?;
+        if epoch != request.database_epoch { return Err(Error::InvalidInput("database epoch mismatch".into())); }
+        let mut results = Vec::new();
+        let mut affected_rows = Vec::new();
+        for (index, (query, args)) in prepared.iter().enumerate() {
+            let result = execute_generated_sql(&tx, &query.sql, args, query.generated_edit.as_ref()).await
+                .map_err(|error| error.operation(index))?;
+            if query.generated_edit.is_none() {
+                query
+                    .result_schema
+                    .as_ref()
+                    .ok_or_else(|| Error::InvalidInput("missing named result schema".into()))?
+                    .validate(&result.response)
+                    .map_err(|_| Error::InvalidInput("named result does not match its compiled schema".into()))
+                    .map_err(|error| error.operation(index))?;
+            }
+            results.push(serde_json::json!({"index": index, "operation": request.operations[index].operation, "value": result.response}));
+            affected_rows.extend(result.affected_rows);
+        }
+        let (_, revision) = crate::server::sync::next_server_revision(&tx).await
+            .map_err(|error| Error::UnsupportedRuntime(error.to_string()))?;
+        response["status"] = JsonValue::from("accepted");
+        response["results"] = JsonValue::Array(results);
+        response["commitRevision"] = JsonValue::from(revision);
+        // Conservative full-scope invalidation covers deletes and permission-dependent writes.
+        response["reconciliation"] = serde_json::json!({"kind": "replaceRequired", "atLeast": revision, "invalidate": true, "minimumSafeRevision": revision});
+        Ok(BatchResult { response, affected_rows })
+    }.await;
+    match execution {
+        Ok(result) => {
+            tx.commit().await.map_err(|_| Error::OutcomeUnknown)?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error)
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct QueryResult {
     pub response: JsonValue,
     pub affected_rows: Vec<AffectedRowTableGroup>,
+}
+
+#[derive(Debug)]
+pub struct CommittedRevision {
+    pub database_epoch: String,
+    pub revision: i64,
 }
 
 #[derive(Debug)]
@@ -36,7 +410,9 @@ pub async fn run(
     input: JsonValue,
     session: &PyreSession,
 ) -> Result<QueryResult, Error> {
-    run_inner(conn, manifest, query_id, input, session, false).await
+    run_inner(conn, manifest, query_id, input, session, false, false)
+        .await
+        .map(|(result, _)| result)
 }
 
 pub async fn run_sync(
@@ -46,7 +422,23 @@ pub async fn run_sync(
     input: JsonValue,
     session: &PyreSession,
 ) -> Result<QueryResult, Error> {
-    run_inner(conn, manifest, query_id, input, session, true).await
+    run_inner(conn, manifest, query_id, input, session, true, false)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// Execute a named operation with a revision committed in the same transaction.
+/// Reads allocate no revision; successful mutations include named no-ops. The
+/// declared response remains unchanged, and publication must reuse this revision.
+pub async fn run_with_revision(
+    conn: &libsql::Connection,
+    manifest: &Manifest,
+    query_id: &str,
+    input: JsonValue,
+    session: &PyreSession,
+    sync_mode: bool,
+) -> Result<(QueryResult, Option<CommittedRevision>), Error> {
+    run_inner(conn, manifest, query_id, input, session, sync_mode, true).await
 }
 
 pub async fn explain(
@@ -123,7 +515,8 @@ async fn run_inner(
     input: JsonValue,
     session: &PyreSession,
     sync_mode: bool,
-) -> Result<QueryResult, Error> {
+    commit_revision: bool,
+) -> Result<(QueryResult, Option<CommittedRevision>), Error> {
     let query = manifest
         .queries
         .get(query_id)
@@ -136,14 +529,33 @@ async fn run_inner(
     };
 
     if query.operation == "query" {
-        return execute_generated_sql(conn, sql, &args).await;
+        return execute_generated_sql(conn, sql, &args, None)
+            .await
+            .map(|result| (result, None));
     }
 
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
         .map_err(|error| Error::Database(error).execution("begin transaction", None))?;
-    match execute_generated_sql(&tx, sql, &args).await {
+    let execution = async {
+        let result = execute_generated_sql(&tx, sql, &args, None).await?;
+        let revision = if commit_revision {
+            let (database_epoch, revision) =
+                crate::server::sync::next_server_revision(&tx)
+                    .await
+                    .map_err(|error| Error::UnsupportedRuntime(error.to_string()))?;
+            Some(CommittedRevision {
+                database_epoch,
+                revision,
+            })
+        } else {
+            None
+        };
+        Ok((result, revision))
+    }
+    .await;
+    match execution {
         Ok(result) => {
             tx.commit()
                 .await
@@ -161,8 +573,10 @@ async fn execute_generated_sql(
     conn: &libsql::Connection,
     sql: &[SqlInfo],
     args: &HashMap<String, JsonValue>,
+    edit: Option<&crate::server::manifest::GeneratedEdit>,
 ) -> Result<QueryResult, Error> {
     let mut included_result_sets = Vec::new();
+    let mut identity = None;
 
     for (index, statement) in sql.iter().enumerate() {
         async {
@@ -176,6 +590,36 @@ async fn execute_generated_sql(
             } else {
                 execute_statement(conn, &sql, values).await?;
             }
+            if edit.is_some_and(|edit| edit.write_statement_indices.contains(&index)) {
+                // changes() excludes trigger writes and is read before any later statement.
+                let mut rows = conn
+                    .query("SELECT changes()", ())
+                    .await
+                    .map_err(Error::Database)?;
+                let count = rows
+                    .next()
+                    .await
+                    .map_err(Error::Database)?
+                    .ok_or(Error::TargetNotWritable)?
+                    .get::<i64>(0)
+                    .map_err(Error::Database)?;
+                if count != 1 {
+                    return Err(Error::TargetNotWritable);
+                }
+                identity = included_result_sets
+                    .last()
+                    .and_then(|set| set.rows.first())
+                    .and_then(|row| row.get("_pyreEditId"))
+                    .filter(|id| {
+                        id.as_i64()
+                            .is_some_and(|id| id.unsigned_abs() <= 9_007_199_254_740_991)
+                            || id.as_str().is_some_and(super::manifest::is_uuid)
+                    })
+                    .cloned();
+                if identity.is_none() {
+                    return Err(Error::TargetNotWritable);
+                }
+            }
             Ok::<_, Error>(())
         }
         .await
@@ -183,7 +627,11 @@ async fn execute_generated_sql(
     }
 
     Ok(QueryResult {
-        response: format_response(&included_result_sets)?,
+        response: if edit.is_some() {
+            serde_json::json!({"id": identity.ok_or(Error::TargetNotWritable)?})
+        } else {
+            format_response(&included_result_sets)?
+        },
         affected_rows: extract_affected_rows(&included_result_sets)?,
     })
 }
@@ -225,9 +673,13 @@ fn build_args(
             )));
         };
 
-        validate_value(name, value, schema)?;
+        crate::server::manifest::validate_field(name, value, schema).map_err(|_| {
+            Error::InvalidInput(format!("input field '{}' must be {}", name, schema.type_))
+        })?;
         let value = if json_args.contains(name) && !value.is_null() {
-            JsonValue::String(value.to_string())
+            JsonValue::String(
+                crate::server::manifest::normalize_json_value(value, schema).to_string(),
+            )
         } else {
             normalize_sql_value(value, schema)
         };
@@ -263,91 +715,6 @@ fn build_args(
     }
 
     Ok(args)
-}
-
-fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result<(), Error> {
-    if value.is_null() {
-        return if schema.nullable {
-            Ok(())
-        } else {
-            Err(Error::InvalidInput(format!(
-                "input field '{}' cannot be null",
-                name
-            )))
-        };
-    }
-
-    let valid = if schema.is_enum {
-        let tag = match value {
-            JsonValue::String(value) => Some(value.as_str()),
-            JsonValue::Object(_) => value.get("_type").and_then(JsonValue::as_str),
-            _ => None,
-        };
-        tag.is_some_and(|tag| schema.enum_variants.iter().any(|variant| variant == tag))
-    } else {
-        match schema.type_.as_str() {
-            "String" => value.is_string(),
-            "DateTime" => datetime_to_epoch_seconds(value).is_some(),
-            "Int" | "Float" => value.is_number(),
-            "Bool" => {
-                value.is_boolean() || value.as_i64().map(|n| n == 0 || n == 1).unwrap_or(false)
-            }
-            type_ if type_.starts_with("Id.Int") => value.is_number(),
-            type_ if type_.starts_with("Id.Uuid") => value.is_string(),
-            type_ if type_.starts_with("Json") => true,
-            _ => true,
-        }
-    };
-
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::InvalidInput(format!(
-            "input field '{}' must be {}",
-            name, schema.type_
-        )))
-    }
-}
-
-fn normalize_sql_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
-    if schema.is_enum {
-        if let Some(tag) = value.get("_type").and_then(JsonValue::as_str) {
-            return JsonValue::String(tag.to_string());
-        }
-    }
-
-    if schema.type_ == "Bool" {
-        return JsonValue::from(
-            if value == &JsonValue::Bool(true) || value.as_i64() == Some(1) {
-                1
-            } else {
-                0
-            },
-        );
-    }
-
-    if schema.type_ == "DateTime" {
-        if let Some(seconds) = datetime_to_epoch_seconds(value) {
-            return JsonValue::from(seconds);
-        }
-    }
-
-    value.clone()
-}
-
-fn datetime_to_epoch_seconds(value: &JsonValue) -> Option<i64> {
-    if let Some(seconds) = value.as_i64() {
-        return Some(seconds);
-    }
-
-    let raw = value.as_str()?.trim();
-    if let Ok(seconds) = raw.parse::<i64>() {
-        return Some(seconds);
-    }
-
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|datetime| datetime.timestamp())
 }
 
 fn statement_args(
@@ -572,6 +939,13 @@ fn libsql_to_json(value: libsql::Value) -> JsonValue {
 
 #[derive(Debug)]
 pub enum Error {
+    OutcomeUnknown,
+    InvalidEdit,
+    TargetNotWritable,
+    Operation {
+        index: usize,
+        source: Box<Error>,
+    },
     Database(libsql::Error),
     Execution {
         stage: &'static str,
@@ -586,6 +960,32 @@ pub enum Error {
 }
 
 impl Error {
+    /// Safe wire code; never serialize database error text or successful prefixes.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::OutcomeUnknown => "OutcomeUnknown",
+            Self::InvalidEdit => "InvalidEdit",
+            Self::TargetNotWritable => "TargetNotWritable",
+            Self::InvalidSession(_) => "InvalidSession",
+            Self::InvalidInput(_) | Self::UnknownQuery(_) | Self::Json(_) => "InvalidRequest",
+            Self::Database(_) | Self::UnsupportedRuntime(_) => "TransactionFailed",
+            Self::Execution { source, .. } | Self::Operation { source, .. } => source.code(),
+        }
+    }
+
+    pub fn operation_index(&self) -> Option<usize> {
+        match self {
+            Self::Operation { index, .. } => Some(*index),
+            Self::Execution { source, .. } => source.operation_index(),
+            _ => None,
+        }
+    }
+    fn operation(self, index: usize) -> Self {
+        Self::Operation {
+            index,
+            source: Box::new(self),
+        }
+    }
     fn execution(self, stage: &'static str, statement_index: Option<usize>) -> Self {
         Self::Execution {
             stage,
@@ -598,6 +998,10 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::OutcomeUnknown => write!(f, "OutcomeUnknown"),
+            Error::InvalidEdit => write!(f, "InvalidEdit"),
+            Error::TargetNotWritable => write!(f, "TargetNotWritable"),
+            Error::Operation { index, source } => write!(f, "operation {}: {}", index, source),
             Error::Database(error) => write!(f, "database error: {}", error),
             Error::Execution {
                 stage,

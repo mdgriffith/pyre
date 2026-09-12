@@ -1,5 +1,9 @@
 import type { ElmApp } from '../types';
+import type { SchemaMetadata } from '@pyre/core';
+import { primaryKeyForTable, rowIdentity } from './identity';
+import { expandTableGroups } from './entity-stream';
 import type { EntityChangeBatchSource, ServerTableGroup } from './entity-stream';
+import type { EditFence, VisibleTables } from './local-edits';
 
 export interface TableGroup {
   table_name: string;
@@ -24,14 +28,16 @@ export interface PutRowsResult {
   skippedOlder: number;
 }
 
-const DB_VERSION = 2;
+// v1/v2 flattened row.id caches cannot be safely reinterpreted. Reset rows and
+// their progress together so the worker fetches the complete scope again.
+const DB_VERSION = 3;
 
 export class IndexedDBStorage {
   private dbName: string;
   private db: IDBDatabase | null = null;
   private initPromise: Promise<IDBDatabase> | null = null;
 
-  constructor(dbName: string) {
+  constructor(dbName: string, private readonly schema: SchemaMetadata) {
     this.dbName = dbName;
   }
 
@@ -54,6 +60,10 @@ export class IndexedDBStorage {
 
       request.onsuccess = () => {
         this.db = request.result;
+        this.db.onversionchange = () => {
+          this.db?.close();
+          this.db = null;
+        };
         this.initPromise = null;
         resolve(this.db);
       };
@@ -61,8 +71,14 @@ export class IndexedDBStorage {
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
 
+        if (event.oldVersion > 0 && event.oldVersion < 3) {
+          for (const name of ['tables', 'syncCursor', 'meta']) {
+            if (db.objectStoreNames.contains(name)) db.deleteObjectStore(name);
+          }
+        }
+
         if (!db.objectStoreNames.contains('tables')) {
-          const tablesStore = db.createObjectStore('tables', { keyPath: ['tableName', 'id'] });
+          const tablesStore = db.createObjectStore('tables', { keyPath: ['tableName', 'identity'] });
           tablesStore.createIndex('byTable', 'tableName', { unique: false });
           tablesStore.createIndex('byUpdatedAt', 'updatedAt', { unique: false });
         }
@@ -101,10 +117,9 @@ export class IndexedDBStorage {
 
       request.onsuccess = () => {
         const result = request.result || [];
-        resolve(result.map((row) => {
-          const { tableName, ...rest } = row as { tableName: string };
-          return rest;
-        }));
+        try {
+          resolve(result.map((row) => this.unpackRow(row)));
+        } catch (error) { reject(error); }
       };
 
       request.onerror = () => {
@@ -146,8 +161,9 @@ export class IndexedDBStorage {
           return;
         }
 
-        const { tableName: _, ...rest } = cursor.value as { tableName: string };
-        rows.push(rest);
+        try {
+          rows.push(this.unpackRow(cursor.value));
+        } catch (error) { reject(error); return; }
         cursor.continue();
       };
 
@@ -177,7 +193,7 @@ export class IndexedDBStorage {
 
   async getAllTables(): Promise<Record<string, unknown[]>> {
     const db = await this.getDB();
-    const tables: Record<string, unknown[]> = {};
+    const tables: Record<string, unknown[]> = Object.create(null);
 
     return new Promise((resolve, reject) => {
       const tx = db.transaction(['tables'], 'readonly');
@@ -187,13 +203,17 @@ export class IndexedDBStorage {
       request.onsuccess = () => {
         const allRows = request.result || [];
 
-        for (const row of allRows) {
-          const tableName = (row as { tableName: string }).tableName;
-          if (!tables[tableName]) {
-            tables[tableName] = [];
+        try {
+          for (const row of allRows) {
+            const tableName = (row as { tableName: string }).tableName;
+            if (!tables[tableName]) {
+              tables[tableName] = [];
+            }
+            tables[tableName].push(this.unpackRow(row));
           }
-          const { tableName: _, ...rest } = row as { tableName: string };
-          tables[tableName].push(rest);
+        } catch (error) {
+          reject(error);
+          return;
         }
 
         resolve(tables);
@@ -220,6 +240,13 @@ export class IndexedDBStorage {
         reject(new Error(`Failed to read sync cursor: ${request.error}`));
       };
     });
+  }
+
+  private unpackRow(stored: { tableName: string; identity: unknown; row: Record<string, unknown> }): Record<string, unknown> {
+    if (!stored.row || rowIdentity(this.schema, stored.tableName, stored.row) !== stored.identity) {
+      throw new Error(`Invalid persisted identity for table ${stored.tableName}`);
+    }
+    return stored.row;
   }
 
   async putSyncCursor(cursor: SyncCursor): Promise<void> {
@@ -307,7 +334,56 @@ export class IndexedDBStorage {
     });
   }
 
+  /** Claim this cache for a new lifetime before starting the worker. Never restore old-auth rows. */
+  async beginLocalEdits(fence: EditFence): Promise<void> {
+    return this.replaceAuthoritative(null, null, fence, true);
+  }
+
+  /** One transaction replaces or evicts rows, legacy cursors, coverage and the full fence. */
+  async replaceAuthoritative(tables: VisibleTables | null, revision: number | null, fence: EditFence, claim = false): Promise<void> {
+    if (tables && (Object.keys(tables).sort().join('\0') !== Object.keys(this.schema.tables).sort().join('\0')
+      || !Number.isSafeInteger(revision) || revision! < 0)) throw new Error('Invalid complete replacement');
+    const rows = Object.entries(tables ?? {}).flatMap(([tableName, values]) => {
+      const ids = new Set<string | number>();
+      return values.map(row => {
+        const identity = rowIdentity(this.schema, tableName, row);
+        if (ids.has(identity)) throw new Error('Duplicate replacement identity');
+        ids.add(identity);
+        return { tableName, identity, updatedAt: row.updatedAt, row };
+      });
+    });
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['tables', 'syncCursor', 'meta'], 'readwrite');
+      tx.oncomplete = () => resolve();
+      tx.onerror = tx.onabort = () => reject(new Error('Authoritative persistence failed'));
+      const owner = JSON.stringify([fence.databaseId, fence.instance, fence.authGeneration, fence.namespace, fence.manifest, fence.databaseEpoch]);
+      const write = () => { try {
+        const store = tx.objectStore('tables');
+        store.clear();
+        tx.objectStore('syncCursor').clear();
+        const meta = tx.objectStore('meta');
+        meta.clear();
+        meta.put(owner, 'localEditsOwner');
+        if (tables) {
+          for (const row of rows) store.put(row);
+          meta.put(revision, 'lastAppliedServerRevision');
+          meta.put(fence.databaseEpoch, 'databaseEpoch');
+          meta.put(fence, 'localEditsFence');
+        }
+      } catch (error) { tx.abort(); reject(error); } };
+      if (claim) write();
+      else {
+        // A retired worker's delayed persistence must not evict or overwrite a newer lifetime.
+        const request = tx.objectStore('meta').get('localEditsOwner');
+        request.onsuccess = () => { if (request.result === owner) write(); };
+      }
+    });
+  }
+
   async putRows(tableName: string, rows: Array<Record<string, unknown>>): Promise<PutRowsResult> {
+    primaryKeyForTable(this.schema, tableName);
+    const identities = rows.map((row) => rowIdentity(this.schema, tableName, row));
     if (rows.length === 0) {
       return { tableName, received: 0, written: 0, skippedOlder: 0 };
     }
@@ -334,11 +410,12 @@ export class IndexedDBStorage {
       tx.onerror = () => {
         reject(new Error(`Transaction failed: ${tx.error}`));
       };
+      tx.onabort = () => reject(new Error(`Transaction aborted: ${tx.error}`));
 
       rows.forEach((row, index) => {
-        const request = store.get([tableName, row.id as IDBValidKey]);
+        const request = store.get([tableName, identities[index]]);
         request.onsuccess = () => {
-          existingRows[index] = request.result || null;
+          existingRows[index] = request.result?.row || null;
           readsCompleted += 1;
 
           if (readsCompleted === rows.length) {
@@ -376,7 +453,7 @@ export class IndexedDBStorage {
             return;
           }
 
-          const rowWithTable = { ...row, tableName };
+          const rowWithTable = { tableName, identity: identities[index], updatedAt: row.updatedAt, row };
           const request = store.put(rowWithTable);
 
           request.onsuccess = () => {
@@ -415,6 +492,12 @@ export class IndexedDbService {
   private onDatabaseEpochReset: (() => void) | null;
   private onDatabaseEpochStored: ((databaseEpoch: string) => void) | null;
   private operationQueue: Promise<void> = Promise.resolve();
+  private initialData: Promise<{
+    tables: Record<string, unknown[]>;
+    cursor: SyncCursor;
+    lastAppliedServerRevision: number | null;
+    databaseEpoch: string | null;
+  }> | null = null;
 
   constructor(
     storage: IndexedDBStorage,
@@ -477,6 +560,19 @@ export class IndexedDbService {
     }
   }
 
+  initialize() {
+    // Share both success and failure: neither client may resume from progress
+    // until the entire persisted snapshot has passed identity validation.
+    return this.initialData ??= (async () => {
+      await this.storage.init();
+      const tables = await this.storage.getAllTables();
+      const cursor = await this.storage.getSyncCursor();
+      const lastAppliedServerRevision = await this.storage.getServerRevision();
+      const databaseEpoch = await this.storage.getDatabaseEpoch();
+      return { tables, cursor, lastAppliedServerRevision, databaseEpoch };
+    })();
+  }
+
   private async sendInitialData(): Promise<void> {
     if (!this.elmApp?.ports.receiveIndexedDbMessage) {
       return;
@@ -485,11 +581,7 @@ export class IndexedDbService {
     try {
       const startedAt = Date.now();
       this.debugLog('[PyreClient] IndexedDB initial data request started');
-      await this.storage.init();
-      const tables = await this.storage.getAllTables();
-      const cursor = await this.storage.getSyncCursor();
-      const lastAppliedServerRevision = await this.storage.getServerRevision();
-      const databaseEpoch = await this.storage.getDatabaseEpoch();
+      const { tables, cursor, lastAppliedServerRevision, databaseEpoch } = await this.initialize();
 
       const tableCounts = Object.fromEntries(
         Object.entries(tables).map(([tableName, rows]) => [tableName, rows.length])
@@ -508,9 +600,7 @@ export class IndexedDbService {
       });
     } catch (error) {
       console.error('[PyreClient] Failed to load initial data:', error);
-      const fallbackMessage = { type: 'initialData', data: { tables: {}, cursor: { tables: {} }, lastAppliedServerRevision: null, databaseEpoch: null } };
-      this.elmApp.ports.receiveIndexedDbMessage.send(fallbackMessage);
-      this.debugLog('[PyreClient] port receiveIndexedDbMessage ->', fallbackMessage);
+      throw error;
     }
   }
 
@@ -544,30 +634,9 @@ export class IndexedDbService {
         rowCount: tableGroups.reduce((sum, group) => sum + group.rows.length, 0),
       });
 
-      for (const tableGroup of tableGroups) {
-        const tableName = tableGroup.table_name;
-        if (!tableName) {
-          continue;
-        }
-
-        const rows = tableGroup.rows.map((rowArray) => {
-          const rowObj: Record<string, unknown> = {};
-          tableGroup.headers.forEach((header, index) => {
-            rowObj[header] = rowArray[index];
-          });
-          return rowObj;
-        });
-
-        try {
-          const result = await this.storage.putRows(tableName, rows);
-          this.debugLog('[PyreClient] IndexedDB writeDelta table written', result);
-        } catch (error) {
-          console.error('[PyreClient] Failed to write delta table:', tableName, error, {
-            rows: rows.length,
-            firstRowId: rows[0]?.id,
-            firstRowKeys: rows[0] ? Object.keys(rows[0]) : [],
-          });
-        }
+      for (const [tableName, rows] of expandTableGroups(tableGroups)) {
+        const result = await this.storage.putRows(tableName, rows);
+        this.debugLog('[PyreClient] IndexedDB writeDelta table written', result);
       }
 
       this.notifyEntityDelta(tableGroups, entityStreamSource);

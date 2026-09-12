@@ -8,6 +8,10 @@ use std::path::Path;
 
 #[derive(Serialize)]
 struct Manifest {
+    #[serde(rename = "replacementContracts")]
+    replacement_contracts: BTreeMap<String, String>,
+    #[serde(rename = "compiledContract")]
+    compiled_contract: String,
     version: u32,
     session_schema: BTreeMap<String, FieldSchema>,
     queries: BTreeMap<String, QueryManifest>,
@@ -15,6 +19,8 @@ struct Manifest {
 
 #[derive(Serialize)]
 struct QueryManifest {
+    #[serde(rename = "compiledContract")]
+    compiled_contract: String,
     id: String,
     operation: String,
     primary_db: String,
@@ -24,12 +30,16 @@ struct QueryManifest {
     optional_input_args: Vec<String>,
     json_input_args: Vec<String>,
     sql: Vec<SqlInfo>,
+    #[serde(rename = "resultSchema")]
+    result_schema: crate::server::manifest::ResultSchema,
     #[serde(rename = "syncSql", skip_serializing_if = "Option::is_none")]
     sync_sql: Option<Vec<SqlInfo>>,
+    #[serde(rename = "generatedEdit", skip_serializing_if = "Option::is_none")]
+    generated_edit: Option<crate::server::manifest::GeneratedEdit>,
 }
 
 #[derive(Serialize)]
-struct FieldSchema {
+pub struct FieldSchema {
     #[serde(rename = "type")]
     type_: String,
     is_enum: bool,
@@ -82,6 +92,8 @@ fn write_manifest(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let manifest = Manifest {
+        replacement_contracts: replacement_contracts(context),
+        compiled_contract: compiled_contract(context, None),
         version: 1,
         session_schema: session_schema(context),
         queries: queries
@@ -101,7 +113,9 @@ fn query_manifest(
     query_info: &typecheck::QueryInfo,
 ) -> QueryManifest {
     QueryManifest {
+        compiled_contract: compiled_contract(context, Some(query)),
         id: query.interface_hash.clone(),
+        generated_edit: generated_edit_metadata(context, query, query_info),
         operation: operation_to_string(&query.operation),
         primary_db: query_info.primary_db.clone(),
         attached_dbs: sorted_strings(&query_info.attached_dbs),
@@ -127,6 +141,7 @@ fn query_manifest(
             .map(|arg| arg.name.clone())
             .collect(),
         sql: query_sql(context, query, query_info, false),
+        result_schema: result_schema(context, query),
         sync_sql: if query.operation == ast::QueryOperation::Query {
             None
         } else {
@@ -135,13 +150,312 @@ fn query_manifest(
     }
 }
 
+pub fn result_schema(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> crate::server::manifest::ResultSchema {
+    use crate::server::manifest::ResultSchema;
+    let fields = query
+        .fields
+        .iter()
+        .filter_map(|field| match field {
+            ast::TopLevelQueryField::Field(field) => context.tables.get(&field.name).map(|table| {
+                (
+                    crate::ext::string::decapitalize(&ast::get_aliased_name(field)),
+                    ResultSchema::Array {
+                        items: Box::new(result_object_schema(
+                            context,
+                            &table.record,
+                            field,
+                            ast::query_field_operation(query, field).clone(),
+                        )),
+                    },
+                )
+            }),
+            _ => None,
+        })
+        .collect();
+    ResultSchema::Object { fields }
+}
+
+fn result_object_schema(
+    context: &typecheck::Context,
+    record: &ast::RecordDetails,
+    query_field: &ast::QueryField,
+    operation: ast::QueryOperation,
+) -> crate::server::manifest::ResultSchema {
+    use crate::server::manifest::ResultSchema;
+    let query_fields = ast::collect_query_fields(&query_field.fields);
+    let explicit = query_fields
+        .iter()
+        .filter(|field| field.name != "*")
+        .filter_map(|field| {
+            record
+                .fields
+                .iter()
+                .find(|candidate| ast::has_field_or_linkname(candidate, &field.name))
+                .and_then(|field| match field {
+                    ast::Field::Column(column) => Some(column.name.clone()),
+                    _ => None,
+                })
+        })
+        .collect::<HashSet<_>>();
+    let mut fields = BTreeMap::new();
+    let mut wildcard = false;
+    for field in query_fields {
+        if field.name == "*" {
+            if wildcard {
+                continue;
+            }
+            wildcard = true;
+            for table_field in &record.fields {
+                if let ast::Field::Column(column) = table_field {
+                    if !explicit.contains(&column.name) {
+                        fields.insert(column.name.clone(), result_column_schema(context, column));
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(table_field) = record
+            .fields
+            .iter()
+            .find(|candidate| ast::has_field_or_linkname(candidate, &field.name))
+        else {
+            continue;
+        };
+        let name = ast::get_aliased_name(field);
+        match table_field {
+            ast::Field::Column(column) => {
+                fields.insert(name, result_column_schema(context, column));
+            }
+            ast::Field::FieldDirective(ast::FieldDirective::Link(link))
+                if operation != ast::QueryOperation::Insert =>
+            {
+                let Some(linked) = typecheck::get_linked_table(context, link) else {
+                    continue;
+                };
+                let nested =
+                    result_object_schema(context, &linked.record, field, operation.clone());
+                let primary_key = ast::get_primary_id_field_name(&record.fields);
+                let one_to_many = link
+                    .local_ids
+                    .iter()
+                    .all(|id| primary_key.as_ref().is_some_and(|primary| id == primary));
+                let schema = if one_to_many {
+                    ResultSchema::Array {
+                        items: Box::new(nested),
+                    }
+                } else if ast::linked_to_unique_field_with_record(link, &linked.record) {
+                    ResultSchema::Nullable {
+                        item: Box::new(nested),
+                    }
+                } else {
+                    nested
+                };
+                fields.insert(name, schema);
+            }
+            _ => {}
+        }
+    }
+    ResultSchema::Object { fields }
+}
+
+fn result_column_schema(
+    context: &typecheck::Context,
+    column: &ast::Column,
+) -> crate::server::manifest::ResultSchema {
+    let generated = session_field_schema(context, column);
+    let schema = serde_json::from_value(
+        serde_json::to_value(generated).expect("generated result field schema"),
+    )
+    .expect("runtime result field schema");
+    crate::server::manifest::ResultSchema::Field { schema }
+}
+
+/// Compile the same artifact used by Rust before exporting its identity to other runtimes.
+pub fn fingerprint(
+    context: &typecheck::Context,
+    queries: &ast::QueryList,
+    info: &HashMap<String, typecheck::QueryInfo>,
+) -> String {
+    let mut files = Vec::new();
+    generate_queries(context, queries, info, &mut files);
+    let manifest: crate::server::manifest::Manifest =
+        serde_json::from_str(&files[0].contents).expect("compiled manifest");
+    manifest.fingerprint()
+}
+
+/// Schema/session identity used by replacement readers, independent of query projections.
+pub fn compiled_schema_contract(context: &typecheck::Context) -> String {
+    compiled_contract(context, None)
+}
+
+pub fn replacement_contracts(context: &typecheck::Context) -> BTreeMap<String, String> {
+    context
+        .valid_namespaces
+        .iter()
+        .map(|namespace| {
+            (
+                namespace.clone(),
+                replacement_contract(context, namespace).expect("known namespace"),
+            )
+        })
+        .collect()
+}
+
+/// Only the selected database's tables, transitive codecs and effective session
+/// authorize replacement. The manifest fingerprint still covers every namespace.
+pub fn replacement_contract(context: &typecheck::Context, namespace: &str) -> Option<String> {
+    if !context.valid_namespaces.contains(namespace) {
+        return None;
+    }
+    Some(schema_contract(context, None, Some(namespace)))
+}
+
+fn compiled_contract(context: &typecheck::Context, query: Option<&ast::Query>) -> String {
+    schema_contract(context, query, None)
+}
+
+fn schema_contract(
+    context: &typecheck::Context,
+    query: Option<&ast::Query>,
+    namespace: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut definitions = BTreeMap::new();
+    let mut required = Vec::new();
+    for table in context
+        .tables
+        .values()
+        .filter(|table| namespace.is_none_or(|ns| table.schema == ns))
+    {
+        for column in ast::collect_columns(&table.record.fields) {
+            column.type_.collect_custom_type_names(&mut required);
+        }
+    }
+    if let Some(session) = &context.session {
+        for column in ast::collect_columns(&session.fields) {
+            column.type_.collect_custom_type_names(&mut required);
+        }
+    }
+    let mut reachable = HashSet::new();
+    while let Some(name) = required.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        if let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(&name) {
+            for variant in variants {
+                if let Some(fields) = &variant.fields {
+                    for column in ast::collect_columns(fields) {
+                        column.type_.collect_custom_type_names(&mut required);
+                    }
+                }
+            }
+        }
+    }
+    for (name, (_, type_)) in &context.types {
+        if namespace.is_some() && !reachable.contains(name) {
+            continue;
+        }
+        if let typecheck::Type::OneOf { variants } = type_ {
+            definitions.insert(
+                name.clone(),
+                ast::Definition::Tagged {
+                    name: name.clone(),
+                    variants: variants.clone(),
+                    start: None,
+                    end: None,
+                },
+            );
+        }
+    }
+    let codec_database = ast::Database {
+        schemas: vec![ast::Schema {
+            files: vec![ast::SchemaFile {
+                path: String::new(),
+                definitions: definitions.into_values().collect(),
+            }],
+            session: context.session.clone(),
+            ..ast::Schema::default()
+        }],
+    };
+    let mut schemas = BTreeMap::new();
+    for (name, table) in &context.tables {
+        if namespace.is_some_and(|ns| table.schema != ns) {
+            continue;
+        }
+        let file = ast::SchemaFile {
+            path: String::new(),
+            definitions: vec![ast::Definition::Record {
+                name: table.record.name.clone(),
+                fields: table.record.fields.clone(),
+                start: None,
+                end: None,
+                start_name: None,
+                end_name: None,
+            }],
+        };
+        schemas.insert(
+            format!("{}/{}", table.schema, name),
+            crate::generate::to_string::schemafile_to_string(&table.schema, &file),
+        );
+    }
+    let sync_modes = context
+        .namespace_sync_modes
+        .iter()
+        .filter(|(name, _)| namespace.is_none_or(|ns| name.as_str() == ns))
+        .map(|(name, mode)| (name, mode.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let contract = serde_json::json!({
+        "schema": schemas,
+        "syncModes": sync_modes,
+        "codecs": crate::generate::typescript::core::compiled_codec_contract(context, query, &codec_database),
+        "runtimeContract": 1
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&contract).expect("compiled contract"))
+    )
+}
+
+pub fn generated_edit_metadata(
+    context: &typecheck::Context,
+    query: &ast::Query,
+    info: &typecheck::QueryInfo,
+) -> Option<crate::server::manifest::GeneratedEdit> {
+    let table = query.fields.iter().find_map(|field| match field {
+        ast::TopLevelQueryField::Field(field) => context.tables.get(&field.name),
+        _ => None,
+    })?;
+    let (kind, _, writable_inputs) = crate::generated_queries::generated_edit(query, table)?;
+    let sql = query_sql(context, query, info, false);
+    let write_statement_indices = sql
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            let sql = statement.sql.trim_start().to_ascii_lowercase();
+            (sql.starts_with("insert ") || sql.starts_with("update ") || sql.starts_with("delete "))
+                .then_some(index)
+        })
+        .collect();
+    Some(crate::server::manifest::GeneratedEdit {
+        kind: kind.to_string(),
+        write_statement_indices,
+        writable_inputs,
+    })
+}
+
 fn sorted_strings(values: &std::collections::HashSet<String>) -> Vec<String> {
     let mut result: Vec<String> = values.iter().cloned().collect();
     result.sort();
     result
 }
 
-fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<String, FieldSchema> {
+pub fn input_schema(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> BTreeMap<String, FieldSchema> {
     query
         .args
         .iter()
@@ -152,13 +466,20 @@ fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<St
                 .map(|type_| typecheck::resolve_query_param_type(context, type_))
                 .unwrap_or_else(|| "Json".to_string());
             let enum_variants = enum_variants(context, &type_);
+            let mut definitions = BTreeMap::new();
+            collect_session_tagged_union_types(
+                context,
+                &ast::ColumnType::from_str(&type_),
+                &mut HashSet::new(),
+                &mut definitions,
+            );
             (
                 arg.name.clone(),
                 FieldSchema {
                     is_enum: !enum_variants.is_empty(),
                     enum_variants,
                     tagged_union_variants: BTreeMap::new(),
-                    tagged_union_types: BTreeMap::new(),
+                    tagged_union_types: definitions,
                     type_,
                     nullable: arg.nullable,
                     omittable: arg.omittable,
@@ -168,7 +489,7 @@ fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<St
         .collect()
 }
 
-fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSchema> {
+pub fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSchema> {
     context
         .session
         .as_ref()
@@ -187,7 +508,10 @@ fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSchema>
         .unwrap_or_default()
 }
 
-fn session_field_schema(context: &typecheck::Context, column: &ast::Column) -> FieldSchema {
+pub(crate) fn session_field_schema(
+    context: &typecheck::Context,
+    column: &ast::Column,
+) -> FieldSchema {
     let mut schema = session_field_schema_inner(context, column, &mut HashSet::new());
     collect_session_tagged_union_types(
         context,
@@ -270,6 +594,16 @@ fn collect_session_tagged_union_types(
     visited: &mut HashSet<String>,
     definitions: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, FieldSchema>>>,
 ) {
+    match type_ {
+        ast::ColumnType::List(inner)
+        | ast::ColumnType::Dict(inner)
+        | ast::ColumnType::JsonTyped(inner)
+        | ast::ColumnType::Nullable(inner) => {
+            collect_session_tagged_union_types(context, inner, visited, definitions);
+            return;
+        }
+        _ => {}
+    }
     let Some(type_name) = type_.get_custom_type_name() else {
         return;
     };
@@ -279,10 +613,6 @@ fn collect_session_tagged_union_types(
     let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(type_name) else {
         return;
     };
-    if variants.iter().all(|variant| variant.fields.is_none()) {
-        return;
-    }
-
     let variant_schemas = variants
         .iter()
         .map(|variant| {

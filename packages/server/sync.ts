@@ -232,6 +232,58 @@ export interface SyncSession {
     [key: string]: SessionValue;
 }
 
+/** Internal materializer: caller must pin revision and these reads in the same transaction. */
+export async function readReplacementTables(
+    db: Pick<Client, "execute">, session: SyncSession, namespace: string, restoreSchema: () => void,
+): Promise<Record<string, { rows: unknown[] }>> {
+    restoreSchema();
+    const raw = wasm.get_replacement_sql(normalizeForWasmJson(session), namespace);
+    if (typeof raw === "string" && raw.startsWith("Error:")) throw new Error("Replacement SQL unavailable");
+    const plan = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!Array.isArray(plan?.tables)) throw new Error("Invalid replacement plan");
+    const tables: Record<string, { rows: unknown[] }> = Object.create(null);
+    for (const table of plan.tables) {
+        if (typeof table.table_name !== "string" || Object.hasOwn(tables, table.table_name)
+            || !Array.isArray(table.headers) || table.headers.some((header: unknown) => typeof header !== "string")
+            || new Set(table.headers).size !== table.headers.length || !Array.isArray(table.sql) || table.sql.length === 0)
+            throw new Error("Invalid replacement table");
+        const rows: unknown[][] = [];
+        const jsonColumns = new Set<string>(table.json_columns ?? []);
+        for (let i = 0; i < table.sql.length; i++) {
+            const result = await db.execute({ sql: table.sql[i], args: normalizeParams(table.params?.[i]) as any[] });
+            const aggregate = result.columns[0] === SYNC_ROWS_JSON_COLUMN;
+            if (aggregate) {
+                const rawRows = result.rows[0]?.[SYNC_ROWS_JSON_COLUMN];
+                const values = typeof rawRows === "string" ? JSON.parse(rawRows) : rawRows;
+                if (result.rows.length !== 1 || !Array.isArray(values)
+                    || values.some(row => !Array.isArray(row) || row.length !== table.headers.length))
+                    throw new Error("Invalid replacement aggregate");
+            } else if (table.headers.some((header: string) => !result.columns.includes(header))) {
+                throw new Error("Incomplete replacement columns");
+            }
+            for (const row of rowsFromSyncQueryResult(result, table.headers)) {
+                // Aggregate cells are already JSON values, including strings resembling JSON.
+                rows.push(table.headers.map((header: string) => !aggregate && jsonColumns.has(header)
+                    && typeof row[header] === "string" ? JSON.parse(row[header]) : row[header]));
+            }
+        }
+        // WASM schema is process-global and another database may have run during execute.
+        restoreSchema();
+        const rawGroups = [{ table_name: table.table_name, headers: table.headers, rows }];
+        if (wasm.validate_replacement_table_groups(normalizeForWasmJson(rawGroups)) !== true) throw new Error("Invalid replacement row values");
+        const groups = reshapeSyncTableGroups(rawGroups);
+        const group = groups[0];
+        if (groups.length !== 1 || group.table_name !== table.table_name || !Array.isArray(group.headers)
+            || !Array.isArray(group.rows) || group.rows.length !== rows.length)
+            throw new Error("Incomplete replacement rows");
+        tables[table.table_name] = { rows: group.rows.map(row => {
+            if (!Array.isArray(row) || row.length !== group.headers.length) throw new Error("Invalid replacement row");
+            return Object.fromEntries(group.headers.map((header, index) => [header, row[index]]));
+        }) };
+    }
+    return tables;
+}
+
 /**
  * Handle a sync request, returning data that needs to be synced.
  * 

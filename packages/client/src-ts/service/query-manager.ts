@@ -1,5 +1,7 @@
 import type { ElmApp } from '../types';
 import { applyQueryDelta } from './query-delta';
+import type { LocalEditsRuntime } from './local-edits';
+import type { QueryUpdate } from './query-client';
 
 export interface QueryRegistration {
   queryId: string;
@@ -31,6 +33,30 @@ export class QueryManagerService {
   private callbackPortToQueryId: Map<string, string> = new Map();
   private queryStates: Map<string, QueryState> = new Map();
   private mutationCallbacks: Map<string, MutationResultCallback> = new Map();
+  private localEdits?: LocalEditsRuntime;
+  private portListener?: (message: unknown) => void;
+
+  setLocalEdits(runtime: LocalEditsRuntime): void { this.localEdits = runtime; }
+
+  sendLocalEdits(message: unknown): void {
+    if (!this.elmApp?.ports.receiveQueryManagerMessage) throw new Error('Local edit worker bridge unavailable');
+    this.elmApp.ports.receiveQueryManagerMessage.send(message);
+  }
+
+  installPublication(updates: QueryUpdate[]): () => void {
+    const callbacks: Array<() => void> = [];
+    for (const update of updates) {
+      const state = this.queryStates.get(update.queryId);
+      if (!state || update.revision <= state.revision) continue;
+      state.result = update.result;
+      state.revision = update.revision;
+      const callback = this.queryCallbacks.get(state.callbackPort);
+      if (callback) callbacks.push(() => {
+        try { callback(update.result); } catch (error) { console.error('[PyreClient] Query listener failed', error); }
+      });
+    }
+    return () => callbacks.forEach(callback => callback());
+  }
 
   constructor(debugLog?: (...args: unknown[]) => void) {
     this.debugLog = debugLog ?? (() => {});
@@ -40,13 +66,24 @@ export class QueryManagerService {
     this.elmApp = elmApp;
 
     if (elmApp.ports.queryManagerOut) {
-      elmApp.ports.queryManagerOut.subscribe((message) => {
+      this.portListener = (message) => {
         this.debugLog('[PyreClient] port queryManagerOut <-', message);
         this.handleMessage(message as { type?: string }).catch((error) => {
           console.error('[PyreClient] Query manager handler failed:', error);
         });
-      });
+      };
+      elmApp.ports.queryManagerOut.subscribe(this.portListener);
     }
+  }
+
+  detach(): void {
+    if (this.portListener) this.elmApp?.ports.queryManagerOut?.unsubscribe?.(this.portListener);
+    this.elmApp = null;
+    this.localEdits = undefined;
+    this.queryCallbacks.clear();
+    this.queryStates.clear();
+    this.callbackPortToQueryId.clear();
+    this.mutationCallbacks.clear();
   }
 
   registerQuery(registration: QueryRegistration, callback: QueryResultCallback): void {
@@ -127,6 +164,10 @@ export class QueryManagerService {
   }
 
   private async handleMessage(message: { type?: string }): Promise<void> {
+    if (message.type === 'localEdits') {
+      this.localEdits?.receiveEnvelope(message as Parameters<LocalEditsRuntime['receiveEnvelope']>[0]);
+      return;
+    }
     if (message.type === 'queryResult') {
       const typedMessage = message as { callbackPort?: string; result?: unknown };
       if (!typedMessage.callbackPort) {

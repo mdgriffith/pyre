@@ -17,6 +17,9 @@ pub fn start() {
 
 #[wasm_bindgen]
 pub fn set_schema(introspection: JsValue) -> Result<(), JsValue> {
+    // cache::set_schema otherwise silently retains the previous schema on bad input.
+    serde_wasm_bindgen::from_value::<pyre::db::introspect::IntrospectionRaw>(introspection.clone())
+        .map_err(|_| JsValue::from_str("InvalidSchema"))?;
     cache::set_schema(introspection);
     Ok(())
 }
@@ -24,6 +27,57 @@ pub fn set_schema(introspection: JsValue) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn process_introspection(introspection: JsValue) -> Result<JsValue, JsValue> {
     cache::process_introspection(introspection)
+}
+
+/// Compare this with the trusted manifest.replacementContracts[namespace] after restoring the
+/// request's captured introspection, without an await before SQL/codec use.
+#[wasm_bindgen]
+pub fn get_schema_compiled_contract() -> Result<String, JsValue> {
+    let introspection = cache::get().ok_or_else(|| JsValue::from_str("InvalidSchema"))?;
+    match &introspection.schema {
+        pyre::db::introspect::SchemaResult::Success { context, .. } => {
+            if context.valid_namespaces.len() != 1 {
+                return Err(JsValue::from_str(
+                    "Replacement requires one database namespace",
+                ));
+            }
+            pyre::generate::manifest::replacement_contract(
+                context,
+                context.valid_namespaces.iter().next().unwrap(),
+            )
+            .ok_or_else(|| JsValue::from_str("InvalidSchema"))
+        }
+        _ => Err(JsValue::from_str("InvalidSchema")),
+    }
+}
+
+/// Validate raw storage groups before ordinary reshaping. This validates rows,
+/// not snapshot coverage: the caller still checks the plan, revision and fence.
+#[wasm_bindgen]
+pub fn validate_replacement_table_groups(table_groups: JsValue) -> bool {
+    let Ok(groups) = serde_wasm_bindgen::from_value::<Vec<pyre::sync_deltas::AffectedRowTableGroup>>(
+        table_groups,
+    ) else {
+        return false;
+    };
+    let Some(introspection) = cache::get() else {
+        return false;
+    };
+    let pyre::db::introspect::SchemaResult::Success { context, .. } = &introspection.schema else {
+        return false;
+    };
+    let mut names = std::collections::HashSet::new();
+    groups.iter().all(|group| {
+        if !names.insert(&group.table_name) {
+            return false;
+        }
+        let Some(table) = context.tables.values().find(|table| {
+            pyre::ast::get_tablename(&table.record.name, &table.record.fields) == group.table_name
+        }) else {
+            return false;
+        };
+        pyre::sync::reshape_replacement_table(context, &table.schema, group).is_ok()
+    })
 }
 
 #[wasm_bindgen]
@@ -129,7 +183,25 @@ pub fn get_sync_sql(
 }
 
 #[wasm_bindgen]
+pub fn get_replacement_sql(session: JsValue, namespace: String) -> JsValue {
+    match sync::get_replacement_sql_wasm(session, namespace) {
+        Ok(sql_result) => {
+            let json_str = serde_json::to_string(&sql_result).unwrap();
+            js_sys::JSON::parse(&json_str).unwrap()
+        }
+        Err(e) => serde_wasm_bindgen::to_value(&("Error: ".to_string() + &e)).unwrap(),
+    }
+}
+
+#[wasm_bindgen]
 pub fn calculate_sync_deltas(affected_rows: JsValue, connected_sessions: JsValue) -> JsValue {
+    if let Some(introspection) = cache::get() {
+        if let pyre::db::introspect::SchemaResult::Success { context, .. } = &introspection.schema {
+            if pyre::sync::requires_replacement(context) {
+                return JsValue::from_str("Error: ReplacementRequired");
+            }
+        }
+    }
     let result = sync_deltas::calculate_sync_deltas_wasm(affected_rows, connected_sessions);
     match result {
         Ok(deltas_result) => {

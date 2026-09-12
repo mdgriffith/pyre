@@ -34,6 +34,33 @@ Start with the [sync guide](../../docs/usage/sync.md) for authentication, app-ow
 
 Use one `PyreClient` per schema family in your browser app. A `databaseId` selects a source database within that family, not a different schema.
 
+### Local Edits
+
+For receipt-based writes, opt in through `ServerConfig.localEdits(databaseId)` and
+use the [local-edit guide](../../docs/usage/local-edits.md) for complete configuration
+and fixture-backed TypeScript/Elm examples. Bind generated TypeScript builders with
+`await client.localEdits(databaseId, Main)`, then call `db.submit(editOrBatch)`
+synchronously. Import schema-specific `batch` and `Commands` from generated
+`typescript/edits/<Namespace>`, not the low-level client helpers.
+
+Generated Elm uses `Db.<Namespace>.Edit.<Record>` opaque patches, nullable `Maybe`
+setters and required create records with optional `createWith` setters. Store the
+`( Model, Effect, Receipt )` from `Pyre.submit`/`Pyre.batch` and forward effects in
+order through the bridge; lifecycle/failure events return on `pyre_receiveQueryDelta`.
+The default compiler namespace is TypeScript `Main`, Elm `Db.Database.Default`,
+and runtime `_default`. Typed database IDs select instances, not authorization.
+
+Install `db.onEditFailure` even when ignoring receipts. Acceptance proves commit;
+confirmation also requires authoritative coverage. Pending writes are memory-only,
+not a durable outbox, and writes are never automatically retried. JSON/unions are
+whole-value replacements and may overwrite concurrent member changes. Prediction
+is conservative; one unpredictable member disables optimism for the entire batch.
+Generated CRUD does not enforce invariants encoded only in named commands; keep
+those writes on their command (MEC-117 follow-up).
+
+The initialization below shows legacy transport configuration, not fenced local
+edits. Cross-runtime release conformance remains subject to verification.
+
 ### Initialization
 
 ```typescript
@@ -149,7 +176,10 @@ subscription?.unsubscribe();
 
 ### Entity Change Streams
 
-Use `onEntityChanges` when you want table rows directly instead of a query-shaped result tree. The first callback is always an `indexeddb-initial` batch, even when no persisted rows match. Later callbacks contain matching incoming catchup or live table deltas.
+Use `onEntityChanges` when you want table rows directly instead of a query-shaped
+result tree. Legacy mode starts with `indexeddb-initial`. Fenced local edits start
+from the worker's visible state with source `local-edits`, never IndexedDB, and
+publish authoritative replacement plus eligible pending intent together.
 
 ```typescript
 const posts = new Map<string | number, unknown>();
@@ -165,7 +195,8 @@ const unsubscribe = await client.onEntityChanges(
   (batch) => {
     for (const change of batch.changes) {
       if (change.tableName === 'posts') {
-        posts.set(change.id, change.row);
+        if (change.op === 'remove') posts.delete(change.id);
+        else posts.set(change.id, change.row);
       }
     }
 
@@ -176,12 +207,15 @@ const unsubscribe = await client.onEntityChanges(
 unsubscribe();
 ```
 
-Entity streams emit current rows only:
+Legacy entity streams emit current rows:
 
 - `source: 'indexeddb-initial'` for the initial persisted snapshot
 - `source: 'catchup'` or `source: 'live'` for incoming server deltas
 - `op: 'row'` for every change
 - no delete events, previous values, field-level diffs, or membership-left events
+
+Fenced streams also emit `{ tableName, id, op: 'remove' }` for deletes, rejected
+creates, filter exits and replacement omissions. Removal events have no row payload.
 
 If filter inputs change, unsubscribe and create a new subscription.
 
@@ -266,6 +300,14 @@ Provide `elm.onMutation` only when you need to override that default mutation be
 
 ### Sending Mutations
 
+Named calls remain supported. In fenced mode, `run` uses the same ordered worker
+queue as generated edits, without inferred optimism. Its callback receives
+`{ ok: true, value }` only on confirmation; other outcomes have `ok: false`, an
+outcome-kind `error`, and a structured `outcome`. Do not treat every callback as
+success or every failure as proof of rollback. Use generated `Commands` plus
+receipts to observe acceptance and late settlement; subscribe to `onEditFailure`
+independently. See [migration details](../../docs/usage/local-edits.md#migrating-named-calls).
+
 ```typescript
 await client.run(bootstrap.mainDatabaseId, CreatePost, { title: 'Hello' }, (result) => {
   console.log('Mutation result:', result);
@@ -289,7 +331,10 @@ sendCreatePost databaseId =
         )
 ```
 
-`PyreClient` will POST that mutation to the configured query endpoint and publish the result to `pyre_receiveMutationResult`.
+In legacy mode, `PyreClient` posts that mutation to the configured query endpoint
+and publishes the result to `pyre_receiveMutationResult`. Fenced named calls use
+the local-edit queue; new Elm edit effects instead return lifecycle events through
+`pyre_receiveQueryDelta`.
 
 This example assumes `CreatePost` belongs to the `Main` schema namespace. Construct its typed database ID from your app's bootstrap string with `Db.Database.fromString`; use the generated namespace for your own schema.
 

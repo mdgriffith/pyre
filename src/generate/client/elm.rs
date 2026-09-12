@@ -547,11 +547,7 @@ fn entity_stream_column_is_id_like(database: &ast::Database, column: &ast::Colum
     match &column.type_ {
         ast::ColumnType::IdInt { .. } | ast::ColumnType::IdUuid { .. } => true,
         ast::ColumnType::ForeignKey { table, field, .. } => {
-            if database_column_type(database, table, field).is_some() {
-                true
-            } else {
-                field == "id"
-            }
+            database_column_type(database, table, field).is_some()
         }
         ast::ColumnType::JsonTyped(inner) | ast::ColumnType::Nullable(inner) => {
             entity_stream_column_is_id_like(
@@ -585,8 +581,6 @@ fn entity_stream_elm_type(database: &ast::Database, type_: &ast::ColumnType) -> 
         ast::ColumnType::ForeignKey { table, field, .. } => {
             if let Some(column_type) = database_column_type(database, table, field) {
                 entity_stream_elm_type(database, &column_type)
-            } else if field == "id" {
-                format!("Db.Id.{}", table)
             } else {
                 "String".to_string()
             }
@@ -599,7 +593,7 @@ fn entity_stream_elm_type(database: &ast::Database, type_: &ast::ColumnType) -> 
         ast::ColumnType::Nullable(inner) => {
             format!("Maybe {}", entity_stream_elm_type(database, inner))
         }
-        _ => elm_type_from_column_type(type_, true),
+        _ => elm_type_from_column_type(database, type_, true),
     }
 }
 
@@ -618,12 +612,6 @@ fn entity_stream_encoder(database: &ast::Database, type_: &ast::ColumnType) -> O
         ast::ColumnType::ForeignKey { table, field, .. } => {
             if let Some(column_type) = database_column_type(database, table, field) {
                 entity_stream_encoder(database, &column_type)
-            } else if field == "id" {
-                match id_kind_for_brand(database, table) {
-                    Some(IdKind::Int) => Some("Db.Id.encodeInt".to_string()),
-                    Some(IdKind::Uuid) => Some("Db.Id.encodeUuid".to_string()),
-                    None => Some("Encode.string".to_string()),
-                }
             } else {
                 Some("Encode.string".to_string())
             }
@@ -648,7 +636,7 @@ fn entity_stream_decoder(database: &ast::Database, type_: &ast::ColumnType) -> S
         }
         ast::ColumnType::IdUuid { table } => {
             if table.is_empty() {
-                "Decode.string".to_string()
+                "Db.Id.decodeUuidString".to_string()
             } else {
                 "Db.Id.decodeUuid".to_string()
             }
@@ -656,12 +644,6 @@ fn entity_stream_decoder(database: &ast::Database, type_: &ast::ColumnType) -> S
         ast::ColumnType::ForeignKey { table, field, .. } => {
             if let Some(column_type) = database_column_type(database, table, field) {
                 entity_stream_decoder(database, &column_type)
-            } else if field == "id" {
-                match id_kind_for_brand(database, table) {
-                    Some(IdKind::Int) => "Db.Id.decodeInt".to_string(),
-                    Some(IdKind::Uuid) => "Db.Id.decodeUuid".to_string(),
-                    None => "Decode.string".to_string(),
-                }
             } else {
                 "Decode.string".to_string()
             }
@@ -712,7 +694,7 @@ fn database_column_type(
 fn entity_stream_id_type(fields: &Vec<ast::Field>) -> Option<(String, &'static str)> {
     for field in fields {
         if let ast::Field::Column(column) = field {
-            if column.name != "id" {
+            if !ast::is_primary_key(column) {
                 continue;
             }
 
@@ -868,6 +850,7 @@ fn to_schema_ids(database: &ast::Database) -> String {
     result.push_str("int =\n");
     result.push_str("    Integer\n\n\n");
 
+    result.push_str("{-| Wrap an already allocated UUID. This function does not generate randomness.\nReceive the UUID through your application's normal command/message flow before\nconstructing an input or edit, then wrap it with `uuid`.\n-}\n");
     result.push_str("uuid : String -> Uuid guard\n");
     result.push_str("uuid =\n");
     result.push_str("    Uuid\n\n\n");
@@ -886,7 +869,8 @@ fn to_schema_ids(database: &ast::Database) -> String {
 
     result.push_str("decodeUuid : Decode.Decoder (Uuid guard)\n");
     result.push_str("decodeUuid =\n");
-    result.push_str("    Decode.map uuid Decode.string\n\n\n");
+    result.push_str("    Decode.map uuid decodeUuidString\n\n\n");
+    result.push_str("decodeUuidString : Decode.Decoder String\ndecodeUuidString =\n    Decode.string |> Decode.andThen (\\value ->\n        if String.length value == 36 && (String.toList value |> List.indexedMap (\\index char -> if List.member index [ 8, 13, 18, 23 ] then char == '-' else String.contains (String.fromChar char) \"0123456789abcdefABCDEF\") |> List.all identity) then\n            Decode.succeed value\n        else\n            Decode.fail \"Invalid UUID\"\n    )\n\n\n");
 
     let brands = collect_id_brands(database);
     if !brands.is_empty() {
@@ -941,65 +925,33 @@ fn collect_id_brands(database: &ast::Database) -> Vec<(String, IdKind)> {
     out
 }
 
-fn split_foreign_key_type(type_: &str) -> Option<(&str, &str)> {
-    let mut parts = type_.split('.');
-    let table = parts.next()?;
-    let field = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((table, field))
-}
-
 fn find_table<'a>(lookup: &'a ElmLookup, table_name: &str) -> Option<&'a ast::RecordDetails> {
     lookup.records_by_name.get(&table_name.to_ascii_lowercase())
 }
 
-fn get_id_kind_for_brand(lookup: &ElmLookup, brand: &str) -> Option<IdKind> {
-    let table = find_table(lookup, brand)?;
-
-    for field in &table.fields {
-        if let ast::Field::Column(column) = field {
-            if column.name == "id" {
-                return match &column.type_ {
-                    ast::ColumnType::IdInt { .. } => Some(IdKind::Int),
-                    ast::ColumnType::IdUuid { .. } => Some(IdKind::Uuid),
-                    _ => None,
-                };
-            }
-        }
-    }
-
-    None
-}
-
-fn resolve_foreign_key_column_type(lookup: &ElmLookup, type_: &str) -> Option<ast::ColumnType> {
-    let (table_name, field_name) = split_foreign_key_type(type_)?;
+fn resolve_foreign_key_column_type(
+    lookup: &ElmLookup,
+    type_: &ast::ColumnType,
+) -> Option<ast::ColumnType> {
+    let ast::ColumnType::ForeignKey {
+        table: table_name,
+        field: field_name,
+        ..
+    } = type_
+    else {
+        return None;
+    };
     let table = find_table(lookup, table_name)?;
 
     for field in &table.fields {
         if let ast::Field::Column(column) = field {
-            if column.name == field_name {
+            if column.name == *field_name {
                 return Some(column.type_.clone());
             }
         }
     }
 
     None
-}
-
-fn id_encoder(kind: IdKind) -> &'static str {
-    match kind {
-        IdKind::Int => "Db.Id.encodeInt",
-        IdKind::Uuid => "Db.Id.encodeUuid",
-    }
-}
-
-fn id_decoder(kind: IdKind) -> &'static str {
-    match kind {
-        IdKind::Int => "Db.Id.decodeInt",
-        IdKind::Uuid => "Db.Id.decodeUuid",
-    }
 }
 
 pub fn write_schema(database: &ast::Database) -> String {
@@ -1015,7 +967,7 @@ pub fn write_schema(database: &ast::Database) -> String {
         for file in &schema.files {
             for definition in &file.definitions {
                 if let ast::Definition::Tagged { .. } = definition {
-                    result.push_str(&to_string_definition(definition));
+                    result.push_str(&to_string_definition(database, definition));
                 }
             }
         }
@@ -1024,7 +976,7 @@ pub fn write_schema(database: &ast::Database) -> String {
     result
 }
 
-fn to_string_definition(definition: &ast::Definition) -> String {
+fn to_string_definition(database: &ast::Database, definition: &ast::Definition) -> String {
     match definition {
         ast::Definition::Lines { count } => {
             if *count > 2 {
@@ -1040,17 +992,17 @@ fn to_string_definition(definition: &ast::Definition) -> String {
             let mut result = format!("type {}\n", name);
             let mut is_first = true;
             for variant in variants {
-                result.push_str(&to_string_variant(is_first, 4, variant));
+                result.push_str(&to_string_variant(database, is_first, 4, variant));
                 is_first = false;
             }
             result.push('\n');
             result
         }
-        ast::Definition::Record { name, fields, .. } => to_type_alias(name, fields),
+        ast::Definition::Record { name, fields, .. } => to_type_alias(database, name, fields),
     }
 }
 
-fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
+fn to_type_alias(database: &ast::Database, name: &str, fields: &Vec<ast::Field>) -> String {
     let mut result = format!("type alias {} =\n", name);
 
     let mut is_first = true;
@@ -1062,7 +1014,7 @@ fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
             continue;
         }
 
-        result.push_str(&to_string_field(is_first, 4, &field));
+        result.push_str(&to_string_field(database, is_first, 4, &field));
 
         if is_first & ast::is_column(field) {
             is_first = false;
@@ -1072,7 +1024,12 @@ fn to_type_alias(name: &str, fields: &Vec<ast::Field>) -> String {
     result
 }
 
-fn to_string_variant(is_first: bool, indent_size: usize, variant: &ast::Variant) -> String {
+fn to_string_variant(
+    database: &ast::Database,
+    is_first: bool,
+    indent_size: usize,
+    variant: &ast::Variant,
+) -> String {
     let prefix = if is_first { " = " } else { " | " };
 
     match &variant.fields {
@@ -1082,7 +1039,7 @@ fn to_string_variant(is_first: bool, indent_size: usize, variant: &ast::Variant)
 
             let mut is_first_field = true;
             for field in fields {
-                result.push_str(&to_string_field(is_first_field, 6, &field));
+                result.push_str(&to_string_field(database, is_first_field, 6, &field));
                 if ast::is_column(field) {
                     is_first_field = false;
                 }
@@ -1094,7 +1051,12 @@ fn to_string_variant(is_first: bool, indent_size: usize, variant: &ast::Variant)
     }
 }
 
-fn to_string_field(is_first: bool, indent: usize, field: &ast::Field) -> String {
+fn to_string_field(
+    database: &ast::Database,
+    is_first: bool,
+    indent: usize,
+    field: &ast::Field,
+) -> String {
     match field {
         ast::Field::ColumnLines { count } => {
             if *count > 2 {
@@ -1103,15 +1065,20 @@ fn to_string_field(is_first: bool, indent: usize, field: &ast::Field) -> String 
                 "\n".repeat(*count as usize)
             }
         }
-        ast::Field::Column(column) => to_string_column(is_first, indent, column),
+        ast::Field::Column(column) => to_string_column(database, is_first, indent, column),
         ast::Field::ColumnComment { .. } => "".to_string(),
         ast::Field::FieldDirective(_) => "".to_string(),
     }
 }
 
-fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> String {
+fn to_string_column(
+    database: &ast::Database,
+    is_first: bool,
+    indent: usize,
+    column: &ast::Column,
+) -> String {
     let maybe = if column.nullable { "Maybe " } else { "" };
-    let type_str = column_to_elm_type(column);
+    let type_str = elm_type_from_column_type(database, &column.type_, false);
 
     if is_first {
         return format!("{} : {}{}\n", column.name, maybe, type_str);
@@ -1123,11 +1090,11 @@ fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> Stri
 
 /// Convert a column to its Elm type representation
 /// For ID types with brands, generates branded types like `UserId` or `Uuid User`
-fn column_to_elm_type(column: &ast::Column) -> String {
-    elm_type_from_column_type(&column.type_, false)
-}
-
-fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) -> String {
+fn elm_type_from_column_type(
+    database: &ast::Database,
+    type_: &ast::ColumnType,
+    qualify_db_types: bool,
+) -> String {
     match type_ {
         ast::ColumnType::String => "String".to_string(),
         ast::ColumnType::Int => "Int".to_string(),
@@ -1142,23 +1109,25 @@ fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) ->
                 "Json".to_string()
             }
         }
-        ast::ColumnType::JsonTyped(inner) => elm_type_from_column_type(inner, qualify_db_types),
+        ast::ColumnType::JsonTyped(inner) => {
+            elm_type_from_column_type(database, inner, qualify_db_types)
+        }
         ast::ColumnType::List(inner) => {
             format!(
                 "List {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                elm_type_from_column_type(database, inner, qualify_db_types)
             )
         }
         ast::ColumnType::Dict(inner) => {
             format!(
                 "Dict String {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                elm_type_from_column_type(database, inner, qualify_db_types)
             )
         }
         ast::ColumnType::Nullable(inner) => {
             format!(
                 "Maybe {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                elm_type_from_column_type(database, inner, qualify_db_types)
             )
         }
         ast::ColumnType::IdInt { table } => {
@@ -1176,11 +1145,9 @@ fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) ->
             }
         }
         ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                format!("Db.Id.{}", table)
-            } else {
-                "String".to_string()
-            }
+            database_column_type(database, table, field)
+                .map(|target| elm_type_from_column_type(database, &target, qualify_db_types))
+                .unwrap_or_else(|| "String".to_string())
         }
         ast::ColumnType::Custom(name) => {
             if qualify_db_types {
@@ -1283,6 +1250,7 @@ fn to_decoder_definition(
                 match &variant.fields {
                     Some(fields) => {
                         result.push_str(&to_type_alias(
+                            database,
                             &format!("{}_{}", name, variant.name),
                             fields,
                         ));
@@ -1377,34 +1345,6 @@ fn to_variant_field_json_decoder(
     }
 }
 
-fn id_kind_for_brand(database: &ast::Database, brand: &str) -> Option<IdKind> {
-    for schema in &database.schemas {
-        for file in &schema.files {
-            for definition in &file.definitions {
-                if let ast::Definition::Record { name, fields, .. } = definition {
-                    if !name.eq_ignore_ascii_case(brand) {
-                        continue;
-                    }
-
-                    for field in fields {
-                        if let ast::Field::Column(column) = field {
-                            if column.name == "id" {
-                                return match &column.type_ {
-                                    ast::ColumnType::IdInt { .. } => Some(IdKind::Int),
-                                    ast::ColumnType::IdUuid { .. } => Some(IdKind::Uuid),
-                                    _ => None,
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
 fn to_json_type_decoder(database: &ast::Database, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "Decode.string".to_string(),
@@ -1427,14 +1367,22 @@ fn to_json_type_decoder(database: &ast::Database, type_: &ast::ColumnType) -> St
                 to_json_type_decoder(database, inner)
             )
         }
-        ast::ColumnType::IdInt { .. } => "Db.Id.decodeInt".to_string(),
-        ast::ColumnType::IdUuid { .. } => "Db.Id.decodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } if field == "id" => {
-            match id_kind_for_brand(database, table) {
-                Some(IdKind::Int) => "Db.Id.decodeInt".to_string(),
-                Some(IdKind::Uuid) => "Db.Id.decodeUuid".to_string(),
-                None => "Db.Id.decodeUuid".to_string(),
-            }
+        ast::ColumnType::IdInt { table } => if table.is_empty() {
+            "Decode.int"
+        } else {
+            "Db.Id.decodeInt"
+        }
+        .to_string(),
+        ast::ColumnType::IdUuid { table } => if table.is_empty() {
+            "Db.Id.decodeUuidString"
+        } else {
+            "Db.Id.decodeUuid"
+        }
+        .to_string(),
+        ast::ColumnType::ForeignKey { table, field, .. } => {
+            database_column_type(database, table, field)
+                .map(|target| to_json_type_decoder(database, &target))
+                .unwrap_or_else(|| "Decode.string".to_string())
         }
         _ => crate::ext::string::decapitalize(&type_.to_string()).to_string(),
     }
@@ -1569,15 +1517,11 @@ fn to_type_encoder(database: &ast::Database, type_: &ast::ColumnType) -> String 
             "(\\maybe__ -> Maybe.map ({} ) maybe__ |> Maybe.withDefault Encode.null)",
             to_type_encoder(database, inner)
         ),
-        ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
-        ast::ColumnType::IdUuid { .. } => "Db.Id.encodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } if field == "id" => {
-            match id_kind_for_brand(database, table) {
-                Some(IdKind::Int) => "Db.Id.encodeInt".to_string(),
-                Some(IdKind::Uuid) => "Db.Id.encodeUuid".to_string(),
-                None => "Db.Id.encodeUuid".to_string(),
-            }
-        }
+        ast::ColumnType::IdInt { table } => if table.is_empty() { "Encode.int" } else { "Db.Id.encodeInt" }.to_string(),
+        ast::ColumnType::IdUuid { table } => if table.is_empty() { "Encode.string" } else { "Db.Id.encodeUuid" }.to_string(),
+        ast::ColumnType::ForeignKey { table, field, .. } => database_column_type(database, table, field)
+            .map(|target| to_type_encoder(database, &target))
+            .unwrap_or_else(|| "Encode.string".to_string()),
         _ => string::decapitalize(&type_.to_string()),
     }
 }
@@ -1605,16 +1549,10 @@ fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
             "(\\maybe__ -> Maybe.map ({} ) maybe__ |> Maybe.withDefault Encode.null)",
             to_elm_encoder(lookup, inner)
         ),
-        ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
-        ast::ColumnType::IdUuid { .. } => "Db.Id.encodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(kind) = get_id_kind_for_brand(lookup, table) {
-                    return id_encoder(kind).to_string();
-                }
-            }
-
-            if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
+        ast::ColumnType::IdInt { table } => if table.is_empty() { "Encode.int" } else { "Db.Id.encodeInt" }.to_string(),
+        ast::ColumnType::IdUuid { table } => if table.is_empty() { "Encode.string" } else { "Db.Id.encodeUuid" }.to_string(),
+        ast::ColumnType::ForeignKey { .. } => {
+            if let Some(col_type) = resolve_foreign_key_column_type(lookup, type_) {
                 return to_elm_encoder(lookup, &col_type);
             }
 
@@ -1634,6 +1572,7 @@ pub fn generate_queries(
     base_out_dir: &Path,
     files: &mut Vec<GeneratedFile<String>>,
 ) {
+    generate_local_edits(context, all_query_info, query_list, base_out_dir, files);
     let mut query_names: Vec<String> = Vec::new();
 
     for operation in &query_list.queries {
@@ -1655,11 +1594,280 @@ pub fn generate_queries(
     }
 
     // Generate the Pyre.elm module that ties all queries together
-    if !query_names.is_empty() {
+    {
         files.push(generate_text_file(
             base_out_dir.join("Pyre.elm"),
             generate_pyre_module(context, all_query_info, query_list, &query_names),
         ));
+    }
+}
+
+fn generate_local_edits(
+    context: &typecheck::Context,
+    info: &HashMap<String, typecheck::QueryInfo>,
+    queries: &ast::QueryList,
+    base: &Path,
+    files: &mut Vec<GeneratedFile<String>>,
+) {
+    for (path, source) in [
+        (
+            "Pyre/Edit.elm",
+            include_str!("./static/elm/src/Pyre/Edit.elm"),
+        ),
+        (
+            "Pyre/Batch.elm",
+            include_str!("./static/elm/src/Pyre/Batch.elm"),
+        ),
+        (
+            "Pyre/Edit/Internal.elm",
+            include_str!("./static/elm/src/Pyre/Edit/Internal.elm"),
+        ),
+        (
+            "Pyre/LocalEdits.elm",
+            include_str!("./static/elm/src/Pyre/LocalEdits.elm"),
+        ),
+    ] {
+        files.push(generate_text_file(base.join(path), source));
+    }
+    let lookup = ElmLookup::from_context(context);
+    let manifest = crate::generate::manifest::fingerprint(context, queries, info);
+    let mut modules = std::collections::BTreeMap::<String, (Vec<String>, String)>::new();
+    for definition in &queries.queries {
+        let ast::QueryDef::Query(query) = definition else {
+            continue;
+        };
+        let Some(query_info) = info.get(&query.name) else {
+            continue;
+        };
+        if !query.generated_crud && query.operation != ast::QueryOperation::Query {
+            let namespace = elm_database_namespace(&query_info.primary_db);
+            let module = format!("Db.{}.Edit.Command.{}", namespace, query.name);
+            files.push(generate_text_file(base.join(format!("{}.elm", module.replace('.', "/"))), format!("module {} exposing (run)\n\nimport Db.Database\nimport Pyre.Edit exposing (Edit)\nimport Pyre.Edit.Internal as Internal\nimport Query.{} as Command\n\n\nrun : Command.Input -> Edit Db.Database.{} Command.ReturnData\nrun input =\n    Internal.operation \"{}\" \"{}\" \"{}\" (Command.encode input) Command.decodeReturnData\n", module, query.name, namespace, query_info.primary_db, manifest, query.interface_hash)));
+            continue;
+        }
+        let Some(table) = query.fields.iter().find_map(|field| match field {
+            ast::TopLevelQueryField::Field(field) => context.tables.get(&field.name),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some((kind, id, writable)) = crate::generated_queries::generated_edit(query, table)
+        else {
+            continue;
+        };
+        let namespace = elm_database_namespace(&query_info.primary_db);
+        let module = format!(
+            "Db.{}.Edit.{}",
+            namespace,
+            elm_module_segment(&table.record.name)
+        );
+        let (exposed, body) = modules.entry(module).or_default();
+        let id_type = format!(
+            "Db.EditIds.{}{}",
+            namespace,
+            elm_module_segment(&table.record.name)
+        );
+        let id_decoder = match id.type_ {
+            ast::ColumnType::IdInt { .. } | ast::ColumnType::Int => "Internal.decodeInt",
+            _ => "Internal.decodeUuid",
+        };
+        let id_encoder = if id_decoder == "Internal.decodeInt" {
+            "Db.Id.encodeInt"
+        } else {
+            "Db.Id.encodeUuid"
+        };
+        let result_type = match kind {
+            "create" => "Created",
+            "update" => "Updated",
+            _ => "Deleted",
+        };
+        let signature = format!(
+            "Edit Db.Database.{} ({} {})",
+            namespace, result_type, id_type
+        );
+        let result_decoder = format!(
+            "(Decode.map {} (Decode.field \"id\" {}))",
+            result_type, id_decoder
+        );
+        let operation = format!(
+            "Internal.operation \"{}\" \"{}\" \"{}\"",
+            query_info.primary_db, manifest, query.interface_hash
+        );
+        exposed.push(kind.to_string());
+        match kind {
+            "delete" => body.push_str(&format!("delete : {} -> {}\ndelete target =\n    {} (Encode.object [ ( \"{}\", {} target ) ]) {}\n\n\n", id_type, signature, operation, id.name, id_encoder, result_decoder)),
+            "update" => {
+                exposed.push("Patch".into());
+                body.push_str("type Patch\n    = Patch String Encode.Value\n\n\n");
+                for arg in query.args.iter().filter(|arg| writable.contains(&arg.name)) {
+                    let (type_, encoder) = local_edit_arg(context, &lookup, table, arg);
+                    let setter = format!("set{}", elm_module_segment(&arg.name));
+                    exposed.push(setter.clone());
+                    body.push_str(&format!("{} : {} -> Patch\n{} value =\n    Patch \"{}\" ({} value)\n\n\n", setter, type_, setter, arg.name, encoder));
+                }
+                body.push_str(&format!("update : {} -> List Patch -> {}\nupdate target patches =\n    {} (Encode.object (( \"{}\", {} target ) :: (List.map (\\(Patch key value) -> ( key, value )) patches |> Dict.fromList |> Dict.toList))) {}\n\n\n", id_type, signature, operation, id.name, id_encoder, result_decoder));
+            }
+            "create" => {
+                exposed.extend(["Create".into(), "CreateOption".into(), "createWith".into()]);
+                let required: Vec<_> = query.args.iter().filter(|arg| !arg.omittable).collect();
+                let fields: Vec<_> = required.iter().map(|arg| {
+                    let (type_, _) = local_edit_arg(context, &lookup, table, arg);
+                    format!("{} : {}", arg.name, type_)
+                }).collect();
+                body.push_str(&format!("type alias Create =\n    {{ {} }}\n\n\ntype CreateOption\n    = CreateOption String Encode.Value\n\n\n", fields.join(", ")));
+                for arg in query.args.iter().filter(|arg| arg.omittable) {
+                    let (type_, encoder) = local_edit_arg(context, &lookup, table, arg);
+                    let setter = format!("with{}", elm_module_segment(&arg.name));
+                    exposed.push(setter.clone());
+                    body.push_str(&format!("{} : {} -> CreateOption\n{} value =\n    CreateOption \"{}\" ({} value)\n\n\n", setter, type_, setter, arg.name, encoder));
+                }
+                let fields: Vec<_> = required.iter().map(|arg| {
+                    let (_, encoder) = local_edit_arg(context, &lookup, table, arg);
+                    format!("( \"{}\", {} required.{} )", arg.name, encoder, arg.name)
+                }).collect();
+                body.push_str(&format!("create : Create -> {}\ncreate required =\n    createWith required []\n\n\ncreateWith : Create -> List CreateOption -> {}\ncreateWith required options =\n    {} (Encode.object ([ {} ] ++ (List.map (\\(CreateOption key value) -> ( key, value )) options |> Dict.fromList |> Dict.toList))) {}\n\n\n", signature, signature, operation, fields.join(", "), result_decoder));
+            }
+            _ => unreachable!(),
+        }
+    }
+    for (module, (exposed, body)) in modules {
+        files.push(generate_text_file(base.join(format!("{}.elm", module.replace('.', "/"))), format!("module {} exposing ({})\n\nimport Db\nimport Db.Database\nimport Db.Decode\nimport Db.Encode\nimport Db.Id\nimport Db.EditIds\nimport Dict exposing (Dict)\nimport Time\nimport Json.Decode as Decode\nimport Json.Encode as Encode\nimport Pyre.Edit exposing (Edit, Created, Updated, Deleted)\nimport Pyre.Edit.Internal as Internal\n\n\n{}", module, exposed.join(", "), body)));
+    }
+    let mut ids = String::from("module Db.EditIds exposing (.. )\n\nimport Db.Id\n\n\n");
+    let mut tables: Vec<_> = context.tables.values().collect();
+    tables.sort_by_key(|table| (&table.schema, &table.record.name));
+    for table in tables {
+        if let Some((identity_kind, id)) = crate::generated_queries::local_edit_identity(table) {
+            let name = format!(
+                "{}{}",
+                elm_database_namespace(&table.schema),
+                elm_module_segment(&table.record.name)
+            );
+            let kind = match identity_kind {
+                crate::generated_queries::LocalEditIdentityKind::Integer => "Integer",
+                crate::generated_queries::LocalEditIdentityKind::Uuid => "Uuid",
+            };
+            // Reuse the query/entity ID guard so read identities can be edited
+            // without unwrapping and rebranding at the application boundary.
+            if matches!(&id.type_, ast::ColumnType::IdInt { table } | ast::ColumnType::IdUuid { table } if !table.is_empty())
+            {
+                ids.push_str(&format!(
+                    "type alias {} =\n    Db.Id.{}\n\n\n",
+                    name, table.record.name
+                ));
+            } else {
+                ids.push_str(&format!("type {}Identity\n    = {}Identity\n\n\ntype alias {} =\n    Db.Id.{} {}Identity\n\n\n", name, name, name, kind, name));
+            }
+        }
+    }
+    files.push(generate_text_file(base.join("Db/EditIds.elm"), ids));
+}
+
+fn local_edit_arg(
+    context: &typecheck::Context,
+    lookup: &ElmLookup,
+    table: &typecheck::Table,
+    arg: &ast::QueryParamDefinition,
+) -> (String, String) {
+    let raw = arg.type_.as_deref().unwrap_or("Json");
+    let mut type_ = to_elm_typename(lookup, raw, false);
+    let mut encoder = to_param_encoder_str(lookup, raw, false);
+    if let Some(ast::Column {
+        type_:
+            ast::ColumnType::ForeignKey {
+                schema,
+                table: target,
+                field,
+                ..
+            },
+        ..
+    }) = table.record.fields.iter().find_map(|field| match field {
+        ast::Field::Column(column) if column.name == arg.name => Some(column),
+        _ => None,
+    }) {
+        if let Some(target) = context.tables.values().find(|candidate| {
+            candidate.record.name == *target
+                && candidate.schema == *schema.as_ref().unwrap_or(&table.schema)
+        }) {
+            if let Some(key) = target.record.fields.iter().find_map(|member| match member {
+                ast::Field::Column(column)
+                    if column.name == *field && ast::is_primary_key(column) =>
+                {
+                    Some(column)
+                }
+                _ => None,
+            }) {
+                type_ = format!(
+                    "Db.EditIds.{}{}",
+                    elm_database_namespace(&target.schema),
+                    elm_module_segment(&target.record.name)
+                );
+                encoder = if matches!(
+                    key.type_,
+                    ast::ColumnType::Int | ast::ColumnType::IdInt { .. }
+                ) {
+                    "Db.Id.encodeInt".into()
+                } else {
+                    "Db.Id.encodeUuid".into()
+                };
+            }
+        }
+    }
+    if table.record.fields.iter().any(|field| matches!(field, ast::Field::Column(column) if column.name == arg.name && ast::is_primary_key(column))) {
+        type_ = format!("Db.EditIds.{}{}", elm_database_namespace(&table.schema), elm_module_segment(&table.record.name));
+        encoder = if raw.contains("Int") { "Db.Id.encodeInt".into() } else { "Db.Id.encodeUuid".into() };
+    }
+    if arg.nullable {
+        type_ = format!("Maybe ({})", type_);
+        encoder = format!(
+            "(\\nullableValue -> Maybe.map ({}) nullableValue |> Maybe.withDefault Encode.null)",
+            encoder
+        );
+    }
+    (format!("({})", type_), encoder)
+}
+
+fn elm_return_columns(
+    context: &typecheck::Context,
+    table: &typecheck::Table,
+    field: &ast::QueryField,
+    parent: &str,
+    columns: &mut HashMap<(String, String), ast::ColumnType>,
+) {
+    let alias = format!(
+        "{}{}",
+        parent,
+        string::capitalize(&ast::get_aliased_name(field))
+    );
+    for selected in ast::collect_query_fields(&field.fields) {
+        for member in &table.record.fields {
+            match member {
+                ast::Field::Column(column)
+                    if selected.name == column.name || selected.name == "*" =>
+                {
+                    let name = if selected.name == "*" {
+                        column.name.clone()
+                    } else {
+                        ast::get_aliased_name(selected)
+                    };
+                    columns.insert((alias.clone(), name), column.type_.clone());
+                }
+                ast::Field::FieldDirective(ast::FieldDirective::Link(link))
+                    if ast::has_field_or_linkname(member, &selected.name) =>
+                {
+                    if let Some(target) = typecheck::get_linked_table(context, link) {
+                        elm_return_columns(
+                            context,
+                            target,
+                            selected,
+                            &format!("{}_", alias),
+                            columns,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1673,6 +1881,18 @@ fn to_query_file(
     use std::rc::Rc;
 
     let type_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    // The shared string formatter drops the brand on primary-key columns.
+    // Recover the actual schema column by projection alias, including nested links.
+    let mut return_columns = HashMap::new();
+    for field in &query.fields {
+        if let ast::TopLevelQueryField::Field(field) = field {
+            if let Some(table) = context.tables.get(&field.name) {
+                elm_return_columns(context, table, field, "", &mut return_columns);
+            }
+        }
+    }
+    let return_columns = Rc::new(return_columns);
+    let current_alias = Rc::new(RefCell::new(String::new()));
     let elm_lookup = ElmLookup::from_context(context);
 
     // Always include Input
@@ -1713,10 +1933,14 @@ fn to_query_file(
     ));
 
     let type_names_clone = type_names.clone();
+    let alias_start = current_alias.clone();
+    let alias_field = current_alias.clone();
+    let columns_for_types = return_columns.clone();
     let elm_lookup_for_types = elm_lookup.clone();
     let formatter = typealias::TypeFormatter {
         to_comment: Box::new(|s| format!("{{-| {} -}}\n", s)),
         to_type_def_start: Box::new(move |name| {
+            *alias_start.borrow_mut() = name.to_string();
             type_names_clone.borrow_mut().push(name.to_string());
             format!("type alias {} =\n    {{ ", name)
         }),
@@ -1728,7 +1952,10 @@ fn to_query_file(
                       is_optional,
                       is_array_relationship: _,
                   }| {
-                let base_type = to_elm_typename(&elm_lookup_for_types, type_, is_link);
+                let base_type = columns_for_types
+                    .get(&(alias_field.borrow().clone(), name.to_string()))
+                    .map(|column| to_elm_type_from_column_type(&elm_lookup_for_types, column))
+                    .unwrap_or_else(|| to_elm_typename(&elm_lookup_for_types, type_, is_link));
 
                 let type_str = if is_link {
                     if is_optional {
@@ -1762,9 +1989,12 @@ fn to_query_file(
     // Helpers
 
     let elm_lookup_for_decoders = elm_lookup.clone();
+    let alias_start = current_alias.clone();
+    let alias_field = current_alias.clone();
     let decoder_formatter = typealias::TypeFormatter {
         to_comment: Box::new(|s| format!("{{-| {} -}}\n", s)),
-        to_type_def_start: Box::new(|name| {
+        to_type_def_start: Box::new(move |name| {
+            *alias_start.borrow_mut() = name.to_string();
             format!(
                 "decode{} : Decode.Decoder {}\ndecode{} =\n    Decode.succeed {}\n        ",
                 name, name, name, name
@@ -1778,7 +2008,10 @@ fn to_query_file(
                       is_optional,
                       is_array_relationship: _,
                   }| {
-                let decoder = to_elm_decoder(&elm_lookup_for_decoders, type_, is_link);
+                let decoder = return_columns
+                    .get(&(alias_field.borrow().clone(), name.to_string()))
+                    .map(|column| to_elm_decoder_from_column_type(&elm_lookup_for_decoders, column))
+                    .unwrap_or_else(|| to_elm_decoder(&elm_lookup_for_decoders, type_, is_link));
 
                 let final_decoder: String = if is_optional {
                     format!("(Decode.nullable {})", decoder)
@@ -1871,6 +2104,7 @@ fn to_query_file(
             exposing_items.push("optimistic".to_string());
         }
         exposing_items.push("decodeMutationResult".to_string());
+        exposing_items.push("decodeReturnData".to_string());
         exposing_items.push("MutationResult".to_string());
     }
 
@@ -2117,6 +2351,14 @@ fn to_elm_typename(lookup: &ElmLookup, type_: &str, is_link: bool) -> String {
     }
 }
 
+fn elm_type_argument(type_: String) -> String {
+    if type_.contains(' ') {
+        format!("({})", type_)
+    } else {
+        type_
+    }
+}
+
 fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "String".to_string(),
@@ -2128,16 +2370,22 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
         ast::ColumnType::Json => "Db.Json".to_string(),
         ast::ColumnType::JsonTyped(inner) => to_elm_type_from_column_type(lookup, inner),
         ast::ColumnType::List(inner) => {
-            format!("List {}", to_elm_type_from_column_type(lookup, inner))
+            format!(
+                "List {}",
+                elm_type_argument(to_elm_type_from_column_type(lookup, inner))
+            )
         }
         ast::ColumnType::Dict(inner) => {
             format!(
                 "Dict String {}",
-                to_elm_type_from_column_type(lookup, inner)
+                elm_type_argument(to_elm_type_from_column_type(lookup, inner))
             )
         }
         ast::ColumnType::Nullable(inner) => {
-            format!("Maybe {}", to_elm_type_from_column_type(lookup, inner))
+            format!(
+                "Maybe {}",
+                elm_type_argument(to_elm_type_from_column_type(lookup, inner))
+            )
         }
         ast::ColumnType::IdInt { table } => {
             if !table.is_empty() {
@@ -2153,15 +2401,8 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
                 "String".to_string()
             }
         }
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(table_def) = find_table(lookup, table) {
-                    return format!("Db.Id.{}", table_def.name);
-                }
-                return format!("Db.Id.{}", table);
-            }
-
-            if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
+        ast::ColumnType::ForeignKey { .. } => {
+            if let Some(col_type) = resolve_foreign_key_column_type(lookup, type_) {
                 return to_elm_type_from_column_type(lookup, &col_type);
             }
 
@@ -2207,16 +2448,20 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
                 to_elm_decoder_from_column_type(lookup, inner)
             )
         }
-        ast::ColumnType::IdInt { .. } => "Db.Id.decodeInt".to_string(),
-        ast::ColumnType::IdUuid { .. } => "Db.Id.decodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(kind) = get_id_kind_for_brand(lookup, table) {
-                    return id_decoder(kind).to_string();
-                }
-            }
-
-            if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
+        ast::ColumnType::IdInt { table } => if table.is_empty() {
+            "Decode.int"
+        } else {
+            "Db.Id.decodeInt"
+        }
+        .to_string(),
+        ast::ColumnType::IdUuid { table } => if table.is_empty() {
+            "Db.Id.decodeUuidString"
+        } else {
+            "Db.Id.decodeUuid"
+        }
+        .to_string(),
+        ast::ColumnType::ForeignKey { .. } => {
+            if let Some(col_type) = resolve_foreign_key_column_type(lookup, type_) {
                 return to_elm_decoder_from_column_type(lookup, &col_type);
             }
 
@@ -3045,9 +3290,9 @@ fn generate_pyre_module(
     let mut result = String::new();
 
     // Module declaration
-    let mut database_namespaces: Vec<String> = query_names
-        .iter()
-        .filter_map(|name| all_query_info.get(name).map(|info| info.primary_db.clone()))
+    let mut database_namespaces: Vec<String> = all_query_info
+        .values()
+        .map(|info| info.primary_db.clone())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -3057,11 +3302,12 @@ fn generate_pyre_module(
     for namespace in &database_namespaces {
         result.push_str(&format!(", {}", elm_database_namespace(namespace)));
     }
-    result.push_str(", QueryId, Model, QueryModel, Query(..), Msg(..), Effect(..), init, update, decodeIncomingDelta, getResult)\n\n\n");
+    result.push_str(", QueryId, Model, QueryModel, Query(..), Msg(..), Effect(..), init, update, decodeIncomingDelta, getResult, Receipt, Outcome, EditFailure, Lifecycle, submit, batch, outcome, editState, lifecycle, failures)\n\n\n");
 
     // Imports
     result.push_str("import Dict exposing (Dict)\n");
     result.push_str("import Db.Database\n");
+    result.push_str("import Pyre.Edit as Edit\nimport Pyre.Batch as Batch\nimport Pyre.Edit.Internal as EditInternal\nimport Pyre.LocalEdits as LocalEdits\n");
     result.push_str("import Json.Decode as Decode\n");
     result.push_str("import Json.Encode as Encode\n");
 
@@ -3074,21 +3320,14 @@ fn generate_pyre_module(
     // Model type
     result.push_str("-- Model\n\n\n");
     result.push_str("type alias Model =\n");
-    result.push_str("    {");
+    result.push_str("    { localEdits : LocalEdits.Model\n");
 
-    for (i, name) in query_names.iter().enumerate() {
+    for name in query_names.iter() {
         let field_name = string::decapitalize(name);
-        if i == 0 {
-            result.push_str(&format!(
-                " {} : Dict String (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
-                field_name, name, name
-            ));
-        } else {
-            result.push_str(&format!(
-                "    , {} : Dict String (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
-                field_name, name, name
-            ));
-        }
+        result.push_str(&format!(
+            "    , {} : Dict String (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
+            field_name, name, name
+        ));
     }
 
     result.push_str("    }\n\n\n");
@@ -3113,6 +3352,9 @@ fn generate_pyre_module(
     }
     result.push_str("type alias QueryId =\n    String\n\n\n");
     result.push_str("type Query\n");
+    if query_names.is_empty() {
+        result.push_str("    = NoQuery\n");
+    }
     for (i, name) in query_names.iter().enumerate() {
         let prefix = if i == 0 { "    = " } else { "    | " };
         let database_type = all_query_info
@@ -3146,6 +3388,7 @@ fn generate_pyre_module(
     }
     result.push_str("\n\n");
 
+    result.push_str("    | LocalEditReceived Decode.Value\n");
     result.push_str("    | IncomingMsgDecodeFailed Decode.Error Decode.Value\n\n\n");
 
     // Effect type
@@ -3162,17 +3405,13 @@ fn generate_pyre_module(
 
     // Init
     result.push_str("-- Init\n\n\n");
-    result.push_str("init : Model\n");
-    result.push_str("init =\n");
-    result.push_str("    {");
+    result.push_str("init : String -> Model\n");
+    result.push_str("init incarnation =\n");
+    result.push_str("    { localEdits = LocalEdits.init incarnation\n");
 
-    for (i, name) in query_names.iter().enumerate() {
+    for name in query_names.iter() {
         let field_name = string::decapitalize(name);
-        if i == 0 {
-            result.push_str(&format!(" {} = Dict.empty\n", field_name));
-        } else {
-            result.push_str(&format!("    , {} = Dict.empty\n", field_name));
-        }
+        result.push_str(&format!("    , {} = Dict.empty\n", field_name));
     }
 
     result.push_str("    }\n\n\n");
@@ -3181,9 +3420,11 @@ fn generate_pyre_module(
     result.push_str("-- Update\n\n\n");
     result.push_str("update : Msg -> Model -> ( Model, Effect )\n");
     result.push_str("update msg model =\n");
+    result.push_str("    updateHelp msg { model | localEdits = LocalEdits.clearFailures model.localEdits }\n\n\nupdateHelp : Msg -> Model -> ( Model, Effect )\nupdateHelp msg model =\n");
     result.push_str("    case msg of\n");
     result.push_str("        QueryUpdate query ->\n");
     result.push_str("            updateQuery query model\n\n");
+    result.push_str("        LocalEditReceived value ->\n            ( { model | localEdits = LocalEdits.receive value model.localEdits }, NoEffect )\n\n");
 
     for name in query_names {
         let field_name = string::decapitalize(name);
@@ -3259,6 +3500,7 @@ fn generate_pyre_module(
 
     result.push_str("incomingDeltaDecoder : Decode.Decoder Msg\n");
     result.push_str("incomingDeltaDecoder =\n");
+    result.push_str("    Decode.oneOf\n        [ Decode.field \"type\" Decode.string\n            |> Decode.andThen\n                (\\kind ->\n                    if kind == \"lifecycle\" || kind == \"failure\" then\n                        Decode.map LocalEditReceived Decode.value\n\n                    else\n                        Decode.fail \"Not a local edit event\"\n                )\n        , queryDeltaDecoder\n        ]\n\n\nqueryDeltaDecoder : Decode.Decoder Msg\nqueryDeltaDecoder =\n");
     result.push_str("    Decode.map2 Tuple.pair\n");
     result.push_str("        (Decode.field \"queryName\" Decode.string)\n");
     result.push_str("        (Decode.field \"queryId\" Decode.string)\n");
@@ -3283,6 +3525,9 @@ fn generate_pyre_module(
     result.push_str("updateQuery : Query -> Model -> ( Model, Effect )\n");
     result.push_str("updateQuery query model =\n");
     result.push_str("    case query of\n");
+    if query_names.is_empty() {
+        result.push_str("        NoQuery ->\n            ( model, NoEffect )\n\n");
+    }
 
     for name in query_names {
         let field_name = string::decapitalize(name);
@@ -3392,6 +3637,8 @@ fn generate_pyre_module(
     );
     result.push_str("                , ( \"value\", json )\n");
     result.push_str("                ]\n");
+    result.push_str("\n\n");
+    result.push_str(include_str!("./static/elm/src/Pyre/Api.elm.fragment"));
 
     result
 }

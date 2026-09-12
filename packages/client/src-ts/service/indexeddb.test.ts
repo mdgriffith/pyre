@@ -1,7 +1,33 @@
 // @ts-nocheck
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 
 import { IndexedDbService, type SyncCursor } from './indexeddb';
+
+test('invalid initial cache fails the shared load and never sends an empty fallback', async () => {
+  const invalid = new Error('Invalid persisted identity');
+  let receive;
+  let scans = 0;
+  const sent = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  const service = new IndexedDbService({
+    init: async () => {},
+    getAllTables: async () => { scans += 1; throw invalid; },
+  });
+  service.attachPorts({ ports: {
+    indexedDbOut: { subscribe: (callback) => { receive = callback; } },
+    receiveIndexedDbMessage: { send: (message) => sent.push(message) },
+  } });
+  try {
+    receive({ type: 'requestInitialData' });
+    await expect(service.initialize()).rejects.toBe(invalid);
+    await Bun.sleep(0);
+    await expect(service.initialize()).rejects.toBe(invalid);
+    expect(scans).toBe(1);
+    expect(sent).toEqual([]);
+  } finally {
+    log.mockRestore();
+  }
+});
 
 test('IndexedDbService restores persisted sync cursor with initial data', async () => {
   const persistedCursor: SyncCursor = {
@@ -149,4 +175,26 @@ test('IndexedDbService acknowledges an atomic database epoch reset', async () =>
   expect(sentMessages).toEqual([
     { type: 'databaseEpochResetCompleted', databaseEpoch: 'new-epoch' },
   ]);
+});
+
+test('IndexedDbService reports invalid writes without publishing catchup entities', async () => {
+  let receive;
+  const notifications = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  const service = new IndexedDbService({
+    init: async () => {},
+    putRows: async () => { throw new Error('Invalid uuid identity for issues.key'); },
+  }, undefined, (...args) => notifications.push(args));
+  service.attachPorts({ ports: { indexedDbOut: { subscribe(callback) { receive = callback; } } } });
+  try {
+    receive({ type: 'writeDelta', entityStreamSource: 'catchup', tableGroups: [
+      { table_name: 'issues', headers: ['key'], rows: [['1']] },
+    ] });
+    await Bun.sleep(0);
+    expect(notifications).toEqual([]);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][1].message).toContain('Invalid uuid identity');
+  } finally {
+    log.mockRestore();
+  }
 });

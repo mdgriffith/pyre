@@ -1,0 +1,10 @@
+type ArchiveState
+    = Stored
+    | Retired
+
+record ArchiveEntry {
+    @public
+    id Id.Uuid @id
+    title String
+    state ArchiveState?
+}

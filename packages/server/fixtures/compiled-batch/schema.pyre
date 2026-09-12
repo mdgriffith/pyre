@@ -1,0 +1,23 @@
+type Role = Member | Admin
+
+type Details
+    = Note { count Int, enabled Bool }
+    | Empty
+    | Raw { data Json, values Json<List<Int?>>, scalar Json<String?> }
+    | Bundle {
+        when DateTime
+        role Role
+        children Json<List<Details>>
+        byName Json<Dict<Details>>
+        note String?
+    }
+
+record Entry {
+    @public
+    id Id.Uuid @id
+    release String
+    enabled Bool
+    count Int
+    role Role
+    details Json<Details>
+}

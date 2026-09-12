@@ -147,11 +147,11 @@ fn validates_paths_body_and_sync_gate() {
     }
 
     let synced = QUERY_ONLY_SCHEMA.replace("@syncable(false)\n", "");
-    let errors = check_schema(&synced).unwrap_err();
-    assert!(errors.iter().any(|error| matches!(
-        &error.error_type,
-        ErrorType::SyncedRelationalQueryPermission
-    )));
+    let context = check_schema(&synced).unwrap();
+    assert!(sync::requires_replacement(&context));
+    assert!(
+        matches!(sync::require_legacy_sync(&context), Err(sync::SyncError::PermissionError(message)) if message == "ReplacementRequired")
+    );
 
     let star = synced
         .replace("@allow(query, update, delete)", "@allow(*)")
@@ -159,7 +159,7 @@ fn validates_paths_body_and_sync_gate() {
     let errors = check_schema(&star).unwrap_err();
     assert!(errors.iter().any(|error| matches!(
         &error.error_type,
-        ErrorType::SyncedRelationalQueryPermission
+        ErrorType::InvalidRelationalPermission { message } if message.contains("insert permissions")
     )));
 
     let server_only = synced.replace(

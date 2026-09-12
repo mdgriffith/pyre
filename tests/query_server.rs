@@ -2,7 +2,7 @@
 mod helpers;
 
 use helpers::test_database::TestDatabase;
-use pyre::server::manifest::{Manifest, PyreSession, QueryManifest};
+use pyre::server::manifest::{BoundManifest, Manifest, PyreSession, QueryManifest};
 use pyre::server::query;
 use pyre::server::sync::{ConnectedSessions, SyncServer, SyncSession};
 use pyre::{ast, parser, typecheck};
@@ -48,6 +48,819 @@ fn only_query(manifest: &Manifest) -> &QueryManifest {
         .values()
         .next()
         .expect("manifest should contain a query")
+}
+
+fn bind(manifest: &Manifest, context: &pyre::typecheck::Context) -> BoundManifest {
+    BoundManifest::new(manifest.clone(), context).unwrap()
+}
+
+#[tokio::test]
+async fn typed_json_session_enums_match_compiled_bundle_writes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = format!(
+        "{}\n{}",
+        include_str!("../packages/server/fixtures/compiled-batch/session.pyre"),
+        include_str!("../packages/server/fixtures/compiled-batch/schema.pyre")
+    );
+    let db = TestDatabase::new(&source).await?;
+    let manifest = manifest_for(
+        &db.context,
+        include_str!("../packages/server/fixtures/compiled-batch/queries.pyre"),
+        true,
+    )?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|query| {
+            query
+                .generated_edit
+                .as_ref()
+                .is_some_and(|edit| edit.kind == "create")
+        })
+        .unwrap();
+    let lookup = manifest
+        .queries
+        .values()
+        .find(|query| query.operation == "query")
+        .unwrap();
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let conn = db.db.connect()?;
+    let details = json!({"_type":"Bundle","when":"2026-01-01T00:00:00Z","role":"Member","children":[{"_type":"Note","count":2,"enabled":false},{"_type":"Bundle","when":1767225600,"role":{"_type":"Admin"},"children":[],"byName":{},"note":null}],"byName":{"empty":{"_type":"Empty"}},"note":null});
+    let mut session_value =
+        json!({"userId":7,"role":"Member","unrelated":"value","context":details});
+    let session = PyreSession::new(session_value.clone(), &manifest.session_schema)?;
+    let request = batch_request(&conn, &binding, vec![query::BatchOperation { operation:create.id.clone(), input:json!({"id":"00000000-0000-4000-8000-000000000001","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":"Member","details":details}) }]).await;
+    query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    let row = conn
+        .query(
+            "select json(details) from entries where id = '00000000-0000-4000-8000-000000000001'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    let stored: serde_json::Value = serde_json::from_str(&row.get::<String>(0)?)?;
+    assert_eq!(stored["role"], json!({"_type":"Member"}));
+    for role in [json!("Member"), json!({"_type":"Member"})] {
+        session_value["role"] = role.clone();
+        session_value["context"]["role"] = role;
+        let session = PyreSession::new(session_value.clone(), &manifest.session_schema)?;
+        assert_eq!(session.sql_args()["session_role"], json!("Member"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                session.sql_args()["session_context"].as_str().unwrap()
+            )?,
+            stored
+        );
+        let found = query::run(&conn, &manifest, &lookup.id, json!({}), &session).await?;
+        assert_eq!(
+            found.response,
+            json!({"entry":[{"id":"00000000-0000-4000-8000-000000000001"}]})
+        );
+    }
+    session_value["context"]["role"] = json!("Admin");
+    let different = PyreSession::new(session_value, &manifest.session_schema)?;
+    let found = query::run(&conn, &manifest, &lookup.id, json!({}), &different).await?;
+    assert_eq!(found.response, json!({"entry":[]}));
+    Ok(())
+}
+
+#[tokio::test]
+async fn compiler_provenance_is_not_inferred_from_named_query_hashes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db =
+        TestDatabase::new("record Item {\n    id Id.Int @id\n    name String\n    @public\n}\n")
+            .await?;
+    let mut queries = ast::QueryList {
+        queries: Vec::new(),
+    };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &db.context);
+    let mut named = queries
+        .queries
+        .iter()
+        .find_map(|q| match q {
+            ast::QueryDef::Query(q) if q.operation == ast::QueryOperation::Update => {
+                Some(q.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    // Same name, contents, hashes, and absent locations as compiler CRUD, but explicitly named.
+    named.generated_crud = false;
+    let queries = ast::QueryList {
+        queries: vec![ast::QueryDef::Query(named)],
+    };
+    let info = typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(&files[0].contents)?;
+    let named = only_query(&manifest);
+    assert!(named.generated_edit.is_none());
+    assert!(named.sql.iter().all(|sql| !sql.sql.contains("_pyreEditId")));
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&named.primary_db, &fingerprint);
+    let conn = db.db.connect()?;
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![query::BatchOperation {
+            operation: named.id.clone(),
+            input: json!({"id":999}),
+        }],
+    )
+    .await;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    assert_eq!(result.response["results"][0]["value"], json!({"item":[]}));
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_fingerprint_covers_permissions_sql_and_codecs_and_matches_ts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = "record Item {\n    id Id.Int @id\n    name String\n    @allow(query) { True }\n    @allow(insert, update, delete) { True }\n}\n";
+    let db = TestDatabase::new(source).await?;
+    let query_source = "update Rename($name: String) {\n    item { name = $name }\n}\n";
+    let manifest = manifest_for(&db.context, query_source, true)?;
+    let fingerprint = manifest.fingerprint();
+    for _ in 0..3 {
+        assert_eq!(
+            manifest_for(&db.context, query_source, true)?.fingerprint(),
+            fingerprint
+        );
+    }
+    let mut reordered = manifest.clone();
+    let mut entries = reordered.queries.drain().collect::<Vec<_>>();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    reordered.queries.extend(entries);
+    assert_eq!(reordered.fingerprint(), fingerprint);
+    let id = manifest.queries.keys().next().unwrap();
+    let mut changed = manifest.clone();
+    changed.queries.get_mut(id).unwrap().sql[0]
+        .sql
+        .push_str(" /* changed */");
+    assert_ne!(changed.fingerprint(), fingerprint);
+    let mut changed = manifest.clone();
+    changed
+        .queries
+        .get_mut(id)
+        .unwrap()
+        .compiled_contract
+        .push('x');
+    assert_ne!(changed.fingerprint(), fingerprint);
+    let denied =
+        TestDatabase::new(&source.replace("@allow(query) { True }", "@allow(query) { False }"))
+            .await?;
+    let denied_manifest = manifest_for(&denied.context, query_source, true)?;
+    assert_ne!(denied_manifest.fingerprint(), fingerprint);
+    assert_eq!(
+        denied_manifest
+            .queries
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        manifest
+            .queries
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_ne!(
+        manifest_for(&db.context, "", false)?.fingerprint(),
+        manifest_for(&denied.context, "", false)?.fingerprint()
+    );
+    let nullable = TestDatabase::new(&source.replace("name String", "name String?")).await?;
+    assert_ne!(
+        manifest_for(&nullable.context, query_source, true)?.fingerprint(),
+        fingerprint
+    );
+    let mut queries = parser::parse_query("query.pyre", query_source).unwrap();
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &db.context);
+    let info = typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::typescript::targets::server::generate_queries(
+        &db.context,
+        &info,
+        &queries,
+        Path::new("typescript"),
+        &mut files,
+    );
+    let server = files
+        .iter()
+        .find(|file| file.path == Path::new("typescript/server.ts"))
+        .unwrap();
+    assert!(server.contents.contains(&format!(
+        "export const manifestVersion = \"{}\";",
+        fingerprint
+    )));
+    Ok(())
+}
+
+async fn batch_request(
+    conn: &libsql::Connection,
+    binding: &query::BatchBinding<'_>,
+    operations: Vec<query::BatchOperation>,
+) -> query::BatchRequest {
+    let mut rows = conn
+        .query("SELECT database_epoch FROM _pyre_sync WHERE id = 1", ())
+        .await
+        .unwrap();
+    let epoch = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    query::BatchRequest {
+        version: 1,
+        database_id: "main".into(),
+        namespace: binding.namespace.into(),
+        manifest: binding.manifest.into(),
+        instance: "test".into(),
+        auth_generation: 1,
+        database_epoch: epoch,
+        request_id: "r1".into(),
+        sequence: 1,
+        operations,
+    }
+}
+
+fn batch_binding<'a>(namespace: &'a str, fingerprint: &'a str) -> query::BatchBinding<'a> {
+    query::BatchBinding {
+        database_id: "main",
+        namespace,
+        manifest: fingerprint,
+        instance: "test",
+        auth_generation: 1,
+    }
+}
+
+#[tokio::test]
+async fn generated_nullable_boolean_keeps_explicit_null() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db =
+        TestDatabase::new("record Item {\n    id Id.Int @id\n    enabled Bool?\n    @public\n}\n")
+            .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|query| {
+            query.operation == "insert"
+                && query
+                    .generated_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.kind == "create")
+        })
+        .unwrap();
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![query::BatchOperation {
+            operation: create.id.clone(),
+            input: json!({"enabled":null}),
+        }],
+    )
+    .await;
+    query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    let mut rows = conn
+        .query("SELECT enabled IS NULL FROM items WHERE id=1", ())
+        .await?;
+    assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_generated_edits_are_ordered_atomic_and_use_direct_cardinality(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Item {
+    id Id.Int @id
+    name String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let create = query_by_operation(&manifest, "insert");
+    let update = query_by_operation(&manifest, "update");
+    let delete = query_by_operation(&manifest, "delete");
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    assert_eq!(
+        update
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .write_statement_indices,
+        vec![0]
+    );
+    assert_eq!(
+        update.generated_edit.as_ref().unwrap().writable_inputs,
+        vec!["name"]
+    );
+    let op = |q: &QueryManifest, input| query::BatchOperation {
+        operation: q.id.clone(),
+        input,
+    };
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![
+            op(create, json!({"name":"first"})),
+            op(create, json!({"name":"second"})),
+            op(update, json!({"id":1,"name":"final"})),
+        ],
+    )
+    .await;
+    // Trigger-side writes do not inflate direct write cardinality.
+    conn.execute("CREATE TABLE audit (message TEXT)", ())
+        .await?;
+    conn.execute("CREATE TRIGGER item_audit AFTER UPDATE ON items BEGIN INSERT INTO audit VALUES ('a'); INSERT INTO audit VALUES ('b'); END", ()).await?;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    assert_eq!(result.response["commitRevision"], 1);
+    assert_eq!(
+        result.response["results"],
+        json!([
+            {"index":0,"operation":create.id,"value":{"id":1}},
+            {"index":1,"operation":create.id,"value":{"id":2}},
+            {"index":2,"operation":update.id,"value":{"id":1}},
+        ])
+    );
+    let mut request = request;
+    request.operations = vec![
+        op(update, json!({"id":1,"name":"rolled back"})),
+        op(delete, json!({"id":999})),
+    ];
+    let error = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("operation 1"));
+    assert!(error.to_string().contains("TargetNotWritable"));
+    let mut rows = conn.query("SELECT name, (SELECT server_revision FROM _pyre_sync WHERE id=1) FROM items WHERE id=1", ()).await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<String>(0)?, "final");
+    assert_eq!(row.get::<i64>(1)?, 1);
+    drop(rows);
+    conn.execute("UPDATE items SET updatedAt = 1 WHERE id = 1", ())
+        .await?;
+    request.operations = vec![op(update, json!({"id":1,"name":"final"}))];
+    assert_eq!(
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await?
+        .response["commitRevision"],
+        2
+    );
+    let mut rows = conn
+        .query("SELECT updatedAt FROM items WHERE id = 1", ())
+        .await?;
+    assert!(rows.next().await?.unwrap().get::<i64>(0)? > 1);
+    drop(rows);
+    request.operations = vec![op(update, json!({"id":1,"name":"protected","updatedAt":1}))];
+    assert_eq!(
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "InvalidRequest"
+    );
+    request.operations = vec![op(update, json!({"id":1}))];
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("InvalidEdit"));
+    request.operations.clear();
+    let empty = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    assert_eq!(empty.response["results"], json!([]));
+    assert!(empty.response.get("commitRevision").is_none());
+    assert!(SyncServer::new(&db.context)
+        .replacement_messages(&empty, &std::collections::HashMap::new())
+        .is_empty());
+
+    conn.execute("DELETE FROM items", ()).await?;
+    conn.execute(
+        "INSERT INTO items(id,name) VALUES(9007199254740991,'boundary')",
+        (),
+    )
+    .await?;
+    request.operations = vec![op(create, json!({"name":"unsafe"}))];
+    let revision_before = conn
+        .query("SELECT server_revision FROM _pyre_sync", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<i64>(0)?;
+    let error = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "TargetNotWritable");
+    let row = conn
+        .query(
+            "SELECT count(*), max(id), (SELECT server_revision FROM _pyre_sync) FROM items",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 1);
+    assert_eq!(row.get::<i64>(1)?, 9_007_199_254_740_991);
+    assert_eq!(row.get::<i64>(2)?, revision_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn named_batch_results_are_validated_before_revision_and_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db =
+        TestDatabase::new("record Item {\n id Id.Int @id\n name String\n @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    let mut manifest = manifest_for(
+        &db.context,
+        "insert Named($name: String) { item { name = $name id } }",
+        true,
+    )?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|query| {
+            query.operation == "insert"
+                && query
+                    .generated_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.kind == "create")
+        })
+        .unwrap();
+    let create_id = create.id.clone();
+    let namespace = create.primary_db.clone();
+    let named_id = manifest
+        .queries
+        .values()
+        .find(|query| query.generated_edit.is_none())
+        .unwrap()
+        .id
+        .clone();
+    manifest.queries.get_mut(&named_id).unwrap().result_schema =
+        Some(pyre::server::manifest::ResultSchema::Array {
+            items: Box::new(pyre::server::manifest::ResultSchema::Object {
+                fields: std::collections::BTreeMap::new(),
+            }),
+        });
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&namespace, &fingerprint);
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![
+            query::BatchOperation {
+                operation: create_id,
+                input: json!({"name":"prefix"}),
+            },
+            query::BatchOperation {
+                operation: named_id,
+                input: json!({"name":"named"}),
+            },
+        ],
+    )
+    .await;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let error = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "InvalidRequest");
+    assert_eq!(error.operation_index(), Some(1));
+    let row = conn
+        .query(
+            "SELECT count(*), (SELECT server_revision FROM _pyre_sync) FROM items",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
+    assert_eq!(row.get::<i64>(1)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_preflight_rejects_invalid_members_scopes_and_limits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Item {
+    id Id.Int @id
+    name String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = query_by_operation(&manifest, "insert");
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let operation = query::BatchOperation {
+        operation: create.id.clone(),
+        input: json!({"name":"ok"}),
+    };
+    let mut request = batch_request(&conn, &binding, vec![operation.clone()]).await;
+    let mut invalid = operation.clone();
+    invalid.input = json!({"name":"bad","id":7});
+    request.operations.push(invalid);
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.operations = vec![operation.clone(); 101];
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.operations = vec![operation.clone()];
+    request.operations[0].input = json!({"name":"a".repeat(query::MAX_BATCH_PAYLOAD_BYTES)});
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.operations = vec![operation];
+    request.namespace = "Unauthorized".into();
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.namespace = binding.namespace.into();
+    let mut attached = manifest.clone();
+    attached.queries.get_mut(&create.id).unwrap().attached_dbs = vec!["Other".into()];
+    let attached_fingerprint = attached.fingerprint();
+    let attached_binding = batch_binding(binding.namespace, &attached_fingerprint);
+    request.manifest = attached_fingerprint.clone();
+    assert!(query::run_batch(
+        &conn,
+        &bind(&attached, &db.context),
+        &attached_binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    let forged_binding = batch_binding(binding.namespace, "forged-version");
+    request.manifest = "forged-version".into();
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &forged_binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.manifest = fingerprint.clone();
+    conn.execute("ATTACH DATABASE ':memory:' AS other", ())
+        .await?;
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    conn.execute("DETACH DATABASE other", ()).await?;
+    request.database_epoch = "stale".into();
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    let mut rows = conn
+        .query(
+            "SELECT (SELECT count(*) FROM items), server_revision FROM _pyre_sync WHERE id=1",
+            (),
+        )
+        .await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
+    assert_eq!(row.get::<i64>(1)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_hidden_identities_named_noops_and_many_targets(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Item {
+    id Id.Int @id
+    name String
+    @allow(query) { False }
+    @allow(insert, update, delete) { True }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+update RenameAll($allName: String) {
+    item { name = $allName }
+}
+update Noop($noopName: String, $missingId: Item.id) {
+    item { @where { id == $missingId } name = $noopName }
+}
+"#,
+        true,
+    )?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let create = query_by_operation(&manifest, "insert");
+    let update = manifest
+        .queries
+        .values()
+        .find(|q| q.operation == "update" && q.generated_edit.is_some())
+        .unwrap();
+    let all = query_by_input_names(&manifest, &["allName"]);
+    let noop = query_by_input_names(&manifest, &["noopName", "missingId"]);
+    assert!(all.generated_edit.is_none());
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let op = |q: &QueryManifest, input| query::BatchOperation {
+        operation: q.id.clone(),
+        input,
+    };
+    let mut request = batch_request(
+        &conn,
+        &binding,
+        vec![
+            op(create, json!({"name":"a"})),
+            op(create, json!({"name":"b"})),
+            op(update, json!({"id":1,"name":"unreadable"})),
+            op(all, json!({"allName":"both"})),
+            op(noop, json!({"noopName":"unused", "missingId":999})),
+        ],
+    )
+    .await;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    assert_eq!(result.response["results"][2]["value"], json!({"id":1}));
+    assert_eq!(
+        result.response["results"][3]["value"],
+        json!({"item":[{"name":"both"},{"name":"both"}]})
+    );
+    assert_eq!(result.response["results"][4]["value"], json!({"item":[]}));
+    assert_eq!(result.response["reconciliation"]["minimumSafeRevision"], 1);
+    request.operations = vec![op(noop, json!({"noopName":"unused", "missingId":999}))];
+    assert_eq!(
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await?
+        .response["commitRevision"],
+        2
+    );
+    // Simulate a faulty compiled target predicate: read visibility and trigger totals must not mask >1.
+    let mut broad = manifest.clone();
+    broad.queries.get_mut(&update.id).unwrap().sql[0].sql =
+        "UPDATE items SET name = 'bad' RETURNING id AS _pyreEditId".into();
+    request.operations = vec![op(update, json!({"id":1,"name":"bad"}))];
+    let broad_fingerprint = broad.fingerprint();
+    let broad_binding = batch_binding(&create.primary_db, &broad_fingerprint);
+    request.manifest = broad_fingerprint.clone();
+    let error = query::run_batch(
+        &conn,
+        &bind(&broad, &db.context),
+        &broad_binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "TargetNotWritable");
+    assert_eq!(error.operation_index(), Some(0));
+    let mut rows = conn
+        .query("SELECT count(*) FROM items WHERE name = 'both'", ())
+        .await?;
+    assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 2);
+    Ok(())
 }
 
 #[tokio::test]
@@ -108,6 +921,21 @@ insert CreateEvent($payload: EventPayload) {
     .await?;
 
     assert_eq!(result.response["event"][0]["payload"], payload);
+    for invalid in [
+        json!({"_type":"Unknown"}),
+        json!({"_type":"PlayerVoteHandStateChanged","authorParticipantId":1.5,"voteId":"v","state":{"_type":"HandRaised"}}),
+        json!({"_type":"PlayerVoteHandStateChanged","authorParticipantId":1,"voteId":"v","state":{"_type":"Invalid"}}),
+    ] {
+        assert!(query::run(
+            &conn,
+            &manifest,
+            &only_query(&manifest).id,
+            json!({"payload":invalid}),
+            &session
+        )
+        .await
+        .is_err());
+    }
     Ok(())
 }
 
@@ -3234,6 +4062,8 @@ query Dashboard {
 #[test]
 fn manifest_load_reads_generated_manifest_file() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = Manifest {
+        replacement_contracts: Default::default(),
+        compiled_contract: String::new(),
         version: 1,
         session_schema: Default::default(),
         queries: Default::default(),
@@ -3294,4 +4124,47 @@ record Item {
         .starts_with("Id.Int"));
     assert!(PyreSession::new(json!({ "userId": 7 }), &manifest.session_schema).is_ok());
     assert!(PyreSession::new(json!({ "userId": 7.5 }), &manifest.session_schema).is_err());
+}
+
+#[test]
+fn session_validation_preserves_extra_claims_and_supported_codec_values() {
+    let schema: std::collections::HashMap<String, pyre::server::manifest::FieldSchema> =
+        serde_json::from_value(json!({
+            "count": {"type":"Int", "nullable":false, "omittable":false},
+            "enabled": {"type":"Bool", "nullable":false, "omittable":false},
+            "date": {"type":"Date", "nullable":false, "omittable":false},
+            "timestamp": {"type":"DateTime", "nullable":false, "omittable":false},
+            "ids": {"type":"Json<List<Int>>", "nullable":true, "omittable":true},
+            "scope": {"type":"Scope", "nullable":false, "omittable":false,
+                "tagged_union_variants": {"Member": {
+                    "id": {"type":"Int", "nullable":false, "omittable":false},
+                    "note": {"type":"String", "nullable":true, "omittable":false}
+                }}
+            }
+        }))
+        .unwrap();
+    let input = json!({"count":1.0,"enabled":1.0,"date":"date-valued-string", "timestamp":1.0,
+        "scope":{"_type":"Member","id":7,"extra":"ignored"}, "applicationClaim":"not a SQL arg"});
+    let session = PyreSession::new(input.clone(), &schema).unwrap();
+    assert_eq!(session.sql_args()["session_count"], json!(1));
+    assert_eq!(session.sql_args()["session_enabled"], json!(1));
+    assert_eq!(session.sql_args()["session_timestamp"], json!(1));
+    assert_eq!(session.sql_args()["session_scope__note"], json!(null));
+    assert!(!session.sql_args().contains_key("session_applicationClaim"));
+    assert!(!session.sql_args().contains_key("session_scope__extra"));
+    assert!(session.revalidate(&schema).is_ok());
+    for (key, value) in [
+        ("count", json!(1.5)),
+        ("count", json!(9_007_199_254_740_992_i64)),
+        ("enabled", json!(2)),
+        ("date", json!(1)),
+        ("timestamp", json!(8_640_000_000_001_i64)),
+        ("timestamp", json!("2016-12-31T23:59:60Z")),
+        ("ids", json!([1, "bad"])),
+        ("scope", json!({"_type":"Member"})),
+    ] {
+        let mut invalid = input.clone();
+        invalid[key] = value;
+        assert!(PyreSession::new(invalid, &schema).is_err(), "invalid {key}");
+    }
 }
