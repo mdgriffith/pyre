@@ -43,10 +43,10 @@ type alias Model =
 
 submission =
     Batch.succeed (\issue audit command -> ( issue, audit, command ))
-        |> Batch.and (Issue.update (Db.Id.uuid "00000000-0000-4000-8000-000000000001") [ Issue.title "first", Issue.title "elm", Issue.assignee Nothing ])
+        |> Batch.and (Issue.update (Db.Id.uuid "00000000-0000-4000-8000-000000000001") [ Issue.setTitle "first", Issue.setTitle "elm", Issue.setAssignee Nothing ])
         |> Batch.and (Audit.create { message = "audit" })
         |> Batch.and (NamedAudit.run { message = "named" })
-        |> (\plan -> Pyre.batch (Database.fromString "one") plan Pyre.init)
+        |> (\plan -> Pyre.batch (Database.fromString "one") plan (Pyre.init "conformance"))
 
 
 main : Program () Model Msg
@@ -108,7 +108,7 @@ update msg model =
                             Batch.succeed identity |> Batch.and (Issue.createWith { id = id, title = "elm related", owner = "me" } [ Issue.withAssignee (Just original) ])
 
                         "nullable" ->
-                            Batch.succeed identity |> Batch.and (Issue.update id [ Issue.assignee Nothing, Issue.payload (Just (Dict.fromList [ ( "items", [ Just 3, Nothing ] ) ])), Issue.watchers (Just [ "ABCDEFAB-CDEF-0123-4567-ABCDEFABCDEF" ]), Issue.dueAt (Just (Time.millisToPosix 1767225600000)) ])
+                            Batch.succeed identity |> Batch.and (Issue.update id [ Issue.setAssignee Nothing, Issue.setPayload (Just (Dict.fromList [ ( "items", [ Just 3, Nothing ] ) ])), Issue.setWatchers (Just [ "ABCDEFAB-CDEF-0123-4567-ABCDEFABCDEF" ]), Issue.setDueAt (Just (Time.millisToPosix 1767225600000)) ])
 
                         "delete" ->
                             Batch.succeed identity |> Batch.and (Issue.delete id)
@@ -117,7 +117,7 @@ update msg model =
                             Batch.succeed identity |> Batch.and (Issue.create { id = Db.Id.uuid "00000000-0000-4000-8000-000000000010\n", title = "invalid", owner = "me" })
 
                         "invalidStructured" ->
-                            Batch.succeed identity |> Batch.and (Issue.update id [ Issue.watchers (Just [ "invalid" ]) ])
+                            Batch.succeed identity |> Batch.and (Issue.update id [ Issue.setWatchers (Just [ "invalid" ]) ])
 
                         "emptyUpdate" ->
                             Batch.succeed identity |> Batch.and (Issue.update id [])

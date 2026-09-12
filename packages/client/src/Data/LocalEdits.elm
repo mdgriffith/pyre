@@ -445,39 +445,43 @@ transition kind value model =
                                                         unknown pending "MalformedResponse" (invalidateUnknown response model)
 
                                             Ok "rejected" ->
-                                                case ( pending.state, D.decodeValue (D.field "code" D.string) response ) of
-                                                    ( Accepted _ _, _ ) ->
-                                                        ( model, [] )
+                                                if List.any (\name -> D.decodeValue (D.field name D.value) response |> Result.toMaybe |> (/=) Nothing) [ "commitRevision", "results", "reconciliation" ] then
+                                                    unknown pending "MalformedResponse" (invalidateUnknown response model)
 
-                                                    ( _, Ok code ) ->
-                                                        let
-                                                            safeCode =
-                                                                if List.member code [ "InvalidEdit", "TargetNotWritable", "InvalidBatch", "InvalidOperation", "ManifestMismatch", "NamespaceMismatch", "NotAuthenticated", "PermissionDenied", "TransactionFailed" ] then
-                                                                    code
+                                                else
+                                                    case ( pending.state, D.decodeValue (D.field "code" D.string) response ) of
+                                                        ( Accepted _ _, _ ) ->
+                                                            ( model, [] )
 
-                                                                else
-                                                                    "Rejected"
+                                                        ( _, Ok code ) ->
+                                                            let
+                                                                safeCode =
+                                                                    if List.member code [ "InvalidEdit", "TargetNotWritable", "InvalidBatch", "InvalidOperation", "ManifestMismatch", "NamespaceMismatch", "NotAuthenticated", "PermissionDenied", "TransactionFailed" ] then
+                                                                        code
 
-                                                            indexFields =
-                                                                case D.decodeValue (D.field "operationIndex" revisionDecoder) response of
-                                                                    Ok index ->
-                                                                        if index < List.length pending.operations then
-                                                                            [ ( "operationIndex", E.int index ) ]
+                                                                    else
+                                                                        "Rejected"
 
-                                                                        else
+                                                                indexFields =
+                                                                    case D.decodeValue (D.field "operationIndex" revisionDecoder) response of
+                                                                        Ok index ->
+                                                                            if index < List.length pending.operations then
+                                                                                [ ( "operationIndex", E.int index ) ]
+
+                                                                            else
+                                                                                []
+
+                                                                        Err _ ->
                                                                             []
+                                                            in
+                                                            ( remove
+                                                            , [ lifecycle model requestId "rejected" [ ( "code", E.string safeCode ) ]
+                                                              , event model "failure" ([ ( "requestId", E.string requestId ), ( "phase", E.string "server" ), ( "code", E.string safeCode ), ( "certainty", E.string "rejected" ) ] ++ indexFields)
+                                                              ]
+                                                            )
 
-                                                                    Err _ ->
-                                                                        []
-                                                        in
-                                                        ( remove
-                                                        , [ lifecycle model requestId "rejected" [ ( "code", E.string safeCode ) ]
-                                                          , event model "failure" ([ ( "requestId", E.string requestId ), ( "phase", E.string "server" ), ( "code", E.string safeCode ), ( "certainty", E.string "rejected" ) ] ++ indexFields)
-                                                          ]
-                                                        )
-
-                                                    _ ->
-                                                        unknown pending "MalformedResponse" model
+                                                        _ ->
+                                                            unknown pending "MalformedResponse" model
 
                                             _ ->
                                                 unknown pending "MalformedResponse" model
@@ -662,7 +666,7 @@ unknown pending code model =
                         )
                         model.pending
               }
-            , [ lifecycle model pending.requestId "outcomeUnknown" [], failure model pending.requestId "transport" code "unknown" ]
+            , [ lifecycle model pending.requestId "outcomeUnknown" [ ( "code", E.string code ) ], failure model pending.requestId "transport" code "unknown" ]
             )
 
         _ ->

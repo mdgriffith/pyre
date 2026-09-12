@@ -196,6 +196,7 @@ pub fn run(root: &Path, generated: &Path) {
     let manifest: Manifest =
         serde_json::from_str(&fs::read_to_string(generated.join("manifest.json")).unwrap())
             .unwrap();
+    let bound = pyre::server::manifest::BoundManifest::new(manifest.clone(), &context).unwrap();
     let db_path = generated.join("rust.db");
     let archive_path = generated.join("rust-archive.db");
     let server = std::thread::spawn(move || {
@@ -219,7 +220,7 @@ pub fn run(root: &Path, generated: &Path) {
                 let response = match message["kind"].as_str().unwrap() {
                     "batch" => {
                         let request = serde_json::from_value(message["request"].clone()).unwrap();
-                        match query::run_batch(&conn, &manifest, &binding, &request, &session).await {
+                        match query::run_batch(&conn, &bound, &binding, &request, &session).await {
                             Ok(result) => json!({"kind":"success", "response":result.response}),
                             Err(error) => json!({"kind":"error", "error":{"errorType":error.code(), "index":error.operation_index()}}),
                         }

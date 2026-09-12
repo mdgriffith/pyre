@@ -25,7 +25,7 @@ test.skipIf(!directory || !playwright)('native Chromium: built PyreClient, gener
   expect(build.success).toBe(true);
   const script = await build.outputs[0].text();
   const { manifest, databases } = await import(`${directory}/typescript/server.ts`);
-  const { Main, Issue } = await import(`${directory}/typescript/edits/Main.ts`);
+  const { Main, Records } = await import(`${directory}/typescript/edits/Main.ts`);
   await initWasm({ module_or_path: readFileSync(process.env.PYRE_CONFORMANCE_WASM) });
   const db = createClient({ url: `file:${directory}/native-browser.db` });
   await databases._default.ensureDatabase(db);
@@ -44,7 +44,7 @@ test.skipIf(!directory || !playwright)('native Chromium: built PyreClient, gener
     }
     if (path === '/auth') { fence.instance = 'browser-2'; fence.authGeneration = 2; return Response.json(fence); }
     if (path === '/hint') {
-      const { definition, input } = Issue.create({ id: '00000000-0000-4000-8000-000000000099', title: 'external', owner: 'me' })[planKey].operations[0];
+      const { definition, input } = Records.Issue.create({ id: '00000000-0000-4000-8000-000000000099', title: 'external', owner: 'me' })[planKey].operations[0];
       const result = await runBatchWithSync(db, manifest, fence, { ...fence, version: 1, requestId: 'external', sequence: 100, operations: [{ operation: definition.id, input }] }, {});
       if (result.kind !== 'success') throw new Error(JSON.stringify(result));
       const revision = Number((await db.execute('select server_revision from _pyre_sync')).rows[0].server_revision);

@@ -12,6 +12,8 @@ Two namespaces use the same UUID in separate databases to verify isolated rows,
 readers, revisions and replacement contracts. Invalid fences and cross-namespace
 operations reject. Existing worker/service transition tests cover deterministic
 overlap, duplicate delivery, quarantine, unknown outcomes and cleanup permutations.
+Generated modules compile systematic `set<Field>` update setters, and effects carry
+the caller-provided model incarnation in their request IDs across bridge dedupe.
 
 From the repository root, with the existing repository-local Playwright install:
 

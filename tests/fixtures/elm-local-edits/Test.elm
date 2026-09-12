@@ -28,7 +28,7 @@ port effectOut : E.Value -> Cmd msg
 
 renameReadRow : Read.Issue -> Edit Database.Default (Updated Db.EditIds.DefaultIssue)
 renameReadRow row =
-    Issue.update row.id [ Issue.title row.title ]
+    Issue.update row.id [ Issue.setTitle row.title ]
 
 
 port incoming : (E.Value -> msg) -> Sub msg
@@ -76,12 +76,11 @@ bridgeSubmission =
     let
         plan =
             Batch.succeed (\issue audit command -> ( issue, audit, command ))
-                |> Batch.and (Issue.update (Db.Id.uuid "00000000-0000-4000-8000-000000000001") [ Issue.title "elm", Issue.assignee Nothing ])
+                |> Batch.and (Issue.update (Db.Id.uuid "00000000-0000-4000-8000-000000000001") [ Issue.setTitle "elm", Issue.setAssignee Nothing ])
                 |> Batch.and (Audit.create { message = "audit" })
                 |> Batch.and (NamedAudit.run { message = "named" })
-
     in
-    Pyre.batch (Database.fromString "one") plan Pyre.init
+    Pyre.batch (Database.fromString "one") plan (Pyre.init "fixture")
 
 
 bridgeEffect : E.Value
@@ -105,7 +104,7 @@ checks =
             Db.Id.uuid "00000000-0000-4000-8000-000000000001"
 
         edit =
-            Issue.update id [ Issue.title "first", Issue.assignee (Just id), Issue.title "last", Issue.assignee Nothing ]
+            Issue.update id [ Issue.setTitle "first", Issue.setAssignee (Just id), Issue.setTitle "last", Issue.setAssignee Nothing ]
 
         plan =
             Batch.succeed Tuple.pair
@@ -113,7 +112,7 @@ checks =
                 |> Batch.and (Audit.create { message = "created" })
 
         ( model, effect, receipt ) =
-            Pyre.batch (Database.fromString "one") plan Pyre.init
+            Pyre.batch (Database.fromString "one") plan (Pyre.init "fixture")
 
         ( other, _, second ) =
             Pyre.submit (Database.fromString "two") (Issue.delete id) model
@@ -156,7 +155,7 @@ checks =
                 )
 
         lifecycle database status results =
-            E.object [ ( "type", E.string "lifecycle" ), ( "databaseId", E.string database ), ( "requestId", E.string "elm:1" ), ( "state", E.string status ), ( "results", results ) ]
+            E.object [ ( "type", E.string "lifecycle" ), ( "databaseId", E.string database ), ( "requestId", E.string "elm:fixture:1" ), ( "state", E.string status ), ( "results", results ) ]
 
         accepted =
             Pyre.update (Pyre.decodeIncomingDelta (lifecycle "one" "accepted" values)) model |> Tuple.first
@@ -177,7 +176,7 @@ checks =
             Pyre.update (Pyre.decodeIncomingDelta (lifecycle "one" "confirmed" (E.list identity []))) model |> Tuple.first
 
         failure =
-            E.object [ ( "type", E.string "failure" ), ( "requestId", E.string "elm:1" ), ( "databaseId", E.string "one" ), ( "code", E.string "Denied" ), ( "certainty", E.string "rejected" ) ]
+            E.object [ ( "type", E.string "failure" ), ( "requestId", E.string "elm:fixture:1" ), ( "databaseId", E.string "one" ), ( "code", E.string "Denied" ), ( "certainty", E.string "rejected" ) ]
 
         failed =
             Pyre.update (Pyre.decodeIncomingDelta failure) model |> Tuple.first
@@ -210,14 +209,14 @@ checks =
                 |> Maybe.withDefault E.null
 
         setId =
-            Issue.update id [ Issue.assignee (Just id) ]
+            Issue.update id [ Issue.setAssignee (Just id) ]
                 |> Internal.single
                 |> Internal.operations
                 |> List.head
                 |> Maybe.withDefault E.null
 
         nested =
-            Issue.update id [ Issue.payload (Just (Dict.fromList [ ( "items", [ Just 1, Nothing ] ) ])), Issue.choice (Just Db.Open) ]
+            Issue.update id [ Issue.setPayload (Just (Dict.fromList [ ( "items", [ Just 1, Nothing ] ) ])), Issue.setChoice (Just Db.Open) ]
                 |> Internal.single
                 |> Internal.operations
                 |> List.head

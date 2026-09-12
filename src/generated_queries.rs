@@ -5,6 +5,49 @@ use crate::typecheck;
 
 use std::collections::HashSet;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalEditIdentityKind {
+    Integer,
+    Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedLocalEditIdentity {
+    pub namespace: String,
+    pub record: String,
+    pub field: String,
+    pub type_: String,
+}
+
+pub fn local_edit_identity(
+    table: &typecheck::Table,
+) -> Option<(LocalEditIdentityKind, &ast::Column)> {
+    let column = primary_key_column(table)?;
+    let kind = match column.type_ {
+        ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => LocalEditIdentityKind::Integer,
+        ast::ColumnType::IdUuid { .. } => LocalEditIdentityKind::Uuid,
+        _ => return None,
+    };
+    Some((kind, column))
+}
+
+pub fn unsupported_local_edit_identities(
+    context: &typecheck::Context,
+) -> Vec<UnsupportedLocalEditIdentity> {
+    sorted_tables(context)
+        .into_iter()
+        .filter(|table| local_edit_identity(table).is_none())
+        .filter_map(|table| {
+            primary_key_column(table).map(|column| UnsupportedLocalEditIdentity {
+                namespace: table.schema.clone(),
+                record: table.record.name.clone(),
+                field: column.name.clone(),
+                type_: column.type_.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Recognize compiler-created CRUD, never a handwritten command by its name.
 pub fn generated_edit<'a>(
     query: &ast::Query,
@@ -19,9 +62,10 @@ pub fn generated_edit<'a>(
         ast::QueryOperation::Delete => ("delete", Vec::new()),
         _ => return None,
     };
+    let (_, primary_key) = local_edit_identity(table)?;
     Some((
         kind,
-        primary_key_column(table)?,
+        primary_key,
         columns.into_iter().map(|c| c.name.clone()).collect(),
     ))
 }
@@ -104,6 +148,9 @@ fn reserved_generated_crud_names(
     let mut result = Vec::new();
 
     for table in sorted_tables(context) {
+        if local_edit_identity(table).is_none() {
+            continue;
+        }
         result.push((
             format!("{}Create", table.record.name),
             table.record.name.clone(),
@@ -128,6 +175,9 @@ fn generated_crud_queries(context: &typecheck::Context) -> Vec<ast::Query> {
     let mut result = Vec::new();
 
     for table in sorted_tables(context) {
+        if local_edit_identity(table).is_none() {
+            continue;
+        }
         result.push(build_create_query(table));
         result.push(build_update_query(table));
         result.push(build_delete_query(table));
@@ -404,4 +454,36 @@ fn primary_key_column(table: &typecheck::Table) -> Option<&ast::Column> {
     scalar_columns(table)
         .into_iter()
         .find(|column| ast::is_primary_key(column))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_primary_keys_are_omitted_without_reserving_crud_names() {
+        let mut schema = ast::Schema::default();
+        crate::parser::run(
+            "schema.pyre",
+            "record Legacy {\n @public\n id String @id\n name String\n}\nrecord Current {\n @public\n id Id.Int @id\n name String\n}",
+            &mut schema,
+        )
+        .unwrap();
+        let context = typecheck::check_schema(&ast::Database {
+            schemas: vec![schema],
+        })
+        .unwrap();
+        let diagnostics = unsupported_local_edit_identities(&context);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].record, "Legacy");
+        assert_eq!(diagnostics[0].type_, "String");
+        let generated = generated_crud_queries(&context);
+        assert_eq!(generated.len(), 3);
+        assert!(generated
+            .iter()
+            .all(|query| query.name.starts_with("Current")));
+        assert!(reserved_generated_crud_names(&context)
+            .iter()
+            .all(|(name, _, _)| !name.starts_with("Legacy")));
+    }
 }

@@ -91,8 +91,27 @@ function harness(options = {}) {
 }
 async function ready(options) { const h = harness(options); await until(() => h.reads.length === 1); await h.replace(); return h; }
 
+test.each([
+  ['commitRevision', { commitRevision: 1 }],
+  ['results', { results: [] }],
+  ['reconciliation', { reconciliation: { kind: 'replaceRequired', atLeast: 1, invalidate: false } }],
+])('rejected response carrying %s is malformed outcome-unknown', async (_field, evidence) => {
+  const h = await ready();
+  const first = h.runtime.submit(edit(command, {}));
+  h.runtime.submit(edit(command, {}));
+  await until(() => h.writes.length === 1);
+  h.writes[0].resolve({ ...fence, requestId: h.writes[0].request.requestId, status: 'rejected', code: 'PermissionDenied', ...evidence });
+  expect(await first.confirmed).toEqual({ kind: 'outcomeUnknown', code: 'MalformedResponse' });
+  await tick();
+  expect(h.writes).toHaveLength(1);
+  expect(h.lifecycle.some(event => event.requestId === first.requestId && event.state === 'rejected')).toBe(false);
+  expect(h.failures).toContainEqual(expect.objectContaining({ requestId: first.requestId, phase: 'transport', code: 'MalformedResponse', certainty: 'unknown' }));
+  expect(h.publications.at(-1)?.invalid).toBe(true);
+});
+
 test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders execute through worker and services', async () => {
-  const { Main, User, Audit, Token, Commands, batch: generatedBatch, operations, manifestVersion } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { Main, Records, Commands, batch: generatedBatch, operations, manifestVersion } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { User, Audit, Token } = Records;
   const { planKey } = await import('@pyre/core/local-edits');
   const complete = Token.create({ key, text: 'known', updatedAt: 0 })[planKey].operations[0];
   expect(complete.definition.predict(complete.input)).toMatchObject({ safe: true, kind: 'create', id: key });
@@ -128,7 +147,8 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders execute 
 });
 
 test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders use server manifest IDs and result codecs', async () => {
-  const { Main, User, Audit, Commands, batch: generatedBatch, operations, manifestVersion } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { Main, Records, Commands, batch: generatedBatch, operations, manifestVersion } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { User, Audit } = Records;
   const { manifest } = await import(process.env.PYRE_GENERATED_EDITS!.replace('edits.ts', 'manifest.ts'));
   const { createClient } = await import('@libsql/client');
   const serverModule = '../../../server/query';
@@ -169,7 +189,8 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders use serv
 });
 
 test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders prove prediction and validate server input codecs', async () => {
-  const { Main, Token, NullableToken, DefaultToken, PrivateToken, Clock, Marker, User, Audit, operations } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { Main, Records, operations } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { Token, NullableToken, DefaultToken, PrivateToken, Clock, Marker, User, Audit } = Records;
   const { planKey } = await import('@pyre/core/local-edits');
   const descriptor = plan => plan[planKey].operations[0];
   for (const plan of [PrivateToken.create({ key, text: 'visible', updatedAt: 0 }), PrivateToken.update(key, { text: 'hidden' }), PrivateToken.delete(key),
@@ -714,7 +735,8 @@ function bridgeInternal(h) {
 }
 
 test.skipIf(!process.env.PYRE_GENERATED_EDITS)('production Elm bridge shares generated descriptors with the typed namespace handle', async () => {
-  const { Main, Audit, Commands, operations } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { Main, Records, Commands, operations } = await import(process.env.PYRE_GENERATED_EDITS!);
+  const { Audit } = Records;
   const { planKey } = await import('@pyre/core/local-edits');
   const generatedFence = { ...fence, namespace: Main.name, manifest: Main.manifest };
   const h = await ready({ fence: generatedFence, operations }), ports = bridgePorts();
@@ -766,6 +788,19 @@ test.each(['bound', 'lazy'])('production Elm bridge preserves mixed %s FIFO, sna
   client.disconnect(); await h.runtime.ended; await tick();
   expect(ports.events.some(e => e.requestId === 'elm-4' && e.state === 'rejected')).toBe(true);
   expect(ports.events.some(e => e.requestId === 'elm-4' && e.type === 'failure')).toBe(true);
+});
+
+test('Elm bridge distinguishes model incarnations while rejecting exact stale effect replays', async () => {
+  const h = await ready(), events = [];
+  const bridge = elmLocalEdits(() => ({ runtime: h.runtime, operations: all }), event => events.push(event));
+  const first = elmEffect('elm:first:1');
+  const reset = elmEffect('elm:second:1', 2);
+  bridge.forward(first); bridge.forward(first);
+  bridge.forward(reset); bridge.forward(reset);
+  const submissions = h.ingress.filter(message => message.type === 'submit');
+  expect(submissions).toHaveLength(2);
+  expect(submissions.map(message => message.operations[0].input.name)).toEqual(['1', '2']);
+  bridge.dispose();
 });
 
 test('production Elm bridge isolates databases, result-port observers and validation failures', async () => {

@@ -21,7 +21,7 @@ namespace string remains `_default`.
 
 ```ts
 // User/Audit schema from src/generate/typescript/local_edits.rs.
-import { Main, User, Audit, Commands, batch, operations, type UserId }
+import { Main, Records, Commands, batch, operations, type UserId }
   from './generated/typescript/edits/Main';
 
 declare const userId: UserId;
@@ -30,9 +30,9 @@ declare const userId: UserId;
 const db = await client.localEdits('main', Main);
 const stopFailures = db.onEditFailure(showWriteFailure);
 const plan = batch([
-  User.create({ key: crypto.randomUUID(), name: 'New', fixed: 'x' }),
-  Audit.create({ message: 'created' }),
-  User.update(userId, { note: null }),
+  Records.User.create({ key: crypto.randomUUID(), name: 'New', fixed: 'x' }),
+  Records.Audit.create({ message: 'created' }),
+  Records.User.update(userId, { note: null }),
   Commands.rename({ key: userId, name: 'Ready' }),
 ] as const);
 const outcome = await db.submit(plan).confirmed;

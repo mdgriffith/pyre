@@ -101,7 +101,8 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
             input: json!({"name":"committed"}),
         }],
     };
-    let result = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let bound = pyre::server::manifest::BoundManifest::new(manifest.clone(), &db.context)?;
+    let result = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     let server = SyncServer::new(&db.context);
     assert_eq!(result.response["commitRevision"], 1);
     assert_eq!(result.response["reconciliation"]["atLeast"], 1);
@@ -273,7 +274,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     // Failure to allocate the next revision must roll back the write, not just its acknowledgement.
     conn.execute("CREATE TRIGGER fail_revision BEFORE UPDATE ON _pyre_sync BEGIN SELECT RAISE(ABORT, 'revision unavailable'); END", ()).await?;
     assert!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
+        query::run_batch(&conn, &bound, &binding, &request, &session)
             .await
             .is_err()
     );
@@ -394,7 +395,8 @@ update MoveKey($id: Int, $next: Int) {
     request.operations = (1..=3)
         .map(|_| operation("create", json!({"ownerId":1,"body":"visible"})))
         .collect();
-    query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let bound = pyre::server::manifest::BoundManifest::new(manifest.clone(), &db.context)?;
+    query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     let server = SyncServer::new(&db.context);
     let catchup = ReplacementRequest {
         version: 1,
@@ -410,7 +412,7 @@ update MoveKey($id: Int, $next: Int) {
         operation("delete", json!({"id":1})),
         operation("update", json!({"id":2,"ownerId":2})),
     ];
-    let removed = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let removed = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     assert_eq!(removed.response["commitRevision"], 2);
     request.operations = vec![query::BatchOperation {
         operation: manifest
@@ -422,7 +424,7 @@ update MoveKey($id: Int, $next: Int) {
             .clone(),
         input: json!({"id":3,"next":30}),
     }];
-    let moved = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let moved = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     assert_eq!(moved.response["commitRevision"], 3);
     // A fixed old target may return a newer complete revision, without replaying intermediate deltas.
     let final_snapshot = server
@@ -433,7 +435,7 @@ update MoveKey($id: Int, $next: Int) {
     assert_eq!(final_snapshot.tables["notes"].rows.len(), 1);
     assert_eq!(final_snapshot.tables["notes"].rows[0]["id"], 30);
     request.operations = vec![operation("delete", json!({"id":30}))];
-    query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     let empty = server
         .replacement(&conn, &manifest, &binding, &catchup, &session)
         .await?;

@@ -1,7 +1,8 @@
-import { Main, Audit, Project, Task, Commands, batch, type AuditId, type ProjectId } from "../../../../target/local-edits-fixture/typescript/edits";
+import { Main, Records, Commands, batch, type AuditId, type ProjectId } from "../../../../target/local-edits-fixture/typescript/edits";
 import type { LocalEdits } from "../../local-edits";
 
 declare const edits: LocalEdits<Main>;
+const { Audit, Project, Task } = Records;
 async function generatedInference() {
   const outcome = await edits.submit(batch([
     Project.create({ id: crypto.randomUUID(), name: "typed", owner: 7 }),

@@ -933,6 +933,31 @@ fn test_generate_command() {
 }
 
 #[test]
+fn test_generate_warns_and_omits_local_edits_for_unsupported_primary_keys() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        "record Legacy {\n @public\n id String @id\n name String\n}\nrecord Current {\n @public\n id Id.Int @id\n name String\n}\n",
+    )
+    .unwrap();
+
+    ctx.run_command("generate")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "local-edit CRUD for record `_default.Legacy` was omitted because primary key `id` has unsupported type `String`",
+        ));
+
+    let edits = std::fs::read_to_string(
+        ctx.workspace_path
+            .join("pyre/generated/typescript/edits/Main.ts"),
+    )
+    .unwrap();
+    assert!(edits.contains("\"Current\": Object.freeze"));
+    assert!(!edits.contains("\"Legacy\": Object.freeze"));
+}
+
+#[test]
 fn test_generate_preserves_namespaced_session_id_storage_types() {
     let ctx = TestContext::new();
     std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();

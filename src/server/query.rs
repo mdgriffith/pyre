@@ -1,4 +1,6 @@
-use crate::server::manifest::{normalize_sql_value, Manifest, PyreSession, QueryManifest, SqlInfo};
+use crate::server::manifest::{
+    normalize_sql_value, BoundManifest, Manifest, PyreSession, QueryManifest, SqlInfo,
+};
 use crate::sync_deltas::AffectedRowTableGroup;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -56,6 +58,7 @@ mod codec_parity_tests {
         let conn = db.connect().unwrap();
         conn.execute_batch("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer); create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer); insert into _pyre_sync values(1,'e1',0);").await.unwrap();
         let fingerprint = manifest.fingerprint();
+        let bound = BoundManifest::new(manifest.clone(), &context).unwrap();
         let binding = BatchBinding {
             database_id: "tenant-1",
             namespace: &create.primary_db,
@@ -104,7 +107,7 @@ mod codec_parity_tests {
                 input: input.clone(),
             }],
         };
-        let result = run_batch(&conn, &manifest, &binding, &request, &session)
+        let result = run_batch(&conn, &bound, &binding, &request, &session)
             .await
             .unwrap();
         assert_eq!(result.response["status"], "accepted");
@@ -126,7 +129,7 @@ mod codec_parity_tests {
         raw_input["id"] = json!("00000000-0000-4000-8000-000000000003");
         raw_input["details"] = raw.clone();
         request.operations[0].input = raw_input;
-        run_batch(&conn, &manifest, &binding, &request, &session)
+        run_batch(&conn, &bound, &binding, &request, &session)
             .await
             .unwrap();
         let row = conn
@@ -158,7 +161,7 @@ mod codec_parity_tests {
             let mut invalid = input.clone();
             invalid[key] = value;
             request.operations[0].input = invalid;
-            let error = run_batch(&conn, &manifest, &binding, &request, &session)
+            let error = run_batch(&conn, &bound, &binding, &request, &session)
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "InvalidRequest");
@@ -171,7 +174,7 @@ mod codec_parity_tests {
             .remove("note");
         request.operations[0].input = missing_nullable;
         assert_eq!(
-            run_batch(&conn, &manifest, &binding, &request, &session)
+            run_batch(&conn, &bound, &binding, &request, &session)
                 .await
                 .unwrap_err()
                 .code(),
@@ -227,7 +230,7 @@ pub struct BatchResult {
 /// Hosts must bound the raw HTTP body too, before decoding it into this request.
 pub async fn run_batch(
     conn: &libsql::Connection,
-    manifest: &Manifest,
+    manifest: &BoundManifest,
     binding: &BatchBinding<'_>,
     request: &BatchRequest,
     session: &PyreSession,
@@ -238,6 +241,7 @@ pub async fn run_batch(
         || request.namespace != binding.namespace
         || request.manifest != binding.manifest
         || binding.manifest != manifest.fingerprint()
+        || !manifest.authorizes_namespace(binding.namespace)
         || request.instance != binding.instance
         || request.auth_generation != binding.auth_generation
         || request.request_id.is_empty()
@@ -334,6 +338,15 @@ pub async fn run_batch(
         for (index, (query, args)) in prepared.iter().enumerate() {
             let result = execute_generated_sql(&tx, &query.sql, args, query.generated_edit.as_ref()).await
                 .map_err(|error| error.operation(index))?;
+            if query.generated_edit.is_none() {
+                query
+                    .result_schema
+                    .as_ref()
+                    .ok_or_else(|| Error::InvalidInput("missing named result schema".into()))?
+                    .validate(&result.response)
+                    .map_err(|_| Error::InvalidInput("named result does not match its compiled schema".into()))
+                    .map_err(|error| error.operation(index))?;
+            }
             results.push(serde_json::json!({"index": index, "operation": request.operations[index].operation, "value": result.response}));
             affected_rows.extend(result.affected_rows);
         }
@@ -598,7 +611,9 @@ async fn execute_generated_sql(
                     .and_then(|set| set.rows.first())
                     .and_then(|row| row.get("_pyreEditId"))
                     .filter(|id| {
-                        id.as_i64().is_some() || id.as_str().is_some_and(super::manifest::is_uuid)
+                        id.as_i64()
+                            .is_some_and(|id| id.unsigned_abs() <= 9_007_199_254_740_991)
+                            || id.as_str().is_some_and(super::manifest::is_uuid)
                     })
                     .cloned();
                 if identity.is_none() {

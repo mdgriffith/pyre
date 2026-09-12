@@ -72,11 +72,15 @@ pub fn generate(
                 ));
             }
         }
-        for q in operations {
+        let mut operation_bindings = Vec::new();
+        for (operation_index, q) in operations.iter().enumerate() {
             let module = crate::ext::string::decapitalize(&q.name);
-            let alias = &q.name;
+            let metadata = format!("$metadata{operation_index}");
+            let input = format!("$input{operation_index}");
+            let operation = format!("$operation{operation_index}");
+            operation_bindings.push(operation.clone());
             text.push_str(&format!(
-                "import * as {alias}Meta from '../core/queries/metadata/{module}';\n"
+                "import * as {metadata} from '../core/queries/metadata/{module}';\n"
             ));
             let table = q.fields.iter().find_map(|f| match f {
                 ast::TopLevelQueryField::Field(f) => context.tables.get(&f.name),
@@ -84,8 +88,7 @@ pub fn generate(
             });
             let generated =
                 table.and_then(|t| crate::generated_queries::generated_edit(q, t).map(|g| (t, g)));
-            let input = format!("{alias}Input");
-            text.push_str(&format!("export type {input} = {{\n"));
+            text.push_str(&format!("type {input} = {{\n"));
             for arg in &q.args {
                 let reference = if q.generated_crud {
                     table
@@ -146,9 +149,8 @@ pub fn generate(
                             _ => None,
                         })
                 });
-                let ty = branded.unwrap_or_else(|| {
-                    format!("JsonInput<{alias}Meta.Input[{}]>", json(&arg.name))
-                });
+                let ty = branded
+                    .unwrap_or_else(|| format!("JsonInput<{metadata}.Input[{}]>", json(&arg.name)));
                 // Client UUID creation accepts a fresh UUID; references and existing targets remain branded.
                 let ty = if generated.as_ref().is_some_and(|(_, (kind, pk, _))| {
                     *kind == "create"
@@ -191,9 +193,9 @@ pub fn generate(
                     }
                 )
             } else {
-                format!("{alias}Meta.Result")
+                format!("{metadata}.Result")
             };
-            text.push_str(&format!("const {alias}Operation: EditOperation<{input}, {result}> = Object.freeze({{\n  id: {alias}Meta.meta.id,\n  parseInput(value: unknown): {input} {{\n    {alias}Meta.RawInputValidator.strict().parse(value);\n    {alias}Meta.meta.InputValidator.strict().parse(value);\n"));
+            text.push_str(&format!("const {operation}: EditOperation<{input}, {result}> = Object.freeze({{\n  id: {metadata}.meta.id,\n  parseInput(value: unknown): {input} {{\n    {metadata}.RawInputValidator.strict().parse(value);\n    {metadata}.meta.InputValidator.strict().parse(value);\n"));
             if let Some((_, (kind, _, writable))) = &generated {
                 if *kind == "update" {
                     text.push_str(&format!("    if (!{}.some(key => Object.prototype.hasOwnProperty.call(value, key))) throw new Error('InvalidEdit');\n", serde_json::to_string(writable).unwrap()));
@@ -247,27 +249,30 @@ pub fn generate(
                     text.push_str(&format!("    return {{ safe: true as const, kind: {} as const, table: {}, id: input[{}]!, fields: {}, writableFields: {}, materializedFields: {} }};\n  }},\n", json(kind), json(&ast::get_tablename(&table.record.name, &table.record.fields)), json(&pk.name), if *kind == "create" { "input".into() } else { format!("Object.fromEntries(Object.entries(input).filter(([key]) => key !== {}))", json(&pk.name)) }, serde_json::to_string(writable).unwrap(), serde_json::to_string(&materialized).unwrap()));
                 }
                 let body = match *kind {
-                    "create" => format!("create: (input: {input}): Edit<{name}, {result}> => scopedEdit({name}, {alias}Operation, input)"),
-                    "update" => format!("update: (id: {input}[{key}], patch: Omit<{input}, {key}>): Edit<{name}, {result}> => {{ if (Object.prototype.hasOwnProperty.call(patch, {key})) throw new Error('InvalidEdit'); return scopedEdit({name}, {alias}Operation, {{ ...patch, [{key}]: id }}); }}", key = json(&pk.name)),
-                    _ => format!("delete: (id: {input}[{key}]): Edit<{name}, {result}> => scopedEdit({name}, {alias}Operation, {{ [{key}]: id }})", key = json(&pk.name)),
+                    "create" => format!("create: (input: {input}): Edit<{name}, {result}> => scopedEdit({name}, {operation}, input)"),
+                    "update" => format!("update: (id: {input}[{key}], patch: Omit<{input}, {key}>): Edit<{name}, {result}> => {{ if (Object.prototype.hasOwnProperty.call(patch, {key})) throw new Error('InvalidEdit'); return scopedEdit({name}, {operation}, {{ ...patch, [{key}]: id }}); }}", key = json(&pk.name)),
+                    _ => format!("delete: (id: {input}[{key}]): Edit<{name}, {result}> => scopedEdit({name}, {operation}, {{ [{key}]: id }})", key = json(&pk.name)),
                 };
                 records
                     .entry(table.record.name.clone())
                     .or_default()
                     .push(body);
             } else {
-                text.push_str(&format!("  decodeResult: (value: unknown) => {alias}Meta.meta.ReturnData.parse(value),\n"));
-                commands.push(format!("{module}: (input: {input}): Edit<{name}, {result}> => scopedEdit({name}, {alias}Operation, input)"));
+                text.push_str(&format!("  decodeResult: (value: unknown) => {metadata}.meta.ReturnData.parse(value),\n"));
+                commands.push(format!("{module}: (input: {input}): Edit<{name}, {result}> => scopedEdit({name}, {operation}, input)"));
             }
             text.push_str("});\n");
         }
+        text.push_str("export const Records = Object.freeze({\n");
         for (record, methods) in records {
             text.push_str(&format!(
-                "export const {record} = Object.freeze({{ {} }});\n",
+                "  {}: Object.freeze({{ {} }}),\n",
+                json(&record),
                 methods.join(",\n")
             ));
         }
-        text.push_str(&format!("export const Commands = Object.freeze({{ {} }});\nexport const operations = Object.freeze([{}]);\nexport const manifestVersion = {};\n", commands.join(",\n"), operations.iter().map(|q| format!("{}Operation", q.name)).collect::<Vec<_>>().join(", "), json(&version)));
+        text.push_str("});\n");
+        text.push_str(&format!("export const Commands = Object.freeze({{ {} }});\nexport const operations = Object.freeze([{}]);\nexport const manifestVersion = {};\n", commands.join(",\n"), operation_bindings.join(", "), json(&version)));
         files.push(generate_text_file(
             core.join("../edits").join(format!("{name}.ts")),
             text,
@@ -344,6 +349,23 @@ record Marker {
   text String
   updatedAt Int @immutable
 }
+record Legacy {
+  @public
+  id String @id
+  value String
+}
+record Main {
+  @public
+  id Id.Int @id
+}
+record Commands {
+  @public
+  id Id.Int @id
+}
+record Records {
+  @public
+  id Id.Int @id
+}
 "#,
             &mut schema,
         )
@@ -382,18 +404,35 @@ record Marker {
         }
         manifest.push_str(&format!("export const manifest = {{ version: 1, manifestVersion: {}, SessionValidator, queries: {{ {} }} }};\n", json(&crate::generate::manifest::fingerprint(&context, &queries, &info)), entries.join(",")));
         files.push(generate_text_file(out.join("manifest.ts"), manifest));
+        let edits = files
+            .iter()
+            .find(|file| file.path.ends_with("edits/Main.ts"))
+            .unwrap();
+        assert!(edits
+            .contents
+            .contains("export const Records = Object.freeze"));
+        assert!(edits.contents.contains("$metadata0"));
+        assert!(edits.contents.contains("$operation0"));
+        assert!(!edits.contents.contains("export const User ="));
+        assert!(!edits.contents.contains("\"Legacy\": Object.freeze"));
+        for record in ["Main", "Commands", "Records"] {
+            assert!(edits
+                .contents
+                .contains(&format!("\"{record}\": Object.freeze")));
+        }
+        assert!(!edits.contents.contains("RenameOperation"));
         for file in files {
             std::fs::create_dir_all(file.path.parent().unwrap()).unwrap();
             std::fs::write(file.path, file.contents).unwrap();
         }
         std::fs::write(out.join("check.ts"), r#"
-import { Main, User, Audit, Commands, batch, type UserId, type AuditId } from './edits';
+import { Main, Records, Commands, batch, type UserId, type AuditId } from './edits';
 import type { Database, EditReceipt } from '../../packages/client/src-ts/service/local-edits';
 import { namespace, scopedBatch } from '@pyre/core/local-edits';
 declare const db: Database<Main>;
 declare const id: UserId;
-const created = User.create({ key: '00000000-0000-0000-0000-000000000001', name: 'new', fixed: 'x' });
-const plan = batch([created, Audit.create({ message: 'audit' }), User.update(id, { note: null }), User.delete(id), Commands.rename({ key: id, name: 'x' })] as const);
+const created = Records.User.create({ key: '00000000-0000-0000-0000-000000000001', name: 'new', fixed: 'x' });
+const plan = batch([created, Records.Audit.create({ message: 'audit' }), Records.User.update(id, { note: null }), Records.User.delete(id), Commands.rename({ key: id, name: 'x' })] as const);
 const receipt = db.submit(plan);
 const empty: EditReceipt<readonly []> = db.submit(batch([]));
 receipt.confirmed.then(outcome => { if (outcome.kind === 'confirmed') {
@@ -403,26 +442,26 @@ receipt.confirmed.then(outcome => { if (outcome.kind === 'confirmed') {
   const wrong: UserId = outcome.result[1].id;
 } });
 // @ts-expect-error required create field
-User.create({ key: id });
+Records.User.create({ key: id });
 // @ts-expect-error integer identity is server generated
-Audit.create({ id: 1, message: 'x' });
+Records.Audit.create({ id: 1, message: 'x' });
 // @ts-expect-error primary key update
-User.update(id, { key: id });
+Records.User.update(id, { key: id });
 // @ts-expect-error immutable update
-User.update(id, { fixed: 'x' });
+Records.User.update(id, { fixed: 'x' });
 // @ts-expect-error managed update
-User.update(id, { updatedAt: 1 });
+Records.User.update(id, { updatedAt: 1 });
 // @ts-expect-error nonnullable field
-User.update(id, { name: null });
+Records.User.update(id, { name: null });
 // @ts-expect-error default omission does not allow null
-Audit.create({ message: 'x', label: null });
-User.update(id, { reviewer: id });
+Records.Audit.create({ message: 'x', label: null });
+Records.User.update(id, { reviewer: id });
 // @ts-expect-error foreign keys share their target identity brand
-User.update(id, { reviewer: 'raw' });
+Records.User.update(id, { reviewer: 'raw' });
 // @ts-expect-error whole union replacement requires its members
-User.update(id, { status: { _type: 'Closed' } });
+Records.User.update(id, { status: { _type: 'Closed' } });
 // @ts-expect-error existing IDs require schema proof
-User.delete('not-an-id');
+Records.User.delete('not-an-id');
 declare const other: unique symbol;
 const Other = namespace<typeof other>('Other', 'm');
 const foreign = scopedBatch(Other)([]);

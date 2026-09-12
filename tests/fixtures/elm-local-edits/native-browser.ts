@@ -63,11 +63,11 @@ export async function verify(fence) {
     database.onEditFailure(event => failures.push(event));
     const id = '00000000-0000-4000-8000-000000000001';
     const submit = async plan => { const result = await database.submit(plan).confirmed; equal(result.kind, 'confirmed', 'receipt'); agree(); return result; };
-    await submit(g.Issue.create({ id, title: 'original', owner: 'me' }));
+    await submit(g.Records.Issue.create({ id, title: 'original', owner: 'me' }));
     await until(async () => JSON.stringify(await cache()).includes('original'), 'authoritative persistence');
     const beforePending = await cache();
     hold = true;
-    const pending = database.submit(g.Issue.update(id, { title: 'pending-only' }));
+    const pending = database.submit(g.Records.Issue.update(id, { title: 'pending-only' }));
     await until(() => release, 'pending update preparation');
     // Permission-dependent Issue edits deliberately have no safe prediction.
     equal(queries.at(-1).issue, [{ id, title: 'original' }], 'unsafe prediction withheld');
@@ -95,7 +95,7 @@ export async function verify(fence) {
     await until(async () => JSON.stringify(await cache()).includes('"audit"'), 'audit persisted');
     const beforeOptimistic = await cache();
     hold = true; release = undefined;
-    const deletion = database.submit(g.Audit.delete(1));
+    const deletion = database.submit(g.Records.Audit.delete(1));
     await until(() => release && !audits.has(1), 'safe optimistic delete');
     equal(await cache(), beforeOptimistic, 'optimistic deletion must not persist');
     hold = false; release();
@@ -108,14 +108,14 @@ export async function verify(fence) {
       agree();
     }
     equal(projected(), [{ id, title: 'elm' }], 'no Elm rollback ghost');
-    await submit(g.Issue.delete(id));
+    await submit(g.Records.Issue.delete(id));
     equal(projected(), [], 'delete removes readers');
     await until(async () => !JSON.stringify((await cache()).tables).includes('"issues"'), 'persisted issue deletion');
     checked.push('TS/Elm reader agreement');
 
     const ghost = crypto.randomUUID();
     const beforeFailure = failures.length;
-    database.submit(g.batch([g.Issue.create({ id: ghost, title: 'ghost', owner: 'me' }), g.Issue.update(crypto.randomUUID(), { title: 'missing' })]));
+    database.submit(g.batch([g.Records.Issue.create({ id: ghost, title: 'ghost', owner: 'me' }), g.Records.Issue.update(crypto.randomUUID(), { title: 'missing' })]));
     await until(() => failures.length > beforeFailure, 'fire-and-forget failure');
     equal(failures.at(-1).certainty, 'rejected', 'failure certainty');
     equal(failures.at(-1).code, 'TargetNotWritable', 'real executor rejection');
@@ -128,11 +128,11 @@ export async function verify(fence) {
     await until(() => hintCount > 0 && reads > beforeHint, 'native EventSource replacement');
     await until(() => queries.at(-1)?.issue?.[0]?.title === 'external', 'hint installs external commit');
     agree();
-    await submit(g.Issue.delete('00000000-0000-4000-8000-000000000099'));
+    await submit(g.Records.Issue.delete('00000000-0000-4000-8000-000000000099'));
     checked.push('EventSource hint');
 
     hold = true; release = undefined;
-    const stale = database.submit(g.Issue.create({ id: ghost, title: 'old-auth', owner: 'me' }));
+    const stale = database.submit(g.Records.Issue.create({ id: ghost, title: 'old-auth', owner: 'me' }));
     await until(() => release, 'prepared old-auth edit');
     const beforeDispose = writes;
     client.disconnect();
@@ -146,7 +146,7 @@ export async function verify(fence) {
     const newQueries = [];
     await client.run('one', { ...meta, operation: 'query' }, {}, result => newQueries.push(result));
     await until(() => newQueries.at(-1)?.issue?.length === 0, 'new auth read-only catchup');
-    equal((await database.submit(g.Issue.delete(id)).confirmed).kind, 'rejected', 'old binding fenced');
+    equal((await database.submit(g.Records.Issue.delete(id)).confirmed).kind, 'rejected', 'old binding fenced');
     equal(writes, beforeDispose, 'no stale or read-only writes');
     assert(!JSON.stringify(await cache()).includes(ghost), 'old auth cannot resurrect cache');
     checked.push('auth/dispose fencing');

@@ -1,4 +1,4 @@
-use pyre::server::manifest::{Manifest, PyreSession};
+use pyre::server::manifest::{BoundManifest, Manifest, PyreSession};
 use pyre::server::query::{self, BatchBinding};
 use pyre::server::sync::{Replacement, ReplacementRequest, SyncFence, SyncServer};
 use pyre::sync_deltas::AffectedRowTableGroup;
@@ -349,6 +349,9 @@ fn replacement_contract_authenticates_permissions_session_codecs_and_sync_scope(
     let original = context(source);
     let compiled = manifest(&original);
     assert!(compiled.matches_context(&original));
+    let bound = BoundManifest::new(compiled.clone(), &original).unwrap();
+    assert_eq!(bound.fingerprint(), compiled.fingerprint());
+    assert!(bound.authorizes_namespace(ast::DEFAULT_SCHEMANAME));
     assert_eq!(
         compiled.compiled_contract,
         generate::manifest::compiled_schema_contract(&original)
@@ -360,13 +363,16 @@ fn replacement_contract_authenticates_permissions_session_codecs_and_sync_scope(
         format!("@syncable(false)\n{source}"),
     ] {
         assert!(!compiled.matches_context(&context(&changed)));
+        assert!(BoundManifest::new(compiled.clone(), &context(&changed)).is_err());
     }
     let mut invalid = compiled.clone();
     invalid.compiled_contract.clear();
     assert!(!invalid.matches_context(&original));
+    assert!(BoundManifest::new(invalid.clone(), &original).is_err());
     invalid = compiled;
     invalid.version = 2;
     assert!(!invalid.matches_context(&original));
+    assert!(BoundManifest::new(invalid, &original).is_err());
 }
 
 const LINKED: &str = r#"

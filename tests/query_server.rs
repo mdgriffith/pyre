@@ -2,7 +2,7 @@
 mod helpers;
 
 use helpers::test_database::TestDatabase;
-use pyre::server::manifest::{Manifest, PyreSession, QueryManifest};
+use pyre::server::manifest::{BoundManifest, Manifest, PyreSession, QueryManifest};
 use pyre::server::query;
 use pyre::server::sync::{ConnectedSessions, SyncServer, SyncSession};
 use pyre::{ast, parser, typecheck};
@@ -50,6 +50,10 @@ fn only_query(manifest: &Manifest) -> &QueryManifest {
         .expect("manifest should contain a query")
 }
 
+fn bind(manifest: &Manifest, context: &pyre::typecheck::Context) -> BoundManifest {
+    BoundManifest::new(manifest.clone(), context).unwrap()
+}
+
 #[tokio::test]
 async fn typed_json_session_enums_match_compiled_bundle_writes(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -87,7 +91,14 @@ async fn typed_json_session_enums_match_compiled_bundle_writes(
         json!({"userId":7,"role":"Member","unrelated":"value","context":details});
     let session = PyreSession::new(session_value.clone(), &manifest.session_schema)?;
     let request = batch_request(&conn, &binding, vec![query::BatchOperation { operation:create.id.clone(), input:json!({"id":"00000000-0000-4000-8000-000000000001","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":"Member","details":details}) }]).await;
-    query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
     let row = conn
         .query(
             "select json(details) from entries where id = '00000000-0000-4000-8000-000000000001'",
@@ -168,7 +179,14 @@ async fn compiler_provenance_is_not_inferred_from_named_query_hashes(
     )
     .await;
     let session = PyreSession::new(json!({}), &manifest.session_schema)?;
-    let result = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
     assert_eq!(result.response["results"][0]["value"], json!({"item":[]}));
     Ok(())
 }
@@ -300,7 +318,17 @@ async fn generated_nullable_boolean_keeps_explicit_null() -> Result<(), Box<dyn 
             .await?;
     let conn = db.db.connect()?;
     let manifest = manifest_for(&db.context, "", true)?;
-    let create = query_by_operation(&manifest, "insert");
+    let create = manifest
+        .queries
+        .values()
+        .find(|query| {
+            query.operation == "insert"
+                && query
+                    .generated_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.kind == "create")
+        })
+        .unwrap();
     let fingerprint = manifest.fingerprint();
     let binding = batch_binding(&create.primary_db, &fingerprint);
     let session = PyreSession::new(json!({}), &manifest.session_schema)?;
@@ -313,7 +341,14 @@ async fn generated_nullable_boolean_keeps_explicit_null() -> Result<(), Box<dyn 
         }],
     )
     .await;
-    query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
     let mut rows = conn
         .query("SELECT enabled IS NULL FROM items WHERE id=1", ())
         .await?;
@@ -372,7 +407,14 @@ record Item {
     conn.execute("CREATE TABLE audit (message TEXT)", ())
         .await?;
     conn.execute("CREATE TRIGGER item_audit AFTER UPDATE ON items BEGIN INSERT INTO audit VALUES ('a'); INSERT INTO audit VALUES ('b'); END", ()).await?;
-    let result = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
     assert_eq!(result.response["commitRevision"], 1);
     assert_eq!(
         result.response["results"],
@@ -387,9 +429,15 @@ record Item {
         op(update, json!({"id":1,"name":"rolled back"})),
         op(delete, json!({"id":999})),
     ];
-    let error = query::run_batch(&conn, &manifest, &binding, &request, &session)
-        .await
-        .unwrap_err();
+    let error = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains("operation 1"));
     assert!(error.to_string().contains("TargetNotWritable"));
     let mut rows = conn.query("SELECT name, (SELECT server_revision FROM _pyre_sync WHERE id=1) FROM items WHERE id=1", ()).await?;
@@ -401,9 +449,15 @@ record Item {
         .await?;
     request.operations = vec![op(update, json!({"id":1,"name":"final"}))];
     assert_eq!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await?
-            .response["commitRevision"],
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await?
+        .response["commitRevision"],
         2
     );
     let mut rows = conn
@@ -413,27 +467,161 @@ record Item {
     drop(rows);
     request.operations = vec![op(update, json!({"id":1,"name":"protected","updatedAt":1}))];
     assert_eq!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await
-            .unwrap_err()
-            .code(),
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await
+        .unwrap_err()
+        .code(),
         "InvalidRequest"
     );
     request.operations = vec![op(update, json!({"id":1}))];
-    assert!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("InvalidEdit")
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("InvalidEdit"));
     request.operations.clear();
-    let empty = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let empty = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
     assert_eq!(empty.response["results"], json!([]));
     assert!(empty.response.get("commitRevision").is_none());
     assert!(SyncServer::new(&db.context)
         .replacement_messages(&empty, &std::collections::HashMap::new())
         .is_empty());
+
+    conn.execute("DELETE FROM items", ()).await?;
+    conn.execute(
+        "INSERT INTO items(id,name) VALUES(9007199254740991,'boundary')",
+        (),
+    )
+    .await?;
+    request.operations = vec![op(create, json!({"name":"unsafe"}))];
+    let revision_before = conn
+        .query("SELECT server_revision FROM _pyre_sync", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<i64>(0)?;
+    let error = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "TargetNotWritable");
+    let row = conn
+        .query(
+            "SELECT count(*), max(id), (SELECT server_revision FROM _pyre_sync) FROM items",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 1);
+    assert_eq!(row.get::<i64>(1)?, 9_007_199_254_740_991);
+    assert_eq!(row.get::<i64>(2)?, revision_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn named_batch_results_are_validated_before_revision_and_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db =
+        TestDatabase::new("record Item {\n id Id.Int @id\n name String\n @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    let mut manifest = manifest_for(
+        &db.context,
+        "insert Named($name: String) { item { name = $name id } }",
+        true,
+    )?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|query| {
+            query.operation == "insert"
+                && query
+                    .generated_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.kind == "create")
+        })
+        .unwrap();
+    let create_id = create.id.clone();
+    let namespace = create.primary_db.clone();
+    let named_id = manifest
+        .queries
+        .values()
+        .find(|query| query.generated_edit.is_none())
+        .unwrap()
+        .id
+        .clone();
+    manifest.queries.get_mut(&named_id).unwrap().result_schema =
+        Some(pyre::server::manifest::ResultSchema::Array {
+            items: Box::new(pyre::server::manifest::ResultSchema::Object {
+                fields: std::collections::BTreeMap::new(),
+            }),
+        });
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&namespace, &fingerprint);
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![
+            query::BatchOperation {
+                operation: create_id,
+                input: json!({"name":"prefix"}),
+            },
+            query::BatchOperation {
+                operation: named_id,
+                input: json!({"name":"named"}),
+            },
+        ],
+    )
+    .await;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let error = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "InvalidRequest");
+    assert_eq!(error.operation_index(), Some(1));
+    let row = conn
+        .query(
+            "SELECT count(*), (SELECT server_revision FROM _pyre_sync) FROM items",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
+    assert_eq!(row.get::<i64>(1)?, 0);
     Ok(())
 }
 
@@ -464,64 +652,96 @@ record Item {
     let mut invalid = operation.clone();
     invalid.input = json!({"name":"bad","id":7});
     request.operations.push(invalid);
-    assert!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await
-            .is_err()
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
     request.operations = vec![operation.clone(); 101];
-    assert!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await
-            .is_err()
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
     request.operations = vec![operation.clone()];
     request.operations[0].input = json!({"name":"a".repeat(query::MAX_BATCH_PAYLOAD_BYTES)});
-    assert!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await
-            .is_err()
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
     request.operations = vec![operation];
     request.namespace = "Unauthorized".into();
-    assert!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await
-            .is_err()
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
     request.namespace = binding.namespace.into();
     let mut attached = manifest.clone();
     attached.queries.get_mut(&create.id).unwrap().attached_dbs = vec!["Other".into()];
     let attached_fingerprint = attached.fingerprint();
     let attached_binding = batch_binding(binding.namespace, &attached_fingerprint);
     request.manifest = attached_fingerprint.clone();
-    assert!(
-        query::run_batch(&conn, &attached, &attached_binding, &request, &session)
-            .await
-            .is_err()
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&attached, &db.context),
+        &attached_binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
     let forged_binding = batch_binding(binding.namespace, "forged-version");
     request.manifest = "forged-version".into();
-    assert!(
-        query::run_batch(&conn, &manifest, &forged_binding, &request, &session)
-            .await
-            .is_err()
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &forged_binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
     request.manifest = fingerprint.clone();
     conn.execute("ATTACH DATABASE ':memory:' AS other", ())
         .await?;
-    assert!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await
-            .is_err()
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
     conn.execute("DETACH DATABASE other", ()).await?;
     request.database_epoch = "stale".into();
-    assert!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await
-            .is_err()
-    );
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
     let mut rows = conn
         .query(
             "SELECT (SELECT count(*) FROM items), server_revision FROM _pyre_sync WHERE id=1",
@@ -589,7 +809,14 @@ update Noop($noopName: String, $missingId: Item.id) {
         ],
     )
     .await;
-    let result = query::run_batch(&conn, &manifest, &binding, &request, &session).await?;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
     assert_eq!(result.response["results"][2]["value"], json!({"id":1}));
     assert_eq!(
         result.response["results"][3]["value"],
@@ -599,9 +826,15 @@ update Noop($noopName: String, $missingId: Item.id) {
     assert_eq!(result.response["reconciliation"]["minimumSafeRevision"], 1);
     request.operations = vec![op(noop, json!({"noopName":"unused", "missingId":999}))];
     assert_eq!(
-        query::run_batch(&conn, &manifest, &binding, &request, &session)
-            .await?
-            .response["commitRevision"],
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await?
+        .response["commitRevision"],
         2
     );
     // Simulate a faulty compiled target predicate: read visibility and trigger totals must not mask >1.
@@ -612,9 +845,15 @@ update Noop($noopName: String, $missingId: Item.id) {
     let broad_fingerprint = broad.fingerprint();
     let broad_binding = batch_binding(&create.primary_db, &broad_fingerprint);
     request.manifest = broad_fingerprint.clone();
-    let error = query::run_batch(&conn, &broad, &broad_binding, &request, &session)
-        .await
-        .unwrap_err();
+    let error = query::run_batch(
+        &conn,
+        &bind(&broad, &db.context),
+        &broad_binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.code(), "TargetNotWritable");
     assert_eq!(error.operation_index(), Some(0));
     let mut rows = conn

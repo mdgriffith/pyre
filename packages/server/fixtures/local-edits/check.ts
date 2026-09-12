@@ -2,13 +2,14 @@ import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod";
 import { namespace, planKey, scopedEdit, type Edit } from "@pyre/core/local-edits";
 import { localEdits, type BindOptions } from "../../local-edits";
-import { Main, Project, Task, Audit, Commands, batch, type ProjectId } from "../../../../target/local-edits-fixture/typescript/edits";
+import { Main, Records, Commands, batch, type ProjectId } from "../../../../target/local-edits-fixture/typescript/edits";
 import { manifest } from "../../../../target/local-edits-fixture/typescript/server";
 import { openDatabase } from "./database";
 import type { BatchSyncRecipient } from "../../query-sync";
 import * as execution from "../../query-sync";
 
 const cleanup: (() => void)[] = [];
+const { Project, Task, Audit } = Records;
 afterEach(() => { for (const close of cleanup.splice(0)) close(); });
 async function setup() {
   const { database, close } = await openDatabase();

@@ -26,7 +26,9 @@ and EventSource against the TypeScript executor. See the
 and coverage boundaries; the reference model remains a separate bounded check.
 
 Client metadata must be regenerated with the required `primaryKey` name/kind.
-Unsupported primary-key types fail explicitly rather than being treated as UUIDs.
+Records whose primary keys are neither integer nor UUID remain available to
+ordinary generation, but local-edit CRUD/descriptors are omitted with an explicit
+generation warning rather than being treated as UUIDs.
 Browser cache version 3 resets prior rows, cursors, revision and epoch together;
 it does not migrate old flattened `id` caches. Invalid current-version caches
 fail initialization. Query publication conservatively sends changed full results,
@@ -60,6 +62,12 @@ are not a security boundary: revalidate inputs, manifest version, namespace,
 protected fields, session, permissions, and database on the server. Managed fields,
 integer generated IDs, immutable update fields, and primary-key updates have no
 setters. Handwritten commands can change a primary key under existing rules.
+The Rust server constructs one immutable `BoundManifest` from the manifest and
+trusted database-loaded schema context, caches its fingerprint and authenticated
+namespace scope, and requires that bound capability for batch execution. Named
+command results are validated recursively against manifest result metadata before
+revision allocation and commit. Generated integer result identities must fit
+JavaScript's safe integer range.
 
 Elm duplicate setters resolve left to right, last setter wins (also for null). Omission
 means unchanged on update, default/nullable omission on create. Empty updates reject
@@ -79,17 +87,17 @@ a client UUID and `AuditId` a server integer. Generated edits/batches are opaque
 and namespace-scoped; application code does not construct their internals.
 
 ```ts
-import { Main, User, Audit, Commands, batch, type UserId, type AuditId }
+import { Main, Records, Commands, batch, type UserId, type AuditId }
   from "./generated/typescript/edits/Main";
 
 declare const userId: UserId;
-const rename = User.update(userId, { name: "final", note: null });
-const create = User.create({ key: crypto.randomUUID(), name: "New", fixed: "x" });
-const remove = User.delete(userId);
+const rename = Records.User.update(userId, { name: "final", note: null });
+const create = Records.User.create({ key: crypto.randomUUID(), name: "New", fixed: "x" });
+const remove = Records.User.delete(userId);
 const db = await client.localEdits("main", Main); // Database<Main>
 db.onEditFailure(event => showWriteError(event)); // install once, independent of receipts
 const receipt = db.submit(rename); // EditReceipt<Updated<UserId>>; no await needed
-const plan = batch([create, Audit.create({ message: "created" }),
+const plan = batch([create, Records.Audit.create({ message: "created" }),
   Commands.rename({ key: userId, name: "final" })] as const);
 const batchReceipt = db.submit(plan); // construction alone does not submit
 const outcome = await batchReceipt.confirmed; // resolves, never an unhandled rejection
@@ -140,7 +148,7 @@ import Pyre.Batch as Batch
 -- Issue.update : Db.EditIds.DefaultIssue -> List Issue.Patch
 --     -> Edit Database.Default (Updated Db.EditIds.DefaultIssue)
 rename issueId =
-    Issue.update issueId [ Issue.title "final", Issue.assignee Nothing ]
+    Issue.update issueId [ Issue.setTitle "final", Issue.setAssignee Nothing ]
 -- Omit assignee: unchanged; Nothing: SQL null; Just id: set. No clear builder.
 -- Non-nullable setters accept plain values, never Maybe.
 
@@ -172,6 +180,9 @@ The bridge forwards effects in production order; do not use unordered independen
 `Cmd.batch` sends for ordered edits. Reusing an unperformed effect is not a new
 submission; request IDs prevent duplicate local enqueue, not server idempotency.
 Callbacks/outcome messages arrive through the existing model/effect bridge.
+`Pyre.init : String -> Model` requires a caller-provided incarnation token. Every
+logical model reset must use a fresh token; request IDs include it plus the local
+counter so stale effects cannot correlate with a new model incarnation.
 
 Elm `create` accepts a required-field record; `createWith` adds opaque optional
 `with<Field>` setters. `Batch.succeed value` with no edits confirms `value` without
@@ -183,12 +194,12 @@ instance. Consume `Pyre.failures` after each update; it is not a retained error 
 ```ts
 // Server seeds use the same compiled executor, no cache, worker, or SSE required.
 import { localEdits } from "@pyre/server/local-edits";
-// Main/User/Audit/batch as above; manifest from generated/typescript/server.
+// Main/Records/batch as above; manifest from generated/typescript/server.
 const seeds = localEdits.bind({ database: mainConnection, databaseId: "main",
   namespace: Main, manifest, session: {} }); // explicit sessionless fixture
 const result = await seeds.submit(batch([
-  User.create({ key: crypto.randomUUID(), name: "Seed", fixed: "x" }),
-  Audit.create({ message: "created" }),
+  Records.User.create({ key: crypto.randomUUID(), name: "Seed", fixed: "x" }),
+  Records.Audit.create({ message: "created" }),
 ] as const));
 // Confirmed carries the typed tuple; confirmed means committed plus
 // authoritative result materialized in this execution (no browser cache to catch up).
@@ -275,6 +286,10 @@ survive later intent. Local atomicity does not assert eventual server acceptance
 | accepted, catchup fails | Stay accepted, retain overlay only against still-precommit base; emit reconciliation failure, retry read-only catchup. |
 | disposal / auth change / epoch reset | Clear overlays and subscriptions; unsent rejects as disposed/fenced, dispatched unknown, accepted stays known committed but not confirmed. Deliver final lifecycle events before detaching. |
 | late/duplicate response | Ignore if fenced; same-lifetime valid evidence may resolve unknown. Duplicate completion emits no duplicate failure/confirmation. |
+
+A `status: "rejected"` envelope that also contains `commitRevision`, `results`, or
+`reconciliation` is contradictory and therefore malformed/outcome-unknown, even
+when the contradictory field is null or otherwise fails decoding.
 
 Standard failure events contain request ID, database/lifetime, phase, code,
 operation index when safely known, and certainty (`rejected`, `unknown`, or

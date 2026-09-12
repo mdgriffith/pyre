@@ -30,6 +30,8 @@ struct QueryManifest {
     optional_input_args: Vec<String>,
     json_input_args: Vec<String>,
     sql: Vec<SqlInfo>,
+    #[serde(rename = "resultSchema")]
+    result_schema: crate::server::manifest::ResultSchema,
     #[serde(rename = "syncSql", skip_serializing_if = "Option::is_none")]
     sync_sql: Option<Vec<SqlInfo>>,
     #[serde(rename = "generatedEdit", skip_serializing_if = "Option::is_none")]
@@ -139,12 +141,136 @@ fn query_manifest(
             .map(|arg| arg.name.clone())
             .collect(),
         sql: query_sql(context, query, query_info, false),
+        result_schema: result_schema(context, query),
         sync_sql: if query.operation == ast::QueryOperation::Query {
             None
         } else {
             Some(query_sql(context, query, query_info, true))
         },
     }
+}
+
+pub fn result_schema(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> crate::server::manifest::ResultSchema {
+    use crate::server::manifest::ResultSchema;
+    let fields = query
+        .fields
+        .iter()
+        .filter_map(|field| match field {
+            ast::TopLevelQueryField::Field(field) => context.tables.get(&field.name).map(|table| {
+                (
+                    crate::ext::string::decapitalize(&ast::get_aliased_name(field)),
+                    ResultSchema::Array {
+                        items: Box::new(result_object_schema(
+                            context,
+                            &table.record,
+                            field,
+                            ast::query_field_operation(query, field).clone(),
+                        )),
+                    },
+                )
+            }),
+            _ => None,
+        })
+        .collect();
+    ResultSchema::Object { fields }
+}
+
+fn result_object_schema(
+    context: &typecheck::Context,
+    record: &ast::RecordDetails,
+    query_field: &ast::QueryField,
+    operation: ast::QueryOperation,
+) -> crate::server::manifest::ResultSchema {
+    use crate::server::manifest::ResultSchema;
+    let query_fields = ast::collect_query_fields(&query_field.fields);
+    let explicit = query_fields
+        .iter()
+        .filter(|field| field.name != "*")
+        .filter_map(|field| {
+            record
+                .fields
+                .iter()
+                .find(|candidate| ast::has_field_or_linkname(candidate, &field.name))
+                .and_then(|field| match field {
+                    ast::Field::Column(column) => Some(column.name.clone()),
+                    _ => None,
+                })
+        })
+        .collect::<HashSet<_>>();
+    let mut fields = BTreeMap::new();
+    let mut wildcard = false;
+    for field in query_fields {
+        if field.name == "*" {
+            if wildcard {
+                continue;
+            }
+            wildcard = true;
+            for table_field in &record.fields {
+                if let ast::Field::Column(column) = table_field {
+                    if !explicit.contains(&column.name) {
+                        fields.insert(column.name.clone(), result_column_schema(context, column));
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(table_field) = record
+            .fields
+            .iter()
+            .find(|candidate| ast::has_field_or_linkname(candidate, &field.name))
+        else {
+            continue;
+        };
+        let name = ast::get_aliased_name(field);
+        match table_field {
+            ast::Field::Column(column) => {
+                fields.insert(name, result_column_schema(context, column));
+            }
+            ast::Field::FieldDirective(ast::FieldDirective::Link(link))
+                if operation != ast::QueryOperation::Insert =>
+            {
+                let Some(linked) = typecheck::get_linked_table(context, link) else {
+                    continue;
+                };
+                let nested =
+                    result_object_schema(context, &linked.record, field, operation.clone());
+                let primary_key = ast::get_primary_id_field_name(&record.fields);
+                let one_to_many = link
+                    .local_ids
+                    .iter()
+                    .all(|id| primary_key.as_ref().is_some_and(|primary| id == primary));
+                let schema = if one_to_many {
+                    ResultSchema::Array {
+                        items: Box::new(nested),
+                    }
+                } else if ast::linked_to_unique_field_with_record(link, &linked.record) {
+                    ResultSchema::Nullable {
+                        item: Box::new(nested),
+                    }
+                } else {
+                    nested
+                };
+                fields.insert(name, schema);
+            }
+            _ => {}
+        }
+    }
+    ResultSchema::Object { fields }
+}
+
+fn result_column_schema(
+    context: &typecheck::Context,
+    column: &ast::Column,
+) -> crate::server::manifest::ResultSchema {
+    let generated = session_field_schema(context, column);
+    let schema = serde_json::from_value(
+        serde_json::to_value(generated).expect("generated result field schema"),
+    )
+    .expect("runtime result field schema");
+    crate::server::manifest::ResultSchema::Field { schema }
 }
 
 /// Compile the same artifact used by Rust before exporting its identity to other runtimes.

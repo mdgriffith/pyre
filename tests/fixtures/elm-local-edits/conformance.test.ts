@@ -109,8 +109,8 @@ for (const server of ['typescript', 'rust']) test.skipIf(!directory)(
       const id = '00000000-0000-4000-8000-000000000001';
       const related = '00000000-0000-4000-8000-000000000002';
       const created = await submit(g.batch([
-        g.Issue.create({ id, title: 'original', owner: 'me', payload: { items: [1, null] }, choice: 'Open' }),
-        g.Issue.create({ id: related, title: 'related', owner: 'me', assignee: id }),
+        g.Records.Issue.create({ id, title: 'original', owner: 'me', payload: { items: [1, null] }, choice: 'Open' }),
+        g.Records.Issue.create({ id: related, title: 'related', owner: 'me', assignee: id }),
       ]));
       expect(created).toMatchObject({ kind: 'confirmed', result: [{ id }, { id: related }] });
       expect(rows('issues').find(row => row.id === related).assignee).toBe(id);
@@ -165,7 +165,7 @@ for (const server of ['typescript', 'rust']) test.skipIf(!directory)(
       archiveRuntime.onEditFailure(value => archiveFailures.push(value));
       try { await until(() => archivePublications.some(p => !p.invalid)); }
       catch (error) { console.error(JSON.stringify({ archiveSchema, archiveReads, archivePublications, archiveFailures })); throw error; }
-      expect(await archiveRuntime.bind(a.Archive).submit(a.ArchiveEntry.create({ id, title: 'archive ts', state: 'Stored' })).confirmed).toMatchObject({ kind: 'confirmed', result: { id } });
+      expect(await archiveRuntime.bind(a.Archive).submit(a.Records.ArchiveEntry.create({ id, title: 'archive ts', state: 'Stored' })).confirmed).toMatchObject({ kind: 'confirmed', result: { id } });
       expect(rows('issues').find(row => row.id === id).title).toBe('original');
       const archiveContext = vm.createContext({ setTimeout, clearTimeout, console });
       vm.runInContext(readFileSync(`${directory}/archive.js`, 'utf8'), archiveContext);
@@ -181,40 +181,40 @@ for (const server of ['typescript', 'rust']) test.skipIf(!directory)(
       expect(rows('issues').find(row => row.id === id).title).toBe('original');
       expect(await revision()).toBe(1);
       expect(archiveReads.every(read => Object.keys(read.tables).join() === 'archiveEntries')).toBe(true);
-      expect(await submit(a.ArchiveEntry.update(id, { title: 'wrong scope' }))).toMatchObject({ kind: 'rejected' });
-      const archiveOperation = a.ArchiveEntry.update(id, { title: 'wrong scope' })[planKey].operations[0];
+      expect(await submit(a.Records.ArchiveEntry.update(id, { title: 'wrong scope' }))).toMatchObject({ kind: 'rejected' });
+      const archiveOperation = a.Records.ArchiveEntry.update(id, { title: 'wrong scope' })[planKey].operations[0];
       expect((await execute('batch', { ...fence, version: 1, requestId: 'cross-operation', sequence: 100, operations: [{ operation: archiveOperation.definition.id, input: archiveOperation.input }] })).kind).toBe('error');
-      const mainOperation = g.Issue.update(id, { title: 'wrong scope' })[planKey].operations[0];
+      const mainOperation = g.Records.Issue.update(id, { title: 'wrong scope' })[planKey].operations[0];
       expect((await archiveExecute('batch', { ...archiveFence, version: 1, requestId: 'cross-operation', sequence: 100, operations: [{ operation: mainOperation.definition.id, input: mainOperation.input }] })).kind).toBe('error');
       expect((await archiveExecute('replacement', { ...fence, version: 1, requestId: 'cross-replacement', target: 0 })).kind).toBe('error');
       expect((await execute('replacement', { ...archiveFence, version: 1, requestId: 'cross-replacement', target: 0 })).kind).toBe('error');
       expect(await databases.Archive.ensureDatabase(archiveDb)).toBe('up-to-date');
 
       const uppercase = 'ABCDEFAB-CDEF-0123-4567-ABCDEFABCDEF';
-      expect(await submit(g.Issue.create({ id: uppercase, title: 'case preserved', owner: 'me', watchers: [uppercase], dueAt: '2026-01-01T00:00:00Z' })))
+      expect(await submit(g.Records.Issue.create({ id: uppercase, title: 'case preserved', owner: 'me', watchers: [uppercase], dueAt: '2026-01-01T00:00:00Z' })))
         .toMatchObject({ kind: 'confirmed', result: { id: uppercase } });
       expect(rows('issues').find(row => row.id === uppercase)).toMatchObject({ id: uppercase, watchers: [uppercase], dueAt: 1767225600 });
-      expect(await submit(g.Issue.delete(uppercase))).toMatchObject({ kind: 'confirmed' });
+      expect(await submit(g.Records.Issue.delete(uppercase))).toMatchObject({ kind: 'confirmed' });
       const baselineRevision = await revision();
 
       // Both client builders and server transaction validation must reject, not
       // strip protected or malformed values and accidentally commit a prefix.
       const beforeInvalid = writes.length;
       for (const patch of [{ owner: 'other' }, { title: null }, { payload: { items: ['bad'] } }, { watchers: ['not-a-uuid'] }, { assignee: 'not-a-uuid' }, {}]) {
-        expect(await submit(g.Issue.update(id, patch))).toMatchObject({ kind: 'rejected' });
+        expect(await submit(g.Records.Issue.update(id, patch))).toMatchObject({ kind: 'rejected' });
       }
       expect(writes).toHaveLength(beforeInvalid);
-      const operation = g.Issue.update(id, { title: 'valid' })[planKey].operations[0].definition.id;
+      const operation = g.Records.Issue.update(id, { title: 'valid' })[planKey].operations[0].definition.id;
       for (const input of [{ id, owner: 'other', title: 'bad' }, { id, title: null }, { id, payload: { items: ['bad'] } }, { id, watchers: ['bad'] }, { id, assignee: 'bad' }]) {
         const request = { ...fence, version: 1, requestId: 'raw-invalid', sequence: 100,
           operations: [{ operation, input: { id, title: 'prefix' } }, { operation, input }] };
         expect((await execute('batch', request)).kind).toBe('error');
         expect(await revision()).toBe(baselineRevision);
       }
-      const createOperation = g.Issue.create({ id, title: 'valid', owner: 'me' })[planKey].operations[0].definition.id;
+      const createOperation = g.Records.Issue.create({ id, title: 'valid', owner: 'me' })[planKey].operations[0].definition.id;
       for (const invalidId of ['symbolic', id.replaceAll('-', ''), `{${id}}`, `${id}\n`, id.replace('4', 'g')]) {
-        expect(() => g.Issue.create({ id, title: 'valid', owner: 'me' })[planKey].operations[0].definition.decodeResult({ id: invalidId })).toThrow();
-        expect(await submit(g.Issue.create({ id: invalidId, title: 'invalid', owner: 'me' }))).toMatchObject({ kind: 'rejected' });
+        expect(() => g.Records.Issue.create({ id, title: 'valid', owner: 'me' })[planKey].operations[0].definition.decodeResult({ id: invalidId })).toThrow();
+        expect(await submit(g.Records.Issue.create({ id: invalidId, title: 'invalid', owner: 'me' }))).toMatchObject({ kind: 'rejected' });
         expect((await execute('batch', { ...fence, version: 1, requestId: 'invalid-uuid', sequence: 101,
           operations: [{ operation: createOperation, input: { id: invalidId, title: 'invalid', owner: 'me' } }] })).kind).toBe('error');
         expect(await revision()).toBe(baselineRevision);
@@ -222,11 +222,11 @@ for (const server of ['typescript', 'rust']) test.skipIf(!directory)(
 
       // Strict permission/missing cardinality rolls back earlier writes and
       // replacement never leaves a rejected UUID create as a ghost.
-      for (const failure of [g.Issue.create({ id: crypto.randomUUID(), title: 'forbidden', owner: 'other' }),
-        g.Issue.update(crypto.randomUUID(), { title: 'missing' })]) {
+      for (const failure of [g.Records.Issue.create({ id: crypto.randomUUID(), title: 'forbidden', owner: 'other' }),
+        g.Records.Issue.update(crypto.randomUUID(), { title: 'missing' })]) {
         const ghost = crypto.randomUUID();
         const beforeRollback = publications.length;
-        expect(await submit(g.batch([g.Issue.create({ id: ghost, title: 'prefix', owner: 'me' }), failure])))
+        expect(await submit(g.batch([g.Records.Issue.create({ id: ghost, title: 'prefix', owner: 'me' }), failure])))
           .toMatchObject({ kind: 'rejected', code: 'TargetNotWritable' });
         expect(rows('issues').some(row => row.id === ghost)).toBe(false);
         expect(publications.slice(beforeRollback).some(p => p.tables.issues?.some(row => row.id === ghost))).toBe(false);
@@ -282,18 +282,18 @@ for (const server of ['typescript', 'rust']) test.skipIf(!directory)(
       expect(await revision()).toBe(elmRevision);
 
       // No temporary integer ID, and a later submission uses the real ID.
-      const auditReceipt = database.submit(g.Audit.create({ message: 'integer' }));
+      const auditReceipt = database.submit(g.Records.Audit.create({ message: 'integer' }));
       expect(rows('audits').map(row => row.id).sort()).toEqual([1, 2]);
       const audit = await auditReceipt.confirmed;
       expect(audit).toMatchObject({ kind: 'confirmed', result: { id: 3 } });
-      expect(await submit(g.Audit.update(audit.result.id, { message: 'updated' }))).toMatchObject({ kind: 'confirmed' });
+      expect(await submit(g.Records.Audit.update(audit.result.id, { message: 'updated' }))).toMatchObject({ kind: 'confirmed' });
       expect(rows('audits').find(row => row.id === 3).message).toBe('updated');
       await db.execute("create trigger normalize_title after update of title on issues when new.title != lower(new.title) begin update issues set title = lower(new.title) where id = new.id; end");
-      expect(await submit(g.Issue.update(id, { title: 'SERVER NORMALIZED' }))).toMatchObject({ kind: 'confirmed' });
+      expect(await submit(g.Records.Issue.update(id, { title: 'SERVER NORMALIZED' }))).toMatchObject({ kind: 'confirmed' });
       expect(rows('issues').find(row => row.id === id).title).toBe('server normalized');
-      expect(await submit(g.Issue.update(id, { payload: null, choice: null }))).toMatchObject({ kind: 'confirmed' });
+      expect(await submit(g.Records.Issue.update(id, { payload: null, choice: null }))).toMatchObject({ kind: 'confirmed' });
       expect(rows('issues').find(row => row.id === id)).toMatchObject({ payload: null, choice: null });
-      expect(await submit(g.batch([g.Issue.delete(related), g.Issue.delete(id), g.Audit.delete(audit.result.id)]))).toMatchObject({ kind: 'confirmed' });
+      expect(await submit(g.batch([g.Records.Issue.delete(related), g.Records.Issue.delete(id), g.Records.Audit.delete(audit.result.id)]))).toMatchObject({ kind: 'confirmed' });
       expect(rows('issues')).toEqual([]);
       expect(archiveEntities.getVisibleTables().archiveEntries[0]).toMatchObject({ id, title: 'archive elm' });
       expect(Number((await archiveDb.execute('select server_revision from _pyre_sync')).rows[0].server_revision)).toBe(2);

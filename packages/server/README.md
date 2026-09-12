@@ -173,7 +173,7 @@ browser, worker, local cache, route, SSE connection, or active subscriber:
 
 ```ts
 import { localEdits } from "@pyre/server/local-edits";
-import { Main, Audit, Commands, batch } from "./generated/typescript/edits";
+import { Main, Records, Commands, batch } from "./generated/typescript/edits";
 import { manifest } from "./generated/typescript/server";
 
 // Resolve/authorize database and databaseId in trusted application code first.
@@ -184,7 +184,7 @@ const edits = localEdits.bind({
   connectedSessions, sendToSession,
 });
 const outcome = await edits.submit(batch([
-  Audit.create({ message: "Seeded" }),
+  Records.Audit.create({ message: "Seeded" }),
   Commands.namedAudit({ message: "Named command in the same transaction" }),
 ]));
 if (outcome.kind === "confirmed") {

@@ -8,8 +8,10 @@ the [usage guide](../usage/local-edits.md) shows current TS/Elm imports.
 
 ## Generation And Permissions
 
-The current compiler creates all three operation definitions for each table and
-reserves their names, including for denied operations. Availability of a builder
+The current compiler creates all three operation definitions for each table with
+an integer or UUID primary key and reserves their names, including for denied
+operations. Other primary-key kinds remain available to ordinary generation, but
+their local-edit CRUD/descriptors are omitted with an explicit warning. Availability of a builder
 is not permission to write. Compiled permission checks and the effective server
 session determine whether execution is allowed; generation does not filter out
 operations based on an individual session's permissions.
@@ -28,7 +30,7 @@ primary key. Primary keys need not be named `id`.
 
 The schema-derived `{Table}.CreateInput` and `{Table}.UpdateInput` concepts describe
 field semantics, not the current generated transport layout. For example, the
-User fixture's `User.update(userId, { note: null })` captures a flat operation
+User fixture's `Records.User.update(userId, { note: null })` captures a flat operation
 input `{ key: userId, note: null }`.
 
 | Field rule | Create | Update |

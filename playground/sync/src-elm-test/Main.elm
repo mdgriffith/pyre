@@ -20,7 +20,7 @@ type alias Model =
 
 init : () -> ( Model, Cmd Msg )
 init _ =
-    ( { pyre = Pyre.init }
+    ( { pyre = Pyre.init "playground" }
     , Cmd.none
     )
 

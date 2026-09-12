@@ -1,9 +1,10 @@
 import { localEdits } from "@pyre/server/local-edits";
-import { Main, Project, Task, Audit, Commands, batch, type ProjectId } from "../../../../target/local-edits-fixture/typescript/edits";
+import { Main, Records, Commands, batch, type ProjectId } from "../../../../target/local-edits-fixture/typescript/edits";
 import { manifest } from "../../../../target/local-edits-fixture/typescript/server";
 import { openDatabase } from "./database";
 
 const { database, close } = await openDatabase();
+const { Project, Task, Audit } = Records;
 try {
   // This process owns this new database and explicitly chooses its real seed session.
   const edits = localEdits.bind({ database, databaseId: "seed-example", namespace: Main, manifest, session: { userId: 7 } });

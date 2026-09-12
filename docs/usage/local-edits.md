@@ -15,18 +15,18 @@ This example uses the User/Audit schema and Rename command from the
 [generator test](../../src/generate/typescript/local_edits.rs):
 
 ```ts
-import { Main, User, Audit, Commands, batch, operations, type UserId }
+import { Main, Records, Commands, batch, operations, type UserId }
   from './generated/typescript/edits/Main';
 
 // client has the fenced configuration below; id is a validated existing UserId.
 declare const id: UserId;
 const db = await client.localEdits('main', Main);
 const stopFailures = db.onEditFailure(showWriteFailure);
-const rename = User.update(id, { name: 'Ready' }); // note is unchanged
-const clearNote = User.update(id, { note: null }); // SQL NULL
+const rename = Records.User.update(id, { name: 'Ready' }); // note is unchanged
+const clearNote = Records.User.update(id, { note: null }); // SQL NULL
 const plan = batch([
-  User.create({ key: crypto.randomUUID(), name: 'New', fixed: 'x' }),
-  Audit.create({ message: 'created' }), // server-generated integer ID
+  Records.User.create({ key: crypto.randomUUID(), name: 'New', fixed: 'x' }),
+  Records.Audit.create({ message: 'created' }), // server-generated integer ID
   rename,
   clearNote,
   Commands.rename({ key: id, name: 'Final' }),
@@ -39,7 +39,7 @@ if (outcome.kind === 'confirmed') {
   const auditId = outcome.result[1].id; // AuditId, not UserId
   const namedResult = outcome.result[4]; // declared Rename result
 }
-// User.delete(id) is also a pure Edit<Main, Deleted<UserId>>.
+// Records.User.delete(id) is also a pure Edit<Main, Deleted<UserId>>.
 ```
 
 CRUD results contain `{ id }`, not a readable row, even for a primary key named
@@ -268,7 +268,7 @@ submission model =
                 [ Issue.withAssignee Nothing ]
 
         rename =
-            Issue.update id [ Issue.title "Ready", Issue.assignee Nothing ]
+            Issue.update id [ Issue.setTitle "Ready", Issue.setAssignee Nothing ]
 
         plan =
             Batch.succeed (\issue audit command -> ( issue, audit, command ))
@@ -281,7 +281,8 @@ submission model =
 ```
 
 `Issue.Patch` and `Issue.CreateOption` are opaque and record-specific. Update
-setters take plain values for non-nullable fields and `Maybe` for nullable ones:
+setters are systematically named `set<Field>` and take plain values for
+non-nullable fields and `Maybe` for nullable ones:
 omit a setter to leave unchanged, `Nothing` to clear, `Just value` to set. Duplicate
 setters resolve left to right, last wins, including null. `create` takes only the
 required record; `createWith required options` adds optional `with<Field>` setters
@@ -290,7 +291,9 @@ for nullable/default fields. There are no primary-key or immutable update setter
 `Batch.succeed value` confirms that value with `Pyre.NoEffect`.
 
 Both submit functions return `( Pyre.Model, Pyre.Effect, Pyre.Receipt a )`.
-Store the returned model and receipt. Forward `Pyre.Send` through the existing
+Initialize with `Pyre.init incarnation`, where the caller supplies a fresh token
+for each logical model incarnation/reset. Request IDs combine that token with a
+counter. Store the returned model and receipt. Forward `Pyre.Send` through the existing
 `pyreStoreOut` port, in production order; do not use independent unordered
 `Cmd.batch` sends for ordered edits. The built-in `PyreClient` bridge handles
 `elm-local-edits` using the configured manifest and worker queue, and sends
@@ -319,7 +322,7 @@ uses this exact binding and generated Project/Audit schema:
 
 ```ts
 import { localEdits } from '@pyre/server/local-edits';
-import { Main, Project, Audit, batch } from './generated/typescript/edits';
+import { Main, Records, batch } from './generated/typescript/edits';
 import { manifest } from './generated/typescript/server';
 
 const seeds = localEdits.bind({
@@ -327,8 +330,8 @@ const seeds = localEdits.bind({
   session: { userId: 7 },
 });
 const outcome = await seeds.submit(batch([
-  Project.create({ id: crypto.randomUUID(), name: 'Seed project', owner: 7 }),
-  Audit.create({ message: 'created' }),
+  Records.Project.create({ id: crypto.randomUUID(), name: 'Seed project', owner: 7 }),
+  Records.Audit.create({ message: 'created' }),
 ] as const));
 if (outcome.kind === 'confirmed') {
   console.log(outcome.result[0].id, outcome.result[1].id);

@@ -1701,8 +1701,9 @@ fn generate_local_edits(
                 body.push_str("type Patch\n    = Patch String Encode.Value\n\n\n");
                 for arg in query.args.iter().filter(|arg| writable.contains(&arg.name)) {
                     let (type_, encoder) = local_edit_arg(context, &lookup, table, arg);
-                    exposed.push(arg.name.clone());
-                    body.push_str(&format!("{} : {} -> Patch\n{} value =\n    Patch \"{}\" ({} value)\n\n\n", arg.name, type_, arg.name, arg.name, encoder));
+                    let setter = format!("set{}", elm_module_segment(&arg.name));
+                    exposed.push(setter.clone());
+                    body.push_str(&format!("{} : {} -> Patch\n{} value =\n    Patch \"{}\" ({} value)\n\n\n", setter, type_, setter, arg.name, encoder));
                 }
                 body.push_str(&format!("update : {} -> List Patch -> {}\nupdate target patches =\n    {} (Encode.object (( \"{}\", {} target ) :: (List.map (\\(Patch key value) -> ( key, value )) patches |> Dict.fromList |> Dict.toList))) {}\n\n\n", id_type, signature, operation, id.name, id_encoder, result_decoder));
             }
@@ -1736,18 +1737,15 @@ fn generate_local_edits(
     let mut tables: Vec<_> = context.tables.values().collect();
     tables.sort_by_key(|table| (&table.schema, &table.record.name));
     for table in tables {
-        if let Some(id) = table.record.fields.iter().find_map(|field| match field {
-            ast::Field::Column(column) if ast::is_primary_key(column) => Some(column),
-            _ => None,
-        }) {
+        if let Some((identity_kind, id)) = crate::generated_queries::local_edit_identity(table) {
             let name = format!(
                 "{}{}",
                 elm_database_namespace(&table.schema),
                 elm_module_segment(&table.record.name)
             );
-            let kind = match id.type_ {
-                ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => "Integer",
-                _ => "Uuid",
+            let kind = match identity_kind {
+                crate::generated_queries::LocalEditIdentityKind::Integer => "Integer",
+                crate::generated_queries::LocalEditIdentityKind::Uuid => "Uuid",
             };
             // Reuse the query/entity ID guard so read identities can be edited
             // without unwrapping and rebranding at the application boundary.
@@ -3407,9 +3405,9 @@ fn generate_pyre_module(
 
     // Init
     result.push_str("-- Init\n\n\n");
-    result.push_str("init : Model\n");
-    result.push_str("init =\n");
-    result.push_str("    { localEdits = LocalEdits.init\n");
+    result.push_str("init : String -> Model\n");
+    result.push_str("init incarnation =\n");
+    result.push_str("    { localEdits = LocalEdits.init incarnation\n");
 
     for name in query_names.iter() {
         let field_name = string::decapitalize(name);

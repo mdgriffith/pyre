@@ -951,6 +951,7 @@ fn dynamic_query_manifest(
             .map(|arg| arg.name.clone())
             .collect(),
         sql,
+        result_schema: Some(generate::manifest::result_schema(context, query)),
         sync_sql: None,
     })
 }

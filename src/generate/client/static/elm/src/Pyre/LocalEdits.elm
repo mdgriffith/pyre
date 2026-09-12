@@ -8,7 +8,7 @@ import Pyre.Edit.Internal as Internal
 
 
 type Model
-    = Model Int (Dict String Entry) (List EditFailure)
+    = Model String Int (Dict String Entry) (List EditFailure)
 
 
 type alias Entry =
@@ -34,16 +34,16 @@ type alias EditFailure =
     { requestId : String, databaseId : String, instance : String, authGeneration : Int, namespace : String, manifest : String, databaseEpoch : String, phase : String, code : String, certainty : String, operationIndex : Maybe Int }
 
 
-init : Model
-init =
-    Model 0 Dict.empty []
+init : String -> Model
+init incarnation =
+    Model incarnation 0 Dict.empty []
 
 
 submit : Database.DatabaseId n -> Internal.Batch n a -> Model -> ( Model, Maybe E.Value, Receipt a )
-submit database plan (Model counter entries _) =
+submit database plan (Model incarnation counter entries _) =
     let
         requestId =
-            "elm:" ++ String.fromInt (counter + 1)
+            "elm:" ++ incarnation ++ ":" ++ String.fromInt (counter + 1)
 
         decode =
             Internal.decoder plan
@@ -75,7 +75,7 @@ submit database plan (Model counter entries _) =
         wire =
             E.object [ ( "type", E.string "elm-local-edits" ), ( "databaseId", Database.encode database ), ( "requestId", E.string requestId ), ( "operations", E.list identity (Internal.operations plan) ) ]
     in
-    ( Model (counter + 1) (Dict.insert requestId entry entries) []
+    ( Model incarnation (counter + 1) (Dict.insert requestId entry entries) []
     , if empty then
         Nothing
 
@@ -86,18 +86,18 @@ submit database plan (Model counter entries _) =
 
 
 state : Receipt a -> Model -> Maybe String
-state (Receipt requestId _) (Model _ entries _) =
+state (Receipt requestId _) (Model _ _ entries _) =
     Dict.get requestId entries |> Maybe.map .state
 
 
 lifecycle : Receipt a -> Model -> Maybe Lifecycle
-lifecycle (Receipt requestId _) (Model _ entries _) =
+lifecycle (Receipt requestId _) (Model _ _ entries _) =
     Dict.get requestId entries
         |> Maybe.map (\entry -> { state = entry.state, sequence = entry.sequence, commitRevision = entry.commitRevision, quarantined = entry.quarantined })
 
 
 outcome : Receipt a -> Model -> Maybe (Outcome a)
-outcome (Receipt requestId decode) (Model _ entries _) =
+outcome (Receipt requestId decode) (Model _ _ entries _) =
     Dict.get requestId entries
         |> Maybe.andThen
             (\entry ->
@@ -120,20 +120,20 @@ outcome (Receipt requestId decode) (Model _ entries _) =
 
 
 failures : Model -> List EditFailure
-failures (Model _ _ events) =
+failures (Model _ _ _ events) =
     events
 
 
 clearFailures : Model -> Model
-clearFailures (Model counter entries _) =
-    Model counter entries []
+clearFailures (Model incarnation counter entries _) =
+    Model incarnation counter entries []
 
 
 {-| Only lifecycle/failure envelopes from the manifest-aware host belong here.
 The host fences worker traffic; this model never receives or caches rows.
 -}
 receive : E.Value -> Model -> Model
-receive value (Model counter entries _) =
+receive value (Model incarnation counter entries _) =
     let
         field name =
             D.decodeValue (D.field name D.string) value |> Result.withDefault ""
@@ -143,19 +143,20 @@ receive value (Model counter entries _) =
     in
     case Dict.get requestId entries of
         Nothing ->
-            Model counter entries []
+            Model incarnation counter entries []
 
         Just entry ->
             if field "databaseId" /= entry.databaseId then
-                Model counter entries []
+                Model incarnation counter entries []
 
             else if field "type" == "failure" then
-                Model counter
+                Model incarnation
+                    counter
                     entries
                     [ { requestId = requestId, databaseId = entry.databaseId, instance = field "instance", authGeneration = D.decodeValue (D.field "authGeneration" D.int) value |> Result.withDefault 0, namespace = field "namespace", manifest = field "manifest", databaseEpoch = field "databaseEpoch", phase = field "phase", code = field "code", certainty = field "certainty", operationIndex = D.decodeValue (D.field "operationIndex" D.int) value |> Result.toMaybe } ]
 
             else if field "type" /= "lifecycle" || List.member entry.state [ "confirmed", "rejected", "acceptedUnreconciled" ] then
-                Model counter entries []
+                Model incarnation counter entries []
 
             else
                 let
@@ -190,7 +191,8 @@ receive value (Model counter entries _) =
                                     False
                 in
                 if valid then
-                    Model counter
+                    Model incarnation
+                        counter
                         (Dict.insert requestId
                             { entry
                                 | state = nextState
@@ -205,4 +207,4 @@ receive value (Model counter entries _) =
                         []
 
                 else
-                    Model counter entries []
+                    Model incarnation counter entries []

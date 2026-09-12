@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use pyre::server::manifest::{Manifest, PyreSession};
+use pyre::server::manifest::{BoundManifest, Manifest, PyreSession};
 use pyre::server::query::{self, BatchBinding, BatchRequest, MAX_BATCH_PAYLOAD_BYTES};
 use pyre::server::schema::{load_schema_from_database, LoadedSchema};
 use pyre::server::sync::{ConnectedSessions, SyncServer};
@@ -60,7 +60,7 @@ enum SessionSource {
 
 struct AppState {
     db: libsql::Database,
-    manifest: Manifest,
+    manifest: BoundManifest,
     loaded_schema: LoadedSchema,
     database_id: String,
     session_source: SessionSource,
@@ -192,6 +192,15 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
     }
 
     let session_source = session_source(&manifest, &options, loopback)?;
+    let manifest = BoundManifest::new(manifest, loaded_schema.context().map_err(|error| {
+        io::Error::new(io::ErrorKind::Other, error.to_string())
+    })?)
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot serve generated queries: {error}. Run `pyre generate` against the loaded schema and try again."),
+        )
+    })?;
     let state = Arc::new(AppState {
         db,
         manifest,
@@ -962,15 +971,18 @@ mod tests {
                 "create": {
                     "id": "create", "operation": "insert", "primary_db": namespace,
                     "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
-                    "sql": [{"include": false, "params": [], "sql": "INSERT INTO items (name) VALUES ('private value')"}]
+                    "sql": [{"include": false, "params": [], "sql": "INSERT INTO items (name) VALUES ('private value')"}],
+                    "resultSchema": {"kind":"object","fields":{}}
                 },
                 "fail": {
                     "id": "fail", "operation": "insert", "primary_db": namespace,
                     "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
-                    "sql": [{"include": false, "params": [], "sql": "INSERT INTO private_missing_table VALUES ('secret')"}]
+                    "sql": [{"include": false, "params": [], "sql": "INSERT INTO private_missing_table VALUES ('secret')"}],
+                    "resultSchema": {"kind":"object","fields":{}}
                 }
             }
         })).unwrap();
+        let manifest = BoundManifest::new(manifest, loaded_schema.context().unwrap()).unwrap();
         let state = Arc::new(AppState {
             db,
             manifest,
@@ -1104,15 +1116,15 @@ mod tests {
                 "record Item {\n id Id.Int @id\n name String\n @allow(query) { name != \"hidden\" }\n @allow(insert, update, delete) { True }\n}\n").await.unwrap();
             let mutable = Arc::get_mut(&mut state).unwrap();
             mutable.loaded_schema = load_schema_from_database(&conn).await.unwrap();
-            mutable.manifest.compiled_contract = pyre::generate::manifest::compiled_schema_contract(
+            let mut manifest = mutable.manifest.manifest().clone();
+            manifest.compiled_contract = pyre::generate::manifest::compiled_schema_contract(
                 mutable.loaded_schema.context().unwrap(),
             );
-            mutable.manifest.replacement_contracts =
-                pyre::generate::manifest::replacement_contracts(
-                    mutable.loaded_schema.context().unwrap(),
-                )
-                .into_iter()
-                .collect();
+            manifest.replacement_contracts = pyre::generate::manifest::replacement_contracts(
+                mutable.loaded_schema.context().unwrap(),
+            )
+            .into_iter()
+            .collect();
             let namespace = mutable.loaded_schema.schema().unwrap().namespace.clone();
             for (id, operation, sql, affected) in [
                 (
@@ -1141,13 +1153,16 @@ mod tests {
                     json!([]),
                 ),
             ] {
-                mutable.manifest.queries.insert(id.into(), serde_json::from_value(json!({
+                manifest.queries.insert(id.into(), serde_json::from_value(json!({
                     "id":id,"operation":operation,"primary_db":namespace,
                     "input_schema":{},"session_args":[],"optional_input_args":[],"json_input_args":[],
                     "sql":[{"include":operation == "query","params":[],"sql":sql},
-                        {"include":true,"params":[],"sql":format!("SELECT json('[]') AS item, '{}' AS _affectedRows", affected)}]
+                        {"include":true,"params":[],"sql":format!("SELECT json('[]') AS item, '{}' AS _affectedRows", affected)}],
+                    "resultSchema":{"kind":"object","fields":{"item":{"kind":"array","items":{"kind":"object","fields":{}}}}}
                 })).unwrap());
             }
+            mutable.manifest =
+                BoundManifest::new(manifest, mutable.loaded_schema.context().unwrap()).unwrap();
             conn.execute(
                 "INSERT INTO items(id,name) VALUES(1,'visible'),(2,'visible')",
                 (),
@@ -1158,7 +1173,7 @@ mod tests {
             let fence = pyre::server::sync::SyncFence {
                 database_id: state.database_id.clone(),
                 namespace,
-                manifest: state.manifest.fingerprint(),
+                manifest: state.manifest.fingerprint().to_string(),
                 database_epoch: body["databaseEpoch"].as_str().unwrap().into(),
                 instance: "recipient".into(),
                 auth_generation: 0,

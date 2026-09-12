@@ -1,7 +1,86 @@
 use crate::sync;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+#[derive(Clone, Debug)]
+pub struct BoundManifest {
+    manifest: Manifest,
+    fingerprint: String,
+    namespaces: HashSet<String>,
+}
+
+impl BoundManifest {
+    /// Authenticate a generated manifest once against schema context loaded from
+    /// the database. A standalone database context binds only its own namespace.
+    pub fn new(manifest: Manifest, context: &crate::typecheck::Context) -> Result<Self, BindError> {
+        if manifest.version != 1
+            || manifest.compiled_contract.is_empty()
+            || context.valid_namespaces.is_empty()
+            || serde_json::to_value(&manifest.session_schema).ok()
+                != serde_json::to_value(crate::generate::manifest::session_schema(context)).ok()
+        {
+            return Err(BindError);
+        }
+        let manifest_namespaces = manifest
+            .replacement_contracts
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if manifest_namespaces == context.valid_namespaces && !manifest.matches_context(context) {
+            return Err(BindError);
+        }
+        let namespaces = context
+            .valid_namespaces
+            .iter()
+            .filter_map(|namespace| {
+                let expected = crate::generate::manifest::replacement_contract(context, namespace)?;
+                (manifest.replacement_contracts.get(namespace) == Some(&expected))
+                    .then(|| namespace.clone())
+            })
+            .collect::<HashSet<_>>();
+        if namespaces.len() != context.valid_namespaces.len() {
+            return Err(BindError);
+        }
+        let fingerprint = manifest.fingerprint();
+        Ok(Self {
+            manifest,
+            fingerprint,
+            namespaces,
+        })
+    }
+
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub fn authorizes_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.contains(namespace)
+    }
+}
+
+impl std::ops::Deref for BoundManifest {
+    type Target = Manifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.manifest
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BindError;
+
+impl std::fmt::Display for BindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "manifest does not match the loaded database schema")
+    }
+}
+
+impl std::error::Error for BindError {}
 
 impl Manifest {
     /// Authenticate the context used for permission SQL against this compiled manifest.
@@ -93,6 +172,12 @@ pub struct QueryManifest {
     pub optional_input_args: Vec<String>,
     pub json_input_args: Vec<String>,
     pub sql: Vec<SqlInfo>,
+    #[serde(
+        default,
+        rename = "resultSchema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub result_schema: Option<ResultSchema>,
     #[serde(default, rename = "syncSql")]
     pub sync_sql: Option<Vec<SqlInfo>>,
     #[serde(
@@ -101,6 +186,66 @@ pub struct QueryManifest {
         skip_serializing_if = "Option::is_none"
     )]
     pub generated_edit: Option<GeneratedEdit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResultSchema {
+    Object {
+        fields: BTreeMap<String, ResultSchema>,
+    },
+    Array {
+        items: Box<ResultSchema>,
+    },
+    Nullable {
+        item: Box<ResultSchema>,
+    },
+    Field {
+        schema: FieldSchema,
+    },
+}
+
+impl ResultSchema {
+    pub(crate) fn validate(&self, value: &JsonValue) -> Result<(), Error> {
+        self.validate_inner(value, "result", 0)
+    }
+
+    fn validate_inner(&self, value: &JsonValue, path: &str, depth: usize) -> Result<(), Error> {
+        if depth > 64 {
+            return Err(Error::InvalidFieldType {
+                field: path.into(),
+                expected: "bounded result".into(),
+            });
+        }
+        match self {
+            ResultSchema::Object { fields } => {
+                let object = value.as_object().ok_or_else(|| Error::InvalidFieldType {
+                    field: path.into(),
+                    expected: "object".into(),
+                })?;
+                for (name, schema) in fields {
+                    let nested = object
+                        .get(name)
+                        .ok_or_else(|| Error::MissingField(format!("{path}.{name}")))?;
+                    schema.validate_inner(nested, &format!("{path}.{name}"), depth + 1)?;
+                }
+                Ok(())
+            }
+            ResultSchema::Array { items } => {
+                let values = value.as_array().ok_or_else(|| Error::InvalidFieldType {
+                    field: path.into(),
+                    expected: "array".into(),
+                })?;
+                for (index, value) in values.iter().enumerate() {
+                    items.validate_inner(value, &format!("{path}[{index}]"), depth + 1)?;
+                }
+                Ok(())
+            }
+            ResultSchema::Nullable { item } if value.is_null() => Ok(()),
+            ResultSchema::Nullable { item } => item.validate_inner(value, path, depth + 1),
+            ResultSchema::Field { schema } => validate_field(path, value, schema),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

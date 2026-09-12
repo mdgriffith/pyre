@@ -18,6 +18,7 @@ test.skipIf(!directory)(
   async () => {
     const generated = await import(`${directory}/typescript/edits/Main.ts`);
     const effect = JSON.parse(readFileSync(`${directory}/effect.json`, 'utf8'));
+    expect(effect.requestId).toBe('elm:fixture:1');
     mkdirSync(`${directory}/worker`, { recursive: true });
     cpSync('packages/client/src', `${directory}/worker/src`, { recursive: true });
     cpSync('packages/client/elm.json', `${directory}/worker/elm.json`);
@@ -190,17 +191,17 @@ test.skipIf(!directory)(
     expect(
       ingress.filter((message) => message.message.type === 'submit'),
     ).toHaveLength(1);
-    bridge.forward({ ...effect, databaseId: 'two', requestId: 'elm:2' });
+    bridge.forward({ ...effect, databaseId: 'two', requestId: 'elm:second:1' });
     await until(() =>
       lifecycle.some(
-        (event) => event.requestId === 'elm:2' && event.state === 'confirmed',
+        (event) => event.requestId === 'elm:second:1' && event.state === 'confirmed',
       ),
     );
     expect(writes).toHaveLength(2);
     expect(writes.map((write) => write.databaseId)).toEqual(['one', 'two']);
     const wrong = {
       ...effect,
-      requestId: 'elm:3',
+      requestId: 'elm:fixture:3',
       operations: effect.operations.map((operation) => ({
         ...operation,
         namespace: 'wrong',
@@ -209,13 +210,13 @@ test.skipIf(!directory)(
     bridge.forward(wrong);
     expect(
       lifecycle.some(
-        (event) => event.requestId === 'elm:3' && event.type === 'failure',
+        (event) => event.requestId === 'elm:fixture:3' && event.type === 'failure',
       ),
     ).toBe(true);
     expect(writes).toHaveLength(2);
     bridge.forward({
       ...effect,
-      requestId: 'elm:4',
+      requestId: 'elm:fixture:4',
       operations: [
         {
           ...effect.operations[0],
@@ -226,13 +227,13 @@ test.skipIf(!directory)(
     });
     await until(() =>
       lifecycle.some(
-        (event) => event.requestId === 'elm:4' && event.state === 'rejected',
+        (event) => event.requestId === 'elm:fixture:4' && event.state === 'rejected',
       ),
     );
     expect(
       lifecycle.some(
         (event) =>
-          event.requestId === 'elm:4' &&
+          event.requestId === 'elm:fixture:4' &&
           event.type === 'failure' &&
           event.certainty === 'rejected',
       ),
