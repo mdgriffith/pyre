@@ -177,6 +177,57 @@ test('IndexedDbService acknowledges an atomic database epoch reset', async () =>
   ]);
 });
 
+test('IndexedDbService reloads initial data after a database epoch reset', async () => {
+  let handleIndexedDbOut;
+  const sent = [];
+  let scans = 0;
+  let snapshot = {
+    tables: { maps: [{ id: 1 }] },
+    cursor: { tables: { maps: { last_seen_updated_at: 4 } } },
+    lastAppliedServerRevision: 4,
+    databaseEpoch: 'old-epoch',
+  };
+  const storage = {
+    init: async () => {},
+    getAllTables: async () => { scans += 1; return snapshot.tables; },
+    getSyncCursor: async () => snapshot.cursor,
+    getServerRevision: async () => snapshot.lastAppliedServerRevision,
+    getDatabaseEpoch: async () => snapshot.databaseEpoch,
+    resetForDatabaseEpoch: async (databaseEpoch) => {
+      snapshot = {
+        tables: {},
+        cursor: { tables: {} },
+        lastAppliedServerRevision: null,
+        databaseEpoch,
+      };
+    },
+  };
+  const service = new IndexedDbService(storage);
+  service.attachPorts({ ports: {
+    indexedDbOut: { subscribe: (callback) => { handleIndexedDbOut = callback; } },
+    receiveIndexedDbMessage: { send: (message) => sent.push(message) },
+  } });
+
+  await service.initialize();
+  handleIndexedDbOut({ type: 'resetForDatabaseEpoch', databaseEpoch: 'new-epoch' });
+  handleIndexedDbOut({ type: 'requestInitialData' });
+  for (let attempt = 0; sent.length < 2 && attempt < 100; attempt += 1) await Bun.sleep(0);
+
+  expect(scans).toBe(2);
+  expect(sent).toEqual([
+    { type: 'databaseEpochResetCompleted', databaseEpoch: 'new-epoch' },
+    {
+      type: 'initialData',
+      data: {
+        tables: {},
+        cursor: { tables: {} },
+        lastAppliedServerRevision: null,
+        databaseEpoch: 'new-epoch',
+      },
+    },
+  ]);
+});
+
 test('IndexedDbService reports invalid writes without publishing catchup entities', async () => {
   let receive;
   const notifications = [];

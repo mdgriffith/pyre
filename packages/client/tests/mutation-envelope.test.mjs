@@ -391,6 +391,25 @@ test("catchup failures retain acceptance and report once across read-only retrie
     assert.equal(last(lifecycle(w, "a")), "confirmed");
 });
 
+test("acceptance after catchup failure reports accepted unreconciled certainty", async () => {
+    const w = await configured();
+    await w.send(submit("a", [op(1, { name: "local" })]));
+    await w.send(wire("syncRequired", { reconciliation: hint(1) }));
+    await w.send(wire("catchupFailed", { requestId: last(editEvents(w, "catchup")).requestId }));
+    await w.send(accepted("a", 1));
+
+    assert.equal(last(lifecycle(w, "a")), "accepted");
+    assert.equal(editEvents(w, "reconciliationFailure").length, 1);
+    assert.deepEqual(
+        editEvents(w, "failure").filter((event) => event.requestId === "a").map(({ phase, code, certainty }) => ({ phase, code, certainty })),
+        [{ phase: "reconciliation", code: "CatchupFailed", certainty: "acceptedUnreconciled" }],
+    );
+
+    await w.send(wire("retryCatchup"));
+    await w.send(snapshot(w, 1, [{ id: 1, name: "server" }]));
+    assert.equal(last(lifecycle(w, "a")), "confirmed");
+});
+
 test("fencing ends queued/sent/accepted work with distinct certainty and ignores old traffic", async () => {
     const w = await configured();
     await w.send(submit("accepted", [op(1, { name: "first" })]));

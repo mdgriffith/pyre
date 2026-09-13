@@ -439,7 +439,15 @@ transition kind value model =
                                                                         next =
                                                                             change (\p -> { p | state = Accepted revision resultValue, quarantined = False }) |> applyHint hint
                                                                     in
-                                                                    ( next, [ lifecycle next requestId "accepted" [ ( "commitRevision", E.int revision ), ( "results", resultValue ) ] ] )
+                                                                    ( next
+                                                                    , lifecycle next requestId "accepted" [ ( "commitRevision", E.int revision ), ( "results", resultValue ) ]
+                                                                        :: (if model.catchupErrorReported then
+                                                                                [ failure next requestId "reconciliation" "CatchupFailed" "acceptedUnreconciled" ]
+
+                                                                            else
+                                                                                []
+                                                                           )
+                                                                    )
 
                                                     Err _ ->
                                                         unknown pending "MalformedResponse" (invalidateUnknown response model)

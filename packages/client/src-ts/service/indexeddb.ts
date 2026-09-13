@@ -610,6 +610,7 @@ export class IndexedDbService {
     }
     try {
       await this.storage.resetForDatabaseEpoch(databaseEpoch);
+      this.initialData = null;
       this.onDatabaseEpochReset?.();
       this.onDatabaseEpochStored?.(databaseEpoch);
       this.elmApp.ports.receiveIndexedDbMessage.send({
