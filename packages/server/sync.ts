@@ -17,7 +17,11 @@ export const DEFAULT_SYNC_PAGE_SIZE = 1000;
 export const MAX_SYNC_PAGE_SIZE = 5000;
 export const MAX_SYNC_CURSOR_TABLES = 512;
 export const MAX_SYNC_CURSOR_PERMISSION_HASH_BYTES = 256;
+export const MAX_REPLACEMENT_ROWS = 10_000;
+export const MAX_REPLACEMENT_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const SYNC_ROWS_JSON_COLUMN = "_pyre_rows";
+const REPLACEMENT_ROW_COUNT_COLUMN = "_pyre_row_count";
+const REPLACEMENT_BYTE_COUNT_COLUMN = "_pyre_byte_count";
 type SyncPrimaryKey = number | string;
 
 function normalizePageSize(pageSize: number): number {
@@ -241,12 +245,39 @@ export async function readReplacementTables(
     if (typeof raw === "string" && raw.startsWith("Error:")) throw new Error("Replacement SQL unavailable");
     const plan = typeof raw === "string" ? JSON.parse(raw) : raw;
     if (!Array.isArray(plan?.tables)) throw new Error("Invalid replacement plan");
-    const tables: Record<string, { rows: unknown[] }> = Object.create(null);
+    const plannedTables: any[] = [];
+    let replacementRows = 0;
+    let replacementBytes = 0;
+    const tableNames = new Set<string>();
     for (const table of plan.tables) {
-        if (typeof table.table_name !== "string" || Object.hasOwn(tables, table.table_name)
+        if (typeof table.table_name !== "string" || tableNames.has(table.table_name)
             || !Array.isArray(table.headers) || table.headers.some((header: unknown) => typeof header !== "string")
-            || new Set(table.headers).size !== table.headers.length || !Array.isArray(table.sql) || table.sql.length === 0)
+            || new Set(table.headers).size !== table.headers.length || !Array.isArray(table.sql) || table.sql.length === 0
+            || typeof table.replacement_bounds_sql !== "string")
             throw new Error("Invalid replacement table");
+        tableNames.add(table.table_name);
+        const result = await db.execute({ sql: table.replacement_bounds_sql, args: normalizeParams(table.params?.[0]) as any[] });
+        const rawRowCount = result.rows[0]?.[REPLACEMENT_ROW_COUNT_COLUMN];
+        const rawByteCount = result.rows[0]?.[REPLACEMENT_BYTE_COUNT_COLUMN];
+        const rowCount = typeof rawRowCount === "bigint" ? Number(rawRowCount)
+            : typeof rawRowCount === "number" ? rawRowCount : Number.NaN;
+        const byteCount = typeof rawByteCount === "bigint" ? Number(rawByteCount)
+            : typeof rawByteCount === "number" ? rawByteCount : Number.NaN;
+        if (result.rows.length !== 1 || !Number.isSafeInteger(rowCount) || rowCount < 0
+            || !Number.isSafeInteger(byteCount) || byteCount < 0)
+            throw new Error("Invalid replacement bounds");
+        const keyBytesPerRow = table.headers.reduce((total: number, header: string) =>
+            total + new TextEncoder().encode(JSON.stringify(header)).byteLength + 1, 0);
+        replacementRows += rowCount;
+        replacementBytes += byteCount + rowCount * keyBytesPerRow;
+        if (!Number.isSafeInteger(replacementRows) || replacementRows > MAX_REPLACEMENT_ROWS
+            || !Number.isSafeInteger(replacementBytes) || replacementBytes > MAX_REPLACEMENT_PAYLOAD_BYTES)
+            throw new Error("Replacement scope is too large");
+        plannedTables.push({ table, rowCount });
+    }
+
+    const tables: Record<string, { rows: unknown[] }> = Object.create(null);
+    for (const { table, rowCount } of plannedTables) {
         const rows: unknown[][] = [];
         const jsonColumns = new Set<string>(table.json_columns ?? []);
         for (let i = 0; i < table.sql.length; i++) {
@@ -267,6 +298,7 @@ export async function readReplacementTables(
                     && typeof row[header] === "string" ? JSON.parse(row[header]) : row[header]));
             }
         }
+        if (rows.length !== rowCount) throw new Error("Replacement bounds changed during read");
         // WASM schema is process-global and another database may have run during execute.
         restoreSchema();
         const rawGroups = [{ table_name: table.table_name, headers: table.headers, rows }];

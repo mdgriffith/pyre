@@ -330,13 +330,40 @@ suite =
         , test "delta decoding rejects mismatched row widths" <|
             \_ ->
                 Decode.decodeString Delta.decodeDelta """[{"table_name":"notes","headers":["number"],"rows":[[1,2]]}]""" |> Expect.err
-        , test "metadata requires explicit identity and rejects unsupported kinds" <|
+        , test "metadata requires explicit identity and accepts the non-editable sentinel" <|
             \_ ->
                 Expect.all
                     [ \_ -> Decode.decodeString Schema.decodeTableMetadata """{"name":"notes","links":{},"indices":[]}""" |> Expect.err
                     , \_ -> Decode.decodeString Schema.decodeTableMetadata """{"name":"notes","links":{},"indices":[],"primaryKey":{"name":"key","kind":"string"}}""" |> Expect.err
                     , \_ -> Decode.decodeString Schema.decodeTableMetadata """{"name":"notes","links":{},"indices":[],"primaryKey":{"name":"","kind":"int"}}""" |> Expect.err
                     , \_ -> Decode.decodeString Schema.decodeTableMetadata """{"name":"notes","links":{},"indices":[],"primaryKey":{"name":"key","kind":"uuid"}}""" |> Result.map .primaryKey |> Expect.equal (Ok { name = "key", kind = Schema.UuidKey })
+                    , \_ -> Decode.decodeString Schema.decodeTableMetadata """{"name":"legacy","links":{},"indices":[],"primaryKey":{"name":"slug","kind":"unsupported"}}""" |> Result.map .primaryKey |> Expect.equal (Ok { name = "slug", kind = Schema.UnsupportedKey })
+                    ]
+                    ()
+        , test "unsupported edit identities still support ordinary cached rows" <|
+            \_ ->
+                let
+                    legacySchema =
+                        { tables = Dict.singleton "legacy" { name = "legacy", primaryKey = { name = "slug", kind = Schema.UnsupportedKey }, links = Dict.empty, indices = [] }
+                        , queryFieldToTable = Dict.singleton "legacy" "legacy"
+                        }
+
+                    legacyInitial =
+                        { tables = Dict.singleton "legacy" [ Dict.fromList [ ( "slug", StringValue "welcome" ), ( "title", StringValue "Welcome" ) ] ]
+                        , cursor = Dict.empty
+                        , databaseEpoch = Nothing
+                        , lastAppliedServerRevision = Nothing
+                        }
+                in
+                Expect.all
+                    [ \_ ->
+                        Db.fromInitialData legacySchema legacyInitial
+                            |> Result.map (\db -> Dict.get "legacy" db.tables |> Maybe.map Dict.size)
+                            |> Expect.equal (Ok (Just 1))
+                    , \_ ->
+                        Identity.fromValue Schema.UnsupportedKey (StringValue "welcome")
+                            |> Result.map Identity.toValue
+                            |> Expect.equal (Ok (StringValue "welcome"))
                     ]
                     ()
         ]

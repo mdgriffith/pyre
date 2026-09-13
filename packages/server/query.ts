@@ -2,6 +2,7 @@ import { Client, InStatement, type Transaction } from "@libsql/client";
 import type { LinkInfo, SchemaMetadata, TableMetadata } from "@pyre/core";
 import { z, type ZodType } from "zod";
 import { buildArgs, executeStatements, formatResultData, TargetNotWritable, toSqlStatements, type GeneratedEdit, type JsonSessionValidators, type SqlInfo } from "./runtime/sql";
+import { bindSchemaManifest } from "./schema";
 
 export type SessionValue =
     | null
@@ -210,6 +211,9 @@ export function runBatch(
     let capturedAuthority: BatchAuthority;
     let captured: BatchRequest;
     try {
+        if (manifest.compiledContract !== undefined || manifest.replacementContracts !== undefined) {
+            bindSchemaManifest(db, authority.namespace, manifest);
+        }
         // Capture and validate synchronously, before queue/transaction acquisition or any I/O.
         capturedAuthority = structuredClone(authority);
         authority = capturedAuthority;

@@ -277,11 +277,23 @@ fn unsupported_primary_keys_are_not_labeled_as_uuids() {
 fn generated_typescript_ids_and_references_compile() {
     let (_, _, files) = fixture();
     let types = content(&files, "typescript/types.ts");
-    assert!(types.contains("export type PersonId = string &"), "{types}");
-    assert!(types.contains("export type AuditId = number &"), "{types}");
+    assert!(
+        types.contains("import type { AuditId, NoteId, PersonId } from './core/ids';"),
+        "{types}"
+    );
+    assert!(
+        types.contains("export type { AuditId, NoteId, PersonId } from './core/ids';"),
+        "{types}"
+    );
     assert!(types.contains("\"personKey\": PersonId;"), "{types}");
     assert!(types.contains("\"auditKey\": AuditId | null;"), "{types}");
     let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    std::fs::create_dir(dir.path().join("core")).unwrap();
+    std::fs::write(
+        dir.path().join("core/ids.ts"),
+        content(&files, "typescript/core/ids.ts"),
+    )
+    .unwrap();
     std::fs::write(dir.path().join("types.ts"), types).unwrap();
     std::fs::write(
         dir.path().join("verify.ts"),
@@ -310,6 +322,7 @@ const wrongTable: NoteId = auditId;
             "--noEmit",
             "--strict",
             "--skipLibCheck",
+            "core/ids.ts",
             "types.ts",
             "verify.ts",
         ])

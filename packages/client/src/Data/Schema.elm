@@ -45,6 +45,7 @@ type alias PrimaryKey =
 type PrimaryKeyKind
     = IntKey
     | UuidKey
+    | UnsupportedKey
 
 
 type alias SchemaMetadata =
@@ -123,6 +124,9 @@ decodeTableMetadata =
 
                                 "uuid" ->
                                     Decode.succeed UuidKey
+
+                                "unsupported" ->
+                                    Decode.succeed UnsupportedKey
 
                                 _ ->
                                     Decode.fail "Unsupported primary key kind"

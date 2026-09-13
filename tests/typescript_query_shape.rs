@@ -154,13 +154,50 @@ transaction ReplaceNote($id: Note.id, $body: String) {
         .find(|file| path_ends_with(&file.path, "queries/metadata/replaceNote.ts"))
         .expect("generated transaction metadata");
 
-    assert!(generated.contents.contains("id: z.number()"));
+    assert!(generated.contents.contains("id: $Ids.NoteId"));
     assert!(generated.contents.contains("body: z.string()"));
     assert!(generated.contents.contains("removed: Removed.array()"));
     assert!(generated.contents.contains("created: Created.array()"));
     assert!(generated
         .contents
         .contains("operation: \"transaction\" as const"));
+}
+
+#[test]
+fn generated_typescript_non_unique_relationship_results_are_arrays() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "record Parent {\n @public\n id Id.Int @id\n code String\n matches @link(code, Target.code)\n}\nrecord Target {\n @public\n id Id.Int @id\n code String\n}\n",
+        &mut schema,
+    )
+    .expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let query_list = parser::parse_query(
+        "query.pyre",
+        "query Parents { parent { id matches { id } } }",
+    )
+    .expect("query parses");
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    core::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+    let generated = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "queries/metadata/parents.ts"))
+        .expect("generated query metadata");
+
+    assert!(generated
+        .contents
+        .contains("matches: Parent_Matches.array()"));
 }
 
 #[test]

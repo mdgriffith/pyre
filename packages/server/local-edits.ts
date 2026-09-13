@@ -3,6 +3,7 @@ import { capture, planKey, type Batch, type Edit, type Namespace } from "@pyre/c
 import { requireDatabaseId } from "./database-id";
 import type { BatchManifest, BatchResponse, Session } from "./query";
 import { runBatchWithSync, type BatchSyncRecipient } from "./query-sync";
+import { bindSchemaManifest } from "./schema";
 
 export type Outcome<R> =
   | { kind: "confirmed"; result: R; commitRevision?: number }
@@ -36,6 +37,8 @@ export function bind<N>(options: BindOptions<N>): LocalEdits<N> {
   const scope = capture({ name: options.namespace.name, manifest: options.namespace.manifest });
   if (!scope.name || options.manifest.version !== 1 || scope.manifest !== options.manifest.manifestVersion)
     throw new Error("InvalidRequest");
+  try { bindSchemaManifest(database, scope.name, options.manifest); }
+  catch { throw new Error("InvalidRequest"); }
   // Retain immutable codecs, but snapshot all mutable compiled execution metadata.
   const manifest: BatchManifest = { ...options.manifest, queries: Object.fromEntries(
     Object.entries(options.manifest.queries).map(([id, query]) => [id, {

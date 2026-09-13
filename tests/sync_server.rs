@@ -526,6 +526,17 @@ record Workspace {
         .await?;
     assert_eq!(before.tables["workspaces"].rows.len(), 5002);
     assert!(before.tables["memberships"].rows.is_empty());
+    conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 5003 UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO workspaces SELECT x, 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces WHERE id > 5002;").await?;
+    assert!(matches!(
+        server
+            .replacement(&conn, &manifest, &binding, &request, &session)
+            .await,
+        Err(pyre::server::sync::Error::ReplacementTooLarge)
+    ));
+    conn.execute_batch(
+        "DELETE FROM memberships WHERE id > 5002; DELETE FROM workspaces WHERE id > 5002;",
+    )
+    .await?;
     // Only the linked permission table changes, not the visible table or its timestamp.
     conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM memberships; UPDATE _pyre_sync SET server_revision=server_revision+1; COMMIT;").await?;
     let after = server

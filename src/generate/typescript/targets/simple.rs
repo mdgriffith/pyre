@@ -13,7 +13,7 @@ pub fn generate_schema(
 ) {
     files.push(generate_text_file(
         base_out_dir.join("types.ts"),
-        crate::generate::server::typescript::schema(database),
+        crate::generate::server::typescript::schema_with_id_import(database, "./core/ids"),
     ));
 }
 

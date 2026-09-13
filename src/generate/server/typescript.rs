@@ -17,10 +17,13 @@ fn collect_brands(database: &ast::Database) -> Vec<(String, &'static str)> {
     for schema in &database.schemas {
         for file in &schema.files {
             for definition in &file.definitions {
-                if let ast::Definition::Record { fields, .. } = definition {
+                if let ast::Definition::Record { name, fields, .. } = definition {
                     for field in fields {
                         if let ast::Field::Column(column) = field {
                             match &column.type_ {
+                                ast::ColumnType::Int if ast::is_primary_key(column) => {
+                                    brands.insert(name.clone(), "number");
+                                }
                                 ast::ColumnType::IdInt { table } if !table.is_empty() => {
                                     brands.insert(table.clone(), "number");
                                 }
@@ -74,6 +77,11 @@ fn column_to_ts_type(database: &ast::Database, type_: &ast::ColumnType) -> Strin
                                 for target in fields {
                                     if let ast::Field::Column(target) = target {
                                         if target.name == *field {
+                                            if matches!(target.type_, ast::ColumnType::Int)
+                                                && ast::is_primary_key(target)
+                                            {
+                                                return format!("{}Id", name);
+                                            }
                                             return column_to_ts_type(database, &target.type_);
                                         }
                                     }
@@ -123,6 +131,14 @@ pub fn generate(
 }
 
 pub fn schema(database: &ast::Database) -> String {
+    schema_with_brands(database, None)
+}
+
+pub(crate) fn schema_with_id_import(database: &ast::Database, import: &str) -> String {
+    schema_with_brands(database, Some(import))
+}
+
+fn schema_with_brands(database: &ast::Database, id_import: Option<&str>) -> String {
     let mut result = String::new();
 
     // Collect all unique brands from ID columns
@@ -130,12 +146,22 @@ pub fn schema(database: &ast::Database) -> String {
 
     // Generate phantom type definitions using the brand pattern
     if !brands.is_empty() {
-        result.push_str("// Branded ID types using intersection types\n");
-        for (brand, primitive) in &brands {
+        if let Some(import) = id_import {
+            let names = brands
+                .iter()
+                .map(|(brand, _)| format!("{brand}Id"))
+                .collect::<Vec<_>>()
+                .join(", ");
             result.push_str(&format!(
-                "export type {}Id = {} & {{ readonly __brand: '{}' }};\n",
-                brand, primitive, brand
+                "import type {{ {names} }} from '{import}';\nexport type {{ {names} }} from '{import}';\n"
             ));
+        } else {
+            result.push_str("// Nominal ID types local to this generated root\n");
+            for (brand, primitive) in &brands {
+                result.push_str(&format!(
+                    "declare const {brand}IdBrand: unique symbol;\nexport type {brand}Id = {primitive} & {{ readonly [{brand}IdBrand]: true }};\n"
+                ));
+            }
         }
         result.push_str("\n");
     }
@@ -186,7 +212,7 @@ fn to_type_alias(database: &ast::Database, name: &str, fields: &Vec<ast::Field>)
             continue;
         }
 
-        result.push_str(&to_string_field(database, is_first, 2, &field));
+        result.push_str(&to_string_field(database, Some(name), is_first, 2, &field));
 
         if is_first & ast::is_column(field) {
             is_first = false;
@@ -219,6 +245,7 @@ fn to_string_variant(
             for field in fields {
                 result.push_str(&to_string_field(
                     database,
+                    None,
                     is_first_field,
                     indent_size + 4,
                     &field,
@@ -238,6 +265,7 @@ fn to_string_variant(
 
 fn to_string_field(
     database: &ast::Database,
+    record_name: Option<&str>,
     is_first: bool,
     indent: usize,
     field: &ast::Field,
@@ -250,7 +278,9 @@ fn to_string_field(
                 "\n".repeat(*count as usize)
             }
         }
-        ast::Field::Column(column) => to_string_column(database, is_first, indent, column),
+        ast::Field::Column(column) => {
+            to_string_column(database, record_name, is_first, indent, column)
+        }
         ast::Field::ColumnComment { .. } => "".to_string(),
         ast::Field::FieldDirective(_) => "".to_string(),
     }
@@ -258,11 +288,17 @@ fn to_string_field(
 
 fn to_string_column(
     database: &ast::Database,
+    record_name: Option<&str>,
     is_first: bool,
     indent: usize,
     column: &ast::Column,
 ) -> String {
-    let mut type_str = column_to_ts_type(database, &column.type_);
+    let mut type_str =
+        if matches!(column.type_, ast::ColumnType::Int) && ast::is_primary_key(column) {
+            format!("{}Id", record_name.expect("record primary key"))
+        } else {
+            column_to_ts_type(database, &column.type_)
+        };
     if column.nullable {
         type_str.push_str(" | null");
     }

@@ -49,6 +49,11 @@ fn replacement_sql_is_complete_and_rejects_unknown_namespace() {
     assert!(table.headers.contains(&"state__reason__code".to_string()));
     assert!(!table.sql[0].contains("LIMIT"));
     assert!(table.sql[0].contains("\"jobs\".\"state__reason__code\" is not 'blocked'"));
+    let bounds_sql = table.replacement_bounds_sql.as_ref().unwrap();
+    assert!(bounds_sql.contains("count(*) AS \"_pyre_row_count\""));
+    assert!(bounds_sql.contains("sum(length(cast(json_array("));
+    assert!(bounds_sql.contains("AS \"_pyre_byte_count\""));
+    assert!(bounds_sql.contains("\"jobs\".\"state__reason__code\" is not 'blocked'"));
     assert!(pyre::sync::get_replacement_sql(&context, &Default::default(), "unknown").is_err());
 }
 

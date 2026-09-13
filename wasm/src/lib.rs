@@ -51,6 +51,19 @@ pub fn get_schema_compiled_contract() -> Result<String, JsValue> {
     }
 }
 
+/// Global schema/session/permission contract used when a manifest contains exactly the loaded
+/// standalone namespace. Multi-database manifests bind standalone clients by replacement contract.
+#[wasm_bindgen]
+pub fn get_schema_manifest_contract() -> Result<String, JsValue> {
+    let introspection = cache::get().ok_or_else(|| JsValue::from_str("InvalidSchema"))?;
+    match &introspection.schema {
+        pyre::db::introspect::SchemaResult::Success { context, .. } => {
+            Ok(pyre::generate::manifest::compiled_schema_contract(context))
+        }
+        _ => Err(JsValue::from_str("InvalidSchema")),
+    }
+}
+
 /// Validate raw storage groups before ordinary reshaping. This validates rows,
 /// not snapshot coverage: the caller still checks the plan, revision and fence.
 #[wasm_bindgen]

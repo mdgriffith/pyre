@@ -16,6 +16,10 @@ pub fn generate_schema(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     files.push(generate_text_file(
+        base_out_dir.join("ids.ts"),
+        generate_id_file(context),
+    ));
+    files.push(generate_text_file(
         base_out_dir.join("decode.ts"),
         generate_decode_file(context, database),
     ));
@@ -27,6 +31,63 @@ pub fn generate_schema(
         base_out_dir.join("queries/sql/types.ts"),
         sql_types_file(),
     ));
+}
+
+fn generate_id_file(context: &typecheck::Context) -> String {
+    let ids = collect_ids(context);
+    if ids.is_empty() {
+        return "export {};\n".to_string();
+    }
+
+    let mut result = String::from("import { z } from 'zod';\n\n");
+    for (brand, primitive) in ids {
+        let validator = if primitive == "number" {
+            "z.number().int()"
+        } else {
+            common::UUID_VALIDATOR
+        };
+        result.push_str(&format!(
+            "declare const {brand}IdBrand: unique symbol;\nexport type {brand}Id = {primitive} & {{ readonly [{brand}IdBrand]: true }};\nexport const {brand}Id = {validator}.transform((value): {brand}Id => value as {brand}Id);\n\n"
+        ));
+    }
+    result
+}
+
+pub(super) fn collect_ids(
+    context: &typecheck::Context,
+) -> std::collections::BTreeMap<String, &'static str> {
+    let mut ids = std::collections::BTreeMap::new();
+    for table in context.tables.values() {
+        for column in ast::collect_columns(&table.record.fields) {
+            match &column.type_ {
+                ast::ColumnType::Int if ast::is_primary_key(&column) => {
+                    ids.insert(table.record.name.clone(), "number");
+                }
+                ast::ColumnType::IdInt { table: brand } => {
+                    ids.insert(
+                        if brand.is_empty() {
+                            table.record.name.clone()
+                        } else {
+                            brand.clone()
+                        },
+                        "number",
+                    );
+                }
+                ast::ColumnType::IdUuid { table: brand } => {
+                    ids.insert(
+                        if brand.is_empty() {
+                            table.record.name.clone()
+                        } else {
+                            brand.clone()
+                        },
+                        "string",
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    ids
 }
 
 pub fn generate_queries(
@@ -334,7 +395,19 @@ fn to_metadata_formatter() -> typealias::TypeFormatter {
                  is_link,
                  is_optional,
                  is_array_relationship,
+                 identity_brand,
              }| {
+                if let Some(brand) = identity_brand {
+                    let validator = format!("$Ids.{}Id", brand);
+                    let validator = match (is_link, is_array_relationship, is_optional) {
+                        (true, true, _) => format!("{}.array()", validator),
+                        (true, false, true) | (false, _, true) => {
+                            format!("{}.nullable()", validator)
+                        }
+                        _ => validator,
+                    };
+                    return format!("  {}: {}", name, validator);
+                }
                 let parsed_type = ast::ColumnType::from_str(type_);
                 let (base_type, is_primitive, needs_coercion) = if is_link {
                     (type_.to_string(), false, false)
@@ -417,6 +490,7 @@ fn to_query_metadata_file(
 
     let mut imports = String::new();
     imports.push_str("import { z } from 'zod';\n");
+    imports.push_str("import * as $Ids from '../../ids';\n");
     if query.operation == ast::QueryOperation::Query {
         imports.push_str("import type { GeneratedQueryShape } from '@pyre/core';\n");
     }
@@ -1519,8 +1593,10 @@ fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", input_zod_type_for_column_type(inner))
         }
+        ast::ColumnType::IdInt { table } if !table.is_empty() => format!("$Ids.{table}Id"),
         ast::ColumnType::IdInt { .. } => "z.number().int()".to_string(),
         ast::ColumnType::ForeignKey { .. } => common::input_column_validator(type_),
+        ast::ColumnType::IdUuid { table } if !table.is_empty() => format!("$Ids.{table}Id"),
         ast::ColumnType::IdUuid { .. } => common::UUID_VALIDATOR.to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}Write", name),
     }
@@ -1583,9 +1659,11 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", output_zod_type_for_column_type(inner))
         }
+        ast::ColumnType::IdInt { table } if !table.is_empty() => format!("$Ids.{table}Id"),
         ast::ColumnType::IdInt { .. } | ast::ColumnType::ForeignKey { .. } => {
             "z.number()".to_string()
         }
+        ast::ColumnType::IdUuid { table } if !table.is_empty() => format!("$Ids.{table}Id"),
         ast::ColumnType::IdUuid { .. } => common::UUID_VALIDATOR.to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}", name),
     }
@@ -1598,12 +1676,15 @@ fn to_param_type_alias(
     let mut result = "export const RawInputValidator = z.object({".to_string();
     let mut is_first = true;
     for arg in args {
-        let type_name = arg
-            .type_
-            .as_deref()
-            .map(|type_| typecheck::resolve_query_param_type(context, type_))
-            .unwrap_or("unknown".to_string());
-        let mut type_string = to_zod_type(&type_name);
+        let mut type_string =
+            query_id_validator(context, arg.type_.as_deref()).unwrap_or_else(|| {
+                let type_name = arg
+                    .type_
+                    .as_deref()
+                    .map(|type_| typecheck::resolve_query_param_type(context, type_))
+                    .unwrap_or("unknown".to_string());
+                to_zod_type(&type_name)
+            });
         if arg.nullable {
             type_string = format!("{}.nullable()", type_string);
         }
@@ -1622,12 +1703,15 @@ fn to_param_type_alias(
     result.push_str("const InputValidator = z.object({");
     let mut is_first = true;
     for arg in args {
-        let type_name = arg
-            .type_
-            .as_deref()
-            .map(|type_| typecheck::resolve_query_param_type(context, type_))
-            .unwrap_or("unknown".to_string());
-        let mut type_string = to_input_decoder_zod_type(&type_name);
+        let mut type_string =
+            query_id_validator(context, arg.type_.as_deref()).unwrap_or_else(|| {
+                let type_name = arg
+                    .type_
+                    .as_deref()
+                    .map(|type_| typecheck::resolve_query_param_type(context, type_))
+                    .unwrap_or("unknown".to_string());
+                to_input_decoder_zod_type(&type_name)
+            });
         if arg.nullable {
             type_string = format!("{}.nullable()", type_string);
         }
@@ -1645,4 +1729,49 @@ fn to_param_type_alias(
 
     result.push_str("export type Input = z.infer<typeof RawInputValidator>;");
     result
+}
+
+fn query_id_validator(context: &typecheck::Context, type_: Option<&str>) -> Option<String> {
+    let type_ = ast::ColumnType::from_str(type_?);
+    match type_ {
+        ast::ColumnType::IdInt { table } | ast::ColumnType::IdUuid { table }
+            if !table.is_empty() =>
+        {
+            Some(format!("$Ids.{table}Id"))
+        }
+        ast::ColumnType::ForeignKey {
+            schema,
+            table,
+            field,
+            ..
+        } => context
+            .tables
+            .values()
+            .find(|candidate| {
+                candidate.record.name == table
+                    && schema
+                        .as_ref()
+                        .is_none_or(|schema| candidate.schema == *schema)
+            })
+            .and_then(|candidate| {
+                ast::collect_columns(&candidate.record.fields)
+                    .into_iter()
+                    .find(|column| column.name == field)
+                    .and_then(|column| match &column.type_ {
+                        ast::ColumnType::Int if ast::is_primary_key(&column) => {
+                            Some(candidate.record.name.clone())
+                        }
+                        ast::ColumnType::IdInt { table } | ast::ColumnType::IdUuid { table } => {
+                            Some(if table.is_empty() {
+                                candidate.record.name.clone()
+                            } else {
+                                table.clone()
+                            })
+                        }
+                        _ => None,
+                    })
+            })
+            .map(|brand| format!("$Ids.{brand}Id")),
+        _ => None,
+    }
 }

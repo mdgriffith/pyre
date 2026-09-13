@@ -67,7 +67,7 @@ fn generated_local_edits_compile_and_run() {
     };
     ast::resolve_id_brands(&mut database);
     let context = typecheck::check_schema(&database).unwrap();
-    let mut queries = parser::parse_query("commands.pyre", "insert NamedAudit($message: String) { audit { message = $message id updatedAt } }\nquery ReadIssues { issue { id title } }").unwrap();
+    let mut queries = parser::parse_query("commands.pyre", "insert NamedAudit($message: String) { audit { message = $message id updatedAt } }\nquery ReadIssues { issue { id title } }\nquery LocalEdits { issue { id } }\nquery QueryUpdate { issue { id } }").unwrap();
     pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
     let info = typecheck::check_queries(&queries, &context).unwrap();
     let mut files: Vec<GeneratedFile<String>> = vec![];

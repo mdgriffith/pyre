@@ -64,6 +64,8 @@ pub struct SessionReplacementMessage {
 pub const MAX_LIVE_SYNC_DELTA_ROWS: usize = 5000;
 pub const MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_LIVE_SYNC_FANOUT_RECIPIENTS: usize = 1000;
+pub const MAX_REPLACEMENT_ROWS: usize = 10_000;
+pub const MAX_REPLACEMENT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct SyncServer<'a> {
     context: &'a typecheck::Context,
@@ -151,14 +153,64 @@ impl<'a> SyncServer<'a> {
             if revision < request.target {
                 return Err(Error::TargetNotReached);
             }
+            let mut replacement_rows = 0usize;
+            let mut replacement_bytes = 0usize;
+            let mut table_row_counts = Vec::with_capacity(sql.tables.len());
+            for table in &sql.tables {
+                let bounds_sql = table
+                    .replacement_bounds_sql
+                    .as_deref()
+                    .ok_or(Error::InvalidReplacementPlan)?;
+                let params = table.params.first().ok_or(Error::InvalidReplacementPlan)?;
+                let bounds = query_objects(&tx, bounds_sql, params).await?;
+                if bounds.len() != 1 {
+                    return Err(Error::InvalidReplacementPlan);
+                }
+                let row_count = bounds[0]
+                    .get(sync::REPLACEMENT_ROW_COUNT_COLUMN)
+                    .and_then(JsonValue::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(Error::InvalidReplacementPlan)?;
+                let byte_count = bounds[0]
+                    .get(sync::REPLACEMENT_BYTE_COUNT_COLUMN)
+                    .and_then(JsonValue::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(Error::InvalidReplacementPlan)?;
+                let key_bytes_per_row =
+                    table.headers.iter().try_fold(0usize, |total, header| {
+                        let key_bytes = serde_json::to_vec(header).map_err(Error::Json)?.len() + 1;
+                        total
+                            .checked_add(key_bytes)
+                            .ok_or(Error::ReplacementTooLarge)
+                    })?;
+                let object_key_bytes = row_count
+                    .checked_mul(key_bytes_per_row)
+                    .ok_or(Error::ReplacementTooLarge)?;
+                replacement_rows = replacement_rows
+                    .checked_add(row_count)
+                    .ok_or(Error::ReplacementTooLarge)?;
+                replacement_bytes = replacement_bytes
+                    .checked_add(byte_count)
+                    .and_then(|total| total.checked_add(object_key_bytes))
+                    .ok_or(Error::ReplacementTooLarge)?;
+                if replacement_rows > MAX_REPLACEMENT_ROWS
+                    || replacement_bytes > MAX_REPLACEMENT_PAYLOAD_BYTES
+                {
+                    return Err(Error::ReplacementTooLarge);
+                }
+                table_row_counts.push(row_count);
+            }
             let mut tables = HashMap::new();
-            for table in sql.tables {
+            for (table, expected_row_count) in sql.tables.into_iter().zip(table_row_counts) {
                 let mut data = Vec::new();
                 for (statement, params) in table.sql.iter().zip(&table.params) {
                     data.extend(expand_sync_rows(
                         query_objects(&tx, statement, params).await?,
                         &table.headers,
                     )?);
+                }
+                if data.len() != expected_row_count {
+                    return Err(Error::InvalidReplacementPlan);
                 }
                 let group = AffectedRowTableGroup {
                     table_name: table.table_name.clone(),
@@ -183,6 +235,11 @@ impl<'a> SyncServer<'a> {
                     .map(|row| row_array_to_object(&shaped.headers, row))
                     .collect();
                 tables.insert(table.table_name, ReplacementTable { rows });
+            }
+            if serde_json::to_vec(&tables).map_err(Error::Json)?.len()
+                > MAX_REPLACEMENT_PAYLOAD_BYTES
+            {
+                return Err(Error::ReplacementTooLarge);
             }
             Ok(Replacement {
                 fence: fence.clone(),
@@ -969,6 +1026,8 @@ pub enum Error {
     InvalidFence,
     InvalidSession,
     TargetNotReached,
+    InvalidReplacementPlan,
+    ReplacementTooLarge,
     Database(libsql::Error),
     DatabaseId(database_id::DatabaseIdError),
     InvalidPageSize,
@@ -984,6 +1043,8 @@ impl std::fmt::Display for Error {
             Error::InvalidFence => write!(f, "InvalidFence"),
             Error::InvalidSession => write!(f, "InvalidSession"),
             Error::TargetNotReached => write!(f, "TargetNotReached"),
+            Error::InvalidReplacementPlan => write!(f, "InvalidReplacementPlan"),
+            Error::ReplacementTooLarge => write!(f, "ReplacementTooLarge"),
             Error::Database(error) => write!(f, "database error: {}", error),
             Error::DatabaseId(error) => write!(f, "database id error: {}", error),
             Error::InvalidPageSize => write!(f, "page_size must be greater than zero"),

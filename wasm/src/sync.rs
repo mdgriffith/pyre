@@ -172,6 +172,8 @@ pub struct TableSyncSqlWasm {
     pub permission_hash: String,
     pub sql: Vec<String>,
     pub params: Vec<Vec<SessionValueWasm>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_bounds_sql: Option<String>,
     pub headers: Vec<String>,
     pub json_columns: Vec<String>,
 }
@@ -316,6 +318,7 @@ impl From<sync::SyncSqlResult> for SyncSqlResultWasm {
                         .into_iter()
                         .map(|params| params.into_iter().map(SessionValueWasm::from).collect())
                         .collect(),
+                    replacement_bounds_sql: t.replacement_bounds_sql,
                     headers: t.headers,
                     json_columns: t.json_columns,
                 })

@@ -32,6 +32,7 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   }),
   set_schema: schema => { activeSchema = schema; },
   get_schema_compiled_contract: () => activeSchema?.compiledContract ?? "contract-1",
+  get_schema_manifest_contract: () => activeSchema?.manifestContract ?? activeSchema?.compiledContract ?? "contract-1",
   validate_replacement_table_groups: () => {
     replacementValidatedSchemas.push(structuredClone(activeSchema));
     return replacementRowsValid ? true : "Error: Invalid union discriminator";
@@ -78,6 +79,7 @@ mock.module("./wasm/pyre_wasm.js", () => ({
 }));
 
 const { runWithSync, runBatchWithSync, catchupReplacement } = await import("./query-sync");
+const { readReplacementTables, MAX_REPLACEMENT_PAYLOAD_BYTES, MAX_REPLACEMENT_ROWS } = await import("./sync");
 const { MAX_LIVE_SYNC_DELTA_ROWS, MAX_LIVE_SYNC_FANOUT_RECIPIENTS, MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES } = await import("./query-sync");
 const { loadSchemaFromDatabase } = await import("./schema");
 
@@ -168,8 +170,11 @@ async function replacementDatabase(run: (fixture: any) => Promise<void>) {
   // Execute permission-filtered compiler-shaped SQL on real libsql, not canned row results.
   replacementPlan = session => ({ tables: [
     { table_name: "notes", headers: ["id", "body", "owner", "project", "updatedAt"], json_columns: [], params: [[session.userId, session.userId]],
+      replacement_bounds_sql: "select count(*) as _pyre_row_count, coalesce(sum(length(cast(json_array(id, body, owner, project, updatedAt) as blob))), 0) + case when count(*) = 0 then 2 else count(*) + 1 end as _pyre_byte_count from notes where owner = ? or exists(select 1 from memberships m where m.project = notes.project and m.userId = ?)",
       sql: ["select * from notes where owner = ? or exists(select 1 from memberships m where m.project = notes.project and m.userId = ?) order by id"] },
-    { table_name: "memberships", headers: ["project", "userId"], params: [[session.userId]], sql: ["select * from memberships where userId = ? order by project"] },
+    { table_name: "memberships", headers: ["project", "userId"], params: [[session.userId]],
+      replacement_bounds_sql: "select count(*) as _pyre_row_count, coalesce(sum(length(cast(json_array(project, userId) as blob))), 0) + case when count(*) = 0 then 2 else count(*) + 1 end as _pyre_byte_count from memberships where userId = ?",
+      sql: ["select * from memberships where userId = ? order by project"] },
   ] });
   try {
     await db.execute("pragma journal_mode = WAL");
@@ -179,7 +184,10 @@ async function replacementDatabase(run: (fixture: any) => Promise<void>) {
     await db.execute("insert into notes values(1,'own',7,1,0),(2,'linked',8,2,0),(3,'private',8,3,0)");
     await db.execute("create table memberships(project integer, userId integer)");
     await db.execute("insert into memberships values(2,7)");
-    await loadSchemaFromDatabase(authority.databaseId, schemaDb);
+    const execute = db.execute;
+    db.execute = schemaDb.execute as typeof db.execute;
+    await loadSchemaFromDatabase(authority.databaseId, db);
+    db.execute = execute;
     const replace = (overrides = {}, session = { userId: 7 }) => catchupReplacement(db, manifest, authority, { ...request, ...overrides }, session);
     const batch = (operations, recipients?, send?) => {
       const { target, ...fence } = request;
@@ -291,15 +299,43 @@ test("replacement errors never publish successful prefixes and read-only retry r
   });
 });
 
-test("replacement never truncates at legacy page limits and rejects malformed aggregate completeness", async () => {
+test("replacement preflights every table before materializing rows and enforces byte bounds", async () => {
+  replacementPlan = { tables: [
+    { table_name: "first", headers: ["id"], replacement_bounds_sql: "small", sql: ["materialize first"] },
+    { table_name: "second", headers: ["id"], replacement_bounds_sql: "oversized", sql: ["materialize second"] },
+  ] };
+  const materialized: string[] = [];
+  const db = { execute: mock(async ({ sql }: { sql: string }) => {
+    if (sql.startsWith("materialize")) {
+      materialized.push(sql);
+      throw Error("row materialization ran");
+    }
+    return { rows: [{ _pyre_row_count: 0, _pyre_byte_count: sql === "small" ? 2 : MAX_REPLACEMENT_PAYLOAD_BYTES + 1 }] };
+  }) };
+
+  await expect(readReplacementTables(db as any, {}, "Main", () => {})).rejects.toThrow("too large");
+  expect(materialized).toEqual([]);
+  expect(db.execute).toHaveBeenCalledTimes(2);
+
+  replacementPlan = { tables: [
+    { table_name: "oversized", headers: ["id"], replacement_bounds_sql: "too many", sql: ["materialize oversized"] },
+  ] };
+  db.execute = mock(async ({ sql }: { sql: string }) => {
+    if (sql.startsWith("materialize")) throw Error("row materialization ran");
+    return { rows: [{ _pyre_row_count: MAX_REPLACEMENT_ROWS + 1, _pyre_byte_count: 0 }] };
+  });
+  await expect(readReplacementTables(db as any, {}, "Main", () => {})).rejects.toThrow("too large");
+});
+
+test("replacement does not reuse live-delta limits and rejects malformed aggregate completeness", async () => {
   await replacementDatabase(async ({ replace, db }) => {
     await db.execute("with recursive ids(n) as (select 10 union all select n + 1 from ids where n < 5010) insert into notes select n, 'many', 7, 1, 0 from ids");
     expect((await replace()).response.tables.notes.rows).toHaveLength(5003);
     for (const sql of ["select null as _pyre_rows", "select '{}' as _pyre_rows", "select '[[]]' as _pyre_rows", "select id as wrong from notes"]) {
-      replacementPlan = { tables: [{ table_name: "notes", headers: ["id"], sql: [sql] }] };
+      replacementPlan = { tables: [{ table_name: "notes", headers: ["id"], replacement_bounds_sql: "select 0 as _pyre_row_count, 2 as _pyre_byte_count", sql: [sql] }] };
       expect((await replace()).error.errorType).toBe("ReplacementUnavailable");
     }
-    replacementPlan = { tables: [{ table_name: "notes", headers: ["id"], sql: ["select '[]' as _pyre_rows"] }] };
+    replacementPlan = { tables: [{ table_name: "notes", headers: ["id"], replacement_bounds_sql: "select 0 as _pyre_row_count, 2 as _pyre_byte_count", sql: ["select '[]' as _pyre_rows"] }] };
     expect((await replace()).response.tables.notes.rows).toEqual([]);
     const transaction = db.transaction.bind(db);
     db.transaction = async mode => {

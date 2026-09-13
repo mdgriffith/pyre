@@ -1,6 +1,6 @@
 import { Client } from "@libsql/client";
 import { z } from "zod";
-import { readReplacementTables } from "./sync";
+import { MAX_REPLACEMENT_PAYLOAD_BYTES, readReplacementTables } from "./sync";
 import * as wasm from "./wasm/pyre_wasm.js";
 import { normalizeForWasmJson } from "./wasm-json";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
@@ -89,7 +89,7 @@ export async function catchupReplacement(
       || !Number.isSafeInteger(revision) || revision < captured.target) return failure("ReplacementUnavailable");
     const tables = await readReplacementTables(tx, session, captured.namespace, restoreSchema);
     // Bound wire materialization without ever turning truncation into completeness.
-    if (new TextEncoder().encode(JSON.stringify(tables)).byteLength > 64 * 1024 * 1024)
+    if (new TextEncoder().encode(JSON.stringify(tables)).byteLength > MAX_REPLACEMENT_PAYLOAD_BYTES)
       return failure("ReplacementUnavailable");
     await tx.commit();
     const { version: _version, ...correlation } = captured;

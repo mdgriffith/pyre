@@ -70,7 +70,10 @@ const result = await runBatch(database, {
 }, effectiveSession);
 ```
 
-The manifest and authority arguments are trusted server configuration. Resolve
+The manifest and authority arguments are trusted server configuration. Generated
+manifests carrying compiled contracts additionally require the exact `Client` to
+have completed generated `ensureDatabase` or `loadSchemaFromDatabase`; `runBatch`
+rechecks that schema evidence before execution. Resolve
 the actual connection, database ID, namespace, manifest fingerprint, client
 instance and auth generation independently of the request. The manifest's
 `version: 1` is its format version, not the fingerprint in the authority/request
@@ -200,6 +203,9 @@ Do not expose `bind` options to request data. No administrator or session is
 synthesized: even sessionless schemas require an explicit `{}`. Invalid binding
 configuration or a session rejected by the full compiled `SessionValidator`
 throws synchronously. Unrecognized application claims confer no permissions.
+The same exact `Client` must first be passed to generated `ensureDatabase` or
+`loadSchemaFromDatabase`. Binding checks its captured schema against the selected
+namespace replacement contract and the required generated `compiledContract` once.
 
 Binding captures session and compiled execution metadata. Submission captures
 inputs, operation IDs, decoders, and result assembly before its first await.
@@ -296,7 +302,8 @@ SSE registration, separately from its legacy sync routes. Signed sessions bind
 the instance and auth generation as they do for POST `/db`.
 
 Replacement currently materializes a complete scope in memory, not pinned pages.
-TypeScript rejects payloads above 64 MiB rather than returning partial coverage;
+Both runtimes preflight the complete scope and reject more than 10,000 rows or
+64 MiB of projected row/object data rather than returning partial coverage;
 remote libSQL remains unverified. The opt-in [browser local-edit runtime](../../docs/usage/local-edits.md)
 implements client installation, pending-intent replay and receipt settlement through
 configured transport adapters. Typed server seeding is described above.

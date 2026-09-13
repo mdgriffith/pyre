@@ -30,6 +30,8 @@ pub const MAX_SYNC_PAGE_SIZE: usize = 5000;
 pub const MAX_SYNC_CURSOR_TABLES: usize = 512;
 pub const MAX_SYNC_CURSOR_PERMISSION_HASH_BYTES: usize = 256;
 pub const SYNC_ROWS_JSON_COLUMN: &str = "_pyre_rows";
+pub const REPLACEMENT_ROW_COUNT_COLUMN: &str = "_pyre_row_count";
+pub const REPLACEMENT_BYTE_COUNT_COLUMN: &str = "_pyre_byte_count";
 
 pub fn normalize_page_size(page_size: usize) -> Result<usize, SyncError> {
     if page_size == 0 {
@@ -93,6 +95,8 @@ pub struct TableSyncSql {
     pub permission_hash: String,
     pub sql: Vec<String>,
     pub params: Vec<Vec<SessionValue>>,
+    /// Scalar count/size query used before complete replacement materialization.
+    pub replacement_bounds_sql: Option<String>,
     /// Column names in the order they appear in the SQL SELECT
     pub headers: Vec<String>,
     /// Column names that should be decoded as JSON values in the runtime
@@ -1353,6 +1357,12 @@ fn get_sync_sql_inner(
             })
             .collect::<Vec<_>>();
 
+        let inner_select = format!(
+            "SELECT {} FROM {}{}",
+            columns.join(", "),
+            quoted_table_name,
+            where_clause,
+        );
         let sql = format!(
             "SELECT coalesce(json_group_array(json_array({})), json('[]')) AS {} FROM (SELECT {} FROM {}{} ORDER BY {}.updatedAt ASC, {}.{} ASC{})",
             row_values.join(", "),
@@ -1365,6 +1375,15 @@ fn get_sync_sql_inner(
             string::quote(&primary_key),
             page_size.map(|size| format!(" LIMIT {}", size + 1)).unwrap_or_default()
         );
+        let replacement_bounds_sql = namespace.map(|_| {
+            format!(
+                "SELECT count(*) AS {}, coalesce(sum(length(cast(json_array({}) AS blob))), 0) + CASE WHEN count(*) = 0 THEN 2 ELSE count(*) + 1 END AS {} FROM ({})",
+                string::quote(REPLACEMENT_ROW_COUNT_COLUMN),
+                row_values.join(", "),
+                string::quote(REPLACEMENT_BYTE_COUNT_COLUMN),
+                inner_select,
+            )
+        });
 
         result.tables.push(TableSyncSql {
             table_name: actual_table_name.clone(),
@@ -1372,6 +1391,7 @@ fn get_sync_sql_inner(
             permission_hash: current_permission_hash.clone(),
             sql: vec![sql], // Single SQL statement
             params: vec![params],
+            replacement_bounds_sql,
             headers,
             json_columns,
         });

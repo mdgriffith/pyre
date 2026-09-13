@@ -82,13 +82,16 @@ test("binding rejects manifest/namespace/target mismatches and descriptor SQL is
   const { options, edits, count } = await setup();
   expect(() => localEdits.bind({ ...options, databaseId: " " })).toThrow();
   expect(() => localEdits.bind({ ...options, manifest: { ...manifest, manifestVersion: "wrong" } })).toThrow("InvalidRequest");
+  expect(() => localEdits.bind({ ...options, manifest: { ...manifest, compiledContract: "stale" } })).toThrow("InvalidRequest");
+  expect(() => localEdits.bind({ ...options, manifest: { ...manifest,
+    replacementContracts: { ...manifest.replacementContracts, [Main.name]: "stale" } } })).toThrow("InvalidRequest");
+  expect(() => localEdits.bind({ ...options, manifest: { ...manifest, compiledContract: undefined } as any })).toThrow("InvalidRequest");
   const operation = Audit.create({ message: "no" })[planKey].operations[0].definition;
   for (const scope of [namespace<Main>("Other", Main.manifest), namespace<Main>(Main.name, "stale")]) {
     expect(await edits.submit(scopedEdit(scope, operation, { message: "no" }))).toEqual({ kind: "rejected", code: "InvalidRequest" });
   }
-  const other = localEdits.bind({ ...options, namespace: namespace<Main>("Other", Main.manifest) });
-  expect(await other.submit(scopedEdit(namespace<Main>("Other", Main.manifest), operation, { message: "no" })))
-    .toMatchObject({ kind: "rejected", code: "InvalidRequest" });
+  expect(() => localEdits.bind({ ...options, namespace: namespace<Main>("Other", Main.manifest) }))
+    .toThrow("InvalidRequest");
   expect(await edits.submit(scopedEdit(Main, { ...operation, id: "unknown" }, { message: "no" })))
     .toMatchObject({ kind: "rejected", index: 0 });
   expect(await count("audits")).toBe(0);
@@ -190,19 +193,27 @@ test("lost commit acknowledgement is unknown and does not replay the write", asy
 test("empty batches confirm [] with no database I/O, executor call, revision or publication", async () => {
   const { database, options, revision } = await setup();
   const io = mock(() => { throw new Error("Empty submission must not touch the database"); });
-  const forbiddenDatabase = new Proxy(database, { get: () => io });
   const publish = mock(() => { throw new Error("Empty submission must not publish"); });
   const registrations = new Map<string, BatchSyncRecipient>();
   const iterate = spyOn(registrations, Symbol.iterator);
   const execute = spyOn(execution, "runBatchWithSync");
+  const edits = localEdits.bind({ ...options, connectedSessions: registrations, sendToSession: publish });
+  const databaseExecute = database.execute;
+  const databaseTransaction = database.transaction;
   try {
-    const edits = localEdits.bind({ ...options, database: forbiddenDatabase, connectedSessions: registrations, sendToSession: publish });
+    database.execute = io as any;
+    database.transaction = io as any;
     expect(await edits.submit(batch([]))).toEqual({ kind: "confirmed", result: [] });
     expect(io).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
     expect(iterate).not.toHaveBeenCalled();
     expect(publish).not.toHaveBeenCalled();
-  } finally { execute.mockRestore(); iterate.mockRestore(); }
+  } finally {
+    database.execute = databaseExecute;
+    database.transaction = databaseTransaction;
+    execute.mockRestore();
+    iterate.mockRestore();
+  }
   expect(await revision()).toBe(0);
 });
 

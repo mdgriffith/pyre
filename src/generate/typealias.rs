@@ -9,13 +9,15 @@ pub struct TypeFormatter {
     pub to_field_separator: Box<dyn Fn(bool) -> String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FieldMetadata {
     pub is_link: bool,
     pub is_optional: bool,
-    /// If true, this relationship should be an array (one-to-many).
-    /// If false and is_link is true, it's many-to-one or one-to-one (optional object).
+    /// If true, this relationship can return multiple rows.
+    /// Only relationships constrained to a unique target are singular.
     pub is_array_relationship: bool,
+    /// The record identity represented by this scalar, when it has one.
+    pub identity_brand: Option<String>,
 }
 
 /// Generates type alias definitions for query return types using the provided formatting functions
@@ -101,6 +103,7 @@ pub fn return_data_aliases(
                         is_link: true,
                         is_optional: false,
                         is_array_relationship: true, // Top-level query fields are always arrays
+                        identity_brand: None,
                     },
                 ));
 
@@ -215,6 +218,7 @@ fn to_query_type_alias(
                             is_link: false,
                             is_optional: column.nullable,
                             is_array_relationship: false,
+                            identity_brand: column_identity(table, column),
                         },
                     ));
                 }
@@ -237,6 +241,7 @@ fn to_query_type_alias(
                             is_link: false,
                             is_optional: col.nullable,
                             is_array_relationship: false,
+                            identity_brand: column_identity(table, col),
                         },
                     ));
                 }
@@ -259,14 +264,16 @@ fn to_query_type_alias(
                         } else {
                             ast::linked_to_unique_field(link)
                         };
+                    let is_singular = !is_one_to_many && linked_to_unique;
 
                     rendered_fields.push((
                         aliased_name.clone(),
                         get_name(&alias_stack, &aliased_name),
                         FieldMetadata {
                             is_link: true,
-                            is_optional: !is_one_to_many && linked_to_unique,
-                            is_array_relationship: is_one_to_many,
+                            is_optional: is_singular,
+                            is_array_relationship: !is_singular,
+                            identity_brand: None,
                         },
                     ));
                 }
@@ -284,6 +291,31 @@ fn to_query_type_alias(
 
     result.push_str(&(formatter.to_type_def_end)());
     result.push_str("\n\n");
+}
+
+fn column_identity(table: &ast::RecordDetails, column: &ast::Column) -> Option<String> {
+    match &column.type_ {
+        ast::ColumnType::Int if ast::is_primary_key(column) => Some(table.name.clone()),
+        ast::ColumnType::IdInt { table: brand } | ast::ColumnType::IdUuid { table: brand } => {
+            Some(if brand.is_empty() {
+                table.name.clone()
+            } else {
+                brand.clone()
+            })
+        }
+        ast::ColumnType::ForeignKey {
+            table,
+            serialization_type,
+            ..
+        } if matches!(
+            serialization_type,
+            Some(ast::ConcreteSerializationType::IdInt | ast::ConcreteSerializationType::IdUuid)
+        ) =>
+        {
+            Some(table.clone())
+        }
+        _ => None,
+    }
 }
 
 pub fn push_alias_stack(field: &ast::QueryField, alias_stack: &str) -> String {

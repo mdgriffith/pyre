@@ -1951,6 +1951,7 @@ fn to_query_file(
                       is_link,
                       is_optional,
                       is_array_relationship: _,
+                      identity_brand: _,
                   }| {
                 let base_type = columns_for_types
                     .get(&(alias_field.borrow().clone(), name.to_string()))
@@ -2007,6 +2008,7 @@ fn to_query_file(
                       is_link,
                       is_optional,
                       is_array_relationship: _,
+                      identity_brand: _,
                   }| {
                 let decoder = return_columns
                     .get(&(alias_field.borrow().clone(), name.to_string()))
@@ -3281,6 +3283,65 @@ fn find_nested_query_field<'a>(
 //
 // Generates the main QueryClient module that ties all queries together
 
+struct ElmQueryName {
+    source: String,
+    module_alias: String,
+    model_field: String,
+    query_constructor: String,
+    data_received_constructor: String,
+    unregistered_constructor: String,
+}
+
+fn generated_elm_query_names(query_names: &[String]) -> Vec<ElmQueryName> {
+    let mut used_constructors = HashSet::from([
+        "NoQuery".to_string(),
+        "QueryUpdate".to_string(),
+        "LocalEditReceived".to_string(),
+        "IncomingMsgDecodeFailed".to_string(),
+        "NoEffect".to_string(),
+        "Send".to_string(),
+        "QueryUpdated".to_string(),
+        "LogError".to_string(),
+        "QueryDeltaApplyFailed".to_string(),
+        "IncomingDeltaDecodeFailed".to_string(),
+    ]);
+    let mut generated = Vec::new();
+
+    for source in query_names {
+        let query_constructor = unique_elm_constructor(source, &mut used_constructors);
+        generated.push(ElmQueryName {
+            source: source.clone(),
+            module_alias: format!("GeneratedQuery{}", source),
+            model_field: format!("query{}", string::capitalize(source)),
+            query_constructor,
+            data_received_constructor: String::new(),
+            unregistered_constructor: String::new(),
+        });
+    }
+
+    for query in &mut generated {
+        query.data_received_constructor = unique_elm_constructor(
+            &format!("{}_DataReceived", query.source),
+            &mut used_constructors,
+        );
+        query.unregistered_constructor = unique_elm_constructor(
+            &format!("{}_Unregistered", query.source),
+            &mut used_constructors,
+        );
+    }
+
+    generated
+}
+
+fn unique_elm_constructor(candidate: &str, used: &mut HashSet<String>) -> String {
+    let mut generated = candidate.to_string();
+    while used.contains(&generated) {
+        generated.push_str("Query");
+    }
+    used.insert(generated.clone());
+    generated
+}
+
 fn generate_pyre_module(
     _context: &typecheck::Context,
     all_query_info: &HashMap<String, typecheck::QueryInfo>,
@@ -3288,6 +3349,7 @@ fn generate_pyre_module(
     query_names: &[String],
 ) -> String {
     let mut result = String::new();
+    let queries = generated_elm_query_names(query_names);
 
     // Module declaration
     let mut database_namespaces: Vec<String> = all_query_info
@@ -3312,8 +3374,11 @@ fn generate_pyre_module(
     result.push_str("import Json.Encode as Encode\n");
 
     // Import query modules
-    for name in query_names {
-        result.push_str(&format!("import Query.{}\n", name));
+    for query in &queries {
+        result.push_str(&format!(
+            "import Query.{} as {}\n",
+            query.source, query.module_alias
+        ));
     }
     result.push_str("\n\n");
 
@@ -3322,11 +3387,10 @@ fn generate_pyre_module(
     result.push_str("type alias Model =\n");
     result.push_str("    { localEdits : LocalEdits.Model\n");
 
-    for name in query_names.iter() {
-        let field_name = string::decapitalize(name);
+    for query in &queries {
         result.push_str(&format!(
-            "    , {} : Dict String (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
-            field_name, name, name
+            "    , {} : Dict String (QueryModel {}.Input {}.ReturnData)\n",
+            query.model_field, query.module_alias, query.module_alias
         ));
     }
 
@@ -3355,15 +3419,15 @@ fn generate_pyre_module(
     if query_names.is_empty() {
         result.push_str("    = NoQuery\n");
     }
-    for (i, name) in query_names.iter().enumerate() {
+    for (i, query) in queries.iter().enumerate() {
         let prefix = if i == 0 { "    = " } else { "    | " };
         let database_type = all_query_info
-            .get(name)
+            .get(&query.source)
             .map(|info| elm_database_id_type(&info.primary_db))
             .unwrap_or_else(|| elm_database_id_type(ast::DEFAULT_SCHEMANAME));
         result.push_str(&format!(
-            "{}{} {} QueryId Query.{}.Input\n",
-            prefix, name, database_type, name
+            "{}{} {} QueryId {}.Input\n",
+            prefix, query.query_constructor, database_type, query.module_alias
         ));
     }
     result.push_str("\n\n");
@@ -3372,18 +3436,18 @@ fn generate_pyre_module(
     result.push_str("-- Msg\n\n\n");
     result.push_str("type Msg\n");
     result.push_str("    = QueryUpdate Query\n");
-    for name in query_names {
+    for query in &queries {
         result.push_str(&format!(
-            "    | {}_DataReceived QueryId Query.{}.QueryDelta\n",
-            name, name
+            "    | {} QueryId {}.QueryDelta\n",
+            query.data_received_constructor, query.module_alias
         ));
         let database_type = all_query_info
-            .get(name)
+            .get(&query.source)
             .map(|info| elm_database_id_type(&info.primary_db))
             .unwrap_or_else(|| elm_database_id_type(ast::DEFAULT_SCHEMANAME));
         result.push_str(&format!(
-            "    | {}_Unregistered {} QueryId\n",
-            name, database_type
+            "    | {} {} QueryId\n",
+            query.unregistered_constructor, database_type
         ));
     }
     result.push_str("\n\n");
@@ -3409,9 +3473,8 @@ fn generate_pyre_module(
     result.push_str("init incarnation =\n");
     result.push_str("    { localEdits = LocalEdits.init incarnation\n");
 
-    for name in query_names.iter() {
-        let field_name = string::decapitalize(name);
-        result.push_str(&format!("    , {} = Dict.empty\n", field_name));
+    for query in &queries {
+        result.push_str(&format!("    , {} = Dict.empty\n", query.model_field));
     }
 
     result.push_str("    }\n\n\n");
@@ -3426,38 +3489,39 @@ fn generate_pyre_module(
     result.push_str("            updateQuery query model\n\n");
     result.push_str("        LocalEditReceived value ->\n            ( { model | localEdits = LocalEdits.receive value model.localEdits }, NoEffect )\n\n");
 
-    for name in query_names {
-        let field_name = string::decapitalize(name);
-
+    for query in &queries {
         // DataReceived
-        result.push_str(&format!("        {}_DataReceived queryId delta ->\n", name));
+        result.push_str(&format!(
+            "        {} queryId delta ->\n",
+            query.data_received_constructor
+        ));
         result.push_str(&format!(
             "            case Dict.get queryId model.{} of\n",
-            field_name
+            query.model_field
         ));
         result.push_str("                Just queryModel ->\n");
         result.push_str(&format!(
-            "                    case Query.{}.applyDelta delta queryModel.result of\n",
-            name
+            "                    case {}.applyDelta delta queryModel.result of\n",
+            query.module_alias
         ));
         result.push_str("                        Ok newResult ->\n");
         result.push_str("                            let\n");
         result.push_str("                                newRevision =\n");
         result.push_str("                                    case delta of\n");
         result.push_str(&format!(
-            "                                        Query.{}.Full rev _ ->\n",
-            name
+            "                                        {}.Full rev _ ->\n",
+            query.module_alias
         ));
         result.push_str("                                            rev\n\n");
         result.push_str(&format!(
-            "                                        Query.{}.Delta rev _ ->\n",
-            name
+            "                                        {}.Delta rev _ ->\n",
+            query.module_alias
         ));
         result.push_str("                                            rev\n");
         result.push_str("                            in\n");
         result.push_str(&format!(
             "                            ( {{ model | {} = Dict.insert queryId {{ queryModel | result = newResult, revision = newRevision }} model.{} }}\n",
-            field_name, field_name
+            query.model_field, query.model_field
         ));
         result.push_str("                            , QueryUpdated queryId\n");
         result.push_str("                            )\n\n");
@@ -3470,12 +3534,12 @@ fn generate_pyre_module(
 
         // Unregistered
         result.push_str(&format!(
-            "        {}_Unregistered databaseId queryId ->\n",
-            name
+            "        {} databaseId queryId ->\n",
+            query.unregistered_constructor
         ));
         result.push_str(&format!(
             "            ( {{ model | {} = Dict.remove queryId model.{} }}\n",
-            field_name, field_name
+            query.model_field, query.model_field
         ));
         result.push_str("            , Send (encodeUnregister databaseId queryId)\n");
         result.push_str("            )\n\n");
@@ -3508,11 +3572,11 @@ fn generate_pyre_module(
     result.push_str("            (\\( source, queryId ) ->\n");
     result.push_str("                case source of\n");
 
-    for name in query_names {
-        result.push_str(&format!("                    \"{}\" ->\n", name));
+    for query in &queries {
+        result.push_str(&format!("                    \"{}\" ->\n", query.source));
         result.push_str(&format!(
-            "                        Decode.map ({}_DataReceived queryId) Query.{}.decodeQueryDelta\n\n",
-            name, name
+            "                        Decode.map ({} queryId) {}.decodeQueryDelta\n\n",
+            query.data_received_constructor, query.module_alias
         ));
     }
 
@@ -3529,49 +3593,51 @@ fn generate_pyre_module(
         result.push_str("        NoQuery ->\n            ( model, NoEffect )\n\n");
     }
 
-    for name in query_names {
-        let field_name = string::decapitalize(name);
+    for query in &queries {
         let empty_return_data = query_list
             .queries
             .iter()
             .find_map(|q| match q {
-                ast::QueryDef::Query(query) if query.name == *name => {
-                    Some(generate_empty_return_data(query))
+                ast::QueryDef::Query(candidate) if candidate.name == query.source => {
+                    Some(generate_empty_return_data(candidate))
                 }
                 _ => None,
             })
             .unwrap_or_else(|| "ReturnData".to_string());
 
-        result.push_str(&format!("        {} databaseId queryId input ->\n", name));
+        result.push_str(&format!(
+            "        {} databaseId queryId input ->\n",
+            query.query_constructor
+        ));
         result.push_str(&format!(
             "            case Dict.get queryId model.{} of\n",
-            field_name
+            query.model_field
         ));
         result.push_str("                Just queryModel ->\n");
         result.push_str(&format!(
             "                    ( {{ model | {} = Dict.insert queryId {{ queryModel | input = input }} model.{} }}\n",
-            field_name, field_name
+            query.model_field, query.model_field
         ));
         result.push_str(&format!(
-            "                    , Send (encodeUpdateInput databaseId queryId Query.{}.queryShape (Query.{}.encode input))\n",
-            name, name
+            "                    , Send (encodeUpdateInput databaseId queryId {}.queryShape ({}.encode input))\n",
+            query.module_alias, query.module_alias
         ));
         result.push_str("                    )\n\n");
         result.push_str("                Nothing ->\n");
         result.push_str("                    let\n");
         result.push_str("                        queryModel =\n");
         result.push_str(&format!(
-            "                            {{ input = input, result = Query.{}.{}, revision = 0 }}\n",
-            name, empty_return_data
+            "                            {{ input = input, result = {}.{}, revision = 0 }}\n",
+            query.module_alias, empty_return_data
         ));
         result.push_str("                    in\n");
         result.push_str(&format!(
             "                    ( {{ model | {} = Dict.insert queryId queryModel model.{} }}\n",
-            field_name, field_name
+            query.model_field, query.model_field
         ));
         result.push_str(&format!(
-            "                    , Send (encodeRegister databaseId \"{}\" Query.{}.queryShape queryId (Query.{}.encode input))\n",
-            name, name, name
+            "                    , Send (encodeRegister databaseId \"{}\" {}.queryShape queryId ({}.encode input))\n",
+            query.source, query.module_alias, query.module_alias
         ));
         result.push_str("                    )\n\n");
     }

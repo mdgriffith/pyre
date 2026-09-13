@@ -3,6 +3,8 @@ module Data.Identity exposing (Key, fromRow, fromValue, int, toValue, uuid)
 import Data.Schema exposing (PrimaryKeyKind(..), SchemaMetadata)
 import Data.Value exposing (Value(..))
 import Dict exposing (Dict)
+import Json.Decode as Decode
+import Json.Encode as Encode
 
 
 {-| Comparable, type-separated keys. Integers retain numeric ordering.
@@ -27,8 +29,12 @@ toValue ( tag, number, text ) =
     if tag == 0 then
         IntValue number
 
-    else
+    else if tag == 1 then
         StringValue text
+
+    else
+        Decode.decodeString Data.Value.decodeValue text
+            |> Result.withDefault NullValue
 
 
 fromValue : PrimaryKeyKind -> Value -> Result String Key
@@ -51,6 +57,18 @@ fromValue kind value =
 
             else
                 Err "Invalid UUID primary key"
+
+        ( UnsupportedKey, (StringValue _ as unsupported) ) ->
+            Ok ( 2, 0, Encode.encode 0 (Data.Value.encodeValue unsupported) )
+
+        ( UnsupportedKey, (IntValue _ as unsupported) ) ->
+            Ok ( 2, 0, Encode.encode 0 (Data.Value.encodeValue unsupported) )
+
+        ( UnsupportedKey, (FloatValue _ as unsupported) ) ->
+            Ok ( 2, 0, Encode.encode 0 (Data.Value.encodeValue unsupported) )
+
+        ( UnsupportedKey, (BoolValue _ as unsupported) ) ->
+            Ok ( 2, 0, Encode.encode 0 (Data.Value.encodeValue unsupported) )
 
         _ ->
             Err "Primary key has the wrong type"

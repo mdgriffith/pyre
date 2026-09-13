@@ -249,12 +249,12 @@ query GetGameWorld($slug: String) {
     );
     assert!(
         content.contains("type alias DatabaseId namespace =\n    Db.Database.DatabaseId namespace\n\n\ntype alias Default =\n    Db.Database.Default\n\n\ntype alias QueryId =\n    String")
-            && content.contains("type Query\n    = GetRulebookByName (DatabaseId Default) QueryId Query.GetRulebookByName.Input\n    | GetGameWorld (DatabaseId Default) QueryId Query.GetGameWorld.Input"),
+            && content.contains("type Query\n    = GetRulebookByName (DatabaseId Default) QueryId GeneratedQueryGetRulebookByName.Input\n    | GetGameWorld (DatabaseId Default) QueryId GeneratedQueryGetGameWorld.Input"),
         "Pyre.elm should generate a Query type for outbound upserts. Generated:\n{}",
         content
     );
     assert!(
-        content.contains("type Msg\n    = QueryUpdate Query\n    | GetRulebookByName_DataReceived QueryId Query.GetRulebookByName.QueryDelta\n    | GetRulebookByName_Unregistered (DatabaseId Default) QueryId\n    | GetGameWorld_DataReceived QueryId Query.GetGameWorld.QueryDelta\n    | GetGameWorld_Unregistered (DatabaseId Default) QueryId"),
+        content.contains("type Msg\n    = QueryUpdate Query\n    | GetRulebookByName_DataReceived QueryId GeneratedQueryGetRulebookByName.QueryDelta\n    | GetRulebookByName_Unregistered (DatabaseId Default) QueryId\n    | GetGameWorld_DataReceived QueryId GeneratedQueryGetGameWorld.QueryDelta\n    | GetGameWorld_Unregistered (DatabaseId Default) QueryId"),
         "Pyre.elm should collapse register/update into QueryUpdate. Generated:\n{}",
         content
     );
@@ -287,8 +287,8 @@ query GetGameWorld($slug: String) {
         content
     );
     assert!(
-        content.contains("Just queryModel ->\n                    ( { model | getRulebookByName = Dict.insert queryId { queryModel | input = input } model.getRulebookByName }\n                    , Send (encodeUpdateInput databaseId queryId Query.GetRulebookByName.queryShape (Query.GetRulebookByName.encode input))")
-            && content.contains("Nothing ->\n                    let\n                        queryModel =\n                            { input = input, result = Query.GetRulebookByName.ReturnData [], revision = 0 }\n                    in\n                    ( { model | getRulebookByName = Dict.insert queryId queryModel model.getRulebookByName }\n                    , Send (encodeRegister databaseId \"GetRulebookByName\" Query.GetRulebookByName.queryShape queryId (Query.GetRulebookByName.encode input))")
+        content.contains("Just queryModel ->\n                    ( { model | queryGetRulebookByName = Dict.insert queryId { queryModel | input = input } model.queryGetRulebookByName }\n                    , Send (encodeUpdateInput databaseId queryId GeneratedQueryGetRulebookByName.queryShape (GeneratedQueryGetRulebookByName.encode input))")
+            && content.contains("Nothing ->\n                    let\n                        queryModel =\n                            { input = input, result = GeneratedQueryGetRulebookByName.ReturnData [], revision = 0 }\n                    in\n                    ( { model | queryGetRulebookByName = Dict.insert queryId queryModel model.queryGetRulebookByName }\n                    , Send (encodeRegister databaseId \"GetRulebookByName\" GeneratedQueryGetRulebookByName.queryShape queryId (GeneratedQueryGetRulebookByName.encode input))")
             && content.contains("encodeRegister : DatabaseId namespace -> String -> Encode.Value -> QueryId -> Encode.Value -> Encode.Value\nencodeRegister databaseId queryName queryShape queryId input =\n    Encode.object\n        [ ( \"type\", Encode.string \"register\" )\n        , ( \"databaseId\", Db.Database.encode databaseId )\n        , ( \"queryName\", Encode.string queryName )\n        , ( \"querySource\", queryShape )")
             && content.contains("encodeUpdateInput : DatabaseId namespace -> QueryId -> Encode.Value -> Encode.Value -> Encode.Value\nencodeUpdateInput databaseId queryId queryShape input =\n    Encode.object\n        [ ( \"type\", Encode.string \"update-input\" )\n        , ( \"databaseId\", Db.Database.encode databaseId )\n        , ( \"queryId\", Encode.string queryId )\n        , ( \"querySource\", queryShape )"),
         "Pyre.elm should upsert queries by id. Generated:\n{}",

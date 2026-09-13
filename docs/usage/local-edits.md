@@ -316,6 +316,11 @@ Use `localEdits.bind` from `@pyre/server/local-edits` with generated builders an
 the generated `typescript/server` manifest. Authorize the database first, then
 bind its connection, database ID, namespace, and actual effective session.
 `session` is required, including an explicit `{}` for sessionless schemas.
+The exact `Client` must already have completed generated `ensureDatabase` or
+`loadSchemaFromDatabase`; `bind` synchronously authenticates that schema evidence
+against the generated namespace and compiled contracts.
+Authoritative replacement rejects scopes above 10,000 rows or 64 MiB instead of
+installing a partial snapshot.
 
 The runnable [seed example](../../packages/server/fixtures/local-edits/seed.ts)
 uses this exact binding and generated Project/Audit schema:
