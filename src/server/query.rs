@@ -432,12 +432,26 @@ pub async fn run_sync(
 /// declared response remains unchanged, and publication must reuse this revision.
 pub async fn run_with_revision(
     conn: &libsql::Connection,
-    manifest: &Manifest,
+    manifest: &BoundManifest,
     query_id: &str,
     input: JsonValue,
     session: &PyreSession,
     sync_mode: bool,
 ) -> Result<(QueryResult, Option<CommittedRevision>), Error> {
+    let query = manifest
+        .queries
+        .get(query_id)
+        .ok_or_else(|| Error::UnknownQuery(query_id.to_string()))?;
+    if !manifest.authorizes_namespace(&query.primary_db)
+        || query
+            .attached_dbs
+            .iter()
+            .any(|namespace| !manifest.authorizes_namespace(namespace))
+    {
+        return Err(Error::InvalidInput(
+            "query is outside authorized database scope".into(),
+        ));
+    }
     run_inner(conn, manifest, query_id, input, session, sync_mode, true).await
 }
 

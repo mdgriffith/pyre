@@ -242,16 +242,16 @@ fn result_object_schema(
                     .local_ids
                     .iter()
                     .all(|id| primary_key.as_ref().is_some_and(|primary| id == primary));
-                let schema = if one_to_many {
+                let linked_to_unique =
+                    ast::linked_to_unique_field_with_record(link, &linked.record);
+                let schema = if one_to_many || !linked_to_unique {
                     ResultSchema::Array {
                         items: Box::new(nested),
                     }
-                } else if ast::linked_to_unique_field_with_record(link, &linked.record) {
+                } else {
                     ResultSchema::Nullable {
                         item: Box::new(nested),
                     }
-                } else {
-                    nested
                 };
                 fields.insert(name, schema);
             }

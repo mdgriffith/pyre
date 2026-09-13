@@ -54,6 +54,110 @@ fn bind(manifest: &Manifest, context: &pyre::typecheck::Context) -> BoundManifes
     BoundManifest::new(manifest.clone(), context).unwrap()
 }
 
+#[test]
+fn non_unique_relationship_results_are_arrays() -> Result<(), Box<dyn std::error::Error>> {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "record Parent {\n @public\n id Id.Int @id\n code String\n matches @link(code, Target.code)\n}\nrecord Target {\n @public\n id Id.Int @id\n code String\n}\n",
+        &mut schema,
+    )
+    .unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).unwrap();
+    let manifest = manifest_for(
+        &context,
+        "query Parents { parent { id matches { id } } }",
+        false,
+    )?;
+    let result = only_query(&manifest).result_schema.as_ref().unwrap();
+    let pyre::server::manifest::ResultSchema::Object { fields } = result else {
+        panic!("top-level query result should be an object");
+    };
+    let pyre::server::manifest::ResultSchema::Array { items } = &fields["parent"] else {
+        panic!("top-level field should be an array");
+    };
+    let pyre::server::manifest::ResultSchema::Object { fields } = items.as_ref() else {
+        panic!("parent rows should be objects");
+    };
+    assert!(matches!(
+        &fields["matches"],
+        pyre::server::manifest::ResultSchema::Array { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn revisioned_named_queries_stay_within_bound_namespace(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut main = ast::Schema {
+        namespace: "Main".into(),
+        ..Default::default()
+    };
+    parser::run(
+        "Main/schema.pyre",
+        "record MainItem {\n @public\n id Id.Int @id\n}\n",
+        &mut main,
+    )
+    .unwrap();
+    let mut archive = ast::Schema {
+        namespace: "Archive".into(),
+        ..Default::default()
+    };
+    parser::run(
+        "Archive/schema.pyre",
+        "record ArchiveItem {\n @public\n id Id.Int @id\n}\n",
+        &mut archive,
+    )
+    .unwrap();
+    let mut database = ast::Database {
+        schemas: vec![main, archive],
+    };
+    ast::resolve_id_brands(&mut database);
+    let context = typecheck::check_schema(&database).unwrap();
+    let manifest = manifest_for(
+        &context,
+        "query ReadMain { mainItem { id } }\nquery ReadArchive { archiveItem { id } }",
+        false,
+    )?;
+
+    let standalone_source =
+        pyre::generate::to_string::standalone_schema_to_string(&context, &database.schemas[0]);
+    let loaded = pyre::db::introspect::from_raw(pyre::db::introspect::IntrospectionRaw {
+        tables: vec![],
+        migration_state: pyre::db::introspect::MigrationState::NoMigrationTable,
+        schema_source: standalone_source,
+        links: vec![],
+    });
+    let pyre::db::introspect::SchemaResult::Success {
+        context: standalone_context,
+        ..
+    } = loaded.schema
+    else {
+        panic!("standalone schema should load");
+    };
+    let bound = BoundManifest::new(manifest.clone(), &standalone_context)?;
+    assert!(bound.authorizes_namespace("Main"));
+    assert!(!bound.authorizes_namespace("Archive"));
+
+    let archive_query = manifest
+        .queries
+        .values()
+        .find(|query| query.primary_db == "Archive")
+        .unwrap();
+    let db = libsql::Builder::new_local(":memory:").build().await?;
+    let conn = db.connect()?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let error =
+        query::run_with_revision(&conn, &bound, &archive_query.id, json!({}), &session, false)
+            .await
+            .unwrap_err();
+    assert!(matches!(error, query::Error::InvalidInput(_)));
+    Ok(())
+}
+
 #[tokio::test]
 async fn typed_json_session_enums_match_compiled_bundle_writes(
 ) -> Result<(), Box<dyn std::error::Error>> {
