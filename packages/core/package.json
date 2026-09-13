@@ -8,12 +8,14 @@
   "module": "./index.ts",
   "types": "./index.ts",
   "exports": {
+    "./local-edits": { "types": "./local-edits.ts", "default": "./local-edits.ts" },
     ".": {
       "types": "./index.ts",
       "default": "./index.ts"
     }
   },
   "files": [
+    "local-edits.ts",
     "index.ts",
     "README.md",
     "package.json"

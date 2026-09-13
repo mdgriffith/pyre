@@ -1,0 +1,6 @@
+query EntriesForContext {
+    entry {
+        @where { details == Session.context }
+        id
+    }
+}

@@ -127,6 +127,15 @@ fn execute(options: &Options, paths: filesystem::Found, out_dir: &Path) -> io::R
                 }
             }
 
+            for unsupported in generated_queries::unsupported_local_edit_identities(&context) {
+                eprintln!(
+                    "Warning: local-edit CRUD for record `{}.{}` was omitted because primary key `{}` has unsupported type `{}`; generated local edits require an integer or UUID primary key.",
+                    unsupported.namespace,
+                    unsupported.record,
+                    unsupported.field,
+                    unsupported.type_
+                );
+            }
             generated_queries::append_generated_crud_queries(&mut all_queries, &context);
             let all_query_info_combined = match typecheck::check_queries(&all_queries, &context) {
                 Ok(info) => info,

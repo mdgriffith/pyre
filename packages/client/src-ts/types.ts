@@ -29,6 +29,8 @@ export interface ServerConfig {
   credentials?: RequestCredentials;
   withCredentials?: boolean;
   liveSyncTransport?: LiveSyncTransport;
+  /** Opt in per database. Adapters own authentication and routing; baseUrl is legacy-only. */
+  localEdits?: (databaseId: string) => import('./service/local-edits').LocalEditsConfig;
 }
 
 export interface SyncProgress {
@@ -63,9 +65,11 @@ export interface ElmPorts {
   };
   queryManagerOut?: {
     subscribe: (callback: (message: unknown) => void) => void;
+    unsubscribe?: (callback: (message: unknown) => void) => void;
   };
   queryClientOut?: {
     subscribe: (callback: (message: unknown) => void) => void;
+    unsubscribe?: (callback: (message: unknown) => void) => void;
   };
   errorOut?: {
     subscribe: (callback: (message: string) => void) => void;

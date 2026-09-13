@@ -431,7 +431,7 @@ fn docs_are_exposed_as_resources() {
     assert!(query_docs["content"]
         .as_str()
         .unwrap()
-        .contains("generated update inputs omit them"));
+        .contains("update inputs omit them and primary-key setters"));
 
     let migration_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "migrations" }));
     assert!(migration_docs["content"]

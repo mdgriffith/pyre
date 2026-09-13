@@ -557,7 +557,7 @@ record DocumentOwner {
             .iter()
             .map(|arg| arg.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["id", "updatedAt"]
+        vec!["id"]
     );
     typecheck::check_queries(&query_list, &context).expect("generated CRUD should typecheck");
 }

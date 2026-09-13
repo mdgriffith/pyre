@@ -1,0 +1,20 @@
+record Project {
+    @allow(*) { owner == Session.userId }
+    id Id.Uuid @id
+    name String
+    owner Int @immutable
+}
+
+record Task {
+    @allow(*) { owner == Session.userId }
+    id Id.Uuid @id
+    project Project.id
+    title String
+    owner Int @immutable
+}
+
+record Audit {
+    @allow(*) { Session.userId == 7 }
+    id Id.Int @id
+    message String
+}

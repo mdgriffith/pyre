@@ -1,3 +1,5 @@
+import type { Client, ResultSet, Transaction } from "@libsql/client";
+
 export type SqlInfo = {
   include: boolean;
   params: string[];
@@ -6,9 +8,51 @@ export type SqlInfo = {
 
 export type SqlStatement = { sql: string; args: Record<string, any> };
 
+export type JsonSessionValidators = Record<string, { parse(value: unknown): unknown }>;
+
+export interface GeneratedEdit {
+  kind: "create" | "update" | "delete";
+  writeStatementIndices: number[];
+  writableInputs: string[];
+}
+
+export class TargetNotWritable extends Error {
+  constructor() { super("TargetNotWritable"); }
+}
+
+/** Capture direct write cardinality before any later statement can overwrite changes(). */
+export async function executeStatements(
+  db: Pick<Client, "batch"> | Pick<Transaction, "execute">,
+  statements: SqlStatement[],
+  generatedEdit?: GeneratedEdit,
+): Promise<ResultSet[]> {
+  if ("batch" in db) {
+    if (generatedEdit) throw new Error("Generated edits require an explicit transaction");
+    return db.batch(statements);
+  }
+  const results: ResultSet[] = [];
+  for (let index = 0; index < statements.length; index++) {
+    const result = await db.execute(statements[index]);
+    if (generatedEdit?.writeStatementIndices.includes(index) && result.columns.length > 0) {
+      // The local libsql adapter hardcodes rowsAffected=0 for all result-producing SQL.
+      // SQLite changes() counts only this direct write, excluding triggers and cascades.
+      const count = await db.execute("select changes() as affected");
+      const affected = Number(count.rows[0]?.affected);
+      if (!Number.isSafeInteger(affected) || affected < 0) throw new Error("Invalid write count");
+      result.rowsAffected = affected;
+    }
+    results.push(result);
+  }
+  if (generatedEdit && generatedEdit.writeStatementIndices.reduce((sum, index) => sum + (results[index]?.rowsAffected ?? NaN), 0) !== 1)
+    throw new TargetNotWritable();
+  return results;
+}
+
 export function toSessionArgs(
   sessionArgs: string[],
   session: Record<string, unknown>,
+  jsonSessionArgs: string[] = [],
+  jsonSessionValidators: JsonSessionValidators = {},
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
@@ -17,10 +61,14 @@ export function toSessionArgs(
   }
 
   for (const key of sessionArgs) {
-    const resolved = resolveSessionArg(key, session);
-    const normalized = normalizeSqlArg(resolved.value);
+    const isJson = jsonSessionArgs.includes(key);
+    const resolved = resolveSessionArg(key, session, isJson);
+    const value = isJson && resolved.value != null && Object.hasOwn(jsonSessionValidators, key)
+      ? jsonSessionValidators[key].parse(resolved.value)
+      : resolved.value;
+    const normalized = normalizeSqlArg(value);
     result[`session_${key}`] =
-      normalized !== null && typeof normalized === "object"
+      normalized !== null && (isJson || typeof normalized === "object")
         ? JSON.stringify(normalized)
         : normalized;
   }
@@ -31,6 +79,7 @@ export function toSessionArgs(
 function resolveSessionArg(
   key: string,
   session: Record<string, unknown>,
+  isJson: boolean,
 ): { value: unknown } {
   let value: unknown = key in session ? session[key] : session;
 
@@ -43,7 +92,7 @@ function resolveSessionArg(
     }
   }
 
-  if (value !== null && typeof value === "object" && "_type" in value) {
+  if (!isJson && value !== null && typeof value === "object" && "_type" in value) {
     value = (value as Record<string, unknown>)._type;
   }
 
@@ -84,6 +133,8 @@ export function buildArgs(
   sessionArgs: string[],
   optionalInputArgs: string[] = [],
   jsonInputArgs: string[] = [],
+  jsonSessionArgs: string[] = [],
+  jsonSessionValidators: JsonSessionValidators = {},
 ): Record<string, unknown> {
   const args: Record<string, unknown> = {};
   const jsonInputArgSet = new Set(jsonInputArgs);
@@ -107,7 +158,7 @@ export function buildArgs(
     }
   }
 
-  Object.assign(args, toSessionArgs(sessionArgs, session));
+  Object.assign(args, toSessionArgs(sessionArgs, session, jsonSessionArgs, jsonSessionValidators));
 
   return args;
 }

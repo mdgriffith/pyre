@@ -1,4 +1,5 @@
 import type { ElmApp } from '../types';
+import { parsePath as parseDeltaPath } from './query-delta';
 
 export interface QueryRegistration {
   queryId: string;
@@ -53,7 +54,7 @@ type ErrorPayload = {
 
 type PathSegment =
   | { type: 'field'; name: string }
-  | { type: 'id'; id: string }
+  | { type: 'id'; id: string | number }
   | { type: 'index'; index: number };
 
 type UpdateResult = { ok: true; node: unknown } | { ok: false; details: string };
@@ -64,6 +65,7 @@ export class QueryClientService {
   private elmApp: ElmApp | null = null;
   private queryStates: Map<string, QueryState> = new Map();
   private hasPorts = false;
+  private portListener?: (message: unknown) => void;
   private logger: (payload: ErrorPayload) => void;
   private debugLog: (...args: unknown[]) => void;
   private onQueryResult: ((queryId: string) => void) | null = null;
@@ -86,15 +88,23 @@ export class QueryClientService {
     );
 
     if (elmApp.ports.queryClientOut) {
-      elmApp.ports.queryClientOut.subscribe((message) => {
+      this.portListener = (message) => {
         this.handleMessage(message).catch((error) => {
           this.logError({
             message: 'Failed to handle QueryDelta message',
             details: error instanceof Error ? error.message : String(error),
           });
         });
-      });
+      };
+      elmApp.ports.queryClientOut.subscribe(this.portListener);
     }
+  }
+
+  detach(): void {
+    if (this.portListener) this.elmApp?.ports.queryClientOut?.unsubscribe?.(this.portListener);
+    this.elmApp = null;
+    this.hasPorts = false;
+    this.queryStates.clear();
   }
 
   isAvailable(): boolean {
@@ -111,6 +121,22 @@ export class QueryClientService {
 
   getRegisteredQueryIds(): string[] {
     return Array.from(this.queryStates.keys());
+  }
+
+  /** Install every query before any observer sees this worker transition. */
+  installPublication(updates: QueryUpdate[]): () => void {
+    const notifications: Array<() => void> = [];
+    for (const update of updates) {
+      const state = this.queryStates.get(update.queryId);
+      if (!state || update.revision <= state.revision) continue;
+      state.result = update.result;
+      state.revision = update.revision;
+      notifications.push(() => {
+        try { state.callback(update); } catch (error) { console.error('[PyreClient] Query listener failed', error); }
+        try { this.onQueryResult?.(update.queryId); } catch (error) { console.error('[PyreClient] Query observer failed', error); }
+      });
+    }
+    return () => notifications.forEach(notify => notify());
   }
 
   refreshQuery(queryId: string): void {
@@ -545,97 +571,18 @@ const updateAtPath = (node: unknown, segments: PathSegment[], updater: UpdateFn)
 };
 
 const parsePath = (path: string): { ok: true; segments: PathSegment[] } | { ok: false; details: string } => {
-  if (!path.startsWith('.')) {
-    return { ok: false, details: 'Path must start with a dot' };
-  }
-
-  const rawSegments = path.slice(1).split('.');
-  if (rawSegments.length === 0) {
-    return { ok: false, details: 'Empty path' };
-  }
-
-  const segments: PathSegment[] = [];
-  for (const raw of rawSegments) {
-    if (!raw) {
-      return { ok: false, details: 'Empty path segment' };
+  const parsed = parseDeltaPath(path);
+  if (!parsed.ok || !parsed.segments) return { ok: false, details: parsed.error ?? 'Invalid path' };
+  return { ok: true, segments: parsed.segments.map((segment): PathSegment => {
+    switch (segment.kind) {
+      case 'field': return { type: 'field', name: segment.name };
+      case 'index': return { type: 'index', index: segment.index };
+      case 'id': return { type: 'id', id: segment.id };
     }
-
-    let cursor = 0;
-    let fieldName = '';
-    while (cursor < raw.length && raw[cursor] !== '#' && raw[cursor] !== '[') {
-      fieldName += raw[cursor];
-      cursor += 1;
-    }
-
-    if (!fieldName) {
-      return { ok: false, details: 'Missing field name' };
-    }
-
-    segments.push({ type: 'field', name: fieldName });
-
-    while (cursor < raw.length) {
-      if (raw[cursor] === '#') {
-        if (raw[cursor + 1] !== '(') {
-          return { ok: false, details: 'Invalid id selector' };
-        }
-        cursor += 2;
-        const parsedId = parseEscapedId(raw, cursor);
-        if (!parsedId.ok) {
-          return { ok: false, details: parsedId.details };
-        }
-        segments.push({ type: 'id', id: parsedId.id });
-        cursor = parsedId.next;
-        continue;
-      }
-
-      if (raw[cursor] === '[') {
-        const closing = raw.indexOf(']', cursor + 1);
-        if (closing === -1) {
-          return { ok: false, details: 'Unclosed index selector' };
-        }
-        const rawIndex = raw.slice(cursor + 1, closing);
-        if (!rawIndex || !/^[0-9]+$/.test(rawIndex)) {
-          return { ok: false, details: 'Invalid index selector' };
-        }
-        segments.push({ type: 'index', index: Number(rawIndex) });
-        cursor = closing + 1;
-        continue;
-      }
-
-      return { ok: false, details: 'Invalid selector segment' };
-    }
-  }
-
-  return { ok: true, segments };
+  }) };
 };
 
-const parseEscapedId = (
-  raw: string,
-  start: number
-): { ok: true; id: string; next: number } | { ok: false; details: string } => {
-  let cursor = start;
-  let id = '';
-  while (cursor < raw.length) {
-    const char = raw[cursor];
-    if (char === ')') {
-      return { ok: true, id, next: cursor + 1 };
-    }
-    if (char === '\\') {
-      const nextChar = raw[cursor + 1];
-      if (nextChar === undefined) {
-        return { ok: false, details: 'Dangling escape in id selector' };
-      }
-      id += nextChar;
-      cursor += 2;
-      continue;
-    }
-    id += char;
-    cursor += 1;
-  }
-  return { ok: false, details: 'Unclosed id selector' };
-};
-
-const findIndexById = (list: unknown[], id: string): number => {
+const findIndexById = (list: unknown[], id: string | number): number => {
   return list.findIndex((row) => {
     if (!isPlainObject(row)) {
       return false;
@@ -643,6 +590,6 @@ const findIndexById = (list: unknown[], id: string): number => {
     if (!('id' in row)) {
       return false;
     }
-    return String((row as { id: unknown }).id) === id;
+    return (row as { id: unknown }).id === id;
   });
 };

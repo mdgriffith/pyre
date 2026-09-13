@@ -10,6 +10,7 @@ const schema = {
   tables: {
     maps: {
       name: 'maps',
+      primaryKey: { name: 'id', kind: 'int' },
       links: {},
       indices: [],
     },

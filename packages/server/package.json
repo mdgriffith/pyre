@@ -7,12 +7,19 @@
   "scripts": {
     "profile:sync": "bun run ./sync-lifecycle.profile.ts",
     "test": "bun test",
+    "test:local-edits": "bun test local-edits.test.ts",
+    "seed:local-edits": "bun fixtures/local-edits/generate.ts && bun fixtures/local-edits/seed.ts",
+    "typecheck:local-edits": "bun fixtures/local-edits/generate.ts && tsc --noEmit -p fixtures/local-edits/tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "main": "./index.ts",
   "module": "./index.ts",
   "types": "./index.ts",
   "exports": {
+    "./local-edits": {
+      "types": "./local-edits.ts",
+      "default": "./local-edits.ts"
+    },
     "./context": {
       "types": "./context.ts",
       "default": "./context.ts"
@@ -64,6 +71,7 @@
     "context.ts",
     "index.ts",
     "init.ts",
+    "local-edits.ts",
     "database-id.ts",
     "query-sync.ts",
     "query.ts",
@@ -73,7 +81,10 @@
     "sync.ts",
     "wasm-json.ts",
     "wasm.ts",
-    "wasm",
+    "wasm/pyre_wasm.js",
+    "wasm/pyre_wasm_bg.wasm",
+    "wasm/pyre_wasm.d.ts",
+    "wasm/pyre_wasm_bg.wasm.d.ts",
     "README.md",
     "package.json"
   ],

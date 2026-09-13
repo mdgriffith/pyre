@@ -1,0 +1,23 @@
+type Choice
+    = Open
+    | Closed
+
+record Issue {
+    @allow(*) { owner == "me" }
+    id Id.Uuid @id
+    title String
+    assignee Issue.id?
+    owner String @immutable
+    createdAt DateTime @default(now)
+    updatedAt DateTime @updatedAt
+    payload Json<Dict<List<Int?>>>?
+    choice Choice?
+    watchers Json<List<Id.Uuid>>?
+    dueAt DateTime?
+}
+
+record Audit {
+    @public
+    id Int @id
+    message String
+}

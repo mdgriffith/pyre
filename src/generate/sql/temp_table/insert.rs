@@ -926,6 +926,7 @@ mod tests {
     fn initial_select_ignores_return_only_updated_at() {
         let context = typecheck::empty_context();
         let query = ast::Query {
+            generated_crud: false,
             interface_hash: String::new(),
             full_hash: String::new(),
             operation: ast::QueryOperation::Insert,
