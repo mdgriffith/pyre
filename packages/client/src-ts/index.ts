@@ -1592,7 +1592,8 @@ export class PyreClient {
     const created = this.config.createInternalClient(this.internalClientConfig(targetDatabaseId));
     this.clients.set(targetDatabaseId, created);
     void created.then((client) => {
-      this.watchInternalClient(targetDatabaseId, generation, client);
+      this.watchInternalClient(targetDatabaseId, generation, created, client);
+      this.startNextSync();
     }, () => {
       if (this.clients.get(targetDatabaseId) === created) this.clients.delete(targetDatabaseId);
     });
@@ -1621,6 +1622,9 @@ export class PyreClient {
 
     for (const databaseId of nextDatabaseIds) {
       await this.getOrCreateClient(databaseId);
+      if (this.latestSyncStates.get(databaseId)?.status === 'live') {
+        this.completedSyncDatabaseIds.add(databaseId);
+      }
     }
 
     this.startNextSync();
@@ -2076,7 +2080,9 @@ export class PyreClient {
       return;
     }
 
-    const nextDatabaseId = this.syncedDatabaseIds.find((databaseId) => !this.completedSyncDatabaseIds.has(databaseId));
+    const nextDatabaseId = this.syncedDatabaseIds.find((databaseId) => (
+      !this.completedSyncDatabaseIds.has(databaseId) && this.clients.has(databaseId)
+    ));
     if (!nextDatabaseId) {
       return;
     }
@@ -2184,7 +2190,12 @@ export class PyreClient {
     }
   }
 
-  private watchInternalClient(databaseId: DatabaseId, generation: number, client: PyreInternalClient): void {
+  private watchInternalClient(
+    databaseId: DatabaseId,
+    generation: number,
+    clientPromise: Promise<PyreInternalClient>,
+    client: PyreInternalClient
+  ): void {
     if (this.clientGenerations.get(databaseId) !== generation) return;
     if (this.config.server.localEdits && client.getLocalEdits) {
       const runtime = client.getLocalEdits();
@@ -2193,6 +2204,30 @@ export class PyreClient {
       while (queue?.length) queue.shift()!(runtime);
       this.initializingEditSubmissions.delete(databaseId);
       this.editRuntimes.set(databaseId, runtime);
+      void runtime.ended.then(() => {
+        if (this.clientGenerations.get(databaseId) !== generation
+          || this.clients.get(databaseId) !== clientPromise
+          || this.editRuntimes.get(databaseId) !== runtime) return;
+        this.clients.delete(databaseId);
+        this.editRuntimes.delete(databaseId);
+        this.initializingEditSubmissions.delete(databaseId);
+        this.latestSyncStates.set(databaseId, createInitialSyncState(this.config.schema));
+        this.completedSyncDatabaseIds.delete(databaseId);
+        if (this.syncingDatabaseId === databaseId) this.syncingDatabaseId = null;
+        this.internalDevtoolsUnsubscribers.get(databaseId)?.();
+        this.internalDevtoolsUnsubscribers.delete(databaseId);
+        const retiredGeneration = generation + 1;
+        this.clientGenerations.set(databaseId, retiredGeneration);
+        client.disconnect();
+        this.emitSyncState();
+        if (this.syncedDatabaseIds.includes(databaseId)
+          && this.clientGenerations.get(databaseId) === retiredGeneration
+          && !this.clients.has(databaseId)) {
+          void this.getOrCreateClient(databaseId).catch(() => this.startNextSync());
+        } else {
+          this.startNextSync();
+        }
+      });
     }
     this.markKnownDatabase(databaseId);
     this.internalDevtoolsUnsubscribers.get(databaseId)?.();

@@ -192,7 +192,7 @@ function sendBestEffort(
   } catch { /* Independent recipient delivery. */ }
 }
 
-function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDeltasFn {
+function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?: string): SyncDeltasFn {
   const normalizedDatabaseId = databaseId ? requireDatabaseId(databaseId) : undefined;
 
   return async (affectedRowGroups, connectedSessions, sendToSession, originSessionId, committedRevision) => {
@@ -204,7 +204,8 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
       if (!Object.hasOwn(recipient, "fence")) continue;
       legacySessions.delete(id);
       const parsed = fenceValidator.safeParse(recipient.fence);
-      if (!parsed.success || parsed.data.databaseId !== normalizedDatabaseId || parsed.data.databaseEpoch !== databaseEpoch) continue;
+      if (!parsed.success || parsed.data.databaseId !== normalizedDatabaseId || parsed.data.databaseEpoch !== databaseEpoch
+        || parsed.data.namespace !== namespace) continue;
       sendBestEffort(sendToSession, id, { type: "syncRequired", ...parsed.data, serverRevision,
         reconciliation: { kind: "replaceRequired", atLeast: serverRevision, invalidate: true, minimumSafeRevision: serverRevision } });
     }
@@ -351,7 +352,7 @@ export async function runWithSync(
   originSessionId?: string,
 ): Promise<QueryResult> {
   const originSession = structuredClone(executingSession);
-  const publish = syncWithWasmForDatabase(db, databaseId);
+  const publish = syncWithWasmForDatabase(db, databaseId, queryMap[queryId]?.primary_db);
   const sync: SyncDeltasFn = (rows, sessions, send, origin, revision) => {
     const current = new Map(sessions);
     if (origin && !current.has(origin)) current.set(origin, { session: originSession });

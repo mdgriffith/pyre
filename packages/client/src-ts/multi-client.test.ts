@@ -419,6 +419,30 @@ test('setSyncedDatabases starts sync one database at a time in order', async () 
   expect(starts).toEqual(['main', 'campaign:123', 'campaign:456']);
 });
 
+test('setSyncedDatabases completes an already-live local-edit client before scheduling the next database', async () => {
+  const starts: string[] = [];
+  const clients = new Map<string, ReturnType<typeof fakeInternalClient>>();
+  const runtime = { ended: new Promise<void>(() => {}), dispose() {} };
+  const client = await PyreClient.create({
+    schema,
+    server: { ...server, localEdits: () => ({}) },
+    cacheNamespace: 'user_42',
+    createInternalClient: async (config) => {
+      const internalClient = { ...fakeInternalClient([], config.databaseId, starts), getLocalEdits: () => runtime };
+      clients.set(config.databaseId, internalClient);
+      return internalClient;
+    },
+  });
+
+  await client.getOrCreateClient('main');
+  clients.get('main')?.emitLive();
+  await client.setSyncedDatabases(['main', 'campaign:123']);
+  await Bun.sleep(0);
+
+  expect(starts).toEqual(['campaign:123']);
+  client.disconnect();
+});
+
 test('setSyncedDatabases does not start removed pending databases', async () => {
   const starts: string[] = [];
   const clients = new Map<string, ReturnType<typeof fakeInternalClient>>();

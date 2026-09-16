@@ -533,6 +533,50 @@ record Item {
 }
 
 #[test]
+fn replacement_shape_resolves_physical_table_names_within_the_requested_namespace() {
+    let mut main = ast::Schema {
+        namespace: "Main".into(),
+        ..Default::default()
+    };
+    parser::run(
+        "main.pyre",
+        "record Current {\n @tablename(\"shared_rows\")\n @public\n id Int @id\n active Bool\n}\n",
+        &mut main,
+    )
+    .unwrap();
+    let mut archive = ast::Schema {
+        namespace: "Archive".into(),
+        ..Default::default()
+    };
+    parser::run(
+        "archive.pyre",
+        "record Historical {\n @tablename(\"shared_rows\")\n @public\n id Int @id\n label String\n}\n",
+        &mut archive,
+    )
+    .unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![main, archive],
+    })
+    .unwrap();
+    let plan = sync::get_replacement_sql(&context, &HashMap::new(), "Main").unwrap();
+    let table = &plan.tables[0];
+    let object = json!({"id": 1, "active": 1, "updatedAt": 0});
+    let group = AffectedRowTableGroup {
+        table_name: table.table_name.clone(),
+        headers: table.headers.clone(),
+        rows: vec![table
+            .headers
+            .iter()
+            .map(|name| object[name].clone())
+            .collect()],
+    };
+
+    let shaped = sync::reshape_replacement_table(&context, "Main", &group).unwrap();
+    assert_eq!(shaped.headers, vec!["id", "active", "updatedAt"]);
+    assert_eq!(shaped.rows, vec![vec![json!(1), json!(true), json!(0)]]);
+}
+
+#[test]
 fn replacement_shape_canonicalizes_datetime_and_nested_custom_wire_values() {
     let context = context(
         r#"

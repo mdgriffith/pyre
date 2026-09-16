@@ -351,7 +351,12 @@ test("replacement does not reuse live-delta limits and rejects malformed aggrega
 
 test("named mutations publish fenced replacement hints at their committed revision, including no-ops", async () => {
   await replacementDatabase(async ({ db, manifest, authority, replace }) => {
-    const recipients = new Map([["reader", { session: { userId: 7 }, fence: { ...authority, databaseEpoch: "e1" } }]]);
+    const recipients = new Map([
+      ["reader", { session: { userId: 7 }, fence: { ...authority, databaseEpoch: "e1" } }],
+      ["other-namespace", { session: { userId: 7 }, fence: {
+        ...authority, namespace: "Archive", manifest: "archive-m1", databaseEpoch: "e1",
+      } }],
+    ]);
     const revoked = await runWithSync(db, manifest.queries, "revoke", {}, { userId: 7 }, recipients, authority.databaseId, "reader");
     expect(revoked.kind).toBe("success");
     expect(revoked.response).toEqual({});

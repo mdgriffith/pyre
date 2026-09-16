@@ -455,6 +455,52 @@ test('epoch mismatch ends the old lifetime instead of adopting foreign revision'
   expect(h.runtime.fence.databaseEpoch).toBe('e1');
 });
 
+test('epoch mismatch automatically recreates an enrolled lifetime and resumes sequential sync', async () => {
+  const old = await ready();
+  const current = await ready({ fence: { ...fence, instance: 'next', databaseEpoch: 'e2' } });
+  const other = await ready({ fence: { ...fence, databaseId: 'other', instance: 'other' } });
+  const states = [], starts = [], mainInternals = [old, current];
+  let mainCreations = 0, makeOtherLive;
+  const client = await PyreClient.create({
+    schema, cacheNamespace: 'test', server: { baseUrl: 'https://unused.invalid', localEdits: () => ({}) },
+    createInternalClient: async config => {
+      const h = config.databaseId === 'main' ? mainInternals[mainCreations++] : other;
+      const callbacks = [];
+      if (config.databaseId === 'other') makeOtherLive = () => callbacks.forEach(callback => callback({ status: 'live', tables: {} }));
+      return {
+        getLocalEdits: () => h.runtime,
+        run: () => undefined,
+        startSync: () => starts.push(`${config.databaseId}:${h.runtime.fence.instance}`),
+        onDevtoolsEvent: () => () => {},
+        onSyncState: callback => {
+          callbacks.push(callback);
+          callback({ status: h === old ? 'live' : 'not_started', tables: {} });
+          return () => {};
+        },
+        disconnect: () => h.runtime.dispose(),
+      };
+    },
+  });
+  client.onSyncState(state => states.push(state));
+  await client.setSyncedDatabases(['main', 'other']);
+  expect(starts).toEqual(['other:other']);
+  makeOtherLive();
+  await tick();
+  const oldRuntime = old.runtime;
+  const receipt = oldRuntime.submitNamed(command.id, {});
+  await until(() => old.writes.length === 1);
+
+  oldRuntime.receiveResponse(receipt.requestId, { ...fence, databaseEpoch: 'e2', requestId: receipt.requestId, status: 'rejected', code: 'PermissionDenied' });
+  await oldRuntime.ended;
+  await until(() => mainCreations === 2 && starts.includes('main:next'));
+
+  expect(client.getInternalDatabaseIds()).toEqual(['other', 'main']);
+  expect(states.at(-1)?.status).not.toBe('live');
+  expect(mainCreations).toBe(2);
+  expect(starts).toEqual(['other:other', 'main:next']);
+  client.disconnect();
+});
+
 test('entity complete publication removes filter exits, absent keys, and cross-table rows in one batch', () => {
   const stream = new EntityStreamService(schema), batches = [];
   stream.subscribeVisible({ tables: [{ tableName: 'users', where: { name: 'base' } }] }, b => batches.push(b));

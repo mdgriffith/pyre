@@ -153,15 +153,11 @@ pub fn reshape_replacement_table(
 ) -> Result<crate::sync_deltas::AffectedRowTableGroup, SyncError> {
     let invalid = || SyncError::SqlGenerationError("InvalidReplacementTable".into());
     let mut candidates = context.tables.values().filter(|table| {
-        ast::get_tablename(&table.record.name, &table.record.fields) == group.table_name
+        table.schema == namespace
+            && ast::get_tablename(&table.record.name, &table.record.fields) == group.table_name
     });
     let table = candidates.next().ok_or_else(invalid)?;
-    // The shared reshaper resolves physical names; reject ambiguity rather than
-    // accidentally applying a different namespace's codec.
-    if candidates.next().is_some()
-        || table.schema != namespace
-        || !table_sync_enabled(context, table)
-    {
+    if candidates.next().is_some() || !table_sync_enabled(context, table) {
         return Err(invalid());
     }
     let mut headers = Vec::new();
@@ -189,9 +185,7 @@ pub fn reshape_replacement_table(
     if group.headers != headers || group.rows.iter().any(|row| row.len() != headers.len()) {
         return Err(invalid());
     }
-    let mut reshaped =
-        crate::sync_shape::reshape_table_groups(std::slice::from_ref(group), context);
-    let result = reshaped.pop().ok_or_else(invalid)?;
+    let result = crate::sync_shape::reshape_table_group_with_table(group, context, table);
     for row in &result.rows {
         for ((name, schema), value) in fields.iter().zip(row) {
             crate::server::manifest::validate_storage_field(name, value, schema)

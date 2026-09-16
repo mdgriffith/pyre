@@ -164,6 +164,14 @@ fn reshape_table_group(
         return table_group.clone();
     };
 
+    reshape_table_group_with_table(table_group, context, table)
+}
+
+pub(crate) fn reshape_table_group_with_table(
+    table_group: &AffectedRowTableGroup,
+    context: &typecheck::Context,
+    table: &typecheck::Table,
+) -> AffectedRowTableGroup {
     let output_headers = table
         .record
         .fields
