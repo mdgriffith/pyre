@@ -42,6 +42,190 @@ fn generated_update_setters_cannot_collide_with_crud_functions() {
 }
 
 #[test]
+fn query_only_namespaces_do_not_generate_elm_local_edit_modules() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "@syncable(false)\nrecord ReadOnly {\n @public\n id Id.Int @id\n name String\n}\n",
+        &mut schema,
+    )
+    .unwrap();
+    let mut database = ast::Database {
+        schemas: vec![schema],
+    };
+    ast::resolve_id_brands(&mut database);
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut queries = parser::parse_query(
+        "queries.pyre",
+        "query ReadOnlyRows { readOnly { id name } }\ninsert NamedWrite($name: String) { readOnly { name = $name id } }\n",
+    )
+    .unwrap();
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = Vec::new();
+    elm::generate_queries(&context, &info, &queries, Path::new("src"), &mut files);
+
+    assert!(files
+        .iter()
+        .any(|file| file.path.ends_with("Query/ReadOnlyRows.elm")));
+    assert!(files
+        .iter()
+        .any(|file| file.path.ends_with("Query/NamedWrite.elm")));
+    assert!(!files
+        .iter()
+        .any(|file| file.path.to_string_lossy().contains("Db/Default/Edit/")));
+}
+
+#[test]
+fn collision_safe_namespace_and_edit_id_names_compile() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir_in(root.join("target")).unwrap();
+    let definitions = [
+        ("_default", "DefaultThing"),
+        ("Default", "NamedThing"),
+        ("Foo", "BarBaz"),
+        ("FooBar", "Baz"),
+    ];
+    let mut schemas = Vec::new();
+    for (namespace, record) in definitions {
+        let mut schema = ast::Schema {
+            namespace: namespace.into(),
+            ..ast::Schema::default()
+        };
+        parser::run(
+            &format!("{namespace}/schema.pyre"),
+            &format!("record {record} {{\n @public\n id Id.Int @id\n}}\n"),
+            &mut schema,
+        )
+        .unwrap();
+        schemas.push(schema);
+    }
+    let foo = schemas
+        .iter_mut()
+        .find(|schema| schema.namespace == "Foo")
+        .unwrap();
+    parser::run(
+        "Foo/collisions.pyre",
+        "record FooBar {\n @public\n id Int @id\n}\nrecord Foo_Bar {\n @public\n id Int @id\n}\nrecord A {\n @public\n id Int @id\n}\nrecord AIdentity {\n @public\n id Int @id\n}\n",
+        foo,
+    )
+    .unwrap();
+    let mut database = ast::Database { schemas };
+    ast::resolve_id_brands(&mut database);
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut queries = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = Vec::new();
+    elm::generate(Path::new("src"), &database, &mut files);
+    elm::generate_queries(&context, &info, &queries, Path::new("src"), &mut files);
+
+    let generated = |suffix: &str| {
+        &files
+            .iter()
+            .find(|file| file.path.ends_with(suffix))
+            .unwrap_or_else(|| panic!("missing generated {suffix}"))
+            .contents
+    };
+    let database_ids = generated("Db/Database.elm");
+    assert!(database_ids.contains("type Default\n    = Default"));
+    assert!(database_ids.contains("type DefaultNamespace\n    = DefaultNamespace"));
+    assert!(files
+        .iter()
+        .any(|file| file.path.ends_with("Db/Default/Edit/DefaultThing.elm")));
+    assert!(files.iter().any(|file| file
+        .path
+        .ends_with("Db/DefaultNamespace/Edit/NamedThing.elm")));
+    let edit_ids = generated("Db/EditIds.elm");
+    assert!(edit_ids.contains("type alias FooBarBaz ="));
+    assert!(edit_ids.contains("type alias FooBarBazNamespace ="));
+    assert!(edit_ids.contains("type FooAIdentityNamespace"));
+    assert!(edit_ids.contains("type alias FooA =\n    Db.Id.Integer FooAIdentityNamespace"));
+    assert!(edit_ids.contains("type alias FooAIdentity ="));
+    assert!(files
+        .iter()
+        .any(|file| file.path.ends_with("Db/Foo/Edit/FooBar.elm")));
+    assert!(files
+        .iter()
+        .any(|file| file.path.ends_with("Db/Foo/Edit/FooBarNamespace.elm")));
+
+    for file in files {
+        let path = temp.path().join(file.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, file.contents).unwrap();
+    }
+    fs::write(
+        temp.path().join("elm.json"),
+        include_str!("fixtures/elm-local-edits/elm.json"),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("src/Collision.elm"),
+        r#"module Collision exposing (all)
+
+import Db.Database
+import Db.Default.Edit.DefaultThing as DefaultThing
+import Db.DefaultNamespace.Edit.NamedThing as NamedThing
+import Db.EditIds
+import Db.Foo.Edit.BarBaz as BarBaz
+import Db.Foo.Edit.FooBar as FooBar
+import Db.Foo.Edit.FooBarNamespace as FooBarUnderscore
+import Db.FooBar.Edit.Baz as Baz
+import Db.Id
+
+defaultDb : Db.Database.DatabaseId Db.Database.Default
+defaultDb = Db.Database.fromString "default"
+
+namedDb : Db.Database.DatabaseId Db.Database.DefaultNamespace
+namedDb = Db.Database.fromString "named"
+
+fooId : Db.EditIds.FooBarBaz
+fooId = Db.Id.int 3
+
+fooBarId : Db.EditIds.FooBarBazNamespace
+fooBarId = Db.Id.int 4
+
+aId : Db.EditIds.FooA
+aId = Db.Id.int 5
+
+aIdentityId : Db.EditIds.FooAIdentity
+aIdentityId = Db.Id.int 6
+
+all =
+    { defaultThing = DefaultThing.delete (Db.Id.int 1)
+    , namedThing = NamedThing.delete (Db.Id.int 2)
+    , barBaz = BarBaz.delete fooId
+    , baz = Baz.delete fooBarId
+    , fooBar = FooBar.delete (Db.Id.int 7)
+    , fooBarUnderscore = FooBarUnderscore.delete (Db.Id.int 8)
+    , a = aId
+    , aIdentity = aIdentityId
+    }
+"#,
+    )
+    .unwrap();
+    let output = Command::new("npx")
+        .args([
+            "--yes",
+            "--package",
+            "elm@0.19.1-6",
+            "elm",
+            "make",
+            "src/Collision.elm",
+            "--output=/dev/null",
+        ])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn generated_local_edits_compile_and_run() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let temp = tempfile::tempdir_in(root.join("target")).unwrap();

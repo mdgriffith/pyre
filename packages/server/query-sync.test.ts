@@ -13,6 +13,7 @@ let introspectionResult = { schema_source: "test schema" };
 let sessionIds = ["s1"];
 let reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]];
 let deltaError: string | undefined;
+let reshapeError: string | undefined;
 let replacementPlan: any;
 let replacementReshape = false;
 let replacementSession: any;
@@ -69,13 +70,13 @@ mock.module("./wasm/pyre_wasm.js", () => ({
       ],
     };
   },
-  reshape_sync_table_groups: (groups: any) => replacementReshape ? groups : ([
+  reshape_sync_table_groups: (groups: any) => reshapeError ?? (replacementReshape ? groups : ([
     {
       table_name: "maps",
       headers: ["id", "name", "tiling"],
       rows: reshapedRows,
     },
-  ]),
+  ])),
 }));
 
 const { runWithSync, runBatchWithSync, catchupReplacement } = await import("./query-sync");
@@ -138,6 +139,7 @@ beforeEach(() => {
   sessionIds = ["s1"];
   reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]];
   deltaError = undefined;
+  reshapeError = undefined;
   replacementPlan = undefined;
   replacementReshape = false;
   replacementSession = undefined;
@@ -855,4 +857,65 @@ test("runWithSync advances revision and requires catchup when delta calculation 
     },
   ]);
   expect(db.executedSql.some((sql) => sql.includes("returning database_epoch, server_revision"))).toBe(true);
+});
+
+test("runWithSync requires revisioned catchup for reshape failures, including the origin", async () => {
+  await replacementDatabase(async ({ db, manifest, authority }) => {
+    sessionIds = ["origin", "first", "second"];
+    reshapeError = "Error: invalid table groups";
+    const result = await runWithSync(
+      db,
+      manifest.queries,
+      "noop",
+      {},
+      { userId: 7 },
+      new Map(sessionIds.map((sessionId) => [sessionId, { session: { userId: 7 } }])),
+      authority.databaseId,
+      "origin",
+    );
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
+    const sent: Array<{ sessionId: string; message: any }> = [];
+    const syncResult = await result.sync((sessionId, message) => sent.push({ sessionId, message }));
+    const fallback = {
+      type: "syncRequired",
+      serverRevision: 1,
+      databaseEpoch: "e1",
+      databaseId: authority.databaseId,
+    };
+
+    expect(sent).toEqual([
+      { sessionId: "first", message: fallback },
+      { sessionId: "second", message: fallback },
+    ]);
+    expect(syncResult.originMessage).toEqual(fallback);
+    expect((result.response as any).sync).toEqual(fallback);
+  });
+});
+
+test("runWithSync isolates thrown and rejected recipient sends during fanout", async () => {
+  await replacementDatabase(async ({ db, manifest, authority }) => {
+    sessionIds = ["throws", "rejects", "later"];
+    const result = await runWithSync(
+      db,
+      manifest.queries,
+      "noop",
+      {},
+      { userId: 7 },
+      new Map(sessionIds.map((sessionId) => [sessionId, { session: { userId: 7 } }])),
+      authority.databaseId,
+    );
+    const sent: Array<{ sessionId: string; message: any }> = [];
+    const syncResult = await result.sync((sessionId, message) => {
+      if (sessionId === "throws") throw new Error("disconnected");
+      if (sessionId === "rejects") return Promise.reject(new Error("closed asynchronously"));
+      sent.push({ sessionId, message });
+    });
+
+    expect(syncResult.serverRevision).toBe(1);
+    expect(sent).toEqual([{
+      sessionId: "later",
+      message: expect.objectContaining({ type: "delta", serverRevision: 1, databaseEpoch: "e1" }),
+    }]);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
+  });
 });

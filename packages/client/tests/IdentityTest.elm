@@ -24,6 +24,7 @@ schema =
         Dict.fromList
             [ ( "people"
               , { name = "people"
+                , columns = Nothing
                 , primaryKey = { name = "personKey", kind = Schema.UuidKey }
                 , indices = [ { field = "name", unique = False, primary = False } ]
                 , links = Dict.fromList [ ( "notes", { type_ = Schema.OneToMany, from = "personKey", to = { table = "notes", column = "owner" } } ) ]
@@ -31,6 +32,7 @@ schema =
               )
             , ( "notes"
               , { name = "notes"
+                , columns = Nothing
                 , primaryKey = { name = "number", kind = Schema.IntKey }
                 , indices = [ { field = "owner", unique = False, primary = False } ]
                 , links =
@@ -262,7 +264,7 @@ suite =
             \_ ->
                 let
                     metadata name =
-                        { name = name, primaryKey = { name = "key", kind = Schema.IntKey }, links = Dict.empty, indices = [] }
+                        { name = name, columns = Nothing, primaryKey = { name = "key", kind = Schema.IntKey }, links = Dict.empty, indices = [] }
 
                     scopedSchema =
                         { tables = Dict.fromList [ ( "a", metadata "a" ), ( "b", metadata "b" ) ], queryFieldToTable = Dict.empty }
@@ -344,7 +346,7 @@ suite =
             \_ ->
                 let
                     legacySchema =
-                        { tables = Dict.singleton "legacy" { name = "legacy", primaryKey = { name = "slug", kind = Schema.UnsupportedKey }, links = Dict.empty, indices = [] }
+                        { tables = Dict.singleton "legacy" { name = "legacy", columns = Nothing, primaryKey = { name = "slug", kind = Schema.UnsupportedKey }, links = Dict.empty, indices = [] }
                         , queryFieldToTable = Dict.singleton "legacy" "legacy"
                         }
 

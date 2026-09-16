@@ -82,7 +82,7 @@ impl<'a> SyncServer<'a> {
     pub async fn replacement(
         &self,
         conn: &libsql::Connection,
-        manifest: &crate::server::manifest::Manifest,
+        manifest: &crate::server::manifest::BoundManifest,
         binding: &crate::server::query::BatchBinding<'_>,
         request: &ReplacementRequest,
         session: &crate::server::manifest::PyreSession,
@@ -90,12 +90,10 @@ impl<'a> SyncServer<'a> {
         let fence = &request.fence;
         if request.version != 1
             || manifest.version != 1
+            || !manifest.authorizes_namespace(binding.namespace)
             || manifest.replacement_contracts.get(binding.namespace)
                 != crate::generate::manifest::replacement_contract(self.context, binding.namespace)
                     .as_ref()
-            || !manifest
-                .replacement_contracts
-                .contains_key(binding.namespace)
             || request.request_id.is_empty()
             || request.target < 0
             || fence.database_id != binding.database_id

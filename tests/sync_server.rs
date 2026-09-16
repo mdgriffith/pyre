@@ -2,7 +2,7 @@
 mod helpers;
 
 use helpers::test_database::TestDatabase;
-use pyre::server::manifest::{FieldSchema, PyreSession};
+use pyre::server::manifest::{BoundManifest, FieldSchema, PyreSession};
 use pyre::server::query::QueryResult;
 use pyre::server::schema::{
     load_context_from_database, load_schema_from_database, Error as SchemaError,
@@ -145,7 +145,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     extra["sql"] = json!("SELECT secret");
     assert!(serde_json::from_value::<ReplacementRequest>(extra).is_err());
     let snapshot = server
-        .replacement(&conn, &manifest, &binding, &replacement_request, &session)
+        .replacement(&conn, &bound, &binding, &replacement_request, &session)
         .await?;
     assert!(snapshot.complete);
     assert_eq!(snapshot.revision, 1);
@@ -165,25 +165,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     let mut mismatched = serde_json::to_value(&manifest)?;
     mismatched["replacementContracts"][binding.namespace] = json!("different-schema");
     let mismatched: Manifest = serde_json::from_value(mismatched)?;
-    let mismatched_fingerprint = mismatched.fingerprint();
-    let mismatched_binding = query::BatchBinding {
-        manifest: &mismatched_fingerprint,
-        ..binding
-    };
-    let mut mismatched_request = replacement_request.clone();
-    mismatched_request.fence.manifest = mismatched_fingerprint.clone();
-    assert!(matches!(
-        server
-            .replacement(
-                &conn,
-                &mismatched,
-                &mismatched_binding,
-                &mismatched_request,
-                &session
-            )
-            .await,
-        Err(pyre::server::sync::Error::InvalidFence)
-    ));
+    assert!(BoundManifest::new(mismatched, &db.context).is_err());
     assert_eq!(
         result.response["results"][0],
         json!({"index":0,"operation":create.id,"value":{"id":1}})
@@ -233,7 +215,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
         assert!(
             matches!(
                 server
-                    .replacement(&conn, &manifest, &binding, &invalid, &session)
+                    .replacement(&conn, &bound, &binding, &invalid, &session)
                     .await,
                 Err(pyre::server::sync::Error::InvalidFence)
             ),
@@ -244,26 +226,26 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     future.target = 2;
     assert!(matches!(
         server
-            .replacement(&conn, &manifest, &binding, &future, &session)
+            .replacement(&conn, &bound, &binding, &future, &session)
             .await,
         Err(pyre::server::sync::Error::TargetNotReached)
     ));
     future.target = -1;
     assert!(server
-        .replacement(&conn, &manifest, &binding, &future, &session)
+        .replacement(&conn, &bound, &binding, &future, &session)
         .await
         .is_err());
     future = replacement_request.clone();
     future.request_id.clear();
     assert!(server
-        .replacement(&conn, &manifest, &binding, &future, &session)
+        .replacement(&conn, &bound, &binding, &future, &session)
         .await
         .is_err());
     conn.execute("ATTACH DATABASE ':memory:' AS other", ())
         .await?;
     assert!(matches!(
         server
-            .replacement(&conn, &manifest, &binding, &replacement_request, &session)
+            .replacement(&conn, &bound, &binding, &replacement_request, &session)
             .await,
         Err(pyre::server::sync::Error::InvalidFence)
     ));
@@ -292,7 +274,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     conn.execute("UPDATE items SET updatedAt = 'invalid'", ())
         .await?;
     assert!(
-        matches!(server.replacement(&conn, &manifest, &binding, &replacement_request, &session).await,
+        matches!(server.replacement(&conn, &bound, &binding, &replacement_request, &session).await,
         Err(pyre::server::sync::Error::Sync(pyre::sync::SyncError::SqlGenerationError(message))) if message == "InvalidReplacementTable")
     );
     Ok(())
@@ -405,7 +387,7 @@ update MoveKey($id: Int, $next: Int) {
         target: 1,
     };
     let first = server
-        .replacement(&conn, &manifest, &binding, &catchup, &session)
+        .replacement(&conn, &bound, &binding, &catchup, &session)
         .await?;
     assert_eq!(first.tables["notes"].rows.len(), 3);
     request.operations = vec![
@@ -428,7 +410,7 @@ update MoveKey($id: Int, $next: Int) {
     assert_eq!(moved.response["commitRevision"], 3);
     // A fixed old target may return a newer complete revision, without replaying intermediate deltas.
     let final_snapshot = server
-        .replacement(&conn, &manifest, &binding, &catchup, &session)
+        .replacement(&conn, &bound, &binding, &catchup, &session)
         .await?;
     assert_eq!(final_snapshot.target, 1);
     assert_eq!(final_snapshot.revision, 3);
@@ -437,7 +419,7 @@ update MoveKey($id: Int, $next: Int) {
     request.operations = vec![operation("delete", json!({"id":30}))];
     query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     let empty = server
-        .replacement(&conn, &manifest, &binding, &catchup, &session)
+        .replacement(&conn, &bound, &binding, &catchup, &session)
         .await?;
     assert_eq!(empty.revision, 4);
     assert!(empty.complete);
@@ -489,6 +471,7 @@ record Workspace {
             .unwrap()
             .contents,
     )?;
+    let bound = BoundManifest::new(manifest.clone(), &db.context)?;
     let fingerprint = manifest.fingerprint();
     let session = PyreSession::new(json!({"userId":1}), &manifest.session_schema)?;
     let conn = db.db.connect()?;
@@ -522,14 +505,14 @@ record Workspace {
     };
     let server = SyncServer::new(&db.context);
     let before = server
-        .replacement(&conn, &manifest, &binding, &request, &session)
+        .replacement(&conn, &bound, &binding, &request, &session)
         .await?;
     assert_eq!(before.tables["workspaces"].rows.len(), 5002);
     assert!(before.tables["memberships"].rows.is_empty());
     conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 5003 UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO workspaces SELECT x, 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces WHERE id > 5002;").await?;
     assert!(matches!(
         server
-            .replacement(&conn, &manifest, &binding, &request, &session)
+            .replacement(&conn, &bound, &binding, &request, &session)
             .await,
         Err(pyre::server::sync::Error::ReplacementTooLarge)
     ));
@@ -540,7 +523,7 @@ record Workspace {
     // Only the linked permission table changes, not the visible table or its timestamp.
     conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM memberships; UPDATE _pyre_sync SET server_revision=server_revision+1; COMMIT;").await?;
     let after = server
-        .replacement(&conn, &manifest, &binding, &request, &session)
+        .replacement(&conn, &bound, &binding, &request, &session)
         .await?;
     assert_eq!(after.revision, 1);
     assert!(after.tables["workspaces"].rows.is_empty());
@@ -616,7 +599,7 @@ record Workspace {
     let invalid_session = PyreSession::new(json!({}), &HashMap::new())?;
     assert!(matches!(
         server
-            .replacement(&conn, &manifest, &binding, &request, &invalid_session)
+            .replacement(&conn, &bound, &binding, &request, &invalid_session)
             .await,
         Err(pyre::server::sync::Error::InvalidSession)
     ));
@@ -645,6 +628,7 @@ async fn replacement_pins_all_tables_and_revision_during_concurrent_commits(
             .unwrap()
             .contents,
     )?;
+    let bound = BoundManifest::new(manifest.clone(), &db.context)?;
     let fingerprint = manifest.fingerprint();
     let namespace = db.context.valid_namespaces.iter().next().unwrap();
     let binding = BatchBinding {
@@ -685,7 +669,7 @@ async fn replacement_pins_all_tables_and_revision_during_concurrent_commits(
     let server = SyncServer::new(&db.context);
     for _ in 0..100 {
         let snapshot = server
-            .replacement(&conn, &manifest, &binding, &request, &session)
+            .replacement(&conn, &bound, &binding, &request, &session)
             .await?;
         assert_eq!(
             snapshot.tables["alphas"].rows[0]["marker"],
@@ -698,7 +682,7 @@ async fn replacement_pins_all_tables_and_revision_during_concurrent_commits(
     }
     commits.await?;
     let final_snapshot = server
-        .replacement(&conn, &manifest, &binding, &request, &session)
+        .replacement(&conn, &bound, &binding, &request, &session)
         .await?;
     assert_eq!(final_snapshot.revision, 100);
     Ok(())

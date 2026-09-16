@@ -219,10 +219,6 @@ async fn runtime_reports_statement_index_and_transaction_stages() {
     statements[0].sql = "INSERT INTO children VALUES (99)".to_string();
     let error = query::run(&conn, &manifest, "Test", json!({}), &session)
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("commit transaction: database error"),
-        "{error}"
-    );
+        .unwrap_err();
+    assert!(matches!(error, query::Error::OutcomeUnknown));
 }

@@ -531,7 +531,7 @@ transition kind value model =
                         if requestId /= expectedId then
                             ( model, [] )
 
-                        else if replacement.target /= target || replacement.revision < target || replacement.revision < model.coveredRevision || Dict.keys replacement.tables /= Dict.keys model.authoritative.schema.tables then
+                        else if replacement.target /= target || replacement.revision < target || replacement.revision < model.coveredRevision || not (validReplacement model.authoritative.schema replacement.tables) then
                             catchupFailure model
 
                         else if model.minimumSafeRevision |> Maybe.map (\minimum -> replacement.revision < minimum) |> Maybe.withDefault True then
@@ -768,16 +768,29 @@ invalidateUnknown value model =
 
 applyHint : Hint -> Model -> Model
 applyHint hint model =
+    let
+        coveredInvalidation =
+            hint.invalidate
+                && not model.invalid
+                && model.coveredRevision >= hint.atLeast
+                && (hint.minimum
+                        |> Maybe.map (\minimum -> minimum >= hint.atLeast && model.coveredRevision >= minimum)
+                        |> Maybe.withDefault False
+                   )
+
+        invalidate =
+            hint.invalidate && not coveredInvalidation
+    in
     { model
         | requiredRevision = max model.requiredRevision hint.atLeast
-        , invalid = model.invalid || hint.invalidate
+        , invalid = model.invalid || invalidate
         , minimumSafeRevision =
             if model.securityBarrierRequired then
                 -- Without a revision bound, an uncorrelated hint could predate the
                 -- uncertainty. Recovery requires a new authenticated lifetime.
                 Nothing
 
-            else if hint.invalidate then
+            else if invalidate then
                 hint.minimum
                     |> Maybe.andThen
                         (\minimum ->
@@ -796,12 +809,183 @@ applyHint hint model =
             else
                 model.minimumSafeRevision
         , securityFloor =
-            if hint.invalidate then
+            if invalidate then
                 max model.securityFloor (max hint.atLeast (Maybe.withDefault 0 hint.minimum))
 
             else
                 model.securityFloor
     }
+
+
+validReplacement : Schema.SchemaMetadata -> Dict String (List (Dict String Value)) -> Bool
+validReplacement schema tables =
+    Dict.keys tables
+        == Dict.keys schema.tables
+        && (Dict.toList tables
+                |> List.all
+                    (\( tableName, rows ) ->
+                        case Dict.get tableName schema.tables |> Maybe.andThen .columns of
+                            Nothing ->
+                                List.isEmpty rows
+
+                            Just columns ->
+                                let
+                                    expected =
+                                        columns |> List.map .name |> Set.fromList
+                                in
+                                Set.size expected
+                                    == List.length columns
+                                    && List.all
+                                        (\row ->
+                                            Set.fromList (Dict.keys row)
+                                                == expected
+                                                && List.all
+                                                    (\column -> Dict.get column.name row |> Maybe.map (validColumnValue column) |> Maybe.withDefault False)
+                                                    columns
+                                        )
+                                        rows
+                    )
+           )
+
+
+validColumnValue : Schema.ColumnInfo -> Value -> Bool
+validColumnValue column value =
+    column.codec
+        |> Maybe.map (\codec -> validCodec Dict.empty codec value)
+        |> Maybe.withDefault False
+
+
+validCodec : Dict String Schema.WireCodec -> Schema.WireCodec -> Value -> Bool
+validCodec named codec value =
+    case codec of
+        Schema.StringCodec ->
+            case value of
+                Value.StringValue _ ->
+                    True
+
+                _ ->
+                    False
+
+        Schema.SafeIntCodec ->
+            safeInt value
+
+        Schema.FloatCodec ->
+            case value of
+                Value.IntValue _ ->
+                    True
+
+                Value.FloatValue _ ->
+                    True
+
+                _ ->
+                    False
+
+        Schema.BoolCodec ->
+            case value of
+                Value.BoolValue _ ->
+                    True
+
+                _ ->
+                    False
+
+        Schema.DateCodec ->
+            case value of
+                Value.StringValue _ ->
+                    True
+
+                _ ->
+                    False
+
+        Schema.DateTimeCodec ->
+            case value of
+                Value.IntValue seconds ->
+                    seconds >= -8640000000000 && seconds <= 8640000000000
+
+                _ ->
+                    False
+
+        Schema.JsonCodec ->
+            value /= Value.NullValue
+
+        Schema.UuidCodec ->
+            Identity.fromValue Schema.UuidKey value |> Result.toMaybe |> (/=) Nothing
+
+        Schema.ListCodec item ->
+            case value of
+                Value.ArrayValue values ->
+                    List.all (validCodec named item) values
+
+                _ ->
+                    False
+
+        Schema.DictCodec item ->
+            case value of
+                Value.ObjectValue values ->
+                    Dict.values values |> List.all (validCodec named item)
+
+                _ ->
+                    False
+
+        Schema.NullableCodec item ->
+            value == Value.NullValue || validCodec named item value
+
+        Schema.EnumCodec values ->
+            case value of
+                Value.ObjectValue object ->
+                    case ( Dict.keys object, Dict.get "_type" object ) of
+                        ( [ "_type" ], Just (Value.StringValue tag) ) ->
+                            Set.member tag values
+
+                        _ ->
+                            False
+
+                _ ->
+                    False
+
+        Schema.TaggedUnionCodec variants ->
+            case value of
+                Value.ObjectValue object ->
+                    case Dict.get "_type" object of
+                        Just (Value.StringValue tag) ->
+                            case Dict.get tag variants of
+                                Just fields ->
+                                    Set.fromList (Dict.keys object)
+                                        == Set.insert "_type" (Set.fromList (Dict.keys fields))
+                                        && (Dict.toList fields
+                                                |> List.all
+                                                    (\( name, fieldCodec ) ->
+                                                        Dict.get name object
+                                                            |> Maybe.map (validCodec named fieldCodec)
+                                                            |> Maybe.withDefault False
+                                                    )
+                                           )
+
+                                Nothing ->
+                                    False
+
+                        _ ->
+                            False
+
+                _ ->
+                    False
+
+        Schema.NamedCodec name inner ->
+            validCodec (Dict.insert name inner named) inner value
+
+        Schema.ReferenceCodec name ->
+            Dict.get name named
+                |> Maybe.map (\inner -> validCodec named inner value)
+                |> Maybe.withDefault False
+
+
+safeInt : Value -> Bool
+safeInt value =
+    case value of
+        Value.IntValue number ->
+            number >= -9007199254740991 && number <= 9007199254740991
+
+        _ ->
+            False
 
 
 finish : Model -> List E.Value -> ( Model, List E.Value )

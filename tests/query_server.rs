@@ -4,7 +4,9 @@ mod helpers;
 use helpers::test_database::TestDatabase;
 use pyre::server::manifest::{BoundManifest, Manifest, PyreSession, QueryManifest};
 use pyre::server::query;
-use pyre::server::sync::{ConnectedSessions, SyncServer, SyncSession};
+use pyre::server::sync::{
+    ConnectedSessions, ReplacementRequest, SyncFence, SyncServer, SyncSession,
+};
 use pyre::{ast, parser, typecheck};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -150,6 +152,33 @@ async fn revisioned_named_queries_stay_within_bound_namespace(
     let db = libsql::Builder::new_local(":memory:").build().await?;
     let conn = db.connect()?;
     let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let fingerprint = bound.fingerprint().to_string();
+    let binding = query::BatchBinding {
+        database_id: "main",
+        namespace: "Archive",
+        manifest: &fingerprint,
+        instance: "test",
+        auth_generation: 0,
+    };
+    let replacement = ReplacementRequest {
+        version: 1,
+        fence: SyncFence {
+            database_id: "main".into(),
+            instance: "test".into(),
+            auth_generation: 0,
+            namespace: "Archive".into(),
+            manifest: fingerprint.clone(),
+            database_epoch: "epoch".into(),
+        },
+        request_id: "replacement".into(),
+        target: 0,
+    };
+    assert!(matches!(
+        SyncServer::new(&standalone_context)
+            .replacement(&conn, &bound, &binding, &replacement, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
     let error =
         query::run_with_revision(&conn, &bound, &archive_query.id, json!({}), &session, false)
             .await

@@ -449,6 +449,7 @@ shouldReExecuteQueryTests =
                             Dict.fromList
                                 [ ( "games"
                                   , { name = "games"
+                                    , columns = Nothing
                                     , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                                     , links =
                                         Dict.fromList
@@ -467,6 +468,7 @@ shouldReExecuteQueryTests =
                                   )
                                 , ( "game_members"
                                   , { name = "game_members"
+                                    , columns = Nothing
                                     , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                                     , links = Dict.empty
                                     , indices = []
@@ -744,7 +746,7 @@ identitySchema : Data.Schema.SchemaMetadata
 identitySchema =
     { tables =
         [ "users", "posts" ]
-            |> List.map (\name -> ( name, { name = name, primaryKey = { name = "id", kind = Data.Schema.IntKey }, links = Dict.empty, indices = [] } ))
+            |> List.map (\name -> ( name, { name = name, columns = Nothing, primaryKey = { name = "id", kind = Data.Schema.IntKey }, links = Dict.empty, indices = [] } ))
             |> Dict.fromList
     , queryFieldToTable = Dict.fromList [ ( "users", "users" ), ( "posts", "posts" ) ]
     }

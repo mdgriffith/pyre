@@ -713,7 +713,7 @@ async fn run_query(
         query.sync.as_deref() == Some("true"),
     )
     .await
-    .map_err(|error| ServeError::BadRequest(error.to_string()))?;
+    .map_err(named_query_error)?;
 
     if let Some(commit) = commit {
         let context = state
@@ -762,6 +762,14 @@ async fn run_query(
         &headers,
         Json(result.response).into_response(),
     ))
+}
+
+fn named_query_error(error: query::Error) -> ServeError {
+    if error.code() == "OutcomeUnknown" {
+        ServeError::Internal(error.code().into())
+    } else {
+        ServeError::BadRequest(error.to_string())
+    }
 }
 
 async fn connected_sessions(state: &AppState) -> ConnectedSessions {
@@ -1648,6 +1656,66 @@ mod tests {
             value,
             json!({"status": "outcomeUnknown", "code": "OutcomeUnknown"})
         );
+    }
+
+    #[tokio::test]
+    async fn named_commit_failure_is_internal_outcome_unknown() {
+        let (_dir, mut state) = batch_state().await;
+        let conn = state.db.connect().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+        conn.execute(
+            "CREATE TABLE children (parent INTEGER REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED)",
+            (),
+        )
+        .await
+        .unwrap();
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        let mut manifest = mutable.manifest.manifest().clone();
+        let namespace = mutable.loaded_schema.schema().unwrap().namespace.clone();
+        manifest.queries.insert(
+            "commitFail".into(),
+            serde_json::from_value(json!({
+                "id":"commitFail", "operation":"insert", "primary_db":namespace,
+                "input_schema":{}, "session_args":[], "optional_input_args":[], "json_input_args":[],
+                "sql":[{"include":false,"params":[],"sql":"INSERT INTO children VALUES (99)"}],
+                "resultSchema":{"kind":"object","fields":{}}
+            }))
+            .unwrap(),
+        );
+        mutable.manifest =
+            BoundManifest::new(manifest, mutable.loaded_schema.context().unwrap()).unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        mutable.connections.get_mut().insert(
+            "legacy".into(),
+            Connection {
+                fence: None,
+                session: HashMap::new(),
+                sender,
+            },
+        );
+        let error = run_query(
+            State(state.clone()),
+            origin_headers(),
+            Query(RequestQuery {
+                database_id: Some(state.database_id.clone()),
+                connection_id: None,
+                sync: Some("true".into()),
+            }),
+            AxumPath("commitFail".into()),
+            Json(json!({})),
+        )
+        .await
+        .unwrap_err();
+        let response = with_cors(&state, &origin_headers(), error.into_response());
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response_json(response).await,
+            json!({"error": "OutcomeUnknown"})
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

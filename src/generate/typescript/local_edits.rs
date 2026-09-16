@@ -22,7 +22,11 @@ pub fn generate(
         if let ast::QueryDef::Query(q) = def {
             if q.operation != ast::QueryOperation::Query {
                 if let Some(i) = info.get(&q.name) {
-                    groups.entry(i.primary_db.clone()).or_default().push(q);
+                    if context.namespace_sync_modes.get(&i.primary_db)
+                        != Some(&ast::SyncMode::QueryOnly)
+                    {
+                        groups.entry(i.primary_db.clone()).or_default().push(q);
+                    }
                 }
             }
         }
@@ -548,6 +552,61 @@ Url.Records.UrlThing.delete(null as unknown as Url.UrlThingId);
             &root,
             r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"node","strict":true,"skipLibCheck":true,"noEmit":true},"files":["check.ts"]}"#,
         );
+    }
+
+    #[test]
+    fn query_only_namespaces_do_not_generate_local_edit_descriptors() {
+        let mut query_only = ast::Schema::default();
+        crate::parser::run(
+            "query-only.pyre",
+            "@syncable(false)\nrecord ReadOnly {\n @public\n id Id.Int @id\n}\n",
+            &mut query_only,
+        )
+        .unwrap();
+        let mut synced = ast::Schema {
+            namespace: "Synced".into(),
+            ..ast::Schema::default()
+        };
+        crate::parser::run(
+            "synced.pyre",
+            "record Writable {\n @public\n id Id.Int @id\n}\n",
+            &mut synced,
+        )
+        .unwrap();
+        let mut database = ast::Database {
+            schemas: vec![query_only, synced],
+        };
+        ast::resolve_id_brands(&mut database);
+        let context = typecheck::check_schema(&database).unwrap();
+        let mut queries =
+            crate::parser::parse_query("queries.pyre", "query ReadOnlyRows { readOnly { id } }\n")
+                .unwrap();
+        crate::generated_queries::append_generated_crud_queries(&mut queries, &context);
+        let info = typecheck::check_queries(&queries, &context).unwrap();
+        let root = Path::new("generated");
+        let mut files = Vec::new();
+        super::super::core::generate_queries(
+            &context,
+            &info,
+            &queries,
+            &root.join("core"),
+            &mut files,
+        );
+
+        assert!(files
+            .iter()
+            .any(|file| file.path.ends_with("core/queries/metadata/readOnlyRows.ts")));
+        assert!(!files
+            .iter()
+            .any(|file| file.path.ends_with("edits/Main.ts")));
+        assert!(files
+            .iter()
+            .any(|file| file.path.ends_with("edits/Synced.ts")));
+        let index = files
+            .iter()
+            .find(|file| file.path.ends_with("edits.ts"))
+            .unwrap();
+        assert_eq!(index.contents, "export * from './edits/Synced';\n");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use pyre::filesystem::GeneratedFile;
 use pyre::generate::client::elm;
 use pyre::parser;
 use pyre::typecheck;
-use std::path::Path;
+use std::{fs, path::Path, process::Command};
 
 fn path_ends_with(path: &Path, suffix: &str) -> bool {
     path.ends_with(Path::new(suffix))
@@ -544,6 +544,167 @@ record Post {
         ),
         "named schema should generate schema-scoped table modules. Generated:\n{}",
         campaign_post_table.contents
+    );
+}
+
+#[test]
+fn fixed_namespace_and_entity_stream_name_collisions_compile() {
+    let fixed_names = [
+        "DatabaseId",
+        "Input",
+        "ReturnData",
+        "RequestId",
+        "MutationResult",
+        "Model",
+        "QueryModel",
+        "Query",
+        "Msg",
+        "Effect",
+        "QueryId",
+        "Receipt",
+        "Outcome",
+        "EditFailure",
+        "Lifecycle",
+        "StreamId",
+        "EntityChange",
+        "EntityChangeBatch",
+        "EntityChangeBatchSource",
+        "EntitySubscription",
+    ];
+    let mut schemas = Vec::new();
+    for namespace in fixed_names {
+        let mut schema = ast::Schema {
+            namespace: namespace.to_string(),
+            ..ast::Schema::default()
+        };
+        let source = if namespace == "StreamId" {
+            r#"
+record Register {
+    @public
+    id Int @id
+}
+
+record Unregister {
+    @public
+    id Int @id
+}
+
+record DecodeIncomingBatch {
+    @public
+    id Int @id
+}
+
+record FooBarRecord {
+    @public
+    @tablename("fooBar")
+    id Int @id
+}
+
+record FooUnderscoreRecord {
+    @public
+    @tablename("foo_bar")
+    id Int @id
+}
+"#
+            .to_string()
+        } else {
+            format!("record {namespace}Thing {{\n @public\n id Int @id\n}}\n")
+        };
+        parser::run(&format!("{namespace}.pyre"), &source, &mut schema).unwrap();
+        schemas.push(schema);
+    }
+
+    let database = ast::Database { schemas };
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut queries = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = Vec::new();
+    elm::generate(Path::new("src"), &database, &mut files);
+    elm::generate_queries(&context, &info, &queries, Path::new("src"), &mut files);
+
+    let database_ids = &files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "Db/Database.elm"))
+        .unwrap()
+        .contents;
+    for namespace in fixed_names {
+        assert!(database_ids.contains(&format!("type {namespace}Namespace\n")));
+    }
+    let stream = &files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "Db/StreamIdNamespace/Stream.elm"))
+        .unwrap()
+        .contents;
+    assert!(stream.contains("registerNamespace :"));
+    assert!(stream.contains("unregisterNamespace :"));
+    assert!(stream.contains("decodeIncomingBatchNamespace :"));
+    assert!(stream.contains("import Db.StreamIdNamespace.Table.FooBar as FooBar"));
+    assert!(stream.contains("import Db.StreamIdNamespace.Table.FooBarNamespace as FooBarNamespace"));
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir_in(root.join("target")).unwrap();
+    for file in files {
+        let path = temp.path().join(file.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, file.contents).unwrap();
+    }
+    fs::write(
+        temp.path().join("elm.json"),
+        include_str!("fixtures/elm-local-edits/elm.json"),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("src/Collision.elm"),
+        r#"module Collision exposing (all)
+
+import Db.Database
+import Db.StreamIdNamespace.Stream as Stream
+import Db.StreamIdNamespace.Table.DecodeIncomingBatches as DecodeIncomingBatches
+import Db.StreamIdNamespace.Table.FooBar as FooBar
+import Db.StreamIdNamespace.Table.FooBarNamespace as FooBarNamespace
+import Db.StreamIdNamespace.Table.Registers as Registers
+import Db.StreamIdNamespace.Table.Unregisters as Unregisters
+import Pyre
+import Query.InputThingCreate as InputMutation
+
+databaseId : Db.Database.DatabaseId Db.Database.StreamIdNamespace
+databaseId =
+    Db.Database.fromString "stream"
+
+all =
+    { model = Pyre.init "collision"
+    , mutationId = InputMutation.id
+    , stream =
+        Stream.register databaseId "collision"
+            [ Stream.registerNamespace Registers.stream
+            , Stream.unregisterNamespace Unregisters.stream
+            , Stream.decodeIncomingBatchNamespace DecodeIncomingBatches.stream
+            , Stream.fooBarRecord FooBar.stream
+            , Stream.fooUnderscoreRecord FooBarNamespace.stream
+            ]
+    }
+"#,
+    )
+    .unwrap();
+    let output = Command::new("npx")
+        .args([
+            "--yes",
+            "--package",
+            "elm@0.19.1-6",
+            "elm",
+            "make",
+            "src/Collision.elm",
+            "--output=/dev/null",
+        ])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

@@ -24,7 +24,11 @@ function deferred() { let resolve, reject; const promise = new Promise((yes, no)
 const fence = { databaseId: 'main', instance: 'tab', authGeneration: 1, namespace: 'Main', manifest: 'm1', databaseEpoch: 'e1' };
 const key = '00000000-0000-0000-0000-000000000001';
 const row = { key, name: 'base', note: 'server' };
-const schema = { tables: { users: { name: 'users', primaryKey: { name: 'key', kind: 'uuid' }, links: {}, indices: [] } }, queryFieldToTable: { users: 'users' } };
+const schema = { tables: { users: { name: 'users', primaryKey: { name: 'key', kind: 'uuid' }, columns: [
+  { name: 'key', type: 'Id.Uuid<Users>', nullable: false, codec: { kind: 'uuid' } },
+  { name: 'name', type: 'String', nullable: false, codec: { kind: 'string' } },
+  { name: 'note', type: 'String', nullable: true, codec: { kind: 'nullable', value: { kind: 'string' } } },
+], links: {}, indices: [] } }, queryFieldToTable: { users: 'users' } };
 const command = { id: 'command@m1', parseInput: value => { if (!value || typeof value !== 'object') throw Error(); return value; }, decodeResult: value => { if (typeof value !== 'string') throw Error(); return value; } };
 const operation = kind => ({
   id: `${kind}@m1`, parseInput: value => { if (!value || typeof value.key !== 'string') throw Error(); return value; },
@@ -365,6 +369,21 @@ test('same-lifetime SSE replacement quarantines sent overlay without manufacturi
   expect(h.lifecycle.at(-1).state).toBe('sent');
   h.accepted(); expect((await receipt.confirmed).kind).toBe('confirmed');
   expect(h.rows()[0].name).toBe('newer server');
+});
+
+test('late production acceptance invalidation already covered by its minimum does not replace again', async () => {
+  const h = await ready();
+  const receipt = h.runtime.submit(edit(update, { key, name: 'local' }));
+  await until(() => h.writes.length === 1);
+  h.runtime.receiveHint({ ...fence, type: 'syncRequired', reconciliation: { kind: 'replaceRequired', atLeast: 1, invalidate: false } });
+  await until(() => h.reads.length === 2); await h.replace([{ ...row, name: 'authoritative' }], 1);
+  const write = h.writes[0];
+  write.resolve({ ...fence, requestId: receipt.requestId, status: 'accepted', commitRevision: 1,
+    results: [{ index: 0, operation: update.id, value: { id: key } }],
+    reconciliation: { kind: 'replaceRequired', atLeast: 1, invalidate: true, minimumSafeRevision: 1 } });
+  expect((await receipt.confirmed).kind).toBe('confirmed'); await tick();
+  expect(h.rows()[0].name).toBe('authoritative'); expect(h.reads).toHaveLength(2);
+  expect(h.publications.at(-1).invalid).toBe(false);
 });
 
 test('offline preparation is cancelled safely, reconnect resumes queue, disconnect after dispatch is unknown', async () => {

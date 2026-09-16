@@ -229,7 +229,7 @@ pub fn run(root: &Path, generated: &Path) {
                         let request = serde_json::from_value(message["request"].clone()).unwrap();
                         let loaded = pyre::server::schema::load_schema_from_database(conn).await.unwrap();
                         let replacement_context = if archive { loaded.context().unwrap() } else { &context };
-                        match SyncServer::new(replacement_context).replacement(conn, &manifest, &binding, &request, &session).await {
+                        match SyncServer::new(replacement_context).replacement(conn, &bound, &binding, &request, &session).await {
                             Ok(response) => json!({"kind":"success", "response":response}),
                             Err(_) => json!({"kind":"error", "error":{"errorType":"InvalidRequest"}}),
                         }

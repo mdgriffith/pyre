@@ -182,6 +182,16 @@ function singleOriginSession(
   return origin ? new Map([[originSessionId, origin]]) : undefined;
 }
 
+function sendBestEffort(
+  sendToSession: (sessionId: string, message: any) => void,
+  sessionId: string,
+  message: unknown,
+): void {
+  try {
+    void Promise.resolve(sendToSession(sessionId, message)).catch(() => {});
+  } catch { /* Independent recipient delivery. */ }
+}
+
 function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDeltasFn {
   const normalizedDatabaseId = databaseId ? requireDatabaseId(databaseId) : undefined;
 
@@ -195,61 +205,66 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
       legacySessions.delete(id);
       const parsed = fenceValidator.safeParse(recipient.fence);
       if (!parsed.success || parsed.data.databaseId !== normalizedDatabaseId || parsed.data.databaseEpoch !== databaseEpoch) continue;
-      try { void Promise.resolve(sendToSession(id, { type: "syncRequired", ...parsed.data, serverRevision,
-        reconciliation: { kind: "replaceRequired", atLeast: serverRevision, invalidate: true, minimumSafeRevision: serverRevision } }))
-        .catch(() => {}); } catch { /* Independent recipient delivery. */ }
+      sendBestEffort(sendToSession, id, { type: "syncRequired", ...parsed.data, serverRevision,
+        reconciliation: { kind: "replaceRequired", atLeast: serverRevision, invalidate: true, minimumSafeRevision: serverRevision } });
     }
     if (legacySessions.size === 0) return revision;
     activateSchemaForDatabase(normalizedDatabaseId);
 
     const broadcastSessions = sessionsWithoutOrigin(legacySessions, originSessionId);
     const originSession = singleOriginSession(legacySessions, originSessionId);
+    const syncRequiredMessage = {
+      type: "syncRequired",
+      serverRevision,
+      databaseEpoch,
+      ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
+    };
+    const requireSync = (sessionIds: Iterable<string>) => {
+      for (const sessionId of sessionIds) sendBestEffort(sendToSession, sessionId, syncRequiredMessage);
+    };
     const normalizeSessions = (sessions: typeof broadcastSessions) => new Map(
       Array.from(sessions, ([id, data]) => [
         id,
         { ...data, session: normalizeForWasmJson(data.session) },
       ]),
     );
-    const deltasResult = wasm.calculate_sync_deltas(
-      affectedRowGroups,
-      normalizeSessions(broadcastSessions),
-    );
-
-    if (typeof deltasResult === "string" && deltasResult.startsWith("Error:")) {
-      console.error("[SyncDeltas] Failed to calculate sync deltas:", deltasResult);
-      const message = {
-        type: "syncRequired",
-        serverRevision,
-        databaseEpoch,
-        ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-      };
-      for (const sessionId of broadcastSessions.keys()) {
-        sendToSession(sessionId, message);
-      }
+    let result: any;
+    try {
+      const deltasResult = wasm.calculate_sync_deltas(
+        affectedRowGroups,
+        normalizeSessions(broadcastSessions),
+      );
+      if (typeof deltasResult === "string" && deltasResult.startsWith("Error:")) throw new Error(deltasResult);
+      result = typeof deltasResult === "string" ? JSON.parse(deltasResult) : deltasResult;
+    } catch (error) {
+      console.error("[SyncDeltas] Failed to calculate sync deltas:", error);
+      requireSync(broadcastSessions.keys());
       return {
         databaseEpoch,
         serverRevision,
-        ...(originSession ? { originMessage: message } : {}),
+        ...(originSession ? { originMessage: syncRequiredMessage } : {}),
       };
     }
-
-    const result = typeof deltasResult === "string" ? JSON.parse(deltasResult) : deltasResult;
 
     if ((!Array.isArray(result.groups) || result.groups.length === 0) && !originSession) {
       return { databaseEpoch, serverRevision };
     }
 
     for (const group of Array.isArray(result.groups) ? result.groups : []) {
-      const reshapedTableGroupsResult = wasm.reshape_sync_table_groups(normalizeForWasmJson(group.table_groups));
-
-      if (typeof reshapedTableGroupsResult === "string" && reshapedTableGroupsResult.startsWith("Error:")) {
-        console.error("[SyncDeltas] Failed to reshape sync deltas:", reshapedTableGroupsResult);
+      let data: any;
+      try {
+        const reshapedTableGroupsResult = wasm.reshape_sync_table_groups(normalizeForWasmJson(group.table_groups));
+        if (typeof reshapedTableGroupsResult === "string" && reshapedTableGroupsResult.startsWith("Error:")) {
+          throw new Error(reshapedTableGroupsResult);
+        }
+        data = typeof reshapedTableGroupsResult === "string"
+          ? JSON.parse(reshapedTableGroupsResult)
+          : reshapedTableGroupsResult;
+      } catch (error) {
+        console.error("[SyncDeltas] Failed to reshape sync deltas:", error);
+        requireSync(group.session_ids);
         continue;
       }
-
-      const data = typeof reshapedTableGroupsResult === "string"
-        ? JSON.parse(reshapedTableGroupsResult)
-        : reshapedTableGroupsResult;
 
       const deltaMessage = {
         type: "delta",
@@ -269,29 +284,29 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
         : deltaMessage;
 
       for (const sessionId of group.session_ids) {
-        sendToSession(sessionId, message);
+        sendBestEffort(sendToSession, sessionId, message);
       }
     }
 
     let originMessage: unknown;
     if (originSession) {
-      const originDeltasResult = wasm.calculate_sync_deltas(
-        affectedRowGroups,
-        normalizeSessions(originSession),
-      );
-
-      if (typeof originDeltasResult === "string" && originDeltasResult.startsWith("Error:")) {
-        console.error("[SyncDeltas] Failed to calculate origin sync delta:", originDeltasResult);
-      } else {
+      try {
+        const originDeltasResult = wasm.calculate_sync_deltas(
+          affectedRowGroups,
+          normalizeSessions(originSession),
+        );
+        if (typeof originDeltasResult === "string" && originDeltasResult.startsWith("Error:")) {
+          throw new Error(originDeltasResult);
+        }
         const originResult = typeof originDeltasResult === "string" ? JSON.parse(originDeltasResult) : originDeltasResult;
         const originGroup = Array.isArray(originResult.groups) ? originResult.groups[0] : undefined;
 
         if (originGroup) {
-          const reshapedTableGroupsResult = wasm.reshape_sync_table_groups(normalizeForWasmJson(originGroup.table_groups));
-
-          if (typeof reshapedTableGroupsResult === "string" && reshapedTableGroupsResult.startsWith("Error:")) {
-            console.error("[SyncDeltas] Failed to reshape origin sync delta:", reshapedTableGroupsResult);
-          } else {
+          try {
+            const reshapedTableGroupsResult = wasm.reshape_sync_table_groups(normalizeForWasmJson(originGroup.table_groups));
+            if (typeof reshapedTableGroupsResult === "string" && reshapedTableGroupsResult.startsWith("Error:")) {
+              throw new Error(reshapedTableGroupsResult);
+            }
             const data = typeof reshapedTableGroupsResult === "string"
               ? JSON.parse(reshapedTableGroupsResult)
               : reshapedTableGroupsResult;
@@ -310,8 +325,14 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
                 ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
               }
               : deltaMessage;
+          } catch (error) {
+            console.error("[SyncDeltas] Failed to reshape origin sync delta:", error);
+            originMessage = syncRequiredMessage;
           }
         }
+      } catch (error) {
+        console.error("[SyncDeltas] Failed to calculate origin sync delta:", error);
+        originMessage = syncRequiredMessage;
       }
     }
 

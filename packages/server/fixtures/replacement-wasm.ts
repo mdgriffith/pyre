@@ -38,12 +38,22 @@ try {
   assert.equal(snapshot.kind, "success", JSON.stringify(snapshot));
   if (snapshot.kind !== "success") throw Error("No replacement");
   assert.equal(snapshot.response.serverRevision, 1);
-  assert.deepEqual(snapshot.response.tables.entries.rows[0], { ...input, enabled: 1, updatedAt: (snapshot.response.tables.entries.rows[0] as any).updatedAt });
+  assert.deepEqual(snapshot.response.tables.entries.rows[0], { ...input, updatedAt: (snapshot.response.tables.entries.rows[0] as any).updatedAt });
+  await db.execute(`update entries set updatedAt = '1700000000', details = jsonb('{"_type":"Bundle","when":"2023-11-14T22:13:20Z","role":"Member","children":[{"_type":"Empty"}],"byName":{"first":{"_type":"Empty"}},"note":null}')`);
+  const canonical = await replace();
+  assert.equal(canonical.kind, "success", JSON.stringify(canonical));
+  if (canonical.kind !== "success") throw Error("No canonical replacement");
+  assert.equal((canonical.response.tables.entries.rows[0] as any).updatedAt, 1700000000);
+  assert.deepEqual((canonical.response.tables.entries.rows[0] as any).details, {
+    _type: "Bundle", when: 1700000000, role: { _type: "Member" }, children: [{ _type: "Empty" }],
+    byName: { first: { _type: "Empty" } }, note: null,
+  });
   for (const corruption of [
     "update entries set role = 'Unknown'",
     "update entries set enabled = 8",
     "update entries set details = jsonb('{\"_type\":\"Unknown\"}')",
     "update entries set details = jsonb('{\"_type\":\"Note\",\"count\":2}')",
+    "update entries set details = jsonb('{\"_type\":\"Note\",\"count\":2,\"enabled\":1}')",
   ]) {
     await db.execute(corruption);
     assert.deepEqual(await replace(), { kind: "error", error: { errorType: "ReplacementUnavailable", message: "ReplacementUnavailable" } });

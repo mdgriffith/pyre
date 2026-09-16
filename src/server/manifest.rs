@@ -960,7 +960,7 @@ fn integer_value(value: &JsonValue) -> Option<i64> {
     (number.fract() == 0.0 && number.abs() <= 9_007_199_254_740_991.0).then_some(number as i64)
 }
 
-fn datetime_to_epoch_seconds(value: &JsonValue) -> Option<i64> {
+pub(crate) fn datetime_to_epoch_seconds(value: &JsonValue) -> Option<i64> {
     // Match generated CoercedDate's whole seconds and JavaScript Date range.
     const MAX_SECONDS: i64 = 8_640_000_000_000;
     if let Some(seconds) = integer_value(value) {

@@ -571,9 +571,7 @@ async fn run_inner(
     .await;
     match execution {
         Ok(result) => {
-            tx.commit()
-                .await
-                .map_err(|error| Error::Database(error).execution("commit transaction", None))?;
+            tx.commit().await.map_err(|_| Error::OutcomeUnknown)?;
             Ok(result)
         }
         Err(error) => {

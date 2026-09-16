@@ -8,12 +8,52 @@ import Dict
 import Expect
 import Json.Decode as D
 import Json.Encode as E
+import Set
 import Test exposing (Test, describe, test)
 
 
 schema : Schema.SchemaMetadata
 schema =
-    { tables = Dict.singleton "users" { name = "users", links = Dict.empty, indices = [ { field = "name", unique = False, primary = False } ], primaryKey = { name = "key", kind = Schema.UuidKey } }
+    { tables =
+        Dict.singleton "users"
+            { name = "users"
+            , columns =
+                Just
+                    [ { name = "key", type_ = "Id.Uuid<Users>", nullable = False, codec = Just Schema.UuidCodec }
+                    , { name = "name", type_ = "String", nullable = False, codec = Just Schema.StringCodec }
+                    , { name = "note", type_ = "String", nullable = True, codec = Just (Schema.NullableCodec Schema.StringCodec) }
+                    , { name = "day", type_ = "Date", nullable = False, codec = Just Schema.DateCodec }
+                    , { name = "changedAt", type_ = "DateTime", nullable = False, codec = Just Schema.DateTimeCodec }
+                    , { name = "enabled", type_ = "Bool", nullable = False, codec = Just Schema.BoolCodec }
+                    , { name = "flags", type_ = "Json<List<Bool>>", nullable = False, codec = Just (Schema.ListCodec Schema.BoolCodec) }
+                    , { name = "choice", type_ = "Choice", nullable = False, codec = Just (Schema.EnumCodec (Set.fromList [ "Open", "Closed" ])) }
+                    , { name = "details"
+                      , type_ = "Details"
+                      , nullable = False
+                      , codec =
+                            Just
+                                (Schema.NamedCodec "Details"
+                                    (Schema.TaggedUnionCodec
+                                        (Dict.fromList
+                                            [ ( "Empty", Dict.empty )
+                                            , ( "Group"
+                                              , Dict.fromList
+                                                    [ ( "members", Schema.ListCodec Schema.UuidCodec )
+                                                    , ( "scores", Schema.DictCodec Schema.FloatCodec )
+                                                    , ( "next", Schema.NullableCodec (Schema.ReferenceCodec "Details") )
+                                                    ]
+                                              )
+                                            ]
+                                        )
+                                    )
+                                )
+                      }
+                    , { name = "payload", type_ = "Json", nullable = False, codec = Just Schema.JsonCodec }
+                    ]
+            , links = Dict.empty
+            , indices = [ { field = "name", unique = False, primary = False } ]
+            , primaryKey = { name = "key", kind = Schema.UuidKey }
+            }
     , queryFieldToTable = Dict.singleton "users" "users"
     }
 
@@ -52,9 +92,43 @@ step kind fields model =
         next.pending
 
 
+typedRow : E.Value -> E.Value -> E.Value -> E.Value -> E.Value -> E.Value
+typedRow key name note choice details =
+    E.object
+        [ ( "key", key )
+        , ( "name", name )
+        , ( "note", note )
+        , ( "day", E.string "2026-09-15" )
+        , ( "changedAt", E.int 1700000000 )
+        , ( "enabled", E.bool True )
+        , ( "flags", E.list E.bool [ True, False ] )
+        , ( "choice", choice )
+        , ( "details", details )
+        , ( "payload", E.object [ ( "anything", E.list identity [ E.int 1, E.bool True ] ) ] )
+        ]
+
+
+replaceField : String -> E.Value -> E.Value -> E.Value
+replaceField name value encoded =
+    D.decodeValue (D.dict D.value) encoded
+        |> Result.map (Dict.insert name value >> Dict.toList >> E.object)
+        |> Result.withDefault encoded
+
+
 row : String -> String -> E.Value
 row name note =
-    E.object [ ( "key", E.string uuid ), ( "name", E.string name ), ( "note", E.string note ) ]
+    typedRow
+        (E.string uuid)
+        (E.string name)
+        (E.string note)
+        (E.object [ ( "_type", E.string "Open" ) ])
+        (E.object
+            [ ( "_type", E.string "Group" )
+            , ( "members", E.list E.string [ uuid ] )
+            , ( "scores", E.object [ ( "one", E.float 1.5 ) ] )
+            , ( "next", E.object [ ( "_type", E.string "Empty" ) ] )
+            ]
+        )
 
 
 replacement : Int -> List E.Value -> Edits.Model -> E.Value
@@ -82,6 +156,11 @@ initial rows =
 hint : Int -> E.Value
 hint revision =
     E.object [ ( "kind", E.string "replaceRequired" ), ( "atLeast", E.int revision ), ( "invalidate", E.bool False ) ]
+
+
+invalidatingHint : Int -> E.Value
+invalidatingHint revision =
+    E.object [ ( "kind", E.string "replaceRequired" ), ( "atLeast", E.int revision ), ( "invalidate", E.bool True ), ( "minimumSafeRevision", E.int revision ) ]
 
 
 operation : String -> List ( String, E.Value ) -> E.Value
@@ -114,6 +193,19 @@ accept requestId revision =
           , E.object
                 (fence
                     ++ [ ( "requestId", E.string requestId ), ( "status", E.string "accepted" ), ( "commitRevision", E.int revision ), ( "reconciliation", hint revision ), ( "results", E.list identity [ E.object [ ( "index", E.int 0 ), ( "operation", E.string "update@hash" ), ( "value", E.object [ ( "id", E.string uuid ) ] ) ] ] ) ]
+                )
+          )
+        ]
+
+
+acceptInvalidating : String -> Int -> Edits.Model -> Edits.Model
+acceptInvalidating requestId revision =
+    step "response"
+        [ ( "requestId", E.string requestId )
+        , ( "response"
+          , E.object
+                (fence
+                    ++ [ ( "requestId", E.string requestId ), ( "status", E.string "accepted" ), ( "commitRevision", E.int revision ), ( "reconciliation", invalidatingHint revision ), ( "results", E.list identity [ E.object [ ( "index", E.int 0 ), ( "operation", E.string "update@hash" ), ( "value", E.object [ ( "id", E.string uuid ) ] ) ] ] ) ]
                 )
           )
         ]
@@ -261,6 +353,105 @@ suite =
                 Expect.equal
                     ( [ Just (Value.StringValue "local"), Just (Value.StringValue "corrected") ], [ False ], ( 1, 2 ) )
                     ( [ field "name" accepted, field "note" accepted ], List.map .quarantined accepted.pending, ( accepted.coveredRevision, accepted.requiredRevision ) )
+            )
+        , test "late invalidating acceptance already covered by its safety minimum stays installed"
+            (\_ ->
+                let
+                    accepted =
+                        initial [ row "base" "original" ]
+                            |> submit "a" [ operation "update" [ ( "name", E.string "local" ) ] ]
+                            |> step "syncRequired" [ ( "reconciliation", hint 1 ) ]
+                            |> install 1 [ row "server" "current" ]
+                            |> acceptInvalidating "a" 1
+                in
+                Expect.equal
+                    ( ( False, Nothing ), ( 1, Just (Value.StringValue "server") ), [] )
+                    ( ( accepted.invalid, accepted.catchup ), ( accepted.coveredRevision, field "name" accepted ), accepted.pending )
+            )
+        , test "malformed complete replacement rows do not clear invalidation or advance coverage"
+            (\_ ->
+                let
+                    candidates =
+                        [ E.object [ ( "key", E.string uuid ), ( "name", E.string "missing nullable field" ) ]
+                        , E.object [ ( "key", E.string uuid ), ( "name", E.string "extra" ), ( "note", E.null ), ( "secret", E.string "no" ) ]
+                        , E.object [ ( "key", E.string uuid ), ( "name", E.int 1 ), ( "note", E.null ) ]
+                        , E.object [ ( "key", E.string uuid ), ( "name", E.null ), ( "note", E.null ) ]
+                        , typedRow (E.string "not-a-uuid") (E.string "bad key") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Empty" ) ])
+                        , typedRow (E.string uuid) (E.string "scalar enum") E.null (E.string "Open") (E.object [ ( "_type", E.string "Empty" ) ])
+                        , typedRow (E.string uuid) (E.string "bad enum") E.null (E.object [ ( "_type", E.string "Unknown" ) ]) (E.object [ ( "_type", E.string "Empty" ) ])
+                        , typedRow (E.string uuid) (E.string "bad list") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Group" ), ( "members", E.list E.string [ "bad" ] ), ( "scores", E.object [] ), ( "next", E.null ) ])
+                        , typedRow (E.string uuid) (E.string "bad dict") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Group" ), ( "members", E.list E.string [] ), ( "scores", E.object [ ( "bad", E.string "float" ) ] ), ( "next", E.null ) ])
+                        , typedRow (E.string uuid) (E.string "missing union field") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Group" ), ( "members", E.list E.string [] ), ( "scores", E.object [] ) ])
+                        , typedRow (E.string uuid) (E.string "extra union field") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Empty" ), ( "extra", E.bool True ) ])
+                        , typedRow (E.string uuid) (E.string "bad bool") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Empty" ) ])
+                            |> replaceField "enabled" (E.int 2)
+                        , typedRow (E.string uuid) (E.string "storage bool") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Empty" ) ])
+                            |> replaceField "enabled" (E.int 1)
+                        , typedRow (E.string uuid) (E.string "typed JSON bool") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Empty" ) ])
+                            |> replaceField "flags" (E.list E.int [ 1 ])
+                        , typedRow (E.string uuid) (E.string "string datetime") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Empty" ) ])
+                            |> replaceField "changedAt" (E.string "1700000000")
+                        , typedRow (E.string uuid) (E.string "bad datetime") E.null (E.object [ ( "_type", E.string "Open" ) ]) (E.object [ ( "_type", E.string "Empty" ) ])
+                            |> replaceField "changedAt" (E.int 8640000000001)
+                        ]
+
+                    check candidate =
+                        let
+                            before =
+                                initial [ row "base" "original" ]
+                                    |> step "syncRequired" [ ( "reconciliation", invalidatingHint 1 ) ]
+
+                            after =
+                                install 1 [ candidate ] before
+                        in
+                        ( ( after.invalid, after.coveredRevision ), ( after.catchupFailed, field "name" after ) )
+                in
+                candidates
+                    |> List.map check
+                    |> Expect.equal (List.repeat 16 ( ( True, 0 ), ( True, Nothing ) ))
+            )
+        , test "canonical replacement enum, datetime, and bool values are accepted"
+            (\_ ->
+                let
+                    canonical =
+                        row "server" "value"
+
+                    installed =
+                        initial [ row "base" "original" ]
+                            |> step "syncRequired" [ ( "reconciliation", invalidatingHint 1 ) ]
+                            |> install 1 [ canonical ]
+                in
+                Expect.equal
+                    ( ( False, 1 ), ( False, Just (Value.ObjectValue (Dict.singleton "_type" (Value.StringValue "Open"))) ) )
+                    ( ( installed.invalid, installed.coveredRevision ), ( installed.catchupFailed, field "choice" installed ) )
+            )
+        , test "nonempty replacements require generated column codec metadata"
+            (\_ ->
+                let
+                    withoutColumns =
+                        { schema | tables = Dict.map (\_ table -> { table | columns = Nothing }) schema.tables }
+
+                    withoutCodecs =
+                        { schema
+                            | tables =
+                                Dict.map
+                                    (\_ table ->
+                                        { table | columns = table.columns |> Maybe.map (List.map (\column -> { column | codec = Nothing })) }
+                                    )
+                                    schema.tables
+                        }
+
+                    attempt testSchema =
+                        Edits.init testSchema
+                            |> step "configure" [ ( "minimumSafeRevision", E.int 0 ) ]
+                            |> install 0 [ row "server" "value" ]
+
+                    summarize model =
+                        ( model.invalid, model.coveredRevision, model.catchupFailed )
+                in
+                [ attempt withoutColumns, attempt withoutCodecs ]
+                    |> List.map summarize
+                    |> Expect.equal [ ( True, -1, True ), ( True, -1, True ) ]
             )
         , test "a missing replay target suppresses every earlier member atomically"
             (\_ ->

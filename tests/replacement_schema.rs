@@ -153,7 +153,8 @@ async fn replacement(
     manifest: &Manifest,
     session: &PyreSession,
 ) -> Replacement {
-    let fingerprint = manifest.fingerprint();
+    let manifest = BoundManifest::new(manifest.clone(), context).unwrap();
+    let fingerprint = manifest.fingerprint().to_string();
     let namespace = ast::DEFAULT_SCHEMANAME;
     let binding = BatchBinding {
         database_id: "test",
@@ -175,7 +176,7 @@ async fn replacement(
     SyncServer::new(context)
         .replacement(
             conn,
-            manifest,
+            &manifest,
             &binding,
             &ReplacementRequest {
                 version: 1,
@@ -479,7 +480,24 @@ record Item {
             .map(|name| object[name].clone())
             .collect()],
     };
-    assert!(sync::reshape_replacement_table(&context, namespace, &group).is_ok());
+    let shaped = sync::reshape_replacement_table(&context, namespace, &group).unwrap();
+    let row = &shaped.rows[0];
+    assert_eq!(
+        row[shaped
+            .headers
+            .iter()
+            .position(|name| name == "active")
+            .unwrap()],
+        json!(true)
+    );
+    assert_eq!(
+        row[shaped
+            .headers
+            .iter()
+            .position(|name| name == "state")
+            .unwrap()],
+        json!({"_type":"Open", "active":false})
+    );
     for (field, value) in [
         ("active", json!(2)),
         ("id", json!("not an integer")),
@@ -512,6 +530,99 @@ record Item {
     missing.rows[0].pop();
     assert!(sync::reshape_replacement_table(&context, namespace, &missing).is_err());
     assert!(sync::reshape_replacement_table(&context, "wrong", &group).is_err());
+}
+
+#[test]
+fn replacement_shape_canonicalizes_datetime_and_nested_custom_wire_values() {
+    let context = context(
+        r#"
+type Choice
+    = First
+    | Second
+type Payload
+    = Values {
+        choice Choice
+        choices Json<List<Choice>>
+        times Json<Dict<DateTime>>
+        enabled Bool
+    }
+record Item {
+    id Int @id
+    happenedAt DateTime
+    choice Choice
+    payload Json<Payload>
+    @public
+}
+"#,
+    );
+    let namespace = context.valid_namespaces.iter().next().unwrap();
+    let plan = sync::get_replacement_sql(&context, &HashMap::new(), namespace).unwrap();
+    let table = &plan.tables[0];
+    let object = json!({
+        "id": 1,
+        "happenedAt": "1700000000",
+        "choice": "First",
+        "payload": {
+            "_type": "Values",
+            "choice": "Second",
+            "choices": ["First", {"_type":"Second"}],
+            "times": {"created":"2023-11-14T22:13:20Z", "updated":"1700000001"},
+            "enabled": true
+        },
+        "updatedAt": 0
+    });
+    let group = AffectedRowTableGroup {
+        table_name: table.table_name.clone(),
+        headers: table.headers.clone(),
+        rows: vec![table
+            .headers
+            .iter()
+            .map(|name| object[name].clone())
+            .collect()],
+    };
+
+    let shaped = sync::reshape_replacement_table(&context, namespace, &group).unwrap();
+    let row = &shaped.rows[0];
+    let field = |name: &str| {
+        &row[shaped
+            .headers
+            .iter()
+            .position(|header| header == name)
+            .unwrap()]
+    };
+    assert_eq!(field("happenedAt"), &json!(1700000000));
+    assert_eq!(field("choice"), &json!({"_type":"First"}));
+    assert_eq!(
+        field("payload"),
+        &json!({
+            "_type": "Values",
+            "choice": {"_type":"Second"},
+            "choices": [{"_type":"First"}, {"_type":"Second"}],
+            "times": {"created":1700000000, "updated":1700000001},
+            "enabled": true
+        })
+    );
+
+    for (field_name, invalid_value) in [
+        ("happenedAt", json!(8640000000001_i64)),
+        ("happenedAt", json!("not-a-date")),
+        (
+            "payload",
+            json!({"_type":"Values", "choice":"First", "choices":["Second"], "times":{}, "enabled":1}),
+        ),
+    ] {
+        let mut invalid = group.clone();
+        let index = invalid
+            .headers
+            .iter()
+            .position(|name| name == field_name)
+            .unwrap();
+        invalid.rows[0][index] = invalid_value;
+        assert!(
+            sync::reshape_replacement_table(&context, namespace, &invalid).is_err(),
+            "{field_name}"
+        );
+    }
 }
 
 #[test]

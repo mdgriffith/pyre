@@ -274,6 +274,63 @@ fn unsupported_primary_keys_are_not_labeled_as_uuids() {
 }
 
 #[test]
+fn schema_metadata_emits_recursive_wire_codecs() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+type Choice = Open | Closed
+type Details
+    = Empty
+    | Values {
+        owners Json<List<Id.Uuid>>
+        scores Json<Dict<Float>>
+        choice Choice
+        maybe Int?
+    }
+record CodecRow {
+    @public
+    id Id.Uuid @id
+    parent CodecRow.id?
+    count Int
+    enabled Bool
+    day Date
+    changedAt DateTime
+    payload Json<Dict<List<Int?>>>
+    choice Choice
+    details Details
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let mut database = ast::Database {
+        schemas: vec![schema],
+    };
+    ast::resolve_id_brands(&mut database);
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut files = Vec::new();
+    generate::generate_schema(&context, &database, &mut files);
+    let metadata = content(&files, "schema.ts");
+
+    for expected in [
+        "codec: { kind: \"uuid\" }",
+        "codec: { kind: \"nullable\", value: { kind: \"uuid\" } }",
+        "codec: { kind: \"safeInt\" }",
+        "codec: { kind: \"bool\" }",
+        "codec: { kind: \"date\" }",
+        "codec: { kind: \"dateTime\" }",
+        "{ kind: \"dict\", value: { kind: \"list\", item: { kind: \"nullable\", value: { kind: \"safeInt\" } } } }",
+        "{ kind: \"named\", name: \"Choice\", value: { kind: \"enum\", values: [\"Open\", \"Closed\"] } }",
+        "{ kind: \"named\", name: \"Details\", value: { kind: \"taggedUnion\"",
+        "\"owners\": { kind: \"list\", item: { kind: \"uuid\" } }",
+        "\"scores\": { kind: \"dict\", value: { kind: \"float\" } }",
+    ] {
+        assert!(metadata.contains(expected), "missing {expected}:\n{metadata}");
+    }
+}
+
+#[test]
 fn generated_typescript_ids_and_references_compile() {
     let (_, _, files) = fixture();
     let types = content(&files, "typescript/types.ts");

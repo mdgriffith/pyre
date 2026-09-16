@@ -99,6 +99,7 @@ schema =
         Dict.fromList
             [ ( "games"
               , { name = "games"
+                , columns = Nothing
                 , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                 , links =
                     Dict.fromList
@@ -117,6 +118,7 @@ schema =
               )
             , ( "game_members"
               , { name = "game_members"
+                , columns = Nothing
                 , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                 , links = Dict.empty
                 , indices = []

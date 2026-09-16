@@ -6,7 +6,7 @@ use crate::generate::sql;
 use crate::generate::typealias;
 use crate::generate::typescript::common;
 use crate::typecheck;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 pub fn generate_schema(
@@ -1373,6 +1373,10 @@ fn schema_metadata_value(context: &typecheck::Context, namespace: Option<&str>) 
                     if column.nullable { "true" } else { "false" }
                 ));
                 result.push_str(&format!(
+                    "          codec: {},\n",
+                    wire_codec(context, &column.type_, column.nullable, &mut HashSet::new())
+                ));
+                result.push_str(&format!(
                     "          primary: {},\n",
                     if is_primary { "true" } else { "false" }
                 ));
@@ -1550,6 +1554,120 @@ fn schema_metadata_value(context: &typecheck::Context, namespace: Option<&str>) 
     result.push_str("\n  }\n");
     result.push_str("}");
     result
+}
+
+fn wire_codec(
+    context: &typecheck::Context,
+    type_: &ast::ColumnType,
+    nullable: bool,
+    expanding: &mut HashSet<String>,
+) -> String {
+    let codec = match type_ {
+        ast::ColumnType::String => "{ kind: \"string\" }".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => "{ kind: \"safeInt\" }".to_string(),
+        ast::ColumnType::Float => "{ kind: \"float\" }".to_string(),
+        ast::ColumnType::Bool => "{ kind: \"bool\" }".to_string(),
+        ast::ColumnType::Date => "{ kind: \"date\" }".to_string(),
+        ast::ColumnType::DateTime => "{ kind: \"dateTime\" }".to_string(),
+        ast::ColumnType::Json => "{ kind: \"json\" }".to_string(),
+        ast::ColumnType::JsonTyped(inner) => wire_codec(context, inner, false, expanding),
+        ast::ColumnType::List(inner) => format!(
+            "{{ kind: \"list\", item: {} }}",
+            wire_codec(context, inner, false, expanding)
+        ),
+        ast::ColumnType::Dict(inner) => format!(
+            "{{ kind: \"dict\", value: {} }}",
+            wire_codec(context, inner, false, expanding)
+        ),
+        ast::ColumnType::Nullable(inner) => return wire_codec(context, inner, true, expanding),
+        ast::ColumnType::IdUuid { .. } => "{ kind: \"uuid\" }".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(serialization),
+            ..
+        } => wire_codec_for_serialization(serialization),
+        ast::ColumnType::ForeignKey { .. } => {
+            panic!("checked foreign key requires a concrete wire codec")
+        }
+        ast::ColumnType::Custom(name) => {
+            if !expanding.insert(name.clone()) {
+                format!("{{ kind: \"reference\", name: {} }}", string::quote(name))
+            } else {
+                let value = match context.types.get(name) {
+                    Some((_, typecheck::Type::OneOf { variants }))
+                        if variants.iter().all(|variant| variant.fields.is_none()) =>
+                    {
+                        let values = variants
+                            .iter()
+                            .map(|variant| string::quote(&variant.name))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{{ kind: \"enum\", values: [{values}] }}")
+                    }
+                    Some((_, typecheck::Type::OneOf { variants })) => {
+                        let variants = variants
+                            .iter()
+                            .map(|variant| {
+                                let fields = variant
+                                    .fields
+                                    .iter()
+                                    .flatten()
+                                    .filter_map(|field| match field {
+                                        ast::Field::Column(column) => Some(format!(
+                                            "{}: {}",
+                                            string::quote(&column.name),
+                                            wire_codec(
+                                                context,
+                                                &column.type_,
+                                                column.nullable,
+                                                expanding,
+                                            )
+                                        )),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("{}: {{ {fields} }}", string::quote(&variant.name))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{{ kind: \"taggedUnion\", variants: {{ {variants} }} }}")
+                    }
+                    Some((_, typecheck::Type::Integer)) => "{ kind: \"safeInt\" }".to_string(),
+                    Some((_, typecheck::Type::Float)) => "{ kind: \"float\" }".to_string(),
+                    Some((_, typecheck::Type::String)) => "{ kind: \"string\" }".to_string(),
+                    _ => panic!("checked custom column type requires a wire codec: {name}"),
+                };
+                expanding.remove(name);
+                format!(
+                    "{{ kind: \"named\", name: {}, value: {value} }}",
+                    string::quote(name)
+                )
+            }
+        }
+    };
+
+    if nullable {
+        format!("{{ kind: \"nullable\", value: {codec} }}")
+    } else {
+        codec
+    }
+}
+
+fn wire_codec_for_serialization(type_: &ast::ConcreteSerializationType) -> String {
+    let kind = match type_ {
+        ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt => {
+            "safeInt"
+        }
+        ast::ConcreteSerializationType::Real => "float",
+        ast::ConcreteSerializationType::Text => "string",
+        ast::ConcreteSerializationType::Date => "date",
+        ast::ConcreteSerializationType::DateTime => "dateTime",
+        ast::ConcreteSerializationType::IdUuid => "uuid",
+        ast::ConcreteSerializationType::Blob
+        | ast::ConcreteSerializationType::VectorBlob { .. }
+        | ast::ConcreteSerializationType::JsonB => "json",
+    };
+    format!("{{ kind: \"{kind}\" }}")
 }
 
 fn get_linked_table<'a>(
