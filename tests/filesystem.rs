@@ -52,13 +52,13 @@ fn test_collect_filepaths_groups_schema_files_by_namespace() {
 
     std::fs::write(
         root.join("pyre/schema/App/schema.pyre"),
-        "record Project {\n    id Int @id\n    @public\n}\n",
+        "@syncable(false)\nrecord Project {\n    id Int @id\n    @public\n}\n",
     )
     .expect("App schema file should be written");
 
     std::fs::write(
         root.join("pyre/schema/Auth/schema.pyre"),
-        "record Account {\n    id Int @id\n    @public\n}\n",
+        "@syncable(false)\nrecord Account {\n    id Int @id\n    @public\n}\n",
     )
     .expect("Auth schema file should be written");
 
@@ -87,7 +87,7 @@ fn test_collect_filepaths_reads_project_session_file() {
         .expect("session file should be written");
     std::fs::write(
         root.join("schema.pyre"),
-        "record User {\n    id Int @id\n}\n",
+        "@syncable(false)\nrecord User {\n    id Int @id\n}\n",
     )
     .expect("schema file should be written");
 
@@ -108,7 +108,7 @@ fn test_schema_serialization_includes_shared_session() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "record Project {\n    id Int @id\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n    ownerId Int\n}\n",
+        "@syncable(false)\nrecord Project {\n    id Int @id\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n    ownerId Int\n}\n",
         &mut schema,
     )
     .expect("schema should parse");
@@ -158,7 +158,7 @@ fn standalone_namespace_serialization_includes_shared_session_types() {
     };
     parser::run(
         "schema/Main/schema.pyre",
-        "type MemberRole\n   = Admin\n   | Player\n\nrecord Member {\n    @public\n    id Id.Int @id\n    role MemberRole\n}\n",
+        "type MemberRole\n   = Admin\n   | Player\n\n@syncable(false)\nrecord Member {\n    @public\n    id Id.Int @id\n    role MemberRole\n}\n",
         &mut main,
     )
     .expect("Main schema should parse");
@@ -170,7 +170,7 @@ fn standalone_namespace_serialization_includes_shared_session_types() {
     };
     parser::run(
         "schema/Child/schema.pyre",
-        "record Document {\n    @allow(query) { Or(Session.role == Admin, Session.role == Player) }\n    @allow(insert, update, delete) { False }\n    id Id.Int @id\n}\n",
+        "@syncable(false)\nrecord Document {\n    @allow(query) { Or(Session.role == Admin, Session.role == Player) }\n    @allow(insert, update, delete) { False }\n    id Id.Int @id\n}\n",
         &mut child,
     )
     .expect("Child schema should parse");

@@ -95,6 +95,109 @@ function harness(options = {}) {
 }
 async function ready(options) { const h = harness(options); await until(() => h.reads.length === 1); await h.replace(); return h; }
 
+const generatedCreate = {
+  id: 'generated-create@m1', generatedCreateUuidInput: 'key',
+  parseInput: value => {
+    if (!value || typeof value !== 'object' || !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.key)
+      || typeof value.name !== 'string') throw Error('InvalidEdit');
+    return value;
+  },
+  decodeResult: value => { if (!value || typeof value.id !== 'string') throw Error(); return value; },
+  predict: input => ({ safe: true, kind: 'create', table: 'users', id: input.key, fields: input,
+    writableFields: ['name', 'note'], materializedFields: ['key', 'name', 'note'] }),
+};
+
+async function withUuidGlobals({ timestamp = 0x01941f297c00, getRandomValues }, callback) {
+  const dateDescriptor = Object.getOwnPropertyDescriptor(Date, 'now');
+  const cryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  let dateChanged = false, cryptoChanged = false;
+  try {
+    Object.defineProperty(Date, 'now', { configurable: true, value: () => timestamp });
+    dateChanged = true;
+    Object.defineProperty(globalThis, 'crypto', { configurable: true, writable: true,
+      value: getRandomValues === undefined ? undefined : { getRandomValues } });
+    cryptoChanged = true;
+    return await callback();
+  } finally {
+    if (cryptoChanged) {
+      if (cryptoDescriptor) Object.defineProperty(globalThis, 'crypto', cryptoDescriptor);
+      else delete globalThis.crypto;
+    }
+    if (dateChanged) Object.defineProperty(Date, 'now', dateDescriptor);
+  }
+}
+
+test('generated UUID create materializes once before optimism and keeps one ID through reprepare and dispatch', async () => {
+  const { planKey } = await import('@pyre/core/local-edits');
+  const preparation = deferred();
+  let calls = 0, submissionsAtAllocation = -1, h;
+  await withUuidGlobals({ getRandomValues: bytes => {
+    calls++;
+    submissionsAtAllocation = h.ingress.filter(message => message.type === 'submit').length;
+    bytes.fill(0xab);
+    return bytes;
+  } }, async () => {
+    h = await ready({ operations: [generatedCreate], preparation });
+    const plan = edit(generatedCreate, { name: 'generated', note: null });
+    expect(plan[planKey].operations[0].input).toEqual({ name: 'generated', note: null });
+
+    h.runtime.submit(plan);
+    const submitted = h.ingress.find(message => message.type === 'submit').operations[0];
+    const id = '01941f29-7c00-7bab-abab-abababababab';
+    expect(submissionsAtAllocation).toBe(0);
+    expect(calls).toBe(1);
+    expect(submitted.input.key).toBe(id);
+    expect(submitted.prediction.id).toBe(id);
+    expect(submitted.prediction.fields.key).toBe(id);
+    await until(() => h.rows().some(item => item.key === id));
+    expect(h.rows()).toContainEqual({ key: id, name: 'generated', note: null });
+
+    await until(() => h.preparations.length === 1);
+    h.runtime.setConnected(false);
+    preparation.resolve();
+    await tick();
+    expect(h.writes).toHaveLength(0);
+    h.runtime.setConnected(true);
+    await until(() => h.preparations.length === 2 && h.writes.length === 1);
+    expect(calls).toBe(1);
+    expect(h.preparations.map(item => item.request.operations[0].input.key)).toEqual([id, id]);
+    expect(h.writes[0].request.operations[0].input.key).toBe(id);
+  });
+});
+
+test('submitting one generated UUID plan twice allocates distinct canonical lowercase UUIDv7 IDs', async () => {
+  let calls = 0;
+  await withUuidGlobals({ getRandomValues: bytes => { bytes.fill(++calls); return bytes; } }, async () => {
+    const h = await ready({ operations: [generatedCreate] });
+    const plan = edit(generatedCreate, { name: 'twice', note: null });
+    h.runtime.submit(plan);
+    h.runtime.submit(plan);
+    const ids = h.ingress.filter(message => message.type === 'submit').map(message => message.operations[0].input.key);
+    expect(calls).toBe(2);
+    expect(new Set(ids).size).toBe(2);
+    expect(ids.every(id => /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id))).toBe(true);
+    expect(ids).toEqual(ids.map(id => id.toLowerCase()));
+  });
+});
+
+test('generated UUID create rejects explicit reserved IDs and missing Web Crypto before ingress', async () => {
+  const h = await ready({ operations: [generatedCreate] });
+  let randomCalls = 0;
+  await withUuidGlobals({ getRandomValues: bytes => { randomCalls++; return bytes; } }, async () => {
+    const explicit = h.runtime.submit(edit(generatedCreate, { key, name: 'reserved', note: null }));
+    expect(await explicit.confirmed).toEqual({ kind: 'rejected', code: 'InvalidEdit' });
+  });
+  expect(randomCalls).toBe(0);
+  expect(h.ingress.filter(message => message.type === 'submit')).toHaveLength(0);
+
+  await withUuidGlobals({ getRandomValues: undefined }, async () => {
+    const unavailable = h.runtime.submit(edit(generatedCreate, { name: 'unavailable', note: null }));
+    expect(await unavailable.confirmed).toEqual({ kind: 'rejected', code: 'InvalidEdit' });
+  });
+  expect(h.ingress.filter(message => message.type === 'submit')).toHaveLength(0);
+  expect(h.failures.map(failure => failure.phase)).toEqual(['validation', 'validation']);
+});
+
 test.each([
   ['commitRevision', { commitRevision: 1 }],
   ['results', { results: [] }],
@@ -117,16 +220,19 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders execute 
   const { Main, Records, Commands, batch: generatedBatch, operations, manifestVersion } = await import(process.env.PYRE_GENERATED_EDITS!);
   const { User, Audit, Token } = Records;
   const { planKey } = await import('@pyre/core/local-edits');
-  const complete = Token.create({ key, text: 'known', updatedAt: 0 })[planKey].operations[0];
-  expect(complete.definition.predict(complete.input)).toMatchObject({ safe: true, kind: 'create', id: key });
-  const integer = Audit.create({ message: 'audit' })[planKey].operations[0];
-  expect(integer.definition.predict).toBeUndefined();
-  const serverOwned = User.create({ key, name: 'new', fixed: 'x' })[planKey].operations[0];
+  const complete = Token.create({ text: 'known', updatedAt: 0 })[planKey].operations[0];
+  expect(complete.input).toEqual({ text: 'known', updatedAt: 0 });
+  expect(complete.definition.generatedCreateUuidInput).toBe('key');
+  expect(complete.definition.predict({ ...complete.input, key })).toMatchObject({ safe: true, kind: 'create', id: key });
+  const audit = Audit.create({ message: 'audit' })[planKey].operations[0];
+  expect(audit.definition.generatedCreateUuidInput).toBe('id');
+  expect(audit.definition.predict).toBeUndefined();
+  const serverOwned = User.create({ name: 'new', fixed: 'x' })[planKey].operations[0];
   expect(serverOwned.definition.predict).toBeUndefined();
   const generatedFence = { ...fence, namespace: Main.name, manifest: manifestVersion };
   const h = await ready({ fence: generatedFence, operations });
   const db = h.runtime.bind(Main);
-  const input = { key, name: 'created', fixed: 'x', note: null, status: { _type: 'Closed', reason: 'original' } };
+  const input = { name: 'created', fixed: 'x', note: null, status: { _type: 'Closed', reason: 'original' } };
   const edits = [User.create(input), Audit.create({ message: 'audit' }), User.update(key, { note: null }), Commands.rename({ key, name: 'final' })];
   const plan = generatedBatch(edits);
   input.status.reason = 'mutated'; edits.length = 0;
@@ -136,14 +242,14 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders execute 
   expect(request.operations).toHaveLength(4);
   expect(request.operations[0].input.status.reason).toBe('original');
   expect(h.ingress.find(m => m.type === 'submit').operations.every(op => !op.prediction)).toBe(true);
-  const values = [{ id: key }, { id: 7 }, { id: key }, { user: [{ name: 'final' }] }];
+  const values = [{ id: request.operations[0].input.key }, { id: request.operations[1].input.id }, { id: key }, { user: [{ name: 'final' }] }];
   h.writes[0].resolve({ ...generatedFence, requestId: request.requestId, status: 'accepted', commitRevision: 1,
     results: request.operations.map((op, index) => ({ index, operation: op.operation, value: values[index] })),
     reconciliation: { kind: 'replaceRequired', atLeast: 1, invalidate: false } });
   await until(() => h.reads.length === 2);
   await h.replace([{ key, name: 'final', note: null }], 1);
   expect((await receipt.confirmed).kind).toBe('confirmed');
-  expect((await receipt.confirmed).result[1]).toEqual({ id: 7 });
+  expect((await receipt.confirmed).result[1]).toEqual({ id: request.operations[1].input.id });
   expect((await db.submit(User.update(key, {})).confirmed).kind).toBe('rejected');
   expect((await db.submit(User.update(key, { fixed: 'forbidden' })).confirmed).kind).toBe('rejected');
   expect(() => h.runtime.bind({ ...Main, name: 'Other' })).toThrow('Namespace mismatch');
@@ -160,8 +266,9 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders use serv
   const sql = createClient({ url: `file:${temp}/generated.db` });
   try {
     await sql.executeMultiple(`create table users(key text primary key, name text, note text, reviewer text, status blob, fixed text, updatedAt integer);
-      create table audits(id integer primary key, message text, label text default 'audit', updatedAt integer);
+      create table audits(id text primary key, message text, label text default 'audit', updatedAt integer);
       create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer);
+      insert into users(key,name,note,fixed) values('${key}','base','server','x');
       insert into _pyre_sync values(1,'e1',0);`);
     const generatedFence = { ...fence, namespace: Main.name, manifest: manifestVersion };
     const responses = [];
@@ -172,23 +279,24 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders use serv
       return result.response;
     } }) });
     const db = h.runtime.bind(Main);
-    const receipt = db.submit(generatedBatch([User.create({ key, name: 'new', fixed: 'x' }), Audit.create({ message: 'audit' }),
+    const receipt = db.submit(generatedBatch([User.create({ name: 'new', fixed: 'x' }), Audit.create({ message: 'audit' }),
       User.update(key, { note: null }), Commands.rename({ key, name: 'final' })]));
     await until(() => responses.length === 1);
-    expect(responses[0].kind).toBe('success');
+    expect(responses[0]).toMatchObject({ kind: 'success' });
     await until(() => h.reads.length === 2);
     await h.replace([{ key, name: 'final', note: null }], 1);
     const outcome = await receipt.confirmed;
     expect(outcome.kind).toBe('confirmed');
-    expect(outcome.result[0]).toEqual({ id: key });
-    expect(outcome.result[1]).toEqual({ id: 1 });
+    expect(outcome.result[0].id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(outcome.result[1].id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(outcome.result[0].id).not.toBe(outcome.result[1].id);
     expect(outcome.result[3]).toEqual({ user: [{ name: 'final' }] });
     const removed = db.submit(User.delete(key));
     await until(() => responses.length === 2);
     await until(() => h.reads.length === 3);
     await h.replace([], 2);
     expect((await removed.confirmed).result).toEqual({ id: key });
-    expect((await sql.execute('select * from users')).rows).toEqual([]);
+    expect((await sql.execute('select key from users')).rows).toEqual([{ key: outcome.result[0].id }]);
   } finally { sql.close(); }
 });
 
@@ -197,22 +305,22 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders prove pr
   const { Token, NullableToken, DefaultToken, PrivateToken, Clock, Marker, User, Audit } = Records;
   const { planKey } = await import('@pyre/core/local-edits');
   const descriptor = plan => plan[planKey].operations[0];
-  for (const plan of [PrivateToken.create({ key, text: 'visible', updatedAt: 0 }), PrivateToken.update(key, { text: 'hidden' }), PrivateToken.delete(key),
-    DefaultToken.create({ key, text: 'explicit', updatedAt: 0 }), Clock.create({ key, at: 1700000000 }), Marker.update(key, { text: 'next' })]) {
+  for (const plan of [PrivateToken.create({ text: 'visible', updatedAt: 0 }), PrivateToken.update(key, { text: 'hidden' }), PrivateToken.delete(key),
+    DefaultToken.create({ text: 'explicit', updatedAt: 0 }), Clock.create({ at: 1700000000 }), Marker.update(key, { text: 'next' })]) {
     expect(descriptor(plan).definition.predict).toBeUndefined();
   }
-  const omitted = descriptor(NullableToken.create({ key, updatedAt: 0 }));
-  expect(omitted.definition.predict(omitted.input)).toBeNull();
+  const omitted = descriptor(NullableToken.create({ updatedAt: 0 }));
+  expect(omitted.definition.predict({ ...omitted.input, key })).toBeNull();
   for (const text of [null, 'value']) {
-    const complete = descriptor(NullableToken.create({ key, text, updatedAt: 0 }));
-    expect(complete.definition.predict(complete.input)).toMatchObject({ safe: true, fields: { key, text, updatedAt: 0 } });
+    const complete = descriptor(NullableToken.create({ text, updatedAt: 0 }));
+    expect(complete.definition.predict({ ...complete.input, key })).toMatchObject({ safe: true, fields: { key, text, updatedAt: 0 } });
   }
   const updatePlan = descriptor(Token.update(key, { text: 'next' }));
   expect(updatePlan.definition.predict(updatePlan.input)).toMatchObject({ kind: 'update', fields: { text: 'next' } });
   const h = await ready({ fence: { ...fence, namespace: Main.name, manifest: Main.manifest }, operations });
   const db = h.runtime.bind(Main);
-  for (const invalid of [Clock.create({ key, at: 'not-a-date' }), Clock.create({ key, at: 1.5 }), User.delete('bad-uuid'),
-    User.update(key, { name: null }), Audit.create({ message: 'x', label: null }), Audit.create({ id: 42, message: 'x' })]) {
+  for (const invalid of [Clock.create({ at: 'not-a-date' }), Clock.create({ at: 1.5 }), User.delete('bad-uuid'),
+    User.update(key, { name: null }), Audit.create({ message: 'x', label: null }), Audit.create({ id: key, message: 'x' })]) {
     expect((await db.submit(invalid).confirmed).kind).toBe('rejected');
   }
   expect(h.ingress.filter(message => message.type === 'submit')).toHaveLength(0);
@@ -817,12 +925,13 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('production Elm bridge shares gen
     ports.emit({ type: 'elm-local-edits', databaseId: 'main', requestId: 'generated', operations: ops });
     const typed = db.submit(Commands.rename({ key, name: 'typed' }));
     await until(() => h.writes.length === 1);
+    const auditId = h.writes[0].request.operations[0].input.id;
     h.writes[0].resolve({ ...generatedFence, requestId: h.writes[0].request.requestId, status: 'accepted', commitRevision: 1,
-      results: ops.map((op, index) => ({ index, operation: op.operation, value: index === 0 ? { id: 7 } : { user: [{ name: 'renamed' }] } })),
+      results: ops.map((op, index) => ({ index, operation: op.operation, value: index === 0 ? { id: auditId } : { user: [{ name: 'renamed' }] } })),
       reconciliation: { kind: 'replaceRequired', atLeast: 1, invalidate: false } });
     await until(() => h.reads.length === 2); await h.replace([row], 1);
     expect(ports.events.find(e => e.state === 'confirmed')).toMatchObject({ requestId: 'generated', results: [
-      { index: 0, operation: ops[0].operation, value: { id: 7 } },
+      { index: 0, operation: ops[0].operation, value: { id: auditId } },
       { index: 1, operation: ops[1].operation, value: { user: [{ name: 'renamed' }] } },
     ] });
     expect(h.ingress.filter(m => m.type === 'submit').map(m => m.operations.length)).toEqual([2, 1]);

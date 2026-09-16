@@ -325,7 +325,7 @@ mod tests {
         };
         parser::run(
             "pyre/schema/App/schema.pyre",
-            "record Post {\n    @public\n    id Id.Int @id\n    userId Auth.User.id\n}\n",
+            "@syncable(false)\nrecord Post {\n    @public\n    id Id.Int @id\n    userId Auth.User.id\n}\n",
             &mut app,
         )
         .expect("App schema should parse");

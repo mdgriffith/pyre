@@ -6,8 +6,8 @@ import './Clients.css'
 interface Client {
   id: string
   name: string
-  userId: number | null
-  requestedUserId: number | null
+  userId: string | null
+  requestedUserId: string | null
   connected: boolean
   pyreClient: PyreClient | null
   indexedDbName?: string | null
@@ -51,7 +51,7 @@ function ClientCard({
       {}, // No input parameters
       (result: any) => {
         // Find the user for this client
-        const userId = client.userId || client.requestedUserId || 0
+        const userId = client.userId || client.requestedUserId
         const user = result.user?.find((u: any) => u.id === userId) || null
 
         // Get all posts from the result

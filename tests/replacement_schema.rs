@@ -28,12 +28,12 @@ fn namespace_contracts_are_isolated_but_share_the_allowlist_fingerprint() {
             namespace: "Main".into(),
             ..Default::default()
         };
-        parser::run("main.pyre", &format!("session {{\n userId Int\n{extra_session}\n}}\ntype Choice\n = Open\n | Closed\nrecord Entry {{\n @public\n id Id.Int @id\n choice Choice\n}}\n"), &mut main).unwrap();
+        parser::run("main.pyre", &format!("session {{\n userId Int\n{extra_session}\n}}\ntype Choice\n = Open\n | Closed\nrecord Entry {{\n @public\n id Id.Uuid @id\n choice Choice\n}}\n"), &mut main).unwrap();
         let mut archive = ast::Schema {
             namespace: "Archive".into(),
             ..Default::default()
         };
-        parser::run("archive.pyre", &format!("type ArchiveOnly\n = Stored\n | Retired\nrecord Saved {{\n @allow(*) {{ {permission} }}\n id Id.Int @id\n state ArchiveOnly\n}}\n"), &mut archive).unwrap();
+        parser::run("archive.pyre", &format!("type ArchiveOnly\n = Stored\n | Retired\nrecord Saved {{\n @allow(*) {{ {permission} }}\n id Id.Uuid @id\n state ArchiveOnly\n}}\n"), &mut archive).unwrap();
         typecheck::check_schema(&ast::Database {
             schemas: vec![main, archive],
         })
@@ -65,7 +65,7 @@ fn stored_session_retains_local_uuid_brand_for_permissions() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "session {\n principalId Principal.id?\n}\nrecord Principal {\n @public\n id Id.Uuid @id\n}\nrecord Member {\n @allow(*) { principalId == Session.principalId }\n id Id.Int @id\n principalId Principal.id\n}\n",
+        "session {\n principalId Principal.id?\n}\nrecord Principal {\n @public\n id Id.Uuid @id\n}\nrecord Member {\n @allow(*) { principalId == Session.principalId }\n id Id.Uuid @id\n principalId Principal.id\n}\n",
         &mut schema,
     )
     .unwrap();
@@ -106,7 +106,7 @@ fn namespace_contracts_survive_standalone_storage_and_dynamic_migration() {
     };
     parser::run(
         "archive.pyre",
-        "record Saved {\n @public\n id Id.Int @id\n choice Choice\n}\n",
+        "record Saved {\n @public\n id Id.Uuid @id\n choice Choice\n}\n",
         &mut archive,
     )
     .unwrap();
@@ -211,14 +211,14 @@ session {{
     value {json_type}?
 }}
 record Membership {{
-    id Int @id
-    workspaceId Int
+    id Id.Uuid @id
+    workspaceId Id.Uuid
     value {json_type}?
     @allow(query) {{ value {operator} {rhs} }}
     @allow(insert, update, delete) {{ False }}
 }}
 record Workspace {{
-    id Int @id
+    id Id.Uuid @id
     memberships @link(Membership.workspaceId)
     @allow(query) {{ exists memberships {{ value {operator} {rhs} }} }}
     @allow(insert, update, delete) {{ False }}
@@ -234,7 +234,7 @@ record Workspace {{
                 pyre::server::schema::ensure_database(&conn, ast::DEFAULT_SCHEMANAME, &source)
                     .await
                     .unwrap();
-                conn.execute_batch("INSERT INTO workspaces(id) VALUES(1),(2),(3); INSERT INTO memberships(id,workspaceId,value) VALUES(1,1,jsonb('7')),(2,2,jsonb('8')),(3,3,NULL);").await.unwrap();
+                conn.execute_batch("INSERT INTO workspaces(id) VALUES('00000000-0000-4000-8000-000000000001'),('00000000-0000-4000-8000-000000000002'),('00000000-0000-4000-8000-000000000003'); INSERT INTO memberships(id,workspaceId,value) VALUES('10000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000001',jsonb('7')),('10000000-0000-4000-8000-000000000002','00000000-0000-4000-8000-000000000002',jsonb('8')),('10000000-0000-4000-8000-000000000003','00000000-0000-4000-8000-000000000003',NULL);").await.unwrap();
                 let queries = parser::parse_query(
                     "query.pyre",
                     "query Visible { membership { id } workspace { id } }",
@@ -272,18 +272,29 @@ record Workspace {{
                         let mut ids = snapshot.tables[table]
                             .rows
                             .iter()
-                            .map(|row| row["id"].as_i64().unwrap())
+                            .map(|row| row["id"].as_str().unwrap())
                             .collect::<Vec<_>>();
                         ids.sort();
+                        let expected_ids = expected
+                            .iter()
+                            .map(|id| {
+                                if table == "memberships" {
+                                    format!("10000000-0000-4000-8000-{id:012}")
+                                } else {
+                                    format!("00000000-0000-4000-8000-{id:012}")
+                                }
+                            })
+                            .collect::<Vec<_>>();
                         assert_eq!(
-                            ids, expected,
+                            ids,
+                            expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
                             "{json_type}: {operator} {rhs}, session={value}, {table}"
                         );
                         let mut query_ids = result.response[field]
                             .as_array()
                             .unwrap()
                             .iter()
-                            .map(|row| row["id"].as_i64().unwrap())
+                            .map(|row| row["id"].as_str().unwrap())
                             .collect::<Vec<_>>();
                         query_ids.sort();
                         assert_eq!(ids, query_ids);
@@ -299,7 +310,7 @@ async fn replacement_decodes_json_strings_exactly_once() {
     let source = r#"
 type Payload = Text { value Json<String> }
 record Item {
-    id Int @id
+    id Id.Uuid @id
     label Json<String>
     raw Json
     optional Json<String?>
@@ -330,13 +341,14 @@ record Item {
     ];
     for (index, value) in strings.iter().enumerate() {
         conn.execute("INSERT INTO items(id,label,raw,optional,payload,payload__value) VALUES(?1,jsonb(?2),jsonb(?2),jsonb('null'),'Text',jsonb(?2))",
-            libsql::params![index as i64, serde_json::to_string(value).unwrap()]).await.unwrap();
+            libsql::params![format!("00000000-0000-4000-8000-{index:012}"), serde_json::to_string(value).unwrap()]).await.unwrap();
     }
     let snapshot = replacement(&conn, &context, &manifest, &session).await;
     assert!(snapshot.complete);
     assert_eq!(snapshot.tables["items"].rows.len(), strings.len());
     for row in &snapshot.tables["items"].rows {
-        let value = strings[row["id"].as_u64().unwrap() as usize];
+        let index = row["id"].as_str().unwrap()[24..].parse::<usize>().unwrap();
+        let value = strings[index];
         assert_eq!(row["label"], value);
         assert_eq!(row["raw"], value);
         assert_eq!(row["optional"], json!(null));
@@ -346,7 +358,7 @@ record Item {
 
 #[test]
 fn replacement_contract_authenticates_permissions_session_codecs_and_sync_scope() {
-    let source = "session {\n    userId Int\n}\nrecord Item {\n    id Int @id\n    owner Int\n    @allow(query) { owner == Session.userId }\n    @allow(insert, update, delete) { False }\n}\n";
+    let source = "session {\n    userId Int\n}\nrecord Item {\n    id Id.Uuid @id\n    owner Int\n    @allow(query) { owner == Session.userId }\n    @allow(insert, update, delete) { False }\n}\n";
     let original = context(source);
     let compiled = manifest(&original);
     assert!(compiled.matches_context(&original));
@@ -381,14 +393,14 @@ session {
     userId Int
 }
 record Membership {
-    id Int @id
-    workspaceId Int
+    id Id.Uuid @id
+    workspaceId Id.Uuid
     userId Int
     @allow(query) { False }
     @allow(insert, update, delete) { False }
 }
 record Workspace {
-    id Int @id
+    id Id.Uuid @id
     memberships @link(Membership.workspaceId)
     @allow(query) { exists memberships { userId == Session.userId } }
     @allow(insert, update, delete) { False }
@@ -408,7 +420,7 @@ async fn normally_checked_linked_schema_supports_replacement_and_rejects_legacy_
         .await
         .unwrap();
     let conn = db.connect().unwrap();
-    conn.execute_batch("CREATE TABLE workspaces(id INTEGER PRIMARY KEY, updatedAt INTEGER); CREATE TABLE memberships(id INTEGER PRIMARY KEY, workspaceId INTEGER, userId INTEGER, updatedAt INTEGER); INSERT INTO workspaces VALUES(1,0),(2,0); INSERT INTO memberships VALUES(1,1,7,0),(2,2,8,0);").await.unwrap();
+    conn.execute_batch("CREATE TABLE workspaces(id TEXT PRIMARY KEY, updatedAt INTEGER); CREATE TABLE memberships(id TEXT PRIMARY KEY, workspaceId TEXT, userId INTEGER, updatedAt INTEGER); INSERT INTO workspaces VALUES('00000000-0000-4000-8000-000000000001',0),('00000000-0000-4000-8000-000000000002',0); INSERT INTO memberships VALUES('10000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000001',7,0),('10000000-0000-4000-8000-000000000002','00000000-0000-4000-8000-000000000002',8,0);").await.unwrap();
     let workspace = plan
         .tables
         .iter()
@@ -459,7 +471,7 @@ type State
 type Document
     = Details { count Int, enabled Bool }
 record Item {
-    id Int @id
+    id Id.Uuid @id
     active Bool
     state State
     document Json<Document>
@@ -470,7 +482,7 @@ record Item {
     let namespace = context.valid_namespaces.iter().next().unwrap();
     let plan = sync::get_replacement_sql(&context, &HashMap::new(), namespace).unwrap();
     let table = &plan.tables[0];
-    let object = json!({"id":1,"active":1,"state":"Open","state__active":0,"document":{"_type":"Details","count":2,"enabled":true},"updatedAt":0});
+    let object = json!({"id":"00000000-0000-4000-8000-000000000001","active":1,"state":"Open","state__active":0,"document":{"_type":"Details","count":2,"enabled":true},"updatedAt":0});
     let group = AffectedRowTableGroup {
         table_name: table.table_name.clone(),
         headers: table.headers.clone(),
@@ -500,7 +512,7 @@ record Item {
     );
     for (field, value) in [
         ("active", json!(2)),
-        ("id", json!("not an integer")),
+        ("id", json!("not-a-uuid")),
         ("state", json!("Unknown")),
         ("state__active", json!(null)),
         (
@@ -540,7 +552,7 @@ fn replacement_shape_resolves_physical_table_names_within_the_requested_namespac
     };
     parser::run(
         "main.pyre",
-        "record Current {\n @tablename(\"shared_rows\")\n @public\n id Int @id\n active Bool\n}\n",
+        "record Current {\n @tablename(\"shared_rows\")\n @public\n id Id.Uuid @id\n active Bool\n}\n",
         &mut main,
     )
     .unwrap();
@@ -550,7 +562,7 @@ fn replacement_shape_resolves_physical_table_names_within_the_requested_namespac
     };
     parser::run(
         "archive.pyre",
-        "record Historical {\n @tablename(\"shared_rows\")\n @public\n id Int @id\n label String\n}\n",
+        "record Historical {\n @tablename(\"shared_rows\")\n @public\n id Id.Uuid @id\n label String\n}\n",
         &mut archive,
     )
     .unwrap();
@@ -560,7 +572,7 @@ fn replacement_shape_resolves_physical_table_names_within_the_requested_namespac
     .unwrap();
     let plan = sync::get_replacement_sql(&context, &HashMap::new(), "Main").unwrap();
     let table = &plan.tables[0];
-    let object = json!({"id": 1, "active": 1, "updatedAt": 0});
+    let object = json!({"id": "00000000-0000-4000-8000-000000000001", "active": 1, "updatedAt": 0});
     let group = AffectedRowTableGroup {
         table_name: table.table_name.clone(),
         headers: table.headers.clone(),
@@ -573,7 +585,14 @@ fn replacement_shape_resolves_physical_table_names_within_the_requested_namespac
 
     let shaped = sync::reshape_replacement_table(&context, "Main", &group).unwrap();
     assert_eq!(shaped.headers, vec!["id", "active", "updatedAt"]);
-    assert_eq!(shaped.rows, vec![vec![json!(1), json!(true), json!(0)]]);
+    assert_eq!(
+        shaped.rows,
+        vec![vec![
+            json!("00000000-0000-4000-8000-000000000001"),
+            json!(true),
+            json!(0)
+        ]]
+    );
 }
 
 #[test]
@@ -591,7 +610,7 @@ type Payload
         enabled Bool
     }
 record Item {
-    id Int @id
+    id Id.Uuid @id
     happenedAt DateTime
     choice Choice
     payload Json<Payload>
@@ -603,7 +622,7 @@ record Item {
     let plan = sync::get_replacement_sql(&context, &HashMap::new(), namespace).unwrap();
     let table = &plan.tables[0];
     let object = json!({
-        "id": 1,
+        "id": "00000000-0000-4000-8000-000000000001",
         "happenedAt": "1700000000",
         "choice": "First",
         "payload": {

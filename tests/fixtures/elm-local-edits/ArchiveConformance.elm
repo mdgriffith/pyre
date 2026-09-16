@@ -19,7 +19,7 @@ port observed : E.Value -> Cmd msg
 
 submission =
     Pyre.submit (Database.fromString "archive")
-        (Entry.update (Db.Id.uuid "00000000-0000-4000-8000-000000000001") [ Entry.setTitle "archive elm" ])
+        (Entry.create { title = "archive elm" })
         (Pyre.init "archive-conformance")
 
 

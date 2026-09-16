@@ -428,7 +428,8 @@ pub fn generated_edit_metadata(
         ast::TopLevelQueryField::Field(field) => context.tables.get(&field.name),
         _ => None,
     })?;
-    let (kind, _, writable_inputs) = crate::generated_queries::generated_edit(query, table)?;
+    let (kind, primary_key, writable_inputs) =
+        crate::generated_queries::generated_edit(query, table)?;
     let sql = query_sql(context, query, info, false);
     let write_statement_indices = sql
         .iter()
@@ -441,6 +442,9 @@ pub fn generated_edit_metadata(
         .collect();
     Some(crate::server::manifest::GeneratedEdit {
         kind: kind.to_string(),
+        create_uuid_input: (kind == "create"
+            && matches!(primary_key.type_, ast::ColumnType::IdUuid { .. }))
+        .then(|| primary_key.name.clone()),
         write_statement_indices,
         writable_inputs,
     })

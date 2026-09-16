@@ -1945,13 +1945,23 @@ fn generate_local_edits(
             }
             "create" => {
                 exposed.extend(["Create".into(), "CreateOption".into(), "createWith".into()]);
-                let required: Vec<_> = query.args.iter().filter(|arg| !arg.omittable).collect();
+                let generated_id = matches!(id.type_, ast::ColumnType::IdUuid { .. })
+                    .then_some(id.name.as_str());
+                let required: Vec<_> = query
+                    .args
+                    .iter()
+                    .filter(|arg| !arg.omittable && Some(arg.name.as_str()) != generated_id)
+                    .collect();
                 let fields: Vec<_> = required.iter().map(|arg| {
                     let (type_, _) = local_edit_arg(context, &lookup, table, arg, names);
                     format!("{} : {}", arg.name, type_)
                 }).collect();
                 body.push_str(&format!("type alias Create =\n    {{ {} }}\n\n\ntype CreateOption\n    = CreateOption String Encode.Value\n\n\n", fields.join(", ")));
-                for arg in query.args.iter().filter(|arg| arg.omittable) {
+                for arg in query
+                    .args
+                    .iter()
+                    .filter(|arg| arg.omittable && Some(arg.name.as_str()) != generated_id)
+                {
                     let (type_, encoder) = local_edit_arg(context, &lookup, table, arg, names);
                     let setter = format!("with{}", elm_module_segment(&arg.name));
                     exposed.push(setter.clone());

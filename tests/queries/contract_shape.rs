@@ -5,6 +5,8 @@ use serde_json::json;
 #[tokio::test]
 async fn test_direct_query_nested_tagged_value_uses_tagged_object_shape() -> Result<(), TestError> {
     let schema = r#"
+@syncable(false)
+
 type TileFormat
    = Png
    | Webp
@@ -65,6 +67,8 @@ record GameMap {
 async fn test_direct_query_many_to_one_with_nested_collections_uses_object_shape(
 ) -> Result<(), TestError> {
     let schema = r#"
+@syncable(false)
+
 record Game {
     id Id.Int @id
     rulebookVersionId RulebookVersion.id
@@ -168,6 +172,8 @@ record RulebookVersionDocument {
 #[tokio::test]
 async fn test_lore_like_game_queries_preserve_generated_contract_shape() -> Result<(), TestError> {
     let schema = r#"
+@syncable(false)
+
 type TileFormat
    = Png
    | Webp

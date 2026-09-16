@@ -10,6 +10,7 @@ async fn seed_inserts_nested_rows_and_serializes_values() -> Result<(), Box<dyn 
 {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Status
    = Draft
    | Published { note String }
@@ -103,6 +104,7 @@ record Post {
 async fn seed_rolls_back_nested_failures() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record User {
     id Id.Int @id
     name String
@@ -151,6 +153,7 @@ async fn seed_inserts_to_one_links_before_the_dependent_row(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record User {
     id Id.Int @id
     name String
@@ -193,6 +196,7 @@ async fn seed_requires_custom_payload_fields_and_normalizes_nested_values(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Details
    = Details {
         active Bool
@@ -248,6 +252,7 @@ async fn seed_supports_uuid_links_defaults_explicit_null_and_flat_foreign_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Owner {
     id Id.Uuid @id
     name String @default("Unknown")
@@ -297,6 +302,7 @@ async fn seed_database_errors_include_paths_and_roll_back() -> Result<(), Box<dy
 {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record User {
     id Id.Int @id
     email String @unique
@@ -331,6 +337,7 @@ async fn seed_rejects_unknown_fields_legacy_discriminators_and_link_conflicts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Status
    = Active
 
@@ -406,6 +413,7 @@ async fn seed_handles_representative_flat_import_volume() -> Result<(), Box<dyn 
 {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Item {
     id Id.Int @id
     externalId String @unique

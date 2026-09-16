@@ -29,7 +29,7 @@ try {
   const epoch = (await db.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch as string;
   const request = { version: 1 as const, ...authority, databaseEpoch: epoch, requestId: "read", target: 1 };
   const session = { userId: 7, role: { _type: "Member" }, unrelated: "required" };
-  const input = { id: "00000000-0000-4000-8000-000000000001", release: "00000000-0000-4000-8000-000000000002", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
+  const input = { id: "01890f6c-7b80-7000-8000-000000000001", release: "00000000-0000-4000-8000-000000000002", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
   const accepted = await runBatch(db, manifest, authority, { version: 1, ...authority, databaseEpoch: epoch,
     requestId: "write", sequence: 1, operations: [{ operation: meta.id, input }] }, session);
   assert.equal(accepted.kind, "success");

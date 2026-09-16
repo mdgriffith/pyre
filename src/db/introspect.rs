@@ -706,6 +706,7 @@ mod tests {
             tables: vec![],
             migration_state: MigrationState::NoMigrationTable,
             schema_source: r#"
+@syncable(false)
 record Parent {
     @public
     id       Id.Int @id

@@ -22,12 +22,12 @@ record Person {
 }
 record Audit {
     @public
-    auditKey Id.Int @id
+    auditKey Id.Uuid @id
     message String
 }
 record Note {
     @public
-    id Id.Int @id
+    id Id.Uuid @id
     personKey Person.personKey
     auditKey Audit.auditKey?
     title String
@@ -79,12 +79,12 @@ fn typed_non_id_references_match_primary_key_kind() {
         "{metadata}"
     );
     assert!(
-        metadata.contains("primaryKey: { name: \"auditKey\", kind: \"int\" }"),
+        metadata.contains("primaryKey: { name: \"auditKey\", kind: \"uuid\" }"),
         "{metadata}"
     );
     let ids = content(&files, "Db/Id.elm");
     assert!(ids.contains("type alias Person = Uuid PersonId"));
-    assert!(ids.contains("type alias Audit = Integer AuditId"));
+    assert!(ids.contains("type alias Audit = Uuid AuditId"));
     assert!(ids.contains("uuid : String -> Uuid guard"));
     assert!(!ids.contains("Cmd") && !ids.contains("Random"));
     let db = content(&files, "client/elm/Db.elm");
@@ -95,25 +95,21 @@ fn typed_non_id_references_match_primary_key_kind() {
         "personKey : Db.Id.Person",
         "auditKey : Maybe Db.Id.Audit",
         "Db.Id.decodeUuid",
-        "Db.Id.decodeInt",
     ] {
         assert!(query.contains(expected), "missing {expected}:\n{query}");
     }
     let create = content(&files, "Query/NoteCreate.elm");
-    assert!(
-        create.contains("Db.Id.encodeUuid") && create.contains("Db.Id.encodeInt"),
-        "{create}"
-    );
+    assert!(create.contains("Db.Id.encodeUuid"), "{create}");
     let stream = content(&files, "Db/Table/Notes.elm");
     assert!(
         stream.contains("personKeyIn : List Db.Id.Person"),
         "{stream}"
     );
     assert!(stream.contains("auditKeyIn : List Db.Id.Audit"), "{stream}");
-    assert!(stream.contains("Db.Id.encodeUuid") && stream.contains("Db.Id.encodeInt"));
+    assert!(stream.contains("Db.Id.encodeUuid"), "{stream}");
     for (module, record, key, kind) in [
         ("People", "Person", "personKey", "Uuid"),
-        ("Audits", "Audit", "auditKey", "Int"),
+        ("Audits", "Audit", "auditKey", "Uuid"),
     ] {
         let table = content(&files, &format!("Db/Table/{module}.elm"));
         for expected in [
@@ -138,7 +134,7 @@ fn typed_non_id_references_match_primary_key_kind() {
 }
 
 #[test]
-fn generated_elm_compiles_with_uuid_allocation_before_construction() {
+fn generated_elm_create_input_omits_uuid_primary_key() {
     let elm = std::env::var("ELM_BINARY").unwrap_or_else(|_| "elm".into());
     if Command::new(&elm).arg("--version").output().is_err() {
         eprintln!("Skipping Elm compilation: install elm or set ELM_BINARY");
@@ -178,10 +174,7 @@ import Query.NoteCreate
 import Query.PersonCreate
 import Query.AuditCreate
 
-port requestUuid : () -> Cmd msg
-port uuidAllocated : (String -> msg) -> Sub msg
-
-type Msg = Allocated String
+type Msg = Never
 
 personRowId : People.Row -> Db.Id.Person
 personRowId row =
@@ -212,7 +205,7 @@ changeId change =
             Db.Id.encodeUuid (personRowId row)
 
         Db.Stream.AuditRow row ->
-            Db.Id.encodeInt (auditRowId row)
+            Db.Id.encodeUuid (auditRowId row)
 
         _ ->
             Encode.null
@@ -225,15 +218,15 @@ type alias Model =
 main : Program () (Maybe Model) Msg
 main =
     Platform.worker
-        { init = \_ -> ( Nothing, requestUuid () )
-        , subscriptions = \_ -> uuidAllocated Allocated
-        , update = \(Allocated raw) _ ->
+        { init = \_ ->
             ( Just
-                { references = Db.References { personKey = Db.Id.uuid raw, auditKey = Just (Db.Id.int 7) }
-                , createInput = { personKey = Db.Id.uuid raw, name = "New" }
+                { references = Db.References { personKey = Db.Id.uuid "00000000-0000-4000-8000-000000000001", auditKey = Just (Db.Id.uuid "00000000-0000-4000-8000-000000000002") }
+                , createInput = { name = "New" }
                 }
             , Cmd.none
             )
+        , subscriptions = \_ -> Sub.none
+        , update = never
         }
 "#,
     )
@@ -256,7 +249,7 @@ fn unsupported_primary_keys_are_not_labeled_as_uuids() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "record Slug {\n @public\n key String @id\n}\n",
+        "@syncable(false)\nrecord Slug {\n @public\n key String @id\n}\n",
         &mut schema,
     )
     .unwrap();
@@ -363,13 +356,13 @@ const personId: PersonId = person.personKey;
 const personRef: PersonId = note.personKey;
 const uuid: string = personId;
 const auditId: AuditId = audit.auditKey;
-const integer: number = auditId;
+const auditUuid: string = auditId;
 const optionalRef: AuditId | null = note.auditKey;
 // @ts-expect-error UUID identities are not integers
 const wrongKind: number = personId;
-// @ts-expect-error Integers are not UUID identities
+// @ts-expect-error Different UUID tables remain distinct
 const wrongUuid: PersonId = auditId;
-// @ts-expect-error Different integer tables remain distinct
+// @ts-expect-error Different UUID tables remain distinct
 const wrongTable: NoteId = auditId;
 "#,
     )

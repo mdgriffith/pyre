@@ -25,8 +25,8 @@ const stopFailures = db.onEditFailure(showWriteFailure);
 const rename = Records.User.update(id, { name: 'Ready' }); // note is unchanged
 const clearNote = Records.User.update(id, { note: null }); // SQL NULL
 const plan = batch([
-  Records.User.create({ key: crypto.randomUUID(), name: 'New', fixed: 'x' }),
-  Records.Audit.create({ message: 'created' }), // server-generated integer ID
+  Records.User.create({ name: 'New', fixed: 'x' }),
+  Records.Audit.create({ message: 'created' }),
   rename,
   clearNote,
   Commands.rename({ key: id, name: 'Final' }),
@@ -43,8 +43,10 @@ if (outcome.kind === 'confirmed') {
 ```
 
 CRUD results contain `{ id }`, not a readable row, even for a primary key named
-`key`. Existing targets and foreign keys use branded IDs; fresh UUID creates accept
-UUID strings. Integer create IDs are server-owned. Required create fields must be
+`key`. Existing targets and foreign keys use branded IDs. Generated create builders
+omit the UUID primary key; the bound runtime allocates one canonical lowercase
+UUIDv7 exactly once at submission and reuses it for prediction, replay, and dispatch.
+Required create fields must be
 supplied; nullable/default fields may be omitted. Updates omit unchanged fields and
 accept `null` only for nullable fields. Managed fields, immutable update fields,
 and primary-key updates have no setters. Empty updates reject as `InvalidEdit` on
@@ -60,12 +62,13 @@ Schema permissions still apply, but using a generated update instead of a domain
 command can bypass that command's checks or side effects. Keep invariant-bearing
 writes on named commands; enforcement/discoverability follow-up remains MEC-117.
 
-Optimism is conservative: named commands and integer creates do not predict.
-UUID identity alone is insufficient; defaults, server-owned fields, complex values
+Optimism is conservative: named commands do not predict. UUID identity alone is
+insufficient; defaults, server-owned fields, complex values
 or unproven visibility can disable prediction. Updates require a known visible row;
 if any member cannot predict, the entire batch is nonoptimistic. Batches preserve
 operation/result order and run atomically in one database; they cannot reference
-earlier results. Submit later after confirmation to use a generated integer ID.
+the hidden generated identity of an earlier create. Submit dependent work after
+confirmation, or use a named trusted command with an explicit UUID.
 
 ## Browser Configuration
 
@@ -141,9 +144,10 @@ Live hints are authenticated, fenced `syncRequired` envelopes, not row deltas.
 throwing `parseInput(unknown): I` and `decodeResult(unknown): R` codecs, and optional
 pure `predict(input)` metadata. Register the same codecs/prediction functions used
 by the builders. The runtime does not infer prediction from operation names or
-application input. Named operations omit `predict`. Generated predictions must
+application input. Generated UUID creates additionally declare their trusted UUID
+input name. Named operations omit `predict`. Generated predictions must
 declare the actual schema identity, writable fields and the complete materialized
-field set; generated integer/default/permission-dependent creates normally omit
+field set; default/permission-dependent creates normally omit
 prediction. Captured inputs and wire results must be JSON values. Named-command
 decoders retain their declared application types, including decoded DateTime
 values; the Elm bridge forwards validated wire values for Elm's own codecs.
@@ -335,7 +339,7 @@ const seeds = localEdits.bind({
   session: { userId: 7 },
 });
 const outcome = await seeds.submit(batch([
-  Records.Project.create({ id: crypto.randomUUID(), name: 'Seed project', owner: 7 }),
+  Records.Project.create({ name: 'Seed project', owner: 7 }),
   Records.Audit.create({ message: 'created' }),
 ] as const));
 if (outcome.kind === 'confirmed') {

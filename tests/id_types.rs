@@ -11,6 +11,7 @@ use tempfile::TempDir;
 #[test]
 fn test_id_int_parsing() {
     let schema_source = r#"
+@syncable(false)
 record User {
     id Id.Int @id
     name String
@@ -88,6 +89,7 @@ record Invite {
 #[test]
 fn test_id_int_generic_parsing_is_rejected() {
     let schema_source = r#"
+@syncable(false)
 record User {
     id Id.Int<User> @id
     name String
@@ -112,7 +114,7 @@ fn test_sync_status_sql_after_roundtrip_with_branded_ids() {
     let schema_source = r#"
 record User {
     @public
-    id Id.Int @id
+    id Id.Uuid @id
     updatedAt DateTime
 }
 "#;
@@ -137,13 +139,13 @@ record User {
         })
         .expect("Should find id field");
 
-    id_field.type_ = ast::ColumnType::IdInt {
+    id_field.type_ = ast::ColumnType::IdUuid {
         table: "User".to_string(),
     };
 
     let roundtripped_schema_source = schema_to_string("", &schema);
-    assert!(!roundtripped_schema_source.contains("Id.Int<"));
-    assert!(roundtripped_schema_source.contains("Id.Int"));
+    assert!(!roundtripped_schema_source.contains("Id.Uuid<"));
+    assert!(roundtripped_schema_source.contains("Id.Uuid"));
 
     let introspection = introspect::from_raw(introspect::IntrospectionRaw {
         tables: vec![],
@@ -172,6 +174,7 @@ record User {
 #[test]
 fn test_foreign_key_field_reference_parsing() {
     let schema_source = r#"
+@syncable(false)
 record User {
     id Id.Int @id
     name String
@@ -222,6 +225,7 @@ record Post {
 #[test]
 fn test_namespaced_foreign_key_field_reference_parsing() {
     let schema_source = r#"
+@syncable(false)
 record Post {
     id Id.Int @id
     authorId Auth.User.id
@@ -258,6 +262,7 @@ record Post {
 #[test]
 fn test_foreign_key_to_unknown_table_error() {
     let schema_source = r#"
+@syncable(false)
 record Post {
     @public
     id Id.Int @id
@@ -311,6 +316,7 @@ record Post {
 #[test]
 fn test_foreign_key_to_unknown_field_error() {
     let schema_source = r#"
+@syncable(false)
 record User {
     @public
     id Id.Int @id
@@ -381,6 +387,7 @@ record Post {
 #[test]
 fn test_foreign_key_to_non_id_field_error() {
     let schema_source = r#"
+@syncable(false)
 record User {
     @public
     id Id.Int @id
@@ -437,6 +444,7 @@ record Post {
 #[test]
 fn test_valid_foreign_key_passes_validation() {
     let schema_source = r#"
+@syncable(false)
 record User {
     @public
     id Id.Int @id
@@ -470,6 +478,7 @@ record Post {
 #[test]
 fn test_foreign_key_with_id_uuid_passes_validation() {
     let schema_source = r#"
+@syncable(false)
 record User {
     @public
     id Id.Uuid @id
@@ -508,6 +517,7 @@ session {
     role   String
 }
 
+@syncable(false)
 record User {
     @allow(*) { id == Session.userId }
 
@@ -574,6 +584,7 @@ session {
     role   String
 }
 
+@syncable(false)
 record User {
     @allow(*) { id == Session.userId }
 
@@ -643,6 +654,7 @@ record Post {
 #[test]
 fn test_schema_to_string_empty_namespace_omits_internal_default_schema_prefix() {
     let schema_source = r#"
+@syncable(false)
 record User {
     @public
     id    Id.Int @id
@@ -688,7 +700,7 @@ session {
 record GameDocument {
     @allow(*) { Session.isAdmin == True }
 
-    id        Id.Int   @id
+    id        Id.Uuid  @id
     updatedAt DateTime @default(now)
 }
 "#;
@@ -723,7 +735,7 @@ record GameDocument {
     let conn = db.connect().expect("Failed to connect to sqlite db");
 
     conn.execute(
-        "create table gameDocuments (id integer not null primary key, updatedAt integer not null)",
+        "create table gameDocuments (id text not null primary key, updatedAt integer not null)",
         (),
     )
     .await

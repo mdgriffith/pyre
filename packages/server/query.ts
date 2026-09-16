@@ -193,6 +193,10 @@ function assertNoStrippedFields(input: unknown, decoded: unknown): void {
     }
 }
 
+function isCanonicalUuidV7(value: unknown): value is string {
+    return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
 const batchQueues = new Map<string, Promise<unknown>>();
 
 /** Executes captured compiled operations, never public runners with independent commits. */
@@ -250,7 +254,12 @@ export function runBatch(
                 if (edit) {
                     if (!["create", "update", "delete"].includes(edit.kind) || edit.writeStatementIndices.length !== 1
                         || edit.writeStatementIndices.some(i => !Number.isInteger(i) || i < 0 || i >= query.sql.length
-                            || query.sql[i].include !== true))
+                            || query.sql[i].include !== true)
+                        || (edit.kind === "create") !== (typeof edit.createUuidInput === "string")
+                        || (edit.createUuidInput !== undefined && (!edit.createUuidInput
+                            || !edit.writableInputs.includes(edit.createUuidInput)
+                            || !isCanonicalUuidV7(member.input !== null && typeof member.input === "object"
+                                ? (member.input as any)[edit.createUuidInput] : undefined))))
                         throw new BatchError("InvalidInput");
                     if (edit.kind === "update" && !edit.writableInputs.some(key => member.input !== null && typeof member.input === "object" && Object.hasOwn(member.input, key) && (member.input as any)[key] !== undefined))
                         throw new BatchError("InvalidEdit");

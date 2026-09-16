@@ -176,7 +176,7 @@ browser, worker, local cache, route, SSE connection, or active subscriber:
 
 ```ts
 import { localEdits } from "@pyre/server/local-edits";
-import { Main, Records, Commands, batch } from "./generated/typescript/edits";
+import { Main, Commands, type AuditId } from "./generated/typescript/edits";
 import { manifest } from "./generated/typescript/server";
 
 // Resolve/authorize database and databaseId in trusted application code first.
@@ -186,13 +186,12 @@ const edits = localEdits.bind({
   // Optional: your existing live Map<string, BatchSyncRecipient> and sender.
   connectedSessions, sendToSession,
 });
-const outcome = await edits.submit(batch([
-  Records.Audit.create({ message: "Seeded" }),
-  Commands.namedAudit({ message: "Named command in the same transaction" }),
-]));
+const outcome = await edits.submit(Commands.namedAudit({
+  id: crypto.randomUUID() as AuditId,
+  message: "Trusted server command",
+}));
 if (outcome.kind === "confirmed") {
-  const [created, namedResult] = outcome.result; // readonly, inferred tuple
-  console.log(created.id, namedResult);
+  console.log(outcome.result);
 }
 ```
 
@@ -215,6 +214,10 @@ manifest allowlist, and rejects attachments. A nonempty batch uses exactly one
 atomic write transaction, including its sync revision. Generated CRUD requires
 exactly one authorized direct write per operation; named commands retain their
 compiled semantics. The permission-bypassing legacy `seed` helpers are not used.
+Generated UUID create APIs omit their primary key and rely on the browser local-edit
+runtime to materialize UUIDv7 before transport. The server binding does not invent
+that client input. Trusted server creation should use a compiled named command with
+an explicit branded UUID, or the generated `seed` helper for setup/import workflows.
 
 `submit(Edit<N, R> | Batch<N, R>): Promise<Outcome<R>>` returns:
 
@@ -252,9 +255,11 @@ There are no automatic write retries. Publication uses the existing postcommit
 registrations. Delivery failures cannot turn a known commit into rejection or
 suppress other recipients. A subscriber is never required for execution.
 
-The runnable [seed example](fixtures/local-edits/seed.ts) creates linked UUID
-records, retrieves a generated integer ID, and mixes a named command into the
-same transaction. Its fresh file-backed SQLite database is removed afterward.
+The runnable [fixture example](fixtures/local-edits/seed.ts) mirrors browser UUIDv7
+materialization before submitting generated creates. It creates a project first,
+then creates its linked task in a later batch because references to rows created
+in the same batch are unsupported. The named command retains an explicit UUID input.
+The example's fresh file-backed SQLite database is removed afterward.
 From the repository root:
 
 ```sh

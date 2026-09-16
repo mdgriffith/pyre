@@ -75,7 +75,12 @@ export function bind<N>(options: BindOptions<N>): LocalEdits<N> {
         decoders = plan.operations.map(member => member.definition.decodeResult);
         operations = plan.operations.map((member, i) => {
           index = i;
-          const input = capture(member.input);
+          const createUuidInput = manifest.queries[member.definition.id]?.generatedEdit?.createUuidInput;
+          let input = capture(member.input);
+          if (createUuidInput) {
+            if (!input || typeof input !== "object" || Array.isArray(input) || Object.hasOwn(input, createUuidInput)) throw new Error("InvalidEdit");
+            input = capture({ ...input, [createUuidInput]: uuidv7() });
+          }
           member.definition.parseInput(input);
           return { operation: member.definition.id, input };
         });
@@ -125,3 +130,18 @@ export function bind<N>(options: BindOptions<N>): LocalEdits<N> {
 }
 
 export const localEdits = Object.freeze({ bind });
+
+function uuidv7(): string {
+  const timestamp = Date.now();
+  if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp >= 2 ** 48) throw new Error("InvalidEdit");
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let remaining = timestamp;
+  for (let index = 5; index >= 0; index--) {
+    bytes[index] = remaining % 256;
+    remaining = Math.floor(remaining / 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}

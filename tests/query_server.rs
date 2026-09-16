@@ -61,7 +61,7 @@ fn non_unique_relationship_results_are_arrays() -> Result<(), Box<dyn std::error
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "record Parent {\n @public\n id Id.Int @id\n code String\n matches @link(code, Target.code)\n}\nrecord Target {\n @public\n id Id.Int @id\n code String\n}\n",
+        "@syncable(false)\nrecord Parent {\n @public\n id Id.Int @id\n code String\n matches @link(code, Target.code)\n}\nrecord Target {\n @public\n id Id.Int @id\n code String\n}\n",
         &mut schema,
     )
     .unwrap();
@@ -100,7 +100,7 @@ async fn revisioned_named_queries_stay_within_bound_namespace(
     };
     parser::run(
         "Main/schema.pyre",
-        "record MainItem {\n @public\n id Id.Int @id\n}\n",
+        "record MainItem {\n @public\n id Id.Uuid @id\n}\n",
         &mut main,
     )
     .unwrap();
@@ -110,7 +110,7 @@ async fn revisioned_named_queries_stay_within_bound_namespace(
     };
     parser::run(
         "Archive/schema.pyre",
-        "record ArchiveItem {\n @public\n id Id.Int @id\n}\n",
+        "record ArchiveItem {\n @public\n id Id.Uuid @id\n}\n",
         &mut archive,
     )
     .unwrap();
@@ -223,7 +223,55 @@ async fn typed_json_session_enums_match_compiled_bundle_writes(
     let mut session_value =
         json!({"userId":7,"role":"Member","unrelated":"value","context":details});
     let session = PyreSession::new(session_value.clone(), &manifest.session_schema)?;
-    let request = batch_request(&conn, &binding, vec![query::BatchOperation { operation:create.id.clone(), input:json!({"id":"00000000-0000-4000-8000-000000000001","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":"Member","details":details}) }]).await;
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
+    let request = batch_request(&conn, &binding, vec![query::BatchOperation { operation:create.id.clone(), input:json!({"id":"01890f6c-7b80-7000-8000-000000000009","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":"Member","details":details}) }]).await;
+    for invalid_id in [
+        Some(json!("01890f6c-7b80-4000-8000-000000000009")),
+        Some(json!("01890F6C-7B80-7000-8000-000000000009")),
+        Some(json!("01890f6c-7b80-7000-7000-000000000009")),
+        Some(json!("not-a-uuid")),
+        Some(json!(7)),
+        None,
+    ] {
+        let mut invalid = request.clone();
+        let input = invalid.operations[0].input.as_object_mut().unwrap();
+        match invalid_id {
+            Some(value) => {
+                input.insert("id".into(), value);
+            }
+            None => {
+                input.remove("id");
+            }
+        }
+        assert!(query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &invalid,
+            &session,
+        )
+        .await
+        .is_err());
+    }
+    let untouched = conn
+        .query(
+            "select (select count(*) from entries), server_revision from _pyre_sync",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(untouched.get::<i64>(0)?, 0);
+    assert_eq!(untouched.get::<i64>(1)?, 0);
     query::run_batch(
         &conn,
         &bind(&manifest, &db.context),
@@ -234,7 +282,7 @@ async fn typed_json_session_enums_match_compiled_bundle_writes(
     .await?;
     let row = conn
         .query(
-            "select json(details) from entries where id = '00000000-0000-4000-8000-000000000001'",
+            "select json(details) from entries where id = '01890f6c-7b80-7000-8000-000000000009'",
             (),
         )
         .await?
@@ -257,7 +305,7 @@ async fn typed_json_session_enums_match_compiled_bundle_writes(
         let found = query::run(&conn, &manifest, &lookup.id, json!({}), &session).await?;
         assert_eq!(
             found.response,
-            json!({"entry":[{"id":"00000000-0000-4000-8000-000000000001"}]})
+            json!({"entry":[{"id":"01890f6c-7b80-7000-8000-000000000009"}]})
         );
     }
     session_value["context"]["role"] = json!("Admin");
@@ -271,7 +319,7 @@ async fn typed_json_session_enums_match_compiled_bundle_writes(
 async fn compiler_provenance_is_not_inferred_from_named_query_hashes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db =
-        TestDatabase::new("record Item {\n    id Id.Int @id\n    name String\n    @public\n}\n")
+        TestDatabase::new("record Item {\n    id Id.Uuid @id\n    name String\n    @public\n}\n")
             .await?;
     let mut queries = ast::QueryList {
         queries: Vec::new(),
@@ -307,7 +355,7 @@ async fn compiler_provenance_is_not_inferred_from_named_query_hashes(
         &binding,
         vec![query::BatchOperation {
             operation: named.id.clone(),
-            input: json!({"id":999}),
+            input: json!({"id":"00000000-0000-0000-0000-000000000999"}),
         }],
     )
     .await;
@@ -327,7 +375,7 @@ async fn compiler_provenance_is_not_inferred_from_named_query_hashes(
 #[tokio::test]
 async fn manifest_fingerprint_covers_permissions_sql_and_codecs_and_matches_ts(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source = "record Item {\n    id Id.Int @id\n    name String\n    @allow(query) { True }\n    @allow(insert, update, delete) { True }\n}\n";
+    let source = "@syncable(false)\nrecord Item {\n    id Id.Int @id\n    name String\n    @allow(query) { True }\n    @allow(insert, update, delete) { True }\n}\n";
     let db = TestDatabase::new(source).await?;
     let query_source = "update Rename($name: String) {\n    item { name = $name }\n}\n";
     let manifest = manifest_for(&db.context, query_source, true)?;
@@ -447,7 +495,7 @@ fn batch_binding<'a>(namespace: &'a str, fingerprint: &'a str) -> query::BatchBi
 async fn generated_nullable_boolean_keeps_explicit_null() -> Result<(), Box<dyn std::error::Error>>
 {
     let db =
-        TestDatabase::new("record Item {\n    id Id.Int @id\n    enabled Bool?\n    @public\n}\n")
+        TestDatabase::new("record Item {\n    id Id.Uuid @id\n    enabled Bool?\n    @public\n}\n")
             .await?;
     let conn = db.db.connect()?;
     let manifest = manifest_for(&db.context, "", true)?;
@@ -470,7 +518,7 @@ async fn generated_nullable_boolean_keeps_explicit_null() -> Result<(), Box<dyn 
         &binding,
         vec![query::BatchOperation {
             operation: create.id.clone(),
-            input: json!({"enabled":null}),
+            input: json!({"id":"01890f6c-7b80-7000-8000-000000000001","enabled":null}),
         }],
     )
     .await;
@@ -483,7 +531,10 @@ async fn generated_nullable_boolean_keeps_explicit_null() -> Result<(), Box<dyn 
     )
     .await?;
     let mut rows = conn
-        .query("SELECT enabled IS NULL FROM items WHERE id=1", ())
+        .query(
+            "SELECT enabled IS NULL FROM items WHERE id='01890f6c-7b80-7000-8000-000000000001'",
+            (),
+        )
         .await?;
     assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 1);
     Ok(())
@@ -495,7 +546,7 @@ async fn batch_generated_edits_are_ordered_atomic_and_use_direct_cardinality(
     let db = TestDatabase::new(
         r#"
 record Item {
-    id Id.Int @id
+    id Id.Uuid @id
     name String
     @public
 }
@@ -510,6 +561,15 @@ record Item {
     let delete = query_by_operation(&manifest, "delete");
     let fingerprint = manifest.fingerprint();
     let binding = batch_binding(&create.primary_db, &fingerprint);
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
     assert_eq!(
         update
             .generated_edit
@@ -530,9 +590,18 @@ record Item {
         &conn,
         &binding,
         vec![
-            op(create, json!({"name":"first"})),
-            op(create, json!({"name":"second"})),
-            op(update, json!({"id":1,"name":"final"})),
+            op(
+                create,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"first"}),
+            ),
+            op(
+                create,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000002","name":"second"}),
+            ),
+            op(
+                update,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"final"}),
+            ),
         ],
     )
     .await;
@@ -552,15 +621,18 @@ record Item {
     assert_eq!(
         result.response["results"],
         json!([
-            {"index":0,"operation":create.id,"value":{"id":1}},
-            {"index":1,"operation":create.id,"value":{"id":2}},
-            {"index":2,"operation":update.id,"value":{"id":1}},
+            {"index":0,"operation":create.id,"value":{"id":"01890f6c-7b80-7000-8000-000000000001"}},
+            {"index":1,"operation":create.id,"value":{"id":"01890f6c-7b80-7000-8000-000000000002"}},
+            {"index":2,"operation":update.id,"value":{"id":"01890f6c-7b80-7000-8000-000000000001"}},
         ])
     );
     let mut request = request;
     request.operations = vec![
-        op(update, json!({"id":1,"name":"rolled back"})),
-        op(delete, json!({"id":999})),
+        op(
+            update,
+            json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"rolled back"}),
+        ),
+        op(delete, json!({"id":"00000000-0000-0000-0000-000000000999"})),
     ];
     let error = query::run_batch(
         &conn,
@@ -573,14 +645,20 @@ record Item {
     .unwrap_err();
     assert!(error.to_string().contains("operation 1"));
     assert!(error.to_string().contains("TargetNotWritable"));
-    let mut rows = conn.query("SELECT name, (SELECT server_revision FROM _pyre_sync WHERE id=1) FROM items WHERE id=1", ()).await?;
+    let mut rows = conn.query("SELECT name, (SELECT server_revision FROM _pyre_sync WHERE id=1) FROM items WHERE id='01890f6c-7b80-7000-8000-000000000001'", ()).await?;
     let row = rows.next().await?.unwrap();
     assert_eq!(row.get::<String>(0)?, "final");
     assert_eq!(row.get::<i64>(1)?, 1);
     drop(rows);
-    conn.execute("UPDATE items SET updatedAt = 1 WHERE id = 1", ())
-        .await?;
-    request.operations = vec![op(update, json!({"id":1,"name":"final"}))];
+    conn.execute(
+        "UPDATE items SET updatedAt = 1 WHERE id = '01890f6c-7b80-7000-8000-000000000001'",
+        (),
+    )
+    .await?;
+    request.operations = vec![op(
+        update,
+        json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"final"}),
+    )];
     assert_eq!(
         query::run_batch(
             &conn,
@@ -594,11 +672,17 @@ record Item {
         2
     );
     let mut rows = conn
-        .query("SELECT updatedAt FROM items WHERE id = 1", ())
+        .query(
+            "SELECT updatedAt FROM items WHERE id = '01890f6c-7b80-7000-8000-000000000001'",
+            (),
+        )
         .await?;
     assert!(rows.next().await?.unwrap().get::<i64>(0)? > 1);
     drop(rows);
-    request.operations = vec![op(update, json!({"id":1,"name":"protected","updatedAt":1}))];
+    request.operations = vec![op(
+        update,
+        json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"protected","updatedAt":1}),
+    )];
     assert_eq!(
         query::run_batch(
             &conn,
@@ -612,7 +696,10 @@ record Item {
         .code(),
         "InvalidRequest"
     );
-    request.operations = vec![op(update, json!({"id":1}))];
+    request.operations = vec![op(
+        update,
+        json!({"id":"01890f6c-7b80-7000-8000-000000000001"}),
+    )];
     assert!(query::run_batch(
         &conn,
         &bind(&manifest, &db.context),
@@ -639,42 +726,6 @@ record Item {
         .replacement_messages(&empty, &std::collections::HashMap::new())
         .is_empty());
 
-    conn.execute("DELETE FROM items", ()).await?;
-    conn.execute(
-        "INSERT INTO items(id,name) VALUES(9007199254740991,'boundary')",
-        (),
-    )
-    .await?;
-    request.operations = vec![op(create, json!({"name":"unsafe"}))];
-    let revision_before = conn
-        .query("SELECT server_revision FROM _pyre_sync", ())
-        .await?
-        .next()
-        .await?
-        .unwrap()
-        .get::<i64>(0)?;
-    let error = query::run_batch(
-        &conn,
-        &bind(&manifest, &db.context),
-        &binding,
-        &request,
-        &session,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), "TargetNotWritable");
-    let row = conn
-        .query(
-            "SELECT count(*), max(id), (SELECT server_revision FROM _pyre_sync) FROM items",
-            (),
-        )
-        .await?
-        .next()
-        .await?
-        .unwrap();
-    assert_eq!(row.get::<i64>(0)?, 1);
-    assert_eq!(row.get::<i64>(1)?, 9_007_199_254_740_991);
-    assert_eq!(row.get::<i64>(2)?, revision_before);
     Ok(())
 }
 
@@ -682,11 +733,11 @@ record Item {
 async fn named_batch_results_are_validated_before_revision_and_commit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db =
-        TestDatabase::new("record Item {\n id Id.Int @id\n name String\n @public\n}\n").await?;
+        TestDatabase::new("record Item {\n id Id.Uuid @id\n name String\n @public\n}\n").await?;
     let conn = db.db.connect()?;
     let mut manifest = manifest_for(
         &db.context,
-        "insert Named($name: String) { item { name = $name id } }",
+        "insert Named($id: Item.id, $name: String) { item { id = $id name = $name } }",
         true,
     )?;
     let create = manifest
@@ -723,11 +774,11 @@ async fn named_batch_results_are_validated_before_revision_and_commit(
         vec![
             query::BatchOperation {
                 operation: create_id,
-                input: json!({"name":"prefix"}),
+                input: json!({"id":"01890f6c-7b80-7000-8000-000000000003","name":"prefix"}),
             },
             query::BatchOperation {
                 operation: named_id,
-                input: json!({"name":"named"}),
+                input: json!({"id":"00000000-0000-0000-0000-000000000004","name":"named"}),
             },
         ],
     )
@@ -764,7 +815,7 @@ async fn batch_preflight_rejects_invalid_members_scopes_and_limits(
     let db = TestDatabase::new(
         r#"
 record Item {
-    id Id.Int @id
+    id Id.Uuid @id
     name String
     @public
 }
@@ -779,11 +830,11 @@ record Item {
     let session = PyreSession::new(json!({}), &manifest.session_schema)?;
     let operation = query::BatchOperation {
         operation: create.id.clone(),
-        input: json!({"name":"ok"}),
+        input: json!({"id":"01890f6c-7b80-7000-8000-000000000005","name":"ok"}),
     };
     let mut request = batch_request(&conn, &binding, vec![operation.clone()]).await;
     let mut invalid = operation.clone();
-    invalid.input = json!({"name":"bad","id":7});
+    invalid.input = json!({"id":"01890f6c-7b80-7000-8000-000000000006","name":"bad","unknown":7});
     request.operations.push(invalid);
     assert!(query::run_batch(
         &conn,
@@ -893,7 +944,7 @@ async fn batch_hidden_identities_named_noops_and_many_targets(
     let db = TestDatabase::new(
         r#"
 record Item {
-    id Id.Int @id
+    id Id.Uuid @id
     name String
     @allow(query) { False }
     @allow(insert, update, delete) { True }
@@ -934,11 +985,23 @@ update Noop($noopName: String, $missingId: Item.id) {
         &conn,
         &binding,
         vec![
-            op(create, json!({"name":"a"})),
-            op(create, json!({"name":"b"})),
-            op(update, json!({"id":1,"name":"unreadable"})),
+            op(
+                create,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000007","name":"a"}),
+            ),
+            op(
+                create,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000008","name":"b"}),
+            ),
+            op(
+                update,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000007","name":"unreadable"}),
+            ),
             op(all, json!({"allName":"both"})),
-            op(noop, json!({"noopName":"unused", "missingId":999})),
+            op(
+                noop,
+                json!({"noopName":"unused", "missingId":"00000000-0000-0000-0000-000000000999"}),
+            ),
         ],
     )
     .await;
@@ -950,14 +1013,20 @@ update Noop($noopName: String, $missingId: Item.id) {
         &session,
     )
     .await?;
-    assert_eq!(result.response["results"][2]["value"], json!({"id":1}));
+    assert_eq!(
+        result.response["results"][2]["value"],
+        json!({"id":"01890f6c-7b80-7000-8000-000000000007"})
+    );
     assert_eq!(
         result.response["results"][3]["value"],
         json!({"item":[{"name":"both"},{"name":"both"}]})
     );
     assert_eq!(result.response["results"][4]["value"], json!({"item":[]}));
     assert_eq!(result.response["reconciliation"]["minimumSafeRevision"], 1);
-    request.operations = vec![op(noop, json!({"noopName":"unused", "missingId":999}))];
+    request.operations = vec![op(
+        noop,
+        json!({"noopName":"unused", "missingId":"00000000-0000-0000-0000-000000000999"}),
+    )];
     assert_eq!(
         query::run_batch(
             &conn,
@@ -974,7 +1043,10 @@ update Noop($noopName: String, $missingId: Item.id) {
     let mut broad = manifest.clone();
     broad.queries.get_mut(&update.id).unwrap().sql[0].sql =
         "UPDATE items SET name = 'bad' RETURNING id AS _pyreEditId".into();
-    request.operations = vec![op(update, json!({"id":1,"name":"bad"}))];
+    request.operations = vec![op(
+        update,
+        json!({"id":"01890f6c-7b80-7000-8000-000000000007","name":"bad"}),
+    )];
     let broad_fingerprint = broad.fingerprint();
     let broad_binding = batch_binding(&create.primary_db, &broad_fingerprint);
     request.manifest = broad_fingerprint.clone();
@@ -1000,6 +1072,7 @@ update Noop($noopName: String, $missingId: Item.id) {
 async fn run_insert_roundtrips_nested_zero_field_union() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type VoteHandState
    = HandLowered
    | HandRaised
@@ -1213,6 +1286,7 @@ async fn generated_manifest_distinguishes_bool_from_unit_enum(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Status
     = Running
     | Stopped
@@ -1278,6 +1352,7 @@ fn generated_rust_crud_omits_immutable_update_input_but_returns_field() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -1733,6 +1808,7 @@ struct ClocktowerParticipantCreateOutput {
 async fn run_mutations_roundtrip_tagged_union_variants() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type ClocktowerGameStatus
     = ClocktowerRunning
     | ClocktowerStopped
@@ -2270,6 +2346,7 @@ transaction ReplaceTask($id: Task.id, $action: Action) {
 async fn run_query_binds_tagged_enum_session_values() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Role
     = Admin
     | Member
@@ -2386,6 +2463,7 @@ delete DeleteNote($id: Note.id) {
 async fn run_query_binds_tagged_union_session_paths() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type SessionScope
     = Workspace {
         id Int
@@ -2484,6 +2562,7 @@ async fn run_query_binds_recursive_tagged_union_session_paths(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type SessionScope
     = Leaf {
         id Int
@@ -2546,6 +2625,7 @@ async fn generated_update_roundtrips_omittable_unit_enum_input(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Status
     = Running
     | Stopped
@@ -2627,6 +2707,7 @@ async fn run_mutation_roundtrips_recursive_union_json_payloads(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Action
     = Create { title String }
     | Delete { id Int }
@@ -2683,6 +2764,7 @@ insert CreateTreeDocument($tree: Tree) {
 async fn run_select_query_formats_response() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -2730,7 +2812,7 @@ async fn run_insert_mutation_returns_result_and_extracts_affected_rows_in_sync_m
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -2742,11 +2824,11 @@ record Note {
     let manifest = manifest_for(
         &db.context,
         r#"
-insert CreateNote($body: String) {
+insert CreateNote($id: Note.id, $body: String) {
     note {
+        id = $id
         body = $body
         updatedAt = 10
-        id
     }
 }
 "#,
@@ -2757,12 +2839,15 @@ insert CreateNote($body: String) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "body": "one" }),
+        json!({ "id": "00000000-0000-0000-0000-000000000101", "body": "one" }),
         &session,
     )
     .await?;
 
-    assert_eq!(result.response["note"][0]["id"], json!(1));
+    assert_eq!(
+        result.response["note"][0]["id"],
+        json!("00000000-0000-0000-0000-000000000101")
+    );
     assert_eq!(result.response["note"][0]["body"], json!("one"));
     assert_eq!(result.affected_rows.len(), 1);
     assert_eq!(result.affected_rows[0].table_name, "notes");
@@ -2777,19 +2862,19 @@ async fn run_transaction_returns_all_steps_and_aggregates_affected_rows(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
 }
 record Counter {
-    id Int @id
+    id Id.Uuid @id
     value Int
     updatedAt Int
     @public
 }
 record Pending {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -2798,26 +2883,26 @@ record Pending {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into counters (id, value, updatedAt) values (1, 0, 10);\n\
-         insert into pendings (id, updatedAt) values (1, 10);",
+        "insert into counters (id, value, updatedAt) values ('00000000-0000-0000-0000-000000000102', 0, 10);\n\
+         insert into pendings (id, updatedAt) values ('00000000-0000-0000-0000-000000000103', 10);",
     )
     .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-transaction Apply($body: String, $value: Int) {
+transaction Apply($noteId: Note.id, $counterId: Counter.id, $pendingId: Pending.id, $body: String, $value: Int) {
     insert created: note {
+        id = $noteId
         body = $body
         updatedAt = 10
-        id
     }
     update changed: counter {
-        @where { id == 1 }
+        @where { id == $counterId }
         value = $value
         id
     }
     delete removed: pending {
-        @where { id == 1 }
+        @where { id == $pendingId }
         id
     }
 }
@@ -2832,14 +2917,23 @@ transaction Apply($body: String, $value: Int) {
         &conn,
         &manifest,
         &transaction.id,
-        json!({ "body": "one", "value": 2 }),
+        json!({
+            "noteId": "00000000-0000-0000-0000-000000000104",
+            "counterId": "00000000-0000-0000-0000-000000000102",
+            "pendingId": "00000000-0000-0000-0000-000000000103",
+            "body": "one",
+            "value": 2
+        }),
         &session,
     )
     .await?;
 
     assert_eq!(result.response["created"][0]["body"], json!("one"));
     assert_eq!(result.response["changed"][0]["value"], json!(2));
-    assert_eq!(result.response["removed"][0]["id"], json!(1));
+    assert_eq!(
+        result.response["removed"][0]["id"],
+        json!("00000000-0000-0000-0000-000000000103")
+    );
     assert_eq!(result.affected_rows.len(), 3);
     assert_eq!(result.affected_rows[0].table_name, "notes");
     assert_eq!(result.affected_rows[1].table_name, "counters");
@@ -2852,6 +2946,7 @@ async fn run_transaction_preserves_aliases_zero_rows_and_shared_session_permissi
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -2928,6 +3023,7 @@ async fn run_transaction_rolls_back_on_late_unique_constraint_failure(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String @unique
@@ -2985,7 +3081,7 @@ async fn failed_nested_transaction_rolls_back_without_sync_publication(
     let db = TestDatabase::new(
         r#"
 record Parent {
-    id Int @id
+    id Id.Uuid @id
     name String
     updatedAt Int
     children @link(Child.parentId)
@@ -2993,8 +3089,8 @@ record Parent {
 }
 
 record Child {
-    id Int @id
-    parentId Int
+    id Id.Uuid @id
+    parentId Parent.id
     slug String @unique
     updatedAt Int
     parent @link(parentId, Parent.id)
@@ -3005,26 +3101,30 @@ record Child {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into parents (id, name, updatedAt) values (1, 'baseline', 10);\n\
-         insert into children (id, parentId, slug, updatedAt) values (1, 1, 'taken', 10);",
+        "insert into parents (id, name, updatedAt) values ('00000000-0000-0000-0000-000000000105', 'baseline', 10);\n\
+         insert into children (id, parentId, slug, updatedAt) values ('00000000-0000-0000-0000-000000000106', '00000000-0000-0000-0000-000000000105', 'taken', 10);",
     )
     .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-transaction CreateParents {
+transaction CreateParents($firstParentId: Parent.id, $firstChildId: Child.id, $secondParentId: Parent.id, $secondChildId: Child.id) {
     insert first: parent {
+        id = $firstParentId
         name = "first"
         updatedAt = 10
         children {
+            id = $firstChildId
             slug = "ok"
             updatedAt = 10
         }
     }
     insert second: parent {
+        id = $secondParentId
         name = "second"
         updatedAt = 10
         children {
+            id = $secondChildId
             slug = "taken"
             updatedAt = 10
         }
@@ -3040,7 +3140,12 @@ transaction CreateParents {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({}),
+        json!({
+            "firstParentId": "00000000-0000-0000-0000-000000000107",
+            "firstChildId": "00000000-0000-0000-0000-000000000108",
+            "secondParentId": "00000000-0000-0000-0000-000000000109",
+            "secondChildId": "00000000-0000-0000-0000-000000000110"
+        }),
         &session,
     )
     .await
@@ -3085,7 +3190,11 @@ transaction CreateParents {
 
 #[tokio::test]
 async fn run_nested_insert_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
-    let db = TestDatabase::new(&helpers::schema::full_schema()).await?;
+    let db = TestDatabase::new(&format!(
+        "@syncable(false)\n{}",
+        helpers::schema::full_schema()
+    ))
+    .await?;
     let conn = db.db.connect()?;
     let query_source = r#"
 insert CreateUserWithPost($name: String, $status: Status) {
@@ -3129,7 +3238,11 @@ insert CreateUserWithPost($name: String, $status: Status) {
 #[tokio::test]
 async fn run_nested_insert_rolls_back_parent_after_child_failure(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db = TestDatabase::new(&helpers::schema::full_schema()).await?;
+    let db = TestDatabase::new(&format!(
+        "@syncable(false)\n{}",
+        helpers::schema::full_schema()
+    ))
+    .await?;
     let conn = db.db.connect()?;
     let query_source = r#"
 insert CreateUserWithPost($name: String, $status: Status) {
@@ -3182,7 +3295,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     attrs Json
     updatedAt Int
@@ -3195,12 +3308,12 @@ record Note {
     let manifest = manifest_for(
         &db.context,
         r#"
-insert CreateNote($attrs: Json) {
+insert CreateNote($id: Note.id, $attrs: Json) {
     note {
+        id = $id
         ownerId = Session.userId
         attrs = $attrs
         updatedAt = 10
-        id
     }
 }
 "#,
@@ -3211,7 +3324,10 @@ insert CreateNote($attrs: Json) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "attrs": { "theme": "forest" } }),
+        json!({
+            "id": "00000000-0000-0000-0000-000000000111",
+            "attrs": { "theme": "forest" }
+        }),
         &session,
     )
     .await?;
@@ -3232,6 +3348,7 @@ async fn generated_update_respects_omitted_vs_null_optional_args(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String?
@@ -3295,6 +3412,7 @@ query GetNotes {
 async fn run_query_reports_unknown_and_invalid_input() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -3345,6 +3463,7 @@ query GetNote($id: Int) {
 async fn run_query_reports_invalid_session() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -3399,6 +3518,7 @@ async fn run_query_handles_parameter_names_with_shared_prefixes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     id2 Int
@@ -3448,7 +3568,7 @@ async fn run_delete_mutation_extracts_affected_rows_in_sync_mode(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -3457,12 +3577,12 @@ record Note {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into notes (id, body, updatedAt) values (1, 'one', 10);")
+    conn.execute_batch("insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000112', 'one', 10);")
         .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-delete DeleteNote($id: Int) {
+delete DeleteNote($id: Note.id) {
     note {
         @where { id == $id }
         id
@@ -3478,14 +3598,17 @@ delete DeleteNote($id: Int) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "id": 1 }),
+        json!({ "id": "00000000-0000-0000-0000-000000000112" }),
         &session,
     )
     .await?;
 
     assert_eq!(result.affected_rows.len(), 1);
     assert_eq!(result.affected_rows[0].table_name, "notes");
-    assert_eq!(result.affected_rows[0].rows[0][0], json!(1));
+    assert_eq!(
+        result.affected_rows[0].rows[0][0],
+        json!("00000000-0000-0000-0000-000000000112")
+    );
     let mut rows = conn.query("select count(*) from notes", ()).await?;
     let row = rows.next().await?.expect("count row should exist");
     assert_eq!(row.get::<i64>(0)?, 0);
@@ -3499,7 +3622,7 @@ async fn generated_crud_create_and_delete_run_through_manifest_runtime(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt DateTime @default(now)
     @public
@@ -3523,12 +3646,24 @@ query GetNotes {
     let session = PyreSession::new(json!({}), &manifest.session_schema)?;
     let create = query_by_operation(&manifest, "insert");
     let delete = query_by_operation(&manifest, "delete");
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
 
     let created = query::run(
         &conn,
         &manifest,
         &create.id,
-        json!({ "body": "generated" }),
+        json!({
+            "id": "01890f6c-7b80-7000-8000-000000000010",
+            "body": "generated"
+        }),
         &session,
     )
     .await?;
@@ -3562,6 +3697,7 @@ async fn generated_crud_runtime_excludes_immutable_update_inputs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Document {
     id      Int @id
     ownerId Int @immutable
@@ -3628,7 +3764,7 @@ type ActionState
 
 record Action {
     @public
-    id    Int @id
+    id    Id.Uuid @id
     state ActionState @immutable
     title String
 }
@@ -3642,6 +3778,15 @@ record Action {
     let update = query_by_operation(&manifest, "update");
 
     assert!(create.input_schema.contains_key("state"));
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
     assert_eq!(create.json_input_args, vec!["state"]);
     assert!(!update.input_schema.contains_key("state"));
     assert!(!update.json_input_args.contains(&"state".to_string()));
@@ -3651,6 +3796,7 @@ record Action {
         &manifest,
         &create.id,
         json!({
+            "id": "01890f6c-7b80-7000-8000-000000000011",
             "state": { "_type": "Open", "startedAt": "now" },
             "title": "first"
         }),
@@ -3678,14 +3824,14 @@ async fn nested_insert_populates_immutable_parent_foreign_key(
         r#"
 record Parent {
     @public
-    id       Id.Int @id
+    id       Id.Uuid @id
     name     String
     children @link(Child.parentId)
 }
 
 record Child {
     @public
-    id       Int @id
+    id       Id.Uuid @id
     parentId Parent.id @immutable
     body     String
 }
@@ -3696,13 +3842,14 @@ record Child {
     let manifest = manifest_for(
         &db.context,
         r#"
-insert CreateParent($name: String, $body: String) {
+insert CreateParent($parentId: Parent.id, $childId: Child.id, $name: String, $body: String) {
     parent {
+        id = $parentId
         name = $name
         children {
+            id = $childId
             body = $body
         }
-        id
     }
 }
 "#,
@@ -3713,19 +3860,24 @@ insert CreateParent($name: String, $body: String) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "name": "parent", "body": "child" }),
+        json!({
+            "parentId": "00000000-0000-0000-0000-000000000113",
+            "childId": "00000000-0000-0000-0000-000000000114",
+            "name": "parent",
+            "body": "child"
+        }),
         &session,
     )
     .await?;
     let parent_id = inserted.response["parent"][0]["id"]
-        .as_i64()
+        .as_str()
         .expect("parent id is returned");
 
     let mut rows = conn
         .query("select parentId, body from children", ())
         .await?;
     let row = rows.next().await?.expect("nested child exists");
-    assert_eq!(row.get::<i64>(0)?, parent_id);
+    assert_eq!(row.get::<String>(0)?, parent_id);
     assert_eq!(row.get::<String>(1)?, "child");
     Ok(())
 }
@@ -3735,6 +3887,7 @@ async fn generated_crud_create_enforces_insert_permission() -> Result<(), Box<dy
 {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -3773,6 +3926,7 @@ async fn run_insert_mutation_binds_repeated_json_union_parameter(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Visibility
    = Hidden
    | Everyone
@@ -3843,6 +3997,7 @@ async fn literal_union_insert_binds_null_for_omitted_nullable_fields(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -4066,7 +4221,7 @@ type ActionState
 
 record Action {
     @public
-    id    Int @id
+    id    Id.Uuid @id
     state ActionState
 }
 "#,
@@ -4079,6 +4234,15 @@ record Action {
     let update = query_by_operation(&manifest, "update");
 
     assert_eq!(create.json_input_args, vec!["state"]);
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
     assert_eq!(update.json_input_args, vec!["state"]);
     assert!(!create.sql[0]
         .sql
@@ -4089,7 +4253,10 @@ record Action {
         &conn,
         &manifest,
         &create.id,
-        json!({ "state": { "_type": "Open", "startedAt": "first" } }),
+        json!({
+            "id": "01890f6c-7b80-7000-8000-000000000012",
+            "state": { "_type": "Open", "startedAt": "first" }
+        }),
         &session,
     )
     .await?;
@@ -4108,7 +4275,7 @@ record Action {
         &manifest,
         &update.id,
         json!({
-            "id": 1,
+            "id": "01890f6c-7b80-7000-8000-000000000012",
             "state": {
                 "_type": "Completed",
                 "startedAt": "first",
@@ -4138,6 +4305,7 @@ async fn run_multi_top_level_query_formats_all_response_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record User {
     id Int @id
     name String
@@ -4218,6 +4386,7 @@ fn generated_manifest_validates_integer_session_foreign_keys() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 session {
     userId User.id
 }

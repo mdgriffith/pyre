@@ -126,16 +126,6 @@ pub fn generate(
                         json(&arg.name)
                     )
                 });
-                // Client UUID creation accepts a fresh UUID; references and existing targets remain branded.
-                let ty = if generated.as_ref().is_some_and(|(_, (kind, pk, _))| {
-                    *kind == "create"
-                        && pk.name == arg.name
-                        && matches!(pk.type_, ast::ColumnType::IdUuid { .. })
-                }) {
-                    "string".into()
-                } else {
-                    ty
-                };
                 text.push_str(&format!(
                     "  readonly {}{}: {};\n",
                     json(&arg.name),
@@ -170,7 +160,16 @@ pub fn generate(
             } else {
                 format!("{metadata}.Result")
             };
-            text.push_str(&format!("const {operation}: $LocalEdits.EditOperation<{input}, {result}> = Object.freeze({{\n  id: {metadata}.meta.id,\n  parseInput(value: unknown): {input} {{\n    {metadata}.RawInputValidator.strict().parse(value);\n    {metadata}.meta.InputValidator.strict().parse(value);\n"));
+            text.push_str(&format!("const {operation}: $LocalEdits.EditOperation<{input}, {result}> = Object.freeze({{\n  id: {metadata}.meta.id,\n"));
+            if let Some((_, (kind, pk, _))) = &generated {
+                if *kind == "create" && matches!(pk.type_, ast::ColumnType::IdUuid { .. }) {
+                    text.push_str(&format!(
+                        "  generatedCreateUuidInput: {},\n",
+                        json(&pk.name)
+                    ));
+                }
+            }
+            text.push_str(&format!("  parseInput(value: unknown): {input} {{\n    {metadata}.RawInputValidator.strict().parse(value);\n    {metadata}.meta.InputValidator.strict().parse(value);\n"));
             if let Some((_, (kind, _, writable))) = &generated {
                 if *kind == "update" {
                     text.push_str(&format!("    if (!{}.some(key => Object.prototype.hasOwnProperty.call(value, key))) throw new Error('InvalidEdit');\n", serde_json::to_string(writable).unwrap()));
@@ -224,6 +223,7 @@ pub fn generate(
                     text.push_str(&format!("    return {{ safe: true as const, kind: {} as const, table: {}, id: input[{}]!, fields: {}, writableFields: {}, materializedFields: {} }};\n  }},\n", json(kind), json(&ast::get_tablename(&table.record.name, &table.record.fields)), json(&pk.name), if *kind == "create" { "input".into() } else { format!("Object.fromEntries(Object.entries(input).filter(([key]) => key !== {}))", json(&pk.name)) }, serde_json::to_string(writable).unwrap(), serde_json::to_string(&materialized).unwrap()));
                 }
                 let body = match *kind {
+                    "create" if matches!(pk.type_, ast::ColumnType::IdUuid { .. }) => format!("create: (input: Omit<{input}, {key}>): $LocalEdits.Edit<{name}, {result}> => $LocalEdits.scopedEdit({name}, {operation}, input as {input})", key = json(&pk.name)),
                     "create" => format!("create: (input: {input}): $LocalEdits.Edit<{name}, {result}> => $LocalEdits.scopedEdit({name}, {operation}, input)"),
                     "update" => format!("update: (id: {input}[{key}], patch: Omit<{input}, {key}>): $LocalEdits.Edit<{name}, {result}> => {{ if (Object.prototype.hasOwnProperty.call(patch, {key})) throw new Error('InvalidEdit'); return $LocalEdits.scopedEdit({name}, {operation}, {{ ...patch, [{key}]: id }}); }}", key = json(&pk.name)),
                     _ => format!("delete: (id: {input}[{key}]): $LocalEdits.Edit<{name}, {result}> => $LocalEdits.scopedEdit({name}, {operation}, {{ [{key}]: id }})", key = json(&pk.name)),
@@ -391,7 +391,7 @@ mod tests {
         let mut schema = ast::Schema::default();
         crate::parser::run(
             "schema.pyre",
-            "record User {\n @public\n id Id.Int @id\n name String\n}\n",
+            "record User {\n @public\n id Id.Uuid @id\n name String\n}\n",
             &mut schema,
         )
         .unwrap();
@@ -460,7 +460,7 @@ B.Records.User.delete(result.user[0].id);
             let mut schema = ast::Schema::default();
             crate::parser::run(
                 &format!("{namespace}/schema.pyre"),
-                &format!("record {record} {{\n @public\n id Id.Int @id\n}}\n"),
+                &format!("record {record} {{\n @public\n id Id.Uuid @id\n}}\n"),
                 &mut schema,
             )
             .unwrap();
@@ -569,7 +569,7 @@ Url.Records.UrlThing.delete(null as unknown as Url.UrlThingId);
         };
         crate::parser::run(
             "synced.pyre",
-            "record Writable {\n @public\n id Id.Int @id\n}\n",
+            "record Writable {\n @public\n id Id.Uuid @id\n}\n",
             &mut synced,
         )
         .unwrap();
@@ -627,7 +627,7 @@ record User {
 }
 record Audit {
   @public
-  id Id.Int @id
+  id Id.Uuid @id
   message String
   label String @default("audit")
 }
@@ -666,22 +666,17 @@ record Marker {
   text String
   updatedAt Int @immutable
 }
-record Legacy {
-  @public
-  id String @id
-  value String
-}
 record Main {
   @public
-  id Id.Int @id
+  id Id.Uuid @id
 }
 record Commands {
   @public
-  id Id.Int @id
+  id Id.Uuid @id
 }
 record Records {
   @public
-  id Id.Int @id
+  id Id.Uuid @id
 }
 "#,
             &mut schema,
@@ -731,7 +726,6 @@ record Records {
         assert!(edits.contents.contains("$metadata0"));
         assert!(edits.contents.contains("$operation0"));
         assert!(!edits.contents.contains("export const User ="));
-        assert!(!edits.contents.contains("\"Legacy\": Object.freeze"));
         for record in ["Main", "Commands", "Records"] {
             assert!(edits
                 .contents
@@ -748,7 +742,7 @@ import type { Database, EditReceipt } from '../../packages/client/src-ts/service
 import { namespace, scopedBatch } from '@pyre/core/local-edits';
 declare const db: Database<Main>;
 declare const id: UserId;
-const created = Records.User.create({ key: '00000000-0000-0000-0000-000000000001', name: 'new', fixed: 'x' });
+const created = Records.User.create({ name: 'new', fixed: 'x' });
 const plan = batch([created, Records.Audit.create({ message: 'audit' }), Records.User.update(id, { note: null }), Records.User.delete(id), Commands.rename({ key: id, name: 'x' })] as const);
 const receipt = db.submit(plan);
 const empty: EditReceipt<readonly []> = db.submit(batch([]));
@@ -759,9 +753,9 @@ receipt.confirmed.then(outcome => { if (outcome.kind === 'confirmed') {
   const wrong: UserId = outcome.result[1].id;
 } });
 // @ts-expect-error required create field
-Records.User.create({ key: id });
-// @ts-expect-error integer identity is server generated
-Records.Audit.create({ id: 1, message: 'x' });
+Records.User.create({});
+// @ts-expect-error UUID identity is generated by the runtime
+Records.Audit.create({ id: '01890f6c-7b80-7000-8000-000000000001', message: 'x' });
 // @ts-expect-error primary key update
 Records.User.update(id, { key: id });
 // @ts-expect-error immutable update

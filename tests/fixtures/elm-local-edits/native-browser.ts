@@ -61,9 +61,9 @@ export async function verify(fence) {
     runtime = await client.localEdits('one');
     const database = await client.localEdits('one', g.Main);
     database.onEditFailure(event => failures.push(event));
-    const id = '00000000-0000-4000-8000-000000000001';
     const submit = async plan => { const result = await database.submit(plan).confirmed; equal(result.kind, 'confirmed', 'receipt'); agree(); return result; };
-    await submit(g.Records.Issue.create({ id, title: 'original', owner: 'me' }));
+    const created = await submit(g.Records.Issue.create({ title: 'original', owner: 'me' }));
+    const id = created.result.id;
     await until(async () => JSON.stringify(await cache()).includes('original'), 'authoritative persistence');
     const beforePending = await cache();
     hold = true;
@@ -83,56 +83,56 @@ export async function verify(fence) {
     app.ports.completed.subscribe(value => completed.push(value));
     client.attachElmBridge({ app, receivePort: 'effectOut', queryResultPort: 'incoming' });
     await until(() => observed.length === 1, 'generated Elm bridge');
-    assert(observed[0].auditId === 1 && observed[0].timestamps[0] > 0, 'Elm authoritative result decoding');
-    equal(queries.at(-1).issue, [{ id, title: 'elm' }], 'Elm update'); agree();
+    assert(typeof observed[0].auditId === 'string' && observed[0].timestamps[0] > 0, 'Elm authoritative result decoding');
+    equal(queries.at(-1).issue, [{ id, title: 'original' }], 'Elm submission'); agree();
     // Public Audit.delete does have a generated safe prediction. Observe it
     // through the entity reader while native storage retains the real row.
     const audits = new Map();
     await client.onEntityChanges('one', { tables: [{ tableName: 'audits' }] }, batch => {
       for (const change of batch.changes) { if (change.op === 'remove') audits.delete(change.id); else audits.set(change.id, change.row); }
     });
-    assert(audits.has(1), 'authoritative audit visible before optimistic deletion');
+    const auditId = [...audits.values()].find(row => row.message === 'audit')?.id;
+    assert(typeof auditId === 'string', 'authoritative audit visible before optimistic deletion');
     await until(async () => JSON.stringify(await cache()).includes('"audit"'), 'audit persisted');
     const beforeOptimistic = await cache();
     hold = true; release = undefined;
-    const deletion = database.submit(g.Records.Audit.delete(1));
-    await until(() => release && !audits.has(1), 'safe optimistic delete');
+    const deletion = database.submit(g.Records.Audit.delete(auditId));
+    await until(() => release && !audits.has(auditId), 'safe optimistic delete');
     equal(await cache(), beforeOptimistic, 'optimistic deletion must not persist');
     hold = false; release();
     equal((await deletion.confirmed).kind, 'confirmed', 'optimistic delete confirmed');
-    await until(async () => !(await cache()).tables.some(row => row.tableName === 'audits' && row.identity === 1), 'authoritative audit deletion persisted');
+    await until(async () => !(await cache()).tables.some(row => row.tableName === 'audits' && row.identity === auditId), 'authoritative audit deletion persisted');
     for (const action of ['create', 'nullable', 'delete', 'rollback']) {
       app.ports.perform.send(action);
       await until(() => completed.at(-1)?.action === action, `Elm ${action}`);
       equal(completed.at(-1).state, action === 'rollback' ? 'rejected' : 'confirmed', `Elm ${action} outcome`);
       agree();
     }
-    equal(projected(), [{ id, title: 'elm' }], 'no Elm rollback ghost');
+    equal(projected(), [{ id, title: 'original' }], 'no Elm rollback ghost');
     await submit(g.Records.Issue.delete(id));
     equal(projected(), [], 'delete removes readers');
     await until(async () => !JSON.stringify((await cache()).tables).includes('"issues"'), 'persisted issue deletion');
     checked.push('TS/Elm reader agreement');
 
-    const ghost = crypto.randomUUID();
     const beforeFailure = failures.length;
-    database.submit(g.batch([g.Records.Issue.create({ id: ghost, title: 'ghost', owner: 'me' }), g.Records.Issue.update(crypto.randomUUID(), { title: 'missing' })]));
+    database.submit(g.batch([g.Records.Issue.create({ title: 'ghost', owner: 'me' }), g.Records.Issue.update(crypto.randomUUID(), { title: 'missing' })]));
     await until(() => failures.length > beforeFailure, 'fire-and-forget failure');
     equal(failures.at(-1).certainty, 'rejected', 'failure certainty');
     equal(failures.at(-1).code, 'TargetNotWritable', 'real executor rejection');
     equal(projected(), [], 'no rejected ghost'); agree();
-    assert(!JSON.stringify(await cache()).includes(ghost), 'no persisted ghost');
+    assert(!JSON.stringify(await cache()).includes('ghost'), 'no persisted ghost');
     checked.push('fire-and-forget rollback');
 
     const beforeHint = reads;
-    await post('/hint', {});
+    const hinted = await post('/hint', {});
     await until(() => hintCount > 0 && reads > beforeHint, 'native EventSource replacement');
     await until(() => queries.at(-1)?.issue?.[0]?.title === 'external', 'hint installs external commit');
     agree();
-    await submit(g.Records.Issue.delete('00000000-0000-4000-8000-000000000099'));
+    await submit(g.Records.Issue.delete(hinted.id));
     checked.push('EventSource hint');
 
     hold = true; release = undefined;
-    const stale = database.submit(g.Records.Issue.create({ id: ghost, title: 'old-auth', owner: 'me' }));
+    const stale = database.submit(g.Records.Issue.create({ title: 'old-auth', owner: 'me' }));
     await until(() => release, 'prepared old-auth edit');
     const beforeDispose = writes;
     client.disconnect();
@@ -148,7 +148,7 @@ export async function verify(fence) {
     await until(() => newQueries.at(-1)?.issue?.length === 0, 'new auth read-only catchup');
     equal((await database.submit(g.Records.Issue.delete(id)).confirmed).kind, 'rejected', 'old binding fenced');
     equal(writes, beforeDispose, 'no stale or read-only writes');
-    assert(!JSON.stringify(await cache()).includes(ghost), 'old auth cannot resurrect cache');
+    assert(!JSON.stringify(await cache()).includes('old-auth'), 'old auth cannot resurrect cache');
     checked.push('auth/dispose fencing');
     return checked;
   } finally { client.disconnect(); await runtime?.ended; }

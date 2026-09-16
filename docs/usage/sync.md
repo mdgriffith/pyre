@@ -85,7 +85,12 @@ pyre migrate db/app.db --push
 
 For checked-in migration files instead of direct push, see [Migration Guide](./migrations.md).
 
-For each syncable table, Pyre manages an `(updatedAt, @id)` index used by catch-up pagination. Query-only namespaces marked `@syncable(false)` do not receive this index; explicitly declared indexes are preserved.
+For each syncable table, Pyre requires one non-null `Id.Uuid @id` and manages an
+`(updatedAt, @id)` index used by catch-up pagination. Query-only namespaces marked
+`@syncable(false)` may use other primary-key types and do not receive this index;
+explicitly declared indexes are preserved. Existing integer-key namespaces must
+either migrate their keys and foreign keys to UUIDs or become query-only before
+upgrading; there is no synchronized identity fallback.
 
 ## 3. Generate Artifacts
 

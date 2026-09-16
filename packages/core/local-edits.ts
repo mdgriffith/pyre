@@ -10,6 +10,7 @@ export interface EditPrediction {
 }
 export interface EditOperation<I = any, R = any> {
   id: string;
+  generatedCreateUuidInput?: string;
   parseInput(input: unknown): I;
   decodeResult(value: unknown): R;
   predict?(input: I): EditPrediction | null;

@@ -38,6 +38,7 @@ fn write_schema(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id   Int    @id
     name String
@@ -62,6 +63,7 @@ session {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 
 record Note {
     id      Int    @id
@@ -78,6 +80,7 @@ fn write_nullable_schema(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id       Int     @id
     nickname String?
@@ -647,7 +650,7 @@ fn init_rejects_session_declaration_in_schema_source() {
         "pyre_init",
         json!({
             "dir": "app-pyre",
-            "schema": "session {\n    userId Int\n}\n\nrecord User {\n    id Int @id\n    @public\n}\n"
+            "schema": "@syncable(false)\nsession {\n    userId Int\n}\n\nrecord User {\n    id Int @id\n    @public\n}\n"
         }),
     );
 
@@ -666,7 +669,7 @@ fn init_creates_single_database_schema_from_required_source() {
         "pyre_init",
         json!({
             "dir": "app-pyre",
-            "schema": "record User {\n    id Int @id\n    name String\n    @public\n}\n"
+            "schema": "@syncable(false)\nrecord User {\n    id Int @id\n    name String\n    @public\n}\n"
         }),
     );
 
@@ -695,7 +698,7 @@ fn init_accepts_shared_session_source() {
         json!({
             "dir": "app-pyre",
             "session": "session {\n    userId Int\n}\n",
-            "schema": "record User {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}\n"
+            "schema": "@syncable(false)\nrecord User {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}\n"
         }),
     );
 
@@ -716,7 +719,7 @@ fn init_creates_namespaced_schema() {
         json!({
             "dir": "multi-pyre",
             "namespace": "Billing",
-            "schema": "record Invoice {\n    id Int @id\n    amount Int\n    @public\n}\n"
+            "schema": "@syncable(false)\nrecord Invoice {\n    id Int @id\n    amount Int\n    @public\n}\n"
         }),
     );
 
@@ -776,7 +779,7 @@ fn init_rejects_unsafe_paths() {
         "pyre_init",
         json!({
             "dir": "../outside",
-            "schema": "record User {\n    id Int @id\n}\n"
+            "schema": "@syncable(false)\nrecord User {\n    id Int @id\n}\n"
         }),
     );
 
@@ -856,7 +859,7 @@ fn init_rejects_lowercase_namespace_without_exiting() {
         json!({
             "dir": "lowercase-pyre",
             "namespace": "billing",
-            "schema": "record Invoice {\n    id Int @id\n}\n"
+            "schema": "@syncable(false)\nrecord Invoice {\n    id Int @id\n}\n"
         }),
     );
 
@@ -877,7 +880,7 @@ fn init_refuses_existing_directory() {
         "pyre_init",
         json!({
             "dir": "pyre",
-            "schema": "record User {\n    id Int @id\n}\n"
+            "schema": "@syncable(false)\nrecord User {\n    id Int @id\n}\n"
         }),
     );
 
@@ -897,7 +900,7 @@ fn init_can_create_and_migrate_local_database() {
         "pyre_init",
         json!({
             "dir": "db-pyre",
-            "schema": "record User {\n    id Int @id\n    name String\n    @public\n}\n",
+            "schema": "@syncable(false)\nrecord User {\n    id Int @id\n    name String\n    @public\n}\n",
             "database": "pyre.db"
         }),
     );
@@ -918,7 +921,7 @@ fn init_refuses_existing_database_without_creating_schema_directory() {
         "pyre_init",
         json!({
             "dir": "db-conflict-pyre",
-            "schema": "record User {\n    id Int @id\n}\n",
+            "schema": "@syncable(false)\nrecord User {\n    id Int @id\n}\n",
             "database": "pyre.db"
         }),
     );
@@ -1057,6 +1060,7 @@ fn pyre_query_binds_tagged_unit_enum_parameters() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 type Status
     = Running
     | Stopped
@@ -1155,6 +1159,7 @@ fn pyre_preview_query_rejects_immutable_updates() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record Document {
     id      Int @id
     ownerId Int @immutable

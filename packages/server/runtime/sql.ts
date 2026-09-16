@@ -12,6 +12,7 @@ export type JsonSessionValidators = Record<string, { parse(value: unknown): unkn
 
 export interface GeneratedEdit {
   kind: "create" | "update" | "delete";
+  createUuidInput?: string;
   writeStatementIndices: number[];
   writableInputs: string[];
 }

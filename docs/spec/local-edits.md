@@ -26,9 +26,9 @@ and EventSource against the TypeScript executor. See the
 and coverage boundaries; the reference model remains a separate bounded check.
 
 Client metadata must be regenerated with the required `primaryKey` name/kind.
-Records whose primary keys are neither integer nor UUID remain available to
-ordinary generation, but local-edit CRUD/descriptors are omitted with an explicit
-generation warning rather than being treated as UUIDs.
+Every record in a synced namespace has one non-null UUID primary key. Other key
+types remain available in query-only namespaces, whose local-edit descriptors are
+omitted.
 Browser cache version 3 resets prior rows, cursors, revision and epoch together;
 it does not migrate old flattened `id` caches. Invalid current-version caches
 fail initialization. Query publication conservatively sends changed full results,
@@ -36,11 +36,12 @@ not identity-based diffs inferred from arbitrary projections. Typed Elm/TS schem
 IDs are generated; TS query codecs retain their primitive result representation.
 Production worker/service and generated-surface conformance tests cover
 rejected-create/no-ghost and delete lifecycle transitions.
-UUID inputs, sessions, generated result codecs and replacement ingestion require
+Generic UUID inputs, sessions, generated result codecs and replacement ingestion require
 36-character hyphenated hexadecimal strings, preserving case without imposing a
 UUID version. Symbolic IDs previously accepted by server string codecs are now
 rejected. Noncanonical stored values require correction before rollout; validators
-do not coerce or rewrite existing identities.
+do not coerce or rewrite existing identities. Generated create inputs are narrower:
+the trusted manifest-nominated identity must be canonical lowercase UUIDv7.
 
 ## Boundary
 
@@ -60,14 +61,13 @@ prediction capability. The server resolves only allowlisted compiled operations;
 the client sends neither SQL nor query text for runtime compilation. Schema types
 are not a security boundary: revalidate inputs, manifest version, namespace,
 protected fields, session, permissions, and database on the server. Managed fields,
-integer generated IDs, immutable update fields, and primary-key updates have no
+immutable update fields, and primary-key updates have no
 setters. Handwritten commands can change a primary key under existing rules.
 The Rust server constructs one immutable `BoundManifest` from the manifest and
 trusted database-loaded schema context, caches its fingerprint and authenticated
 namespace scope, and requires that bound capability for batch execution. Named
 command results are validated recursively against manifest result metadata before
-revision allocation and commit. Generated integer result identities must fit
-JavaScript's safe integer range.
+revision allocation and commit.
 
 Elm duplicate setters resolve left to right, last setter wins (also for null). Omission
 means unchanged on update, default/nullable omission on create. Empty updates reject
@@ -82,8 +82,8 @@ builder or submission must not alter its intent. Elm values are already immutabl
 ## Public Surface
 
 These signatures reflect the implemented generated surface. The TypeScript example
-uses the User/Audit schema in `src/generate/typescript/local_edits.rs`; `UserId` is
-a client UUID and `AuditId` a server integer. Generated edits/batches are opaque
+uses the User/Audit schema in `src/generate/typescript/local_edits.rs`; both IDs are
+UUID brands. Generated edits/batches are opaque
 and namespace-scoped; application code does not construct their internals.
 
 ```ts
@@ -92,7 +92,7 @@ import { Main, Records, Commands, batch, type UserId, type AuditId }
 
 declare const userId: UserId;
 const rename = Records.User.update(userId, { name: "final", note: null });
-const create = Records.User.create({ key: crypto.randomUUID(), name: "New", fixed: "x" });
+const create = Records.User.create({ name: "New", fixed: "x" });
 const remove = Records.User.delete(userId);
 const db = await client.localEdits("main", Main); // Database<Main>
 db.onEditFailure(event => showWriteError(event)); // install once, independent of receipts
@@ -198,7 +198,7 @@ import { localEdits } from "@pyre/server/local-edits";
 const seeds = localEdits.bind({ database: mainConnection, databaseId: "main",
   namespace: Main, manifest, session: {} }); // explicit sessionless fixture
 const result = await seeds.submit(batch([
-  Records.User.create({ key: crypto.randomUUID(), name: "Seed", fixed: "x" }),
+  Records.User.create({ name: "Seed", fixed: "x" }),
   Records.Audit.create({ message: "created" }),
 ] as const));
 // Confirmed carries the typed tuple; confirmed means committed plus
@@ -209,7 +209,7 @@ The server executor's `submit<R>(Edit<N,R> | Batch<N,R>): Promise<Outcome<R>>`
 directly returns the outcome, unlike browser receipts. Seed binding requires an
 explicit validated effective session; no implicit admin
 or legacy permission-bypassing seed helper. These are inserts, not rerunnable
-upserts. Integer creates have no temporary IDs, result binding, or references to
+upserts. Newly created rows have no same-batch result binding or references to
 earlier operation results. A later submit after confirmation may use the real ID.
 
 Server outcomes are `confirmed`, `rejected`, `outcomeUnknown`, or
@@ -257,15 +257,15 @@ follow-up; this API must not imply it is already solved.
 | Operation | Capability and fallback |
 | --- | --- |
 | Existing update | Patch known visible row only when manifest proves predictable values and visibility; never fabricate missing fields/rows. |
-| Complete client-UUID create | Optimistic only with stable identity and every materialized field and visibility known safe. UUID alone is insufficient. |
+| Complete generated UUID create | Optimistic only with its runtime-captured identity and every materialized field and visibility known safe. UUID alone is insufficient. |
 | Default/server-owned/permission-dependent create | Non-optimistic unless all resulting values and visibility are provably known; no invented timestamps/defaults. |
-| Server-integer create | Non-optimistic; authoritative integer identity only. |
 | Delete | Optimistic removal of known visible target when predictable; server still checks cardinality. |
 | Named command | Non-optimistic, even when its name resembles CRUD. |
 | Mixed batch | Whole batch non-optimistic if any operation is unpredictable. No partially optimistic batch. |
 
-Evaluate predictability in ordered simulated state (so complete UUID create then
-update can qualify). Missing targets during replay suppress that whole batch's
+Evaluate predictability in ordered simulated state. A later operation cannot name
+an earlier create's hidden generated identity; that requires a future placeholder
+design. Missing targets during replay suppress that whole batch's
 overlay, not resurrect rows or reject server work. All readers use one model:
 `visible = replay(authoritative, ordered eligible pending intent)`; never replay
 whole-row forward snapshots or restore inverse snapshots on rejection. Recompute

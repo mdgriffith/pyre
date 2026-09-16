@@ -1,13 +1,13 @@
 
 session {
-    userId Int
+    userId User.id
     role   String
 }
 
 record User {
     @allow(*) { id == Session.userId  }
 
-    id        Int     @id
+    id        Id.Uuid @id
     name      String?
     email     String?
     createdAt DateTime @default(now)
@@ -24,9 +24,9 @@ record Post {
     }
     @allow(update, insert, delete) { authorUserId == Session.userId  }
 
-    id           Int     @id
+    id           Id.Uuid @id
     createdAt    DateTime @default(now)
-    authorUserId Int
+    authorUserId User.id
     title        String
     content      String
     published    Bool    @default(False)

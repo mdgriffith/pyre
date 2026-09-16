@@ -47,7 +47,7 @@ test.skipIf(!directory)(
         },
         audits: {
           name: 'audits',
-          primaryKey: { name: 'id', kind: 'int' },
+          primaryKey: { name: 'id', kind: 'uuid' },
           links: {},
           indices: [],
         },
@@ -99,12 +99,12 @@ test.skipIf(!directory)(
                   operation: operation.operation,
                   value:
                     index === 2
-                      ? { audit: [{ id: 24, message: 'named', updatedAt: 1700000000 }] }
+                      ? { audit: [{ id: '00000000-0000-4000-8000-000000000024', message: 'named', updatedAt: 1700000000 }] }
                       : {
                           id:
                             index === 0
                               ? '00000000-0000-4000-8000-000000000001'
-                              : 23,
+                              : '00000000-0000-4000-8000-000000000023',
                         },
                 })),
                 reconciliation: {
@@ -180,11 +180,11 @@ test.skipIf(!directory)(
     expect(
       lifecycle.find((event) => event.state === 'confirmed').results[1].value
         .id,
-    ).toBe(23);
+    ).toBe('00000000-0000-4000-8000-000000000023');
     expect(
       lifecycle.find((event) => event.state === 'confirmed').results[2].value
         .audit[0].id,
-    ).toBe(24);
+    ).toBe('00000000-0000-4000-8000-000000000024');
     expect(
       lifecycle.every((event) => event.requestId === effect.requestId),
     ).toBe(true);

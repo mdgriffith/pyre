@@ -13,6 +13,7 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 #[test]
 fn generated_elm_lenses_are_uniquely_named_for_nested_siblings() {
     let schema_source = r#"
+@syncable(false)
 record Rulebook {
     @public
 

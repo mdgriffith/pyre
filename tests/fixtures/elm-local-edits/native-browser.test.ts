@@ -44,12 +44,13 @@ test.skipIf(!directory || !playwright)('native Chromium: built PyreClient, gener
     }
     if (path === '/auth') { fence.instance = 'browser-2'; fence.authGeneration = 2; return Response.json(fence); }
     if (path === '/hint') {
-      const { definition, input } = Records.Issue.create({ id: '00000000-0000-4000-8000-000000000099', title: 'external', owner: 'me' })[planKey].operations[0];
-      const result = await runBatchWithSync(db, manifest, fence, { ...fence, version: 1, requestId: 'external', sequence: 100, operations: [{ operation: definition.id, input }] }, {});
+      const { definition, input } = Records.Issue.create({ title: 'external', owner: 'me' })[planKey].operations[0];
+      const id = '01890f6c-7b80-7000-8000-000000000099';
+      const result = await runBatchWithSync(db, manifest, fence, { ...fence, version: 1, requestId: 'external', sequence: 100, operations: [{ operation: definition.id, input: { ...input, id } }] }, {});
       if (result.kind !== 'success') throw new Error(JSON.stringify(result));
       const revision = Number((await db.execute('select server_revision from _pyre_sync')).rows[0].server_revision);
       for (const stream of streams) { try { stream.enqueue(encoder.encode(`data: ${JSON.stringify({ ...fence, type: 'syncRequired', reconciliation: result.response.reconciliation })}\n\n`)); } catch { streams.delete(stream); } }
-      return Response.json({ revision });
+      return Response.json({ revision, id });
     }
     if (path === '/batch' || path === '/replacement') {
       const body = await request.json();

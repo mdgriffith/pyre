@@ -15,6 +15,7 @@ fn both_client_generators_reject_only_authored_session_arguments() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 type Scope
     = Workspace { id Int }
     | Account { id Int }
@@ -113,6 +114,7 @@ record Reply {
 #[test]
 fn generated_typescript_transaction_has_shared_input_and_step_results() {
     let schema_source = r#"
+@syncable(false)
 record Note {
     id Id.Int @id
     body String
@@ -168,7 +170,7 @@ fn generated_typescript_non_unique_relationship_results_are_arrays() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "record Parent {\n @public\n id Id.Int @id\n code String\n matches @link(code, Target.code)\n}\nrecord Target {\n @public\n id Id.Int @id\n code String\n}\n",
+        "@syncable(false)\nrecord Parent {\n @public\n id Id.Int @id\n code String\n matches @link(code, Target.code)\n}\nrecord Target {\n @public\n id Id.Int @id\n code String\n}\n",
         &mut schema,
     )
     .expect("schema parses");
@@ -203,6 +205,7 @@ fn generated_typescript_non_unique_relationship_results_are_arrays() {
 #[test]
 fn generated_typescript_query_shape_rejects_session_filters() {
     let schema_source = r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -267,6 +270,7 @@ query GetRulebookByName($name: String) {
 #[test]
 fn generated_typescript_query_input_validates_typed_json_params_without_stringifying() {
     let schema_source = r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -343,6 +347,7 @@ insert SeedEvent($payload: Json<Lifecycle>) {
 #[test]
 fn generated_typescript_datetime_input_preserves_public_type_and_coerces_at_runtime() {
     let schema_source = r#"
+@syncable(false)
 record Event {
     @public
     id Id.Int @id
@@ -389,6 +394,7 @@ fn generated_typescript_crud_omits_immutable_update_artifacts() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id

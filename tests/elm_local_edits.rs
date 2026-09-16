@@ -6,7 +6,7 @@ fn generated_update_setters_cannot_collide_with_crud_functions() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "record Collision {\n @public\n id Id.Int @id\n update String?\n delete String?\n createWith String?\n}\n",
+        "record Collision {\n @public\n id Id.Uuid @id\n update String?\n delete String?\n createWith String?\n}\n",
         &mut schema,
     )
     .unwrap();
@@ -94,7 +94,7 @@ fn collision_safe_namespace_and_edit_id_names_compile() {
         };
         parser::run(
             &format!("{namespace}/schema.pyre"),
-            &format!("record {record} {{\n @public\n id Id.Int @id\n}}\n"),
+            &format!("record {record} {{\n @public\n id Id.Uuid @id\n}}\n"),
             &mut schema,
         )
         .unwrap();
@@ -106,7 +106,7 @@ fn collision_safe_namespace_and_edit_id_names_compile() {
         .unwrap();
     parser::run(
         "Foo/collisions.pyre",
-        "record FooBar {\n @public\n id Int @id\n}\nrecord Foo_Bar {\n @public\n id Int @id\n}\nrecord A {\n @public\n id Int @id\n}\nrecord AIdentity {\n @public\n id Int @id\n}\n",
+        "record FooBar {\n @public\n id Id.Uuid @id\n}\nrecord Foo_Bar {\n @public\n id Id.Uuid @id\n}\nrecord A {\n @public\n id Id.Uuid @id\n}\nrecord AIdentity {\n @public\n id Id.Uuid @id\n}\n",
         foo,
     )
     .unwrap();
@@ -139,9 +139,8 @@ fn collision_safe_namespace_and_edit_id_names_compile() {
     let edit_ids = generated("Db/EditIds.elm");
     assert!(edit_ids.contains("type alias FooBarBaz ="));
     assert!(edit_ids.contains("type alias FooBarBazNamespace ="));
-    assert!(edit_ids.contains("type FooAIdentityNamespace"));
-    assert!(edit_ids.contains("type alias FooA =\n    Db.Id.Integer FooAIdentityNamespace"));
-    assert!(edit_ids.contains("type alias FooAIdentity ="));
+    assert!(edit_ids.contains("type alias FooA =\n    Db.Id.A"));
+    assert!(edit_ids.contains("type alias FooAIdentity =\n    Db.Id.AIdentity"));
     assert!(files
         .iter()
         .any(|file| file.path.ends_with("Db/Foo/Edit/FooBar.elm")));
@@ -180,24 +179,24 @@ namedDb : Db.Database.DatabaseId Db.Database.DefaultNamespace
 namedDb = Db.Database.fromString "named"
 
 fooId : Db.EditIds.FooBarBaz
-fooId = Db.Id.int 3
+fooId = Db.Id.uuid "00000000-0000-4000-8000-000000000003"
 
 fooBarId : Db.EditIds.FooBarBazNamespace
-fooBarId = Db.Id.int 4
+fooBarId = Db.Id.uuid "00000000-0000-4000-8000-000000000004"
 
 aId : Db.EditIds.FooA
-aId = Db.Id.int 5
+aId = Db.Id.uuid "00000000-0000-4000-8000-000000000005"
 
 aIdentityId : Db.EditIds.FooAIdentity
-aIdentityId = Db.Id.int 6
+aIdentityId = Db.Id.uuid "00000000-0000-4000-8000-000000000006"
 
 all =
-    { defaultThing = DefaultThing.delete (Db.Id.int 1)
-    , namedThing = NamedThing.delete (Db.Id.int 2)
+    { defaultThing = DefaultThing.delete (Db.Id.uuid "00000000-0000-4000-8000-000000000001")
+    , namedThing = NamedThing.delete (Db.Id.uuid "00000000-0000-4000-8000-000000000002")
     , barBaz = BarBaz.delete fooId
     , baz = Baz.delete fooBarId
-    , fooBar = FooBar.delete (Db.Id.int 7)
-    , fooBarUnderscore = FooBarUnderscore.delete (Db.Id.int 8)
+    , fooBar = FooBar.delete (Db.Id.uuid "00000000-0000-4000-8000-000000000007")
+    , fooBarUnderscore = FooBarUnderscore.delete (Db.Id.uuid "00000000-0000-4000-8000-000000000008")
     , a = aId
     , aIdentity = aIdentityId
     }
@@ -242,7 +241,7 @@ fn generated_local_edits_compile_and_run() {
     };
     parser::run(
         "archive.pyre",
-        "record ArchiveEntry {\n @public\n key Id.Int @id\n title String\n}\n",
+        include_str!("fixtures/elm-local-edits/archive.pyre"),
         &mut archive,
     )
     .unwrap();
@@ -251,7 +250,7 @@ fn generated_local_edits_compile_and_run() {
     };
     ast::resolve_id_brands(&mut database);
     let context = typecheck::check_schema(&database).unwrap();
-    let mut queries = parser::parse_query("commands.pyre", "insert NamedAudit($message: String) { audit { message = $message id updatedAt } }\nquery ReadIssues { issue { id title } }\nquery LocalEdits { issue { id } }\nquery QueryUpdate { issue { id } }").unwrap();
+    let mut queries = parser::parse_query("commands.pyre", "insert NamedAudit($id: Audit.id, $message: String) { audit { id = $id message = $message updatedAt } }\nquery ReadIssues { issue { id title } }\nquery LocalEdits { issue { id } }\nquery QueryUpdate { issue { id } }").unwrap();
     pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
     let info = typecheck::check_queries(&queries, &context).unwrap();
     let mut files: Vec<GeneratedFile<String>> = vec![];
@@ -338,13 +337,13 @@ fn generated_local_edits_compile_and_run() {
         "Issue.update (Db.Id.uuid uuid) [ Issue.setId (Db.Id.uuid uuid) ]",
         "Issue.update (Db.Id.uuid uuid) [ Issue.setOwner \"bad\" ]",
         "Issue.update (Db.Id.uuid uuid) [ Issue.setUpdatedAt Time.utc ]",
-        "Audit.create { id = Db.Id.int 1, message = \"bad\" }",
-        "Batch.succeed Tuple.pair |> Batch.and (Issue.delete (Db.Id.uuid uuid)) |> Batch.and (Archive.delete (Db.Id.int 1))",
+        "Audit.create { id = Db.Id.uuid uuid, message = \"bad\" }",
+        "Batch.succeed Tuple.pair |> Batch.and (Issue.delete (Db.Id.uuid uuid)) |> Batch.and (Archive.delete (Db.Id.uuid uuid))",
         "Pyre.submit archive (Issue.delete (Db.Id.uuid uuid)) (Pyre.init \"bad\")",
         "Issue.delete (Db.Id.int 1)",
         "Audit.delete archiveId",
     ] {
-        let source = format!("module Bad exposing (bad)\nimport Db.Default.Edit.Issue as Issue\nimport Db.Default.Edit.Audit as Audit\nimport Db.Archive.Edit.ArchiveEntry as Archive\nimport Db.Database\nimport Db.EditIds\nimport Pyre\nimport Pyre.Batch as Batch\nimport Time\nimport Db.Id\narchive : Db.Database.DatabaseId Db.Database.Archive\narchive = Db.Database.fromString \"archive\"\narchiveId : Db.EditIds.ArchiveArchiveEntry\narchiveId = Db.Id.int 1\nuuid = \"00000000-0000-4000-8000-000000000001\"\nbad = {}\n", expression);
+        let source = format!("module Bad exposing (bad)\nimport Db.Default.Edit.Issue as Issue\nimport Db.Default.Edit.Audit as Audit\nimport Db.Archive.Edit.ArchiveEntry as Archive\nimport Db.Database\nimport Db.EditIds\nimport Pyre\nimport Pyre.Batch as Batch\nimport Time\nimport Db.Id\narchive : Db.Database.DatabaseId Db.Database.Archive\narchive = Db.Database.fromString \"archive\"\narchiveId : Db.EditIds.ArchiveArchiveEntry\narchiveId = Db.Id.uuid \"00000000-0000-4000-8000-000000000001\"\nuuid = \"00000000-0000-4000-8000-000000000001\"\nbad = {}\n", expression);
         fs::write(temp.path().join("src/Bad.elm"), source).unwrap();
         let output = Command::new("npx").args(["--yes", "--package", "elm@0.19.1-6", "elm", "make", "src/Bad.elm", "--output=/dev/null"]).current_dir(temp.path()).output().unwrap();
         assert!(!output.status.success(), "unexpected compile success: {expression}");

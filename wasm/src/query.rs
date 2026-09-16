@@ -134,6 +134,7 @@ mod tests {
         parser::run(
             "schema.pyre",
             r#"
+@syncable(false)
 type EventPayload
    = Created { title String }
    | Deleted

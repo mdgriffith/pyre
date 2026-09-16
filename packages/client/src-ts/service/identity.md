@@ -34,10 +34,12 @@ matches numeric 1 only; `#("1")` matches string "1" only. Quoted selectors use J
 string escaping; legacy bare nonnumeric strings remain supported. Worker
 producers should use positional paths when there is no selected identity.
 
-This change adds no edit runtime, temporary integer IDs, UUID create optimism,
-or UUID allocation API. Applications can allocate UUIDs with `crypto.randomUUID()`
-before constructing future generated edits. Existing optimistic updates no
-longer invent a row for a missing cached target.
+Generated local-edit create builders omit synchronized UUID primary keys. The
+shared TypeScript host for TypeScript and Elm allocates one canonical lowercase
+UUIDv7 at submission, before prediction and worker dispatch, then captures it for
+the operation's full replay lifetime. Generic identity ingestion remains
+version-agnostic and does not case-fold existing values. Existing optimistic
+updates do not invent a row for a missing cached target.
 
 ## Verification
 

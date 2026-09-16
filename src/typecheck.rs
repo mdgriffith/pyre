@@ -1283,6 +1283,34 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                                 }],
                                             });
                                         }
+                                        if schema.sync_mode == ast::SyncMode::Synced
+                                            && (!matches!(
+                                                column.type_,
+                                                ast::ColumnType::IdUuid { .. }
+                                            ) || column.nullable)
+                                        {
+                                            let found = format!(
+                                                "{}{}",
+                                                column.type_.to_string(),
+                                                if column.nullable { "?" } else { "" }
+                                            );
+                                            errors.push(Error {
+                                                filepath: file.path.clone(),
+                                                error_type:
+                                                    ErrorType::SyncablePrimaryKeyMustBeUuid {
+                                                        record: name.clone(),
+                                                        field: column.name.clone(),
+                                                        found,
+                                                    },
+                                                locations: vec![Location {
+                                                    contexts: to_range(&start, &end),
+                                                    primary: to_range(
+                                                        &column.start_typename,
+                                                        &column.end_typename,
+                                                    ),
+                                                }],
+                                            });
+                                        }
                                         has_primary_id = true;
                                     }
 

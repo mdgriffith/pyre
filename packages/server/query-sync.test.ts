@@ -9,6 +9,12 @@ import { join } from "node:path";
 import { meta as compiledCreate } from "./fixtures/compiled-batch/generated/queries/metadata/entryCreate";
 import { sql as compiledCreateSql, syncSql as compiledCreateSyncSql } from "./fixtures/compiled-batch/generated/queries/sql/entryCreate";
 
+const createUuidV7 = "01890f2e-7b5c-7cc8-98c4-dc0c0c07398f";
+const compiledCreateMetadata = {
+  ...compiledCreate,
+  generatedEdit: { ...compiledCreate.generatedEdit, createUuidInput: "id" },
+};
+
 let introspectionResult = { schema_source: "test schema" };
 let sessionIds = ["s1"];
 let reshapedRows = [[1, "World", { _type: "Tiling", tileRootKey: "tiles/root", tileWidth: 256, format: { _type: "Png" } }]];
@@ -97,14 +103,14 @@ test("batch sync publishes only after atomic commit and needs no registered orig
     await db.execute("create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer)");
     await db.execute("insert into _pyre_sync values(1,'e1',0)");
     const manifest = { version: 1, manifestVersion: "m1", SessionValidator: z.object({ userId: z.number() }), queries: {
-      create: { id: "create", operation: "insert", primary_db: "Main", InputValidator: z.object({}), SessionValidator: z.object({ userId: z.number() }),
-        generatedEdit: { kind: "create", writableInputs: [], writeStatementIndices: [0] },
+      create: { id: "create", operation: "insert", primary_db: "Main", InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({ userId: z.number() }),
+        generatedEdit: { kind: "create", createUuidInput: "id", writableInputs: ["id"], writeStatementIndices: [0] },
         session_args: [], optional_input_args: [], json_input_args: [],
         sql: [{ include: true, params: [], sql: "insert into notes default values returning id as _pyreEditId" }],
       },
     } };
     const authority = { databaseId: "tenant-1", namespace: "Main", manifest: "m1", instance: "tab-1", authGeneration: 2 };
-    const request = { version: 1, ...authority, databaseEpoch: "e1", requestId: "request-1", sequence: 1, operations: [{ operation: "create", input: {} }] };
+    const request = { version: 1, ...authority, databaseEpoch: "e1", requestId: "request-1", sequence: 1, operations: [{ operation: "create", input: { id: createUuidV7 } }] };
     const sent = [];
     const observedAtPublication = [];
     const result = await runBatchWithSync(db, manifest, authority, request, { userId: 7 }, new Map([
@@ -432,8 +438,8 @@ test("named no-op revision commits without subscribers, while declared reads all
 test("named sync executes actual generated SQL, retains declared rows, and never sends deltas to fenced readers", async () => {
   await replacementDatabase(async ({ db, authority }) => {
     await db.execute("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer)");
-    const query = { ...compiledCreate, sql: compiledCreateSql, syncSql: compiledCreateSyncSql };
-    const input = { id: "00000000-0000-4000-8000-000000000001", release: "release", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
+    const query = { ...compiledCreateMetadata, sql: compiledCreateSql, syncSql: compiledCreateSyncSql };
+    const input = { id: createUuidV7, release: "release", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
     const fence = { ...authority, namespace: query.primary_db, databaseEpoch: "e1", instance: "other-tab", authGeneration: 8 };
     const result = await runWithSync(db, { [query.id]: query }, query.id, input,
       { userId: 7, role: { _type: "Member" }, unrelated: "required" },
@@ -491,14 +497,14 @@ test("memory batch sync rejects without detaching or publishing, while empty bat
     await db.execute("create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer)");
     await db.execute("insert into _pyre_sync values(1,'e1',0)");
     const manifest = { version: 1, manifestVersion: "m1", SessionValidator: z.object({}), queries: {
-      create: { id: "create", operation: "insert", primary_db: "Main", InputValidator: z.object({}), SessionValidator: z.object({}),
-        generatedEdit: { kind: "create", writableInputs: [], writeStatementIndices: [0] },
+      create: { id: "create", operation: "insert", primary_db: "Main", InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({}),
+        generatedEdit: { kind: "create", createUuidInput: "id", writableInputs: ["id"], writeStatementIndices: [0] },
         session_args: [], optional_input_args: [], json_input_args: [],
         sql: [{ include: true, params: [], sql: "insert into notes default values returning id as _pyreEditId" }],
       },
     } };
     const authority = { databaseId: "memory-sync", namespace: "Main", manifest: "m1", instance: "tab-1", authGeneration: 2 };
-    const request = { version: 1, ...authority, databaseEpoch: "e1", requestId: "request-1", sequence: 1, operations: [{ operation: "create", input: {} }] };
+    const request = { version: 1, ...authority, databaseEpoch: "e1", requestId: "request-1", sequence: 1, operations: [{ operation: "create", input: { id: createUuidV7 } }] };
     const send = mock(() => {});
     const recipients = new Map([["subscriber", { session: {} }]]);
     expect(await runBatchWithSync(db, manifest, authority, request, {}, recipients, send))

@@ -12,6 +12,7 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 #[test]
 fn generated_elm_update_groups_list_input_types() {
     let schema_source = r#"
+@syncable(false)
 record MapEntityTrail {
     @public
 
@@ -62,6 +63,7 @@ type ChoiceStorage
         values Json<List<String>>
      }
 
+@syncable(false)
 record LegacyChoice {
     @public
 
@@ -125,6 +127,7 @@ fn generated_elm_crud_omits_immutable_update_encoder_but_returns_field() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -180,6 +183,7 @@ record Document {
 #[test]
 fn generated_pyre_elm_uses_query_upserts() {
     let schema_source = r#"
+@syncable(false)
 record Rulebook {
     @public
 
@@ -299,6 +303,7 @@ query GetGameWorld($slug: String) {
 #[test]
 fn generated_elm_mutation_modules_include_bridge_metadata() {
     let schema_source = r#"
+@syncable(false)
 record Post {
     @public
 
@@ -368,7 +373,7 @@ fn generated_schema_scoped_entity_stream_modules_encode_id_filtered_streams() {
 record Post {
     @public
 
-    id    Id.Int @id
+    id    Id.Uuid @id
     title String
 }
 
@@ -384,7 +389,7 @@ record Comment {
 record Post {
     @public
 
-    id    Id.Int @id
+    id    Id.Uuid @id
     title String
 }
 "#;
@@ -482,18 +487,18 @@ record Post {
             .contains("module Db.Table.Posts exposing (Row, Stream, decodeRow, stream, idIn)")
             && post_table
                 .contents
-                .contains("type alias Row =\n    { id : Int\n    , title : String\n    }")
+                .contains("type alias Row =\n    { id : String\n    , title : String\n    }")
             && post_table
                 .contents
                 .contains("stream : StreamInternal.TableSubscription Stream\nstream =\n    StreamInternal.table \"posts\"")
-            && post_table.contents.contains("idIn : List Int -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream")
-            && post_table.contents.contains("StreamInternal.addCondition \"id\" (Encode.object [ ( \"$in\", Encode.list Encode.int values ) ]) subscription")
+            && post_table.contents.contains("idIn : List String -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream")
+            && post_table.contents.contains("StreamInternal.addCondition \"id\" (Encode.object [ ( \"$in\", Encode.list Encode.string values ) ]) subscription")
             && post_table
                 .contents
                 .contains("decodeRow : Decode.Decoder Row\ndecodeRow =\n    Decode.succeed Row")
             && post_table
                 .contents
-                .contains("|> Db.Decode.andField \"id\" Decode.int"),
+                .contains("|> Db.Decode.andField \"id\" Db.Id.decodeUuidString"),
         "Db.Table.Posts should expose the row type and decoder. Generated:\n{}",
         post_table.contents
     );
@@ -507,11 +512,11 @@ record Post {
             .contents
             .contains("module Db.Table.Comments exposing (Row, Stream, decodeRow, stream, idIn, postIdIn)")
             && comment_table.contents.contains(
-            "type alias Row =\n    { id : String\n    , postId : Int\n    , body : String\n    }"
+            "type alias Row =\n    { id : String\n    , postId : String\n    , body : String\n    }"
         ) && comment_table
             .contents
-            .contains("|> Db.Decode.andField \"postId\" Decode.int")
-            && comment_table.contents.contains("postIdIn : List Int -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream"),
+            .contains("|> Db.Decode.andField \"postId\" Db.Id.decodeUuidString")
+            && comment_table.contents.contains("postIdIn : List String -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream"),
         "Db.Table.Comments should expose the row type and decoder. Generated:\n{}",
         comment_table.contents
     );
@@ -579,6 +584,7 @@ fn fixed_namespace_and_entity_stream_name_collisions_compile() {
         };
         let source = if namespace == "StreamId" {
             r#"
+@syncable(false)
 record Register {
     @public
     id Int @id
@@ -608,7 +614,7 @@ record FooUnderscoreRecord {
 "#
             .to_string()
         } else {
-            format!("record {namespace}Thing {{\n @public\n id Int @id\n}}\n")
+            format!("@syncable(false)\nrecord {namespace}Thing {{\n @public\n id Int @id\n}}\n")
         };
         parser::run(&format!("{namespace}.pyre"), &source, &mut schema).unwrap();
         schemas.push(schema);

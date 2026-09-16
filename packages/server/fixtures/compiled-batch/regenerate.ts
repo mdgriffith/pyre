@@ -17,7 +17,7 @@ try {
   const bundled = await Bun.build({ entrypoints: [server], target: "bun", external: ["zod", "@pyre/*"] });
   if (!bundled.success) throw new AggregateError(bundled.logs, "Generated server metadata must compile");
   copyFileSync(join(output, "typescript/databases.ts"), join(fixture, "generated/databases.ts"));
-  for (const path of ["decode.ts", "queries/metadata/entryCreate.ts", "queries/sql/entryCreate.ts", "queries/metadata/entriesForContext.ts", "queries/sql/entriesForContext.ts", "queries/sql/types.ts"]) {
+  for (const path of ["decode.ts", "ids.ts", "queries/metadata/entryCreate.ts", "queries/sql/entryCreate.ts", "queries/metadata/entriesForContext.ts", "queries/sql/entriesForContext.ts", "queries/sql/types.ts"]) {
     const destination = join(fixture, "generated", path);
     mkdirSync(dirname(destination), { recursive: true });
     copyFileSync(join(output, "typescript/core", path), destination);

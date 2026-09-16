@@ -67,7 +67,7 @@ pub fn run(root: &Path, generated: &Path) {
     };
     pyre::ast::resolve_id_brands(&mut database);
     let context = pyre::typecheck::check_schema(&database).unwrap();
-    let mut queries = pyre::parser::parse_query("commands.pyre", "insert NamedAudit($message: String) { audit { message = $message id updatedAt } }\nquery ReadIssues { issue { id title } }\nquery ReadArchive { archiveEntry { id title } }").unwrap();
+    let mut queries = pyre::parser::parse_query("commands.pyre", "insert NamedAudit($id: Audit.id, $message: String) { audit { id = $id message = $message updatedAt } }\nquery ReadIssues { issue { id title } }\nquery ReadArchive { archiveEntry { id title } }").unwrap();
     pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
     let info = pyre::typecheck::check_queries(&queries, &context).unwrap();
     let mut files = Vec::new();

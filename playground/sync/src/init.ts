@@ -9,8 +9,8 @@ import init, {
     sql_introspect,
     sql_introspect_uninitialized,
     set_schema,
-    seed_database,
 } from "../../../wasm/pkg/pyre_wasm.js";
+import { SEEDED_USER_COUNT, userIdForIndex } from "./userIds";
 
 // Initialize WASM
 const wasmPath = join(process.cwd(), "..", "..", "wasm", "pkg", "pyre_wasm_bg.wasm");
@@ -119,41 +119,15 @@ async function seedDatabase(dbPath?: string) {
 
     console.log("Seeding database...");
 
-    // Read schema file for seed_database
-    const schemaPath = join(process.cwd(), "pyre", "schema.pyre");
-    if (!existsSync(schemaPath)) {
-        throw new Error(`Schema file not found: ${schemaPath}`);
-    }
-    const schemaSource = readFileSync(schemaPath, "utf-8");
-
-    // Configure seed options: only 20 users, no posts
-    const seedOptions = {
-        table_rows: {
-            "User": 20,
-            "Post": 0,
-        },
-    };
-
-    // Use seed_database from WASM to generate seed SQL
-    const seedResult = seed_database(schemaSource, seedOptions);
-
-    // Check if result is an error string
-    if (typeof seedResult === 'string' && seedResult.startsWith('Error:')) {
-        throw new Error(`Failed to generate seed SQL: ${seedResult}`);
-    }
-
-    // seedResult should be a SeedSql object with sql array
-    if (!seedResult.sql || !Array.isArray(seedResult.sql)) {
-        throw new Error(`Unexpected seed result format: ${JSON.stringify(seedResult)}`);
-    }
-
-    // Execute the seed SQL statements
-    if (seedResult.sql.length > 0) {
-        await db.batch(seedResult.sql);
-        console.log(`Seeded database with ${seedResult.sql.length} SQL statements`);
-    } else {
-        console.log("No seed data to insert");
-    }
+    const users = Array.from({ length: SEEDED_USER_COUNT }, (_, offset) => {
+        const index = offset + 1;
+        return {
+            sql: "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
+            args: [userIdForIndex(index), `User ${index}`, `user${index}@example.com`],
+        };
+    });
+    await db.batch(users);
+    console.log(`Seeded database with ${users.length} users`);
 
     console.log("Seeding completed");
 }

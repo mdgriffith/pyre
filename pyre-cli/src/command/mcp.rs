@@ -1231,6 +1231,7 @@ type Details
         states Json<Dict<Status>>
     }
 
+@syncable(false)
 record Entry {
     id Id.Int @id
     details Details

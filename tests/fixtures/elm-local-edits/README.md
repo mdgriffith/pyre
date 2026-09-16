@@ -7,9 +7,9 @@ TypeScript executor. It does not add a production browser dependency.
 
 The executor suite checks permissions and strict rollback, structured/nullable
 values, protected fields, server normalization/timestamps, related UUID writes,
-integer identity results, named commands, empty batches and no-SSE replacement.
-Two namespaces use the same UUID in separate databases to verify isolated rows,
-readers, revisions and replacement contracts. Invalid fences and cross-namespace
+runtime-allocated UUID identity results, named commands, empty batches and no-SSE replacement.
+Two namespaces use runtime-allocated UUIDs in separate databases to verify isolated
+rows, readers, revisions and replacement contracts. Invalid fences and cross-namespace
 operations reject. Existing worker/service transition tests cover deterministic
 overlap, duplicate delivery, quarantine, unknown outcomes and cleanup permutations.
 Generated modules compile systematic `set<Field>` update setters, and effects carry

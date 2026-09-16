@@ -8,10 +8,10 @@ the [usage guide](../usage/local-edits.md) shows current TS/Elm imports.
 
 ## Generation And Permissions
 
-The current compiler creates all three operation definitions for each table with
-an integer or UUID primary key and reserves their names, including for denied
-operations. Other primary-key kinds remain available to ordinary generation, but
-their local-edit CRUD/descriptors are omitted with an explicit warning. Availability of a builder
+The current compiler creates all three operation definitions for each table in a
+synced namespace. Such tables necessarily have a UUID primary key. Query-only
+tables may use other primary-key kinds but do not receive local-edit descriptors.
+Availability of a builder
 is not permission to write. Compiled permission checks and the effective server
 session determine whether execution is allowed; generation does not filter out
 operations based on an individual session's permissions.
@@ -40,8 +40,7 @@ input `{ key: userId, note: null }`.
 | Non-nullable with default | May omit to use default; null is invalid | May omit; null is invalid |
 | Immutable and otherwise insertable | Included | Excluded |
 | Managed/server-owned | Excluded | Excluded |
-| Client UUID primary key | Supplied when required by schema | Target only, never a patch field |
-| Generated integer primary key | Excluded | Target only, never a patch field |
+| UUID primary key | Excluded; materialized as UUIDv7 by the bound runtime | Target only, never a patch field |
 
 Unknown/protected fields are rejected, not silently ignored. An empty update is
 `InvalidEdit`, not a read or successful no-op. Setting a writable field to its
@@ -57,8 +56,8 @@ required record plus optional opaque `CreateOption` setters through `createWith`
 
 Generated CRUD returns `Created<Id>`, `Updated<Id>`, or `Deleted<Id>`, each containing
 `{ id }` with the affected identity, regardless of the schema's primary-key name.
-It does not promise a readable row. Server-generated integer IDs come only from
-authoritative execution, not temporary client IDs.
+It does not promise a readable row. The generated UUID is captured once before
+prediction or dispatch and remains stable through replay and reconciliation.
 
 Every generated operation must affect exactly one row inside the transaction.
 Zero/multiple writable targets reject with non-disclosing `TargetNotWritable` and
@@ -69,6 +68,9 @@ retain their declared zero/many behavior and result codecs.
 The server independently validates the manifest, namespace, session, protected
 fields and inputs. A batch executes in order in one transaction and allocates one
 commit revision on success, never exposing a successful prefix on rejection.
+At the trusted generated-create boundary, the nominated identity input must be a
+canonical lowercase UUIDv7. Generic UUID codecs and named commands remain
+version-agnostic and preserve explicit UUID case.
 Named commands and generated CRUD share this executor; neither caller-supplied SQL
 nor runtime query compilation is part of the edit protocol.
 

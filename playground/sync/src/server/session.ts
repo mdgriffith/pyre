@@ -15,7 +15,7 @@ class RequestValidationError extends Error {
     }
 }
 
-export function createSession(userId: number): { sessionId: string; session: Session } {
+export function createSession(userId: string): { sessionId: string; session: Session } {
     const sessionId = `session_${nextSessionId++}`;
     const session = {
         userId,
@@ -60,18 +60,17 @@ function requireSession(sessionId: string): Session {
     return session;
 }
 
-export function readLoginRequest(c: Context): { userId: number } {
+export function readLoginRequest(c: Context): { userId: string } {
     const userId = c.req.query("userId");
     if (!userId) {
         throw new RequestValidationError(400, "userId query parameter is required");
     }
 
-    const parsedUserId = parseInt(userId, 10);
-    if (Number.isNaN(parsedUserId) || parsedUserId < 1) {
-        throw new RequestValidationError(400, "userId must be a positive integer");
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(userId)) {
+        throw new RequestValidationError(400, "userId must be a canonical lowercase UUIDv7");
     }
 
-    return { userId: parsedUserId };
+    return { userId };
 }
 
 export function readSyncCursor(c: Context): unknown {

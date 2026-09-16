@@ -91,7 +91,7 @@ mod codec_parity_tests {
             .await
             .unwrap();
         assert_eq!(context_result.response, json!({"entry":[{"id":"note"}]}));
-        let input = json!({"id":"00000000-0000-4000-8000-000000000001","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":{"_type":"Member"},"details":details});
+        let input = json!({"id":"01890f6c-7b80-7000-8000-000000000001","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":{"_type":"Member"},"details":details});
         let mut request = BatchRequest {
             version: 1,
             database_id: "tenant-1".into(),
@@ -126,14 +126,14 @@ mod codec_parity_tests {
         assert_eq!(stored, expected);
         let raw = json!({"_type":"Raw","data":{"arbitrary":[null,true,{"_type":"Uninterpreted","extra":"retain"}]},"values":[1,null,2],"scalar":null});
         let mut raw_input = input.clone();
-        raw_input["id"] = json!("00000000-0000-4000-8000-000000000003");
+        raw_input["id"] = json!("01890f6c-7b80-7000-8000-000000000003");
         raw_input["details"] = raw.clone();
         request.operations[0].input = raw_input;
         run_batch(&conn, &bound, &binding, &request, &session)
             .await
             .unwrap();
         let row = conn
-            .query("select json(details) from entries where id = '00000000-0000-4000-8000-000000000003'", ())
+            .query("select json(details) from entries where id = '01890f6c-7b80-7000-8000-000000000003'", ())
             .await
             .unwrap()
             .next()
@@ -286,6 +286,15 @@ pub async fn run_batch(
                     || edit.write_statement_indices.len() != 1
                     || edit.write_statement_indices[0] >= query.sql.len()
                     || !query.sql[edit.write_statement_indices[0]].include
+                    || (edit.kind == "create") != edit.create_uuid_input.is_some()
+                    || edit.create_uuid_input.as_ref().is_some_and(|input| {
+                        !edit.writable_inputs.contains(input)
+                            || !operation
+                                .input
+                                .get(input)
+                                .and_then(JsonValue::as_str)
+                                .is_some_and(crate::server::manifest::is_canonical_uuid_v7)
+                    })
                 {
                     return Err(Error::InvalidInput(
                         "invalid generated edit metadata".into(),

@@ -968,7 +968,7 @@ mod tests {
         pyre::server::schema::ensure_database(
             &conn,
             pyre::ast::DEFAULT_SCHEMANAME,
-            "record Item {\n id Id.Int @id\n name String\n @public\n}\n",
+            "record Item {\n id Id.Uuid @id\n name String\n @public\n}\n",
         )
         .await
         .unwrap();
@@ -979,7 +979,7 @@ mod tests {
                 "create": {
                     "id": "create", "operation": "insert", "primary_db": namespace,
                     "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
-                    "sql": [{"include": false, "params": [], "sql": "INSERT INTO items (name) VALUES ('private value')"}],
+                    "sql": [{"include": false, "params": [], "sql": "INSERT OR REPLACE INTO items (id, name) VALUES ('01890f6c-7b80-7000-8000-000000000001', 'private value')"}],
                     "resultSchema": {"kind":"object","fields":{}}
                 },
                 "fail": {
@@ -1121,7 +1121,7 @@ mod tests {
             let (_dir, mut state) = batch_state().await;
             let conn = state.db.connect().unwrap();
             pyre::server::schema::ensure_database(&conn, pyre::ast::DEFAULT_SCHEMANAME,
-                "record Item {\n id Id.Int @id\n name String\n @allow(query) { name != \"hidden\" }\n @allow(insert, update, delete) { True }\n}\n").await.unwrap();
+                "record Item {\n id Id.Uuid @id\n name String\n @allow(query) { name != \"hidden\" }\n @allow(insert, update, delete) { True }\n}\n").await.unwrap();
             let mutable = Arc::get_mut(&mut state).unwrap();
             mutable.loaded_schema = load_schema_from_database(&conn).await.unwrap();
             let mut manifest = mutable.manifest.manifest().clone();
@@ -1138,26 +1138,26 @@ mod tests {
                 (
                     "delete",
                     "delete",
-                    "DELETE FROM items WHERE id=1",
-                    json!([{ "table_name":"items", "headers":["id","name"], "rows":[[1,"visible"]] }]),
+                    "DELETE FROM items WHERE id='01890f6c-7b80-7000-8000-000000000001'",
+                    json!([{ "table_name":"items", "headers":["id","name"], "rows":[["01890f6c-7b80-7000-8000-000000000001","visible"]] }]),
                 ),
                 (
                     "hide",
                     "update",
-                    "UPDATE items SET name='hidden' WHERE id=2",
-                    json!([{ "table_name":"items", "headers":["id","name"], "rows":[[2,"hidden"]] }]),
+                    "UPDATE items SET name='hidden' WHERE id='01890f6c-7b80-7000-8000-000000000002'",
+                    json!([{ "table_name":"items", "headers":["id","name"], "rows":[["01890f6c-7b80-7000-8000-000000000002","hidden"]] }]),
                 ),
                 (
                     "noop",
                     "update",
-                    "UPDATE items SET name='unused' WHERE id=999",
+                    "UPDATE items SET name='unused' WHERE id='01890f6c-7b80-7000-8000-000000000999'",
                     json!([]),
                 ),
                 ("read", "query", "SELECT 1", json!([])),
                 (
                     "restore",
                     "update",
-                    "UPDATE items SET name='visible' WHERE id=2",
+                    "UPDATE items SET name='visible' WHERE id='01890f6c-7b80-7000-8000-000000000002'",
                     json!([]),
                 ),
             ] {
@@ -1172,7 +1172,7 @@ mod tests {
             mutable.manifest =
                 BoundManifest::new(manifest, mutable.loaded_schema.context().unwrap()).unwrap();
             conn.execute(
-                "INSERT INTO items(id,name) VALUES(1,'visible'),(2,'visible')",
+                "INSERT INTO items(id,name) VALUES('01890f6c-7b80-7000-8000-000000000001','visible'),('01890f6c-7b80-7000-8000-000000000002','visible')",
                 (),
             )
             .await
@@ -1276,7 +1276,7 @@ mod tests {
             }
             let row = conn
                 .query(
-                    "SELECT server_revision, (SELECT name FROM items WHERE id=2) FROM _pyre_sync",
+                    "SELECT server_revision, (SELECT name FROM items WHERE id='01890f6c-7b80-7000-8000-000000000002') FROM _pyre_sync",
                     (),
                 )
                 .await

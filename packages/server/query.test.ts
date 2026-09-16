@@ -16,6 +16,14 @@ import { meta as compiledContextQuery } from "./fixtures/compiled-batch/generate
 import { sql as compiledContextSql } from "./fixtures/compiled-batch/generated/queries/sql/entriesForContext";
 
 const batchAuthority = { databaseId: "tenant-1", namespace: "Main", manifest: "m1", instance: "tab-1", authGeneration: 2 };
+const createUuidV7 = "01890f2e-7b5c-7cc8-98c4-dc0c0c07398f";
+const secondCreateUuidV7 = "01890f2e-7b5c-7cc8-98c4-dc0c0c073990";
+const genericUuid = z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+const createInput = <T>(body: T) => ({ id: createUuidV7, body });
+const compiledCreateMetadata = {
+  ...compiledCreate,
+  generatedEdit: { ...compiledCreate.generatedEdit, createUuidInput: "id" },
+};
 const batchRequest = (operations: BatchRequest["operations"]): BatchRequest => ({
   version: 1, ...batchAuthority, databaseEpoch: "e1", requestId: "request-1", sequence: 1, operations,
 });
@@ -36,8 +44,8 @@ function editManifest(): BatchManifest {
   };
   return { version: 1, manifestVersion: "m1", SessionValidator: common.SessionValidator, queries: {
     update,
-    create: { ...common, id: "create", operation: "insert", InputValidator: z.object({ body: z.string() }),
-      generatedEdit: { kind: "create", writeStatementIndices: [0], writableInputs: ["body"] },
+    create: { ...common, id: "create", operation: "insert", InputValidator: z.object({ id: genericUuid, body: z.string() }),
+      generatedEdit: { kind: "create", createUuidInput: "id", writeStatementIndices: [0], writableInputs: ["id", "body"] },
       sql: [{ include: true, params: ["body", "session_userId"], sql: "insert into notes(body, owner) values ($body, $session_userId) returning id as _pyreEditId" }],
     },
     delete: { ...common, id: "delete", operation: "delete", InputValidator: z.object({ id: z.number() }),
@@ -104,7 +112,7 @@ test("memory batches reject before detachment, including otherwise-valid writes 
 test("local batch storage guard fails closed when the main filename cannot be established", async () => {
   for (const rows of [[], [{ name: "temp", file: "/tmp/temporary" }], [{ name: "main", file: null }]]) {
     const db = { protocol: "file", execute: mock(async () => ({ rows })), transaction: mock(() => { throw Error("must not detach"); }) };
-    expect(await runBatch(db as any, editManifest(), batchAuthority, batchRequest([{ operation: "create", input: { body: "new" } }]), { userId: 7 }))
+    expect(await runBatch(db as any, editManifest(), batchAuthority, batchRequest([{ operation: "create", input: createInput("new") }]), { userId: 7 }))
       .toEqual({ kind: "error", error: { errorType: "TransactionFailed", message: "TransactionFailed" } });
     expect(db.execute).toHaveBeenCalledWith("pragma database_list");
     expect(db.transaction).not.toHaveBeenCalled();
@@ -149,7 +157,7 @@ test("compiled batch preserves repeated IDs and named results; hidden reads do n
       { operation: "update", input: { id: 1, body: "first" } },
       { operation: "update", input: { id: 1, body: "final" } },
       { operation: "named", input: {} },
-      { operation: "create", input: { body: "third" } },
+      { operation: "create", input: createInput("third") },
       { operation: "delete", input: { id: 1 } },
     ]), { userId: 7 });
     expect(result.kind).toBe("success");
@@ -176,7 +184,7 @@ test("generated missing, forbidden, many-target and SQL failures roll back the e
     const publish = mock(() => {});
     try {
       const result = await runBatch(db, manifest, batchAuthority, batchRequest([
-        { operation: "create", input: { body: "prefix" } },
+        { operation: "create", input: createInput("prefix") },
         failure === "codec" ? { operation: "named", input: {} } : {
           operation: "update", input: { id: failure === "missing" ? 99 : failure === "forbidden" ? 2 : 1, body: failure === "constraint" ? "second" : "new" },
         },
@@ -207,7 +215,7 @@ test("batch validates every member, authority, session, strip-mode protected fie
     [{ ...valid, manifest: "old" }, { userId: 7 }],
     [{ ...valid, instance: "old" }, { userId: 7 }],
     [batchRequest(Array(101).fill(valid.operations[0])), { userId: 7 }],
-    [batchRequest([{ operation: "create", input: { body: "x".repeat(1024 * 1024) } }]), { userId: 7 }],
+    [batchRequest([{ operation: "create", input: createInput("x".repeat(1024 * 1024)) }]), { userId: 7 }],
   ];
   for (const [request, session] of cases) expect((await runBatch(db as any, manifest, batchAuthority, request, session)).kind).toBe("error");
   manifest.queries.update.primary_db = "Other";
@@ -259,14 +267,14 @@ test("batch captures nested JSON and rejects nested stripped fields", async () =
   const db = await batchDatabase();
   try {
     const manifest = editManifest();
-    manifest.queries.create.InputValidator = z.object({ body: z.object({ title: z.string() }) });
+    manifest.queries.create.InputValidator = z.object({ id: genericUuid, body: z.object({ title: z.string() }) });
     manifest.queries.create.json_input_args = ["body"];
     const body = { title: "captured" };
-    const pending = runBatch(db, manifest, batchAuthority, batchRequest([{ operation: "create", input: { body } }]), { userId: 7 });
+    const pending = runBatch(db, manifest, batchAuthority, batchRequest([{ operation: "create", input: createInput(body) }]), { userId: 7 });
     body.title = "mutated";
     expect((await pending).kind).toBe("success");
     expect((await db.execute("select body from notes where id = 3")).rows[0].body).toBe('{"title":"captured"}');
-    const invalid = await runBatch(db, manifest, batchAuthority, batchRequest([{ operation: "create", input: { body: { title: "bad", managed: true } } }]), { userId: 7 });
+    const invalid = await runBatch(db, manifest, batchAuthority, batchRequest([{ operation: "create", input: createInput({ title: "bad", managed: true }) }]), { userId: 7 });
     expect(invalid.kind).toBe("error");
   } finally { db.close(); }
 });
@@ -275,12 +283,12 @@ test("attached connections and compiler attachment metadata reject before writes
   const db = await batchDatabase();
   try {
     await db.execute("attach database ':memory:' as other");
-    const result = await runBatch(db, editManifest(), batchAuthority, batchRequest([{ operation: "create", input: { body: "blocked" } }]), { userId: 7 });
+    const result = await runBatch(db, editManifest(), batchAuthority, batchRequest([{ operation: "create", input: createInput("blocked") }]), { userId: 7 });
     expect(result).toMatchObject({ kind: "error", error: { errorType: "InvalidRequest" } });
     expect((await db.execute("select count(*) as n from notes")).rows[0].n).toBe(2);
     const manifest = editManifest();
     manifest.queries.create.attached_dbs = ["other"];
-    expect(await runBatch(db, manifest, batchAuthority, batchRequest([{ operation: "create", input: { body: "blocked" } }]), { userId: 7 }))
+    expect(await runBatch(db, manifest, batchAuthority, batchRequest([{ operation: "create", input: createInput("blocked") }]), { userId: 7 }))
       .toMatchObject({ kind: "error", error: { errorType: "InvalidRequest", index: 0 } });
   } finally { db.close(); }
 });
@@ -289,7 +297,7 @@ test("revision allocation failure rolls writes back and stale epoch rejects", as
   const db = await batchDatabase();
   try {
     await db.execute("create trigger no_revision before update on _pyre_sync begin select raise(abort, 'private revision failure'); end");
-    const request = batchRequest([{ operation: "create", input: { body: "prefix" } }]);
+    const request = batchRequest([{ operation: "create", input: createInput("prefix") }]);
     const result = await runBatch(db, editManifest(), batchAuthority, request, { userId: 7 });
     expect(result).toEqual({ kind: "error", error: { errorType: "TransactionFailed", message: "TransactionFailed" } });
     expect((await db.execute("select count(*) as n from notes")).rows[0].n).toBe(2);
@@ -322,7 +330,7 @@ test("lost commit response is unknown, never a definitive rollback", async () =>
       return tx;
     };
     const publish = mock(() => {});
-    const result = await runBatch(db, editManifest(), batchAuthority, batchRequest([{ operation: "create", input: { body: "committed" } }]), { userId: 7 }, publish);
+    const result = await runBatch(db, editManifest(), batchAuthority, batchRequest([{ operation: "create", input: createInput("committed") }]), { userId: 7 }, publish);
     expect(result).toEqual({ kind: "unknown", error: { errorType: "OutcomeUnknown", message: "OutcomeUnknown" } });
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
     expect((await db.execute("select body from notes where id = 3")).rows[0].body).toBe("committed");
@@ -337,7 +345,7 @@ test("batch accepts the exact operation and serialized UTF-8 payload limits", as
     const many = await runBatch(db, manifest, batchAuthority, batchRequest(Array.from({ length: 100 }, () => ({ operation: "named", input: {} }))), { userId: 7 });
     expect(many.kind).toBe("success");
     if (many.kind === "success") expect(many.response.results).toHaveLength(100);
-    const request = batchRequest([{ operation: "create", input: { body: "" } }]);
+    const request = batchRequest([{ operation: "create", input: createInput("") }]);
     const overhead = new TextEncoder().encode(JSON.stringify(request)).byteLength;
     (request.operations[0].input as { body: string }).body = "x".repeat(1024 * 1024 - overhead);
     expect(new TextEncoder().encode(JSON.stringify(request)).byteLength).toBe(1024 * 1024);
@@ -370,7 +378,7 @@ test("batch codecs preserve explicit null, structured inputs and session discrim
 
 test("batch wire request requires every fence and rejects unknown envelope/member fields and bad types", async () => {
   const db = { transaction: mock(() => { throw Error("must not execute"); }) };
-  const valid = batchRequest([{ operation: "create", input: { body: "one" } }]);
+  const valid = batchRequest([{ operation: "create", input: createInput("one") }]);
   const malformed: unknown[] = [
     null, [], { ...valid, extra: true }, { ...valid, version: 2 }, { ...valid, version: "1" },
     { ...valid, sequence: 0 }, { ...valid, sequence: -1 }, { ...valid, sequence: 1.5 },
@@ -402,18 +410,75 @@ test("generated edits require exactly one nominated included statement", async (
   for (const indices of [[], [0, 1], [-1], [0.5], [99], [0, 0]]) {
     const manifest = editManifest();
     manifest.queries.create.generatedEdit!.writeStatementIndices = indices;
-    expect(await runBatch(db as any, manifest, batchAuthority, batchRequest([{ operation: "create", input: { body: "one" } }]), { userId: 7 }))
+    expect(await runBatch(db as any, manifest, batchAuthority, batchRequest([{ operation: "create", input: createInput("one") }]), { userId: 7 }))
       .toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest", index: 0 } });
   }
   const manifest = editManifest();
   manifest.queries.create.sql[0].include = false;
-  expect(await runBatch(db as any, manifest, batchAuthority, batchRequest([{ operation: "create", input: { body: "one" } }]), { userId: 7 }))
+  expect(await runBatch(db as any, manifest, batchAuthority, batchRequest([{ operation: "create", input: createInput("one") }]), { userId: 7 }))
     .toMatchObject({ kind: "error", error: { errorType: "InvalidRequest", index: 0 } });
+  for (const createUuidInput of [undefined, "", "other"]) {
+    const malformed = editManifest();
+    malformed.queries.create.generatedEdit!.createUuidInput = createUuidInput;
+    expect(await runBatch(db as any, malformed, batchAuthority, batchRequest([{ operation: "create", input: createInput("one") }]), { userId: 7 }))
+      .toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest", index: 0 } });
+  }
+  const nonCreate = editManifest();
+  nonCreate.queries.update.generatedEdit!.createUuidInput = "id";
+  expect(await runBatch(db as any, nonCreate, batchAuthority, batchRequest([{ operation: "update", input: { id: 1, body: "one" } }]), { userId: 7 }))
+    .toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest", index: 0 } });
   expect(db.transaction).not.toHaveBeenCalled();
 });
 
+test("generated creates accept canonical lowercase UUIDv7 and reject other IDs before transaction or I/O", async () => {
+  const database = await batchDatabase();
+  try {
+    expect(await runBatch(database, editManifest(), batchAuthority, batchRequest([
+      { operation: "create", input: createInput("canonical-v7") },
+    ]), { userId: 7 })).toMatchObject({ kind: "success", response: { results: [{ operation: "create", value: { id: 3 } }] } });
+  } finally { database.close(); }
+
+  const db = {
+    execute: mock(() => { throw Error("must not perform I/O"); }),
+    transaction: mock(() => { throw Error("must not start a transaction"); }),
+  };
+  const invalidInputs: unknown[] = [
+    { id: "01890f2e-7b5c-4cc8-98c4-dc0c0c07398f", body: "lowercase-v4" },
+    { id: createUuidV7.toUpperCase(), body: "uppercase-v7" },
+    { id: "01890f2e-7b5c-7cc8-78c4-dc0c0c07398f", body: "wrong-variant" },
+    { id: "01890f2e-7b5c-7cc8-98c4", body: "malformed" },
+    { body: "missing" },
+    { id: 7, body: "non-string" },
+  ];
+  for (const input of invalidInputs) {
+    const manifest = editManifest();
+    manifest.queries.create.InputValidator = z.object({ id: z.unknown().optional(), body: z.string() });
+    const pending = runBatch(db as any, manifest, batchAuthority, batchRequest([{ operation: "create", input }]), { userId: 7 });
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(db.execute).not.toHaveBeenCalled();
+    expect(await pending)
+      .toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest", index: 0 } });
+  }
+  expect(db.transaction).not.toHaveBeenCalled();
+  expect(db.execute).not.toHaveBeenCalled();
+});
+
+test("named generic UUID inputs remain version- and case-agnostic", async () => {
+  const db = await batchDatabase();
+  try {
+    const manifest = editManifest();
+    manifest.queries.named.InputValidator = z.object({ ids: z.array(genericUuid) });
+    manifest.queries.named.ReturnData = z.object({ ids: z.array(genericUuid) });
+    manifest.queries.named.json_input_args = ["ids"];
+    manifest.queries.named.sql = [{ include: true, params: ["ids"], sql: "select json($ids) as ids" }];
+    const ids = ["00000000-0000-4000-8000-000000000001", createUuidV7.toUpperCase()];
+    expect(await runBatch(db, manifest, batchAuthority, batchRequest([{ operation: "named", input: { ids } }]), { userId: 7 }))
+      .toMatchObject({ kind: "success", response: { results: [{ operation: "named", value: { ids } }] } });
+  } finally { db.close(); }
+});
+
 const compiledInput = {
-  id: "00000000-0000-4000-8000-000000000001", release: "00000000-0000-4000-8000-000000000002", enabled: true, count: 1,
+  id: createUuidV7, release: "00000000-0000-4000-8000-000000000002", enabled: true, count: 1,
   role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: true },
 };
 
@@ -422,7 +487,7 @@ test("actual generated metadata executes release identifier and full unused sess
   try {
     await db.execute("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer)");
     const manifest: BatchManifest = { version: 1, manifestVersion: compiledFingerprint, SessionValidator: compiledSession, queries: {
-      [compiledCreate.id]: { ...compiledCreate, sql: compiledCreateSql },
+      [compiledCreate.id]: { ...compiledCreateMetadata, sql: compiledCreateSql },
     } };
     const authority = { ...batchAuthority, manifest: compiledFingerprint, namespace: compiledCreate.primary_db };
     const request = { ...batchRequest([{ operation: compiledCreate.id, input: compiledInput }]), manifest: compiledFingerprint, namespace: authority.namespace };
@@ -489,7 +554,7 @@ test("compiled recursive JSON preserves nested enums, dates, nulls, lists and di
   try {
     await db.execute("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer)");
     const manifest: BatchManifest = { version: 1, manifestVersion: compiledFingerprint, SessionValidator: compiledSession, queries: {
-      [compiledCreate.id]: { ...compiledCreate, sql: compiledCreateSql },
+      [compiledCreate.id]: { ...compiledCreateMetadata, sql: compiledCreateSql },
     } };
     expect(compiledFingerprint).toMatch(/^sha256:[a-f0-9]{64}$/);
     const authority = { ...batchAuthority, manifest: compiledFingerprint, namespace: compiledCreate.primary_db };
@@ -518,8 +583,8 @@ test("compiled recursive JSON preserves nested enums, dates, nulls, lists and di
     });
     expect(different.response).toEqual({ entry: [] });
     const raw = { _type: "Raw", data: { arbitrary: [null, true, { _type: "Uninterpreted", extra: "retain" }] }, values: [1, null, 2], scalar: null };
-    expect((await runBatch(db, manifest, authority, { ...request, operations: [{ operation: compiledCreate.id, input: { ...compiledInput, id: "00000000-0000-4000-8000-000000000003", details: raw } }] }, session)).kind).toBe("success");
-    expect(JSON.parse((await db.execute("select json(details) as details from entries where id = '00000000-0000-4000-8000-000000000003'")).rows[0].details as string)).toEqual(raw);
+    expect((await runBatch(db, manifest, authority, { ...request, operations: [{ operation: compiledCreate.id, input: { ...compiledInput, id: secondCreateUuidV7, details: raw } }] }, session)).kind).toBe("success");
+    expect(JSON.parse((await db.execute({ sql: "select json(details) as details from entries where id = ?", args: [secondCreateUuidV7] })).rows[0].details as string)).toEqual(raw);
     expect(compiledCreate.InputValidator.safeParse({ ...compiledInput, details: { ...raw, data: undefined } }).success).toBe(false);
     expect(compiledCreate.InputValidator.safeParse({ ...compiledInput, details: { ...raw, data: null } }).success).toBe(false);
     for (const data of [{ lost: undefined }, { lossy: NaN }, { lossy: Infinity }]) {

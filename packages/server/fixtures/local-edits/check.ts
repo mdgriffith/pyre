@@ -2,7 +2,7 @@ import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod";
 import { namespace, planKey, scopedEdit, type Edit } from "@pyre/core/local-edits";
 import { localEdits, type BindOptions } from "../../local-edits";
-import { Main, Records, Commands, batch, type ProjectId } from "../../../../target/local-edits-fixture/typescript/edits";
+import { Main, Records, Commands, batch, type AuditId, type ProjectId } from "../../../../target/local-edits-fixture/typescript/edits";
 import { manifest } from "../../../../target/local-edits-fixture/typescript/server";
 import { openDatabase } from "./database";
 import type { BatchSyncRecipient } from "../../query-sync";
@@ -10,6 +10,8 @@ import * as execution from "../../query-sync";
 
 const cleanup: (() => void)[] = [];
 const { Project, Task, Audit } = Records;
+const uuidV7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+function expectUuidV7(value: unknown) { expect(value).toEqual(expect.stringMatching(uuidV7)); }
 afterEach(() => { for (const close of cleanup.splice(0)) close(); });
 async function setup() {
   const { database, close } = await openDatabase();
@@ -20,42 +22,46 @@ async function setup() {
   return { database, options, edits: localEdits.bind(options), revision, count };
 }
 
-test("generated tuple batch: related UUIDs, integer identities, mixed named commands, zero subscribers", async () => {
+test("generated tuple batch: related UUIDs, mixed named commands, zero subscribers", async () => {
   const { edits, database, revision } = await setup();
   const transaction = database.transaction.bind(database);
   let writes = 0;
   database.transaction = async mode => { if (mode === "write") writes++; return transaction(mode); };
-  const id = crypto.randomUUID() as ProjectId;
-  const taskId = crypto.randomUUID();
+  const project = await edits.submit(Project.create({ name: "project", owner: 7 }));
+  if (project.kind !== "confirmed") throw new Error(JSON.stringify(project));
+  const projectId = project.result.id;
+  const namedId = crypto.randomUUID() as AuditId;
   const outcome = await edits.submit(batch([
-    Project.create({ id, name: "project", owner: 7 }),
-    Task.create({ id: taskId, project: id, title: "task", owner: 7 }),
+    Task.create({ project: projectId, title: "task", owner: 7 }),
     Audit.create({ message: "first" }),
-    Commands.namedAudit({ message: "named" }),
+    Commands.namedAudit({ id: namedId, message: "named" }),
     Audit.create({ message: "last" }),
   ]));
   expect(outcome.kind).toBe("confirmed");
   if (outcome.kind !== "confirmed") return;
-  expect(outcome.result.slice(0, 3)).toEqual([{ id }, { id: taskId }, { id: 1 }]);
-  expect(outcome.result[3].audit[0]).toMatchObject({ id: 2, message: "named" });
-  expect(outcome.result[3].audit[0].updatedAt).toBeInstanceOf(Date);
-  expect(outcome.result[4]).toEqual({ id: 3 });
-  expect(outcome.commitRevision).toBe(1);
-  expect((await database.execute("select project from tasks")).rows[0].project).toBe(id);
-  expect(await revision()).toBe(1);
-  expect(writes).toBe(1);
+  expectUuidV7(projectId);
+  expectUuidV7(outcome.result[0].id);
+  expectUuidV7(outcome.result[1].id);
+  expect(outcome.result[2].audit[0]).toMatchObject({ id: namedId, message: "named" });
+  expect(outcome.result[2].audit[0].updatedAt).toBeInstanceOf(Date);
+  expectUuidV7(outcome.result[3].id);
+  expect(outcome.commitRevision).toBe(2);
+  expect((await database.execute("select project from tasks")).rows[0].project).toBe(projectId);
+  expect(await revision()).toBe(2);
+  expect(writes).toBe(2);
 });
 
 test("operation N forbidden, missing, and SQL constraint failures roll back all preceding operations", async () => {
   for (const kind of ["forbidden", "missing", "constraint"] as const) {
     const { edits, count, revision } = await setup();
-    const id = crypto.randomUUID() as ProjectId;
-    const failure = kind === "forbidden" ? Project.create({ id, name: "forbidden", owner: 8 })
+    const explicitId = crypto.randomUUID() as AuditId;
+    const failure = kind === "forbidden" ? Project.create({ name: "forbidden", owner: 8 })
       : kind === "missing" ? Project.update(crypto.randomUUID() as ProjectId, { name: "missing" })
-      : Project.create({ id, name: "duplicate", owner: 7 });
+      : Commands.namedAudit({ id: explicitId, message: "duplicate" });
     const result = await edits.submit(batch([
-      Project.create({ id, name: "prefix", owner: 7 }),
-      Audit.create({ message: "also rolled back" }),
+      Project.create({ name: "prefix", owner: 7 }),
+      kind === "constraint" ? Commands.namedAudit({ id: explicitId, message: "also rolled back" })
+        : Audit.create({ message: "also rolled back" }),
       failure,
     ]));
     expect(result).toEqual({ kind: "rejected", index: 2,
@@ -109,7 +115,7 @@ test("generated update cardinality is strict even when compiled SQL accidentally
   expect(await localEdits.bind({ ...options, manifest: broken }).submit(edit)).toMatchObject({
     kind: "rejected", code: "TargetNotWritable", index: 0,
   });
-  expect((await database.execute("select message from audits order by id")).rows).toEqual([{ message: "one" }, { message: "two" }]);
+  expect((await database.execute("select message from audits")).rows.map(row => row.message).sort()).toEqual(["one", "two"]);
   expect(await revision()).toBe(1);
 });
 
@@ -124,15 +130,16 @@ test("captures binding authority, compiled metadata, plan inputs and decoders be
   options.databaseId = "changed";
   sql[0].sql = "invalid SQL";
   const definition = { ...source.operations[0].definition };
-  const input = { message: "captured" };
+  const input = structuredClone(source.operations[0].input) as { id?: string; message: string };
   const plan = { ...source, operations: [{ definition, input }] };
-  const promise = edits.submit({ [planKey]: plan } as unknown as Edit<Main, { id: number }>);
+  const promise = edits.submit({ [planKey]: plan } as unknown as Edit<Main, { id: string }>);
   input.message = "mutated";
   definition.id = "mutated operation";
   definition.decodeResult = () => { throw new Error("mutated decoder"); };
   plan.result = () => { throw new Error("mutated result"); };
   const outcome = await promise;
-  expect(outcome).toEqual({ kind: "confirmed", result: { id: 1 }, commitRevision: 1 });
+  expect(outcome).toMatchObject({ kind: "confirmed", commitRevision: 1 });
+  if (outcome.kind === "confirmed") expectUuidV7(outcome.result.id);
   expect((await database.execute("select message from audits")).rows[0].message).toBe("captured");
 });
 
@@ -151,7 +158,9 @@ test("publishes existing syncRequired protocol to current matching subscribers w
   recipients.set("broken", { session: { userId: 7 }, fence });
   recipients.set("active", { session: { userId: 7 }, fence });
   recipients.set("other-target", { session: { userId: 7 }, fence: { ...fence, databaseId: "other" } });
-  expect(await pending).toEqual({ kind: "confirmed", result: { id: 1 }, commitRevision: 1 });
+  const outcome = await pending;
+  expect(outcome).toMatchObject({ kind: "confirmed", commitRevision: 1 });
+  if (outcome.kind === "confirmed") expectUuidV7(outcome.result.id);
   expect(sent).toEqual([{ id: "active", message: { type: "syncRequired", ...fence, serverRevision: 1,
     reconciliation: { kind: "replaceRequired", atLeast: 1, invalidate: true, minimumSafeRevision: 1 } } }]);
 });
@@ -283,14 +292,14 @@ test("seed bindings reserve the shared executor queue before any database I/O", 
     instance: "network", authGeneration: 0 };
   const third = execution.runBatchWithSync(database, manifest, authority, {
     version: 1, ...authority, databaseEpoch, requestId: "third", sequence: 1,
-    operations: [{ operation: operation.definition.id, input: operation.input }],
+    operations: [{ operation: operation.definition.id, input: { ...operation.input as object, id: "01890f6c-7b80-7000-8000-000000000003" } }],
   }, options.session);
   await Bun.sleep(10);
   release();
   expect((await first).kind).toBe("confirmed");
   expect((await second).kind).toBe("confirmed");
   expect((await third).kind).toBe("success");
-  expect((await database.execute("select message from audits order by id")).rows)
+  expect((await database.execute("select message from audits order by message")).rows)
     .toEqual([{ message: "first" }, { message: "second" }, { message: "third" }]);
 });
 
@@ -307,7 +316,7 @@ test("committed results must match operation count, index, manifest ID and gener
       if (defect === "hole") delete result.response.results[1];
       if (defect === "index") result.response.results[1].index = 0;
       if (defect === "operation") result.response.results[1].operation = "wrong-manifest-id";
-      if (defect === "codec") result.response.results[1].value = { id: "not-an-integer" };
+      if (defect === "codec") result.response.results[1].value = { id: "not-a-uuid" };
       return result;
     });
     try {
@@ -321,7 +330,7 @@ test("committed results must match operation count, index, manifest ID and gener
 
 test("compiled named result validation fails inside the transaction, before typed descriptor decoding", async () => {
   const { options, count, revision } = await setup();
-  const named = Commands.namedAudit({ message: "invalid named result" });
+  const named = Commands.namedAudit({ id: crypto.randomUUID() as AuditId, message: "invalid named result" });
   const id = named[planKey].operations[0].definition.id;
   const invalid = { ...manifest, queries: { ...manifest.queries, [id]: { ...manifest.queries[id], ReturnData: z.never() } } };
   const result = await localEdits.bind({ ...options, manifest: invalid }).submit(batch([Audit.create({ message: "prefix" }), named]));

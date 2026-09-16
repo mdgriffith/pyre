@@ -322,7 +322,7 @@ mod tests {
         let mut schema = ast::Schema::default();
         crate::parser::run(
             "schema.pyre",
-            "record Item {\n    @public\n    id Int @id\n}",
+            "@syncable(false)\nrecord Item {\n    @public\n    id Int @id\n}",
             &mut schema,
         )
         .unwrap();
@@ -342,7 +342,7 @@ mod tests {
         let mut schema = ast::Schema::default();
         crate::parser::run(
             "schema.pyre",
-            "record Item {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}",
+            "@syncable(false)\nrecord Item {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}",
             &mut schema,
         )
         .unwrap();

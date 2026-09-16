@@ -16,6 +16,12 @@ use pyre::sync_deltas::AffectedRowTableGroup;
 use serde_json::json;
 use std::collections::HashMap;
 
+const UUID_1: &str = "01890f47-2f00-7000-8000-000000000001";
+const UUID_2: &str = "01890f47-2f00-7000-8000-000000000002";
+const UUID_3: &str = "01890f47-2f00-7000-8000-000000000003";
+const UUID_4: &str = "01890f47-2f00-7000-8000-000000000004";
+const UUID_30: &str = "01890f47-2f00-7000-8000-00000000001e";
+
 const UNION_PREDICATE_PARITY_SCHEMA: &str = r#"
 type ProviderReason
    = ProviderRejected {
@@ -30,7 +36,7 @@ type JobState
    | Ready
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     state JobState
     updatedAt Int
     @allow(query) { state.Failed.reason.ProviderRejected.code != "blocked" }
@@ -50,7 +56,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use pyre::server::{manifest::Manifest, query};
     let db =
-        TestDatabase::new("record Item {\n    id Id.Int @id\n    name String\n    @public\n}\n")
+        TestDatabase::new("record Item {\n    id Id.Uuid @id\n    name String\n    @public\n}\n")
             .await?;
     let conn = db.db.connect()?;
     let mut queries = pyre::ast::QueryList {
@@ -98,7 +104,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
         sequence: 1,
         operations: vec![query::BatchOperation {
             operation: create.id.clone(),
-            input: json!({"name":"committed"}),
+            input: json!({"id":UUID_1,"name":"committed"}),
         }],
     };
     let bound = pyre::server::manifest::BoundManifest::new(manifest.clone(), &db.context)?;
@@ -168,7 +174,7 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     assert!(BoundManifest::new(mismatched, &db.context).is_err());
     assert_eq!(
         result.response["results"][0],
-        json!({"index":0,"operation":create.id,"value":{"id":1}})
+        json!({"index":0,"operation":create.id,"value":{"id":UUID_1}})
     );
     let before = result.response.clone();
     let mut recipient = fence.clone();
@@ -294,7 +300,7 @@ session {
     userId Int
 }
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     @allow(query) { ownerId == Session.userId }
@@ -307,7 +313,7 @@ record Note {
     let mut queries = pyre::parser::parse_query(
         "commands.pyre",
         r#"
-update MoveKey($id: Int, $next: Int) {
+update MoveKey($id: Note.id, $next: Note.id) {
     note {
         @where { id == $id }
         id = $next
@@ -374,8 +380,9 @@ update MoveKey($id: Int, $next: Int) {
             .clone(),
         input,
     };
-    request.operations = (1..=3)
-        .map(|_| operation("create", json!({"ownerId":1,"body":"visible"})))
+    request.operations = [UUID_1, UUID_2, UUID_3]
+        .into_iter()
+        .map(|id| operation("create", json!({"id":id,"ownerId":1,"body":"visible"})))
         .collect();
     let bound = pyre::server::manifest::BoundManifest::new(manifest.clone(), &db.context)?;
     query::run_batch(&conn, &bound, &binding, &request, &session).await?;
@@ -391,8 +398,8 @@ update MoveKey($id: Int, $next: Int) {
         .await?;
     assert_eq!(first.tables["notes"].rows.len(), 3);
     request.operations = vec![
-        operation("delete", json!({"id":1})),
-        operation("update", json!({"id":2,"ownerId":2})),
+        operation("delete", json!({"id":UUID_1})),
+        operation("update", json!({"id":UUID_2,"ownerId":2})),
     ];
     let removed = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     assert_eq!(removed.response["commitRevision"], 2);
@@ -404,7 +411,7 @@ update MoveKey($id: Int, $next: Int) {
             .unwrap()
             .id
             .clone(),
-        input: json!({"id":3,"next":30}),
+        input: json!({"id":UUID_3,"next":UUID_30}),
     }];
     let moved = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     assert_eq!(moved.response["commitRevision"], 3);
@@ -415,8 +422,8 @@ update MoveKey($id: Int, $next: Int) {
     assert_eq!(final_snapshot.target, 1);
     assert_eq!(final_snapshot.revision, 3);
     assert_eq!(final_snapshot.tables["notes"].rows.len(), 1);
-    assert_eq!(final_snapshot.tables["notes"].rows[0]["id"], 30);
-    request.operations = vec![operation("delete", json!({"id":30}))];
+    assert_eq!(final_snapshot.tables["notes"].rows[0]["id"], UUID_30);
+    request.operations = vec![operation("delete", json!({"id":UUID_30}))];
     query::run_batch(&conn, &bound, &binding, &request, &session).await?;
     let empty = server
         .replacement(&conn, &bound, &binding, &catchup, &session)
@@ -441,15 +448,15 @@ session {
     userId Int
 }
 record Membership {
-    id Int @id
-    workspaceId Int
+    id Id.Uuid @id
+    workspaceId Workspace.id
     userId Int
     updatedAt Int
     @allow(query) { False }
     @allow(insert, update, delete) { True }
 }
 record Workspace {
-    id Int @id
+    id Id.Uuid @id
     name String
     updatedAt Int
     memberships @link(Membership.workspaceId)
@@ -475,7 +482,7 @@ record Workspace {
     let fingerprint = manifest.fingerprint();
     let session = PyreSession::new(json!({"userId":1}), &manifest.session_schema)?;
     let conn = db.db.connect()?;
-    conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<5002) INSERT INTO workspaces SELECT x, 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces;").await?;
+    conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<5002) INSERT INTO workspaces SELECT format('01890f47-2f00-7000-8000-%012x', x), 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces;").await?;
     let epoch = conn
         .query("SELECT database_epoch FROM _pyre_sync", ())
         .await?
@@ -509,7 +516,7 @@ record Workspace {
         .await?;
     assert_eq!(before.tables["workspaces"].rows.len(), 5002);
     assert!(before.tables["memberships"].rows.is_empty());
-    conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 5003 UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO workspaces SELECT x, 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces WHERE id > 5002;").await?;
+    conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 5003 UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO workspaces SELECT format('01890f47-2f00-7000-8000-%012x', x), 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces WHERE id > '01890f47-2f00-7000-8000-00000000138a';").await?;
     assert!(matches!(
         server
             .replacement(&conn, &bound, &binding, &request, &session)
@@ -517,7 +524,7 @@ record Workspace {
         Err(pyre::server::sync::Error::ReplacementTooLarge)
     ));
     conn.execute_batch(
-        "DELETE FROM memberships WHERE id > 5002; DELETE FROM workspaces WHERE id > 5002;",
+        "DELETE FROM memberships WHERE id > '01890f47-2f00-7000-8000-00000000138a'; DELETE FROM workspaces WHERE id > '01890f47-2f00-7000-8000-00000000138a';",
     )
     .await?;
     // Only the linked permission table changes, not the visible table or its timestamp.
@@ -545,7 +552,7 @@ record Workspace {
             "userId".into(),
             "updatedAt".into(),
         ],
-        rows: vec![vec![json!(1), json!(1), json!(1), json!(0)]],
+        rows: vec![vec![json!(UUID_1), json!(UUID_1), json!(1), json!(0)]],
     }];
     let commit = pyre::server::query::CommittedRevision {
         database_epoch: request.fence.database_epoch.clone(),
@@ -614,9 +621,9 @@ async fn replacement_pins_all_tables_and_revision_during_concurrent_commits(
         query::BatchBinding,
         sync::{ReplacementRequest, SyncFence},
     };
-    let db = TestDatabase::new("record Alpha {\n    id Int @id\n    marker Int\n    @public\n}\nrecord Beta {\n    id Int @id\n    marker Int\n    @public\n}\n").await?;
+    let db = TestDatabase::new("record Alpha {\n    id Id.Uuid @id\n    marker Int\n    @public\n}\nrecord Beta {\n    id Id.Uuid @id\n    marker Int\n    @public\n}\n").await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO alphas(id,marker) VALUES(1,0); INSERT INTO betas(id,marker) VALUES(1,0);").await?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO alphas(id,marker) VALUES('01890f47-2f00-7000-8000-000000000001',0); INSERT INTO betas(id,marker) VALUES('01890f47-2f00-7000-8000-000000000001',0);").await?;
     let queries = pyre::ast::QueryList { queries: vec![] };
     let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
     let mut files = vec![];
@@ -697,10 +704,10 @@ async fn qualified_union_permission_has_query_catchup_and_live_delta_parity(
         r#"
 insert into jobs (id, state, state__reason, state__reason__code, updatedAt)
 values
-    (1, 'Failed', 'ProviderRejected', 'allowed', 10),
-    (2, 'Failed', 'ProviderRejected', 'blocked', 20),
-    (3, 'Failed', 'ProviderRejected', null, 30),
-    (4, 'Ready', 'ProviderRejected', 'allowed', 40);
+    ('01890f47-2f00-7000-8000-000000000001', 'Failed', 'ProviderRejected', 'allowed', 10),
+    ('01890f47-2f00-7000-8000-000000000002', 'Failed', 'ProviderRejected', 'blocked', 20),
+    ('01890f47-2f00-7000-8000-000000000003', 'Failed', 'ProviderRejected', null, 30),
+    ('01890f47-2f00-7000-8000-000000000004', 'Ready', 'ProviderRejected', 'allowed', 40);
 "#,
     )
     .await?;
@@ -751,28 +758,28 @@ query VisibleJobs {
         ],
         rows: vec![
             vec![
-                json!(1),
+                json!(UUID_1),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!("allowed"),
                 json!(10),
             ],
             vec![
-                json!(2),
+                json!(UUID_2),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!("blocked"),
                 json!(20),
             ],
             vec![
-                json!(3),
+                json!(UUID_3),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!(null),
                 json!(30),
             ],
             vec![
-                json!(4),
+                json!(UUID_4),
                 json!("Ready"),
                 json!("ProviderRejected"),
                 json!("allowed"),
@@ -789,7 +796,7 @@ query VisibleJobs {
         .map(|row| row[0].clone())
         .collect::<Vec<_>>();
 
-    assert_eq!(query_ids, vec![json!(1), json!(3)]);
+    assert_eq!(query_ids, vec![json!(UUID_1), json!(UUID_3)]);
     assert_eq!(catchup_ids, query_ids);
     assert_eq!(live_ids, query_ids);
     Ok(())
@@ -837,7 +844,7 @@ async fn catchup_paginates_rows_with_equal_timestamps() -> Result<(), Box<dyn st
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -848,9 +855,9 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, body, updatedAt) values (1, 'one', 10);
-insert into notes (id, body, updatedAt) values (2, 'two', 10);
-insert into notes (id, body, updatedAt) values (3, 'three', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'one', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 'two', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000003', 'three', 10);
 "#,
     )
     .await?;
@@ -861,10 +868,10 @@ insert into notes (id, body, updatedAt) values (3, 'three', 10);
 
     assert!(first.has_more);
     assert_eq!(notes.rows.len(), 2);
-    assert_eq!(notes.rows[0]["id"], json!(1));
-    assert_eq!(notes.rows[1]["id"], json!(2));
+    assert_eq!(notes.rows[0]["id"], json!(UUID_1));
+    assert_eq!(notes.rows[1]["id"], json!(UUID_2));
     assert_eq!(notes.last_seen_updated_at, Some(10));
-    assert_eq!(notes.last_seen_primary_key, Some(json!(2)));
+    assert_eq!(notes.last_seen_primary_key, Some(json!(UUID_2)));
 
     let mut cursor = SyncCursor::new();
     cursor.insert(
@@ -884,9 +891,9 @@ insert into notes (id, body, updatedAt) values (3, 'three', 10);
 
     assert!(!second.has_more);
     assert_eq!(notes.rows.len(), 1);
-    assert_eq!(notes.rows[0]["id"], json!(3));
+    assert_eq!(notes.rows[0]["id"], json!(UUID_3));
     assert_eq!(notes.last_seen_updated_at, Some(10));
-    assert_eq!(notes.last_seen_primary_key, Some(json!(3)));
+    assert_eq!(notes.last_seen_primary_key, Some(json!(UUID_3)));
 
     cursor.insert(
         "notes".to_string(),
@@ -920,9 +927,9 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000001', 'one', 10);
-insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000002', 'two', 10);
-insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000003', 'three', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'one', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 'two', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000003', 'three', 10);
 "#,
     )
     .await?;
@@ -932,10 +939,7 @@ insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-0000000
     let notes = first.tables.get("notes").expect("notes should sync");
     assert!(first.has_more);
     assert_eq!(notes.rows.len(), 2);
-    assert_eq!(
-        notes.last_seen_primary_key,
-        Some(json!("00000000-0000-0000-0000-000000000002"))
-    );
+    assert_eq!(notes.last_seen_primary_key, Some(json!(UUID_2)));
 
     let cursor = SyncCursor::from([(
         "notes".to_string(),
@@ -952,10 +956,7 @@ insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-0000000
         .expect("remaining note should sync");
     assert!(!second.has_more);
     assert_eq!(notes.rows.len(), 1);
-    assert_eq!(
-        notes.rows[0]["id"],
-        json!("00000000-0000-0000-0000-000000000003")
-    );
+    assert_eq!(notes.rows[0]["id"], json!(UUID_3));
 
     Ok(())
 }
@@ -986,7 +987,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -999,9 +1000,9 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, ownerId, body, updatedAt) values (1, 1, 'one', 10);
-insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
-insert into notes (id, ownerId, body, updatedAt) values (3, 1, 'three', 30);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 1, 'one', 10);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 2, 'two', 20);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000003', 1, 'three', 30);
 "#,
     )
     .await?;
@@ -1020,7 +1021,7 @@ insert into notes (id, ownerId, body, updatedAt) values (3, 1, 'three', 30);
         .map(|row| row["id"].clone())
         .collect::<Vec<_>>();
 
-    assert_eq!(ids, vec![json!(1), json!(3)]);
+    assert_eq!(ids, vec![json!(UUID_1), json!(UUID_3)]);
     assert_eq!(result.database_id.as_deref(), Some("main"));
     assert_eq!(result.server_revision, Some(0));
     assert_eq!(notes.last_seen_updated_at, Some(30));
@@ -1036,7 +1037,7 @@ insert into notes (id, ownerId, body, updatedAt) values (3, 1, 'three', 30);
         .map(|row| row["id"].clone())
         .collect::<Vec<_>>();
 
-    assert_eq!(ids, vec![json!(2)]);
+    assert_eq!(ids, vec![json!(UUID_2)]);
     assert_eq!(notes.last_seen_updated_at, Some(20));
 
     Ok(())
@@ -1051,7 +1052,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     tenant String
     body String
     updatedAt Int
@@ -1064,8 +1065,8 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, tenant, body, updatedAt) values (1, 'safe', 'one', 10);
-insert into notes (id, tenant, body, updatedAt) values (2, 'x'' OR 1=1 --', 'two', 20);
+insert into notes (id, tenant, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'safe', 'one', 10);
+insert into notes (id, tenant, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 'x'' OR 1=1 --', 'two', 20);
 "#,
     )
     .await?;
@@ -1080,7 +1081,7 @@ insert into notes (id, tenant, body, updatedAt) values (2, 'x'' OR 1=1 --', 'two
     let notes = result.tables.get("notes").expect("notes should sync");
 
     assert_eq!(notes.rows.len(), 1);
-    assert_eq!(notes.rows[0]["id"], json!(2));
+    assert_eq!(notes.rows[0]["id"], json!(UUID_2));
 
     Ok(())
 }
@@ -1099,7 +1100,7 @@ type CampaignRole
    | CampaignObserver
 
 record World {
-    id Int @id
+    id Id.Uuid @id
     name String
     updatedAt Int
     @allow(query) { Session.campaignRole == CampaignGM }
@@ -1109,7 +1110,7 @@ record World {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into worlds (id, name, updatedAt) values (1, 'Allowed', 10);")
+    conn.execute_batch("insert into worlds (id, name, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'Allowed', 10);")
         .await?;
     let session_schema = HashMap::from([(
         "campaignRole".to_string(),
@@ -1157,7 +1158,7 @@ record World {
     let worlds = result.tables.get("worlds").expect("worlds should sync");
 
     assert_eq!(worlds.rows.len(), 1);
-    assert_eq!(worlds.rows[0]["id"], json!(1));
+    assert_eq!(worlds.rows[0]["id"], json!(UUID_1));
 
     let affected = vec![AffectedRowTableGroup {
         table_name: "worlds".to_string(),
@@ -1166,7 +1167,7 @@ record World {
             "name".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("Allowed"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("Allowed"), json!(10)]],
     }];
     let sessions = HashMap::from([("session".to_string(), session.logical().clone())]);
     let deltas = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &db.context)
@@ -1193,7 +1194,7 @@ type Tiling
      }
 
 record Map {
-    id Int @id
+    id Id.Uuid @id
     name String
     attrs Json
     tiling Tiling?
@@ -1216,7 +1217,7 @@ insert into maps (
     tiling__format,
     updatedAt
 ) values (
-    1,
+    '01890f47-2f00-7000-8000-000000000001',
     'World',
     json_object('theme', 'forest', 'danger', 4),
     'Tiling',
@@ -1271,7 +1272,7 @@ type EventPayload
    = Secret { secretEvent Json<SecretEvent> }
 
 record Event {
-    id Int @id
+    id Id.Uuid @id
     payload EventPayload?
     createdAt Int
     updatedAt Int
@@ -1283,8 +1284,8 @@ record Event {
     let conn = db.db.connect()?;
     let secret_event = r#"{"_type":"SetupRecorded","setup":{"_type":"Started","script":{"_type":"TroubleBrewing"},"seats":[]}}"#;
     conn.execute(
-        "insert into events (id, payload, payload__secretEvent, createdAt, updatedAt) values (1, 'Secret', ?1, 10, 10)",
-        [secret_event],
+        "insert into events (id, payload, payload__secretEvent, createdAt, updatedAt) values (?1, 'Secret', ?2, 10, 10)",
+        [UUID_1, secret_event],
     )
     .await?;
 
@@ -1301,7 +1302,7 @@ record Event {
             "updatedAt".to_string(),
         ],
         rows: vec![vec![
-            json!(1),
+            json!(UUID_1),
             json!("Secret"),
             json!(secret_event),
             json!(10),
@@ -1351,7 +1352,7 @@ async fn catchup_rejects_zero_page_size() -> Result<(), Box<dyn std::error::Erro
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1376,7 +1377,7 @@ async fn calculate_deltas_sends_public_rows_to_all_sessions(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1392,7 +1393,7 @@ record Note {
             "body".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("one"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("one"), json!(10)]],
     }];
     let connected_sessions = ConnectedSessions::from([
         ("a".to_string(), SyncSession::new()),
@@ -1410,7 +1411,7 @@ record Note {
     assert_eq!(messages[0].message.data[0].table_name, "notes");
     assert_eq!(
         messages[0].message.data[0].rows[0],
-        vec![json!(1), json!("one"), json!(10)]
+        vec![json!(UUID_1), json!("one"), json!(10)]
     );
     assert_eq!(messages[1].session_id, "b");
 
@@ -1422,7 +1423,7 @@ async fn native_sync_revision_persists_in_pyre_sync() -> Result<(), Box<dyn std:
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1439,7 +1440,7 @@ record Note {
             "body".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("one"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("one"), json!(10)]],
     }];
     let connected_sessions = ConnectedSessions::from([
         ("a".to_string(), SyncSession::new()),
@@ -1483,7 +1484,7 @@ async fn database_epoch_mismatch_returns_explicit_replacement(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -1518,7 +1519,7 @@ async fn matching_database_epoch_returns_sync_page() -> Result<(), Box<dyn std::
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -1552,7 +1553,7 @@ async fn rotating_database_epoch_resets_the_revision() -> Result<(), Box<dyn std
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -1595,7 +1596,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -1615,8 +1616,8 @@ record Note {
             "updatedAt".to_string(),
         ],
         rows: vec![
-            vec![json!(1), json!(1), json!("one"), json!(10)],
-            vec![json!(2), json!(2), json!("two"), json!(20)],
+            vec![json!(UUID_1), json!(1), json!("one"), json!(10)],
+            vec![json!(UUID_2), json!(2), json!("two"), json!(20)],
         ],
     }];
     let connected_sessions = ConnectedSessions::from([
@@ -1638,9 +1639,9 @@ record Note {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].session_id, "user-1");
     assert_eq!(messages[0].message.database_id.as_deref(), Some("main"));
-    assert_eq!(messages[0].message.data[0].rows[0][0], json!(1));
+    assert_eq!(messages[0].message.data[0].rows[0][0], json!(UUID_1));
     assert_eq!(messages[1].session_id, "user-2");
-    assert_eq!(messages[1].message.data[0].rows[0][0], json!(2));
+    assert_eq!(messages[1].message.data[0].rows[0][0], json!(UUID_2));
 
     Ok(())
 }
@@ -1651,11 +1652,11 @@ async fn calculate_deltas_supports_json_session_membership_lists(
     let db = TestDatabase::new(
         r#"
 session {
-    gameIds Json<List<String>>
+    gameIds Json<List<Game.id>>
 }
 
 record Game {
-    id String @id
+    id Id.Uuid @id
     updatedAt Int
     @allow(query) { id in Session.gameIds }
     @allow(insert, update, delete) { False }
@@ -1667,21 +1668,21 @@ record Game {
     let affected_rows = vec![AffectedRowTableGroup {
         table_name: "games".to_string(),
         headers: vec!["id".to_string(), "updatedAt".to_string()],
-        rows: vec![vec![json!("game-1"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!(10)]],
     }];
     let connected_sessions = ConnectedSessions::from([
         (
             "allowed".to_string(),
             SyncSession::from([(
                 "gameIds".to_string(),
-                pyre::sync::SessionValue::Text(r#"["game-1"]"#.to_string()),
+                pyre::sync::SessionValue::Text(format!(r#"["{UUID_1}"]"#)),
             )]),
         ),
         (
             "denied".to_string(),
             SyncSession::from([(
                 "gameIds".to_string(),
-                pyre::sync::SessionValue::Text(r#"["game-2"]"#.to_string()),
+                pyre::sync::SessionValue::Text(format!(r#"["{UUID_2}"]"#)),
             )]),
         ),
     ]);
@@ -1693,7 +1694,7 @@ record Game {
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].session_id, "allowed");
-    assert_eq!(messages[0].message.data[0].rows[0][0], json!("game-1"));
+    assert_eq!(messages[0].message.data[0].rows[0][0], json!(UUID_1));
 
     Ok(())
 }
@@ -1714,7 +1715,7 @@ type Tiling
      }
 
 record Map {
-    id Int @id
+    id Id.Uuid @id
     tiling Tiling?
     updatedAt Int
     @public
@@ -1734,7 +1735,7 @@ record Map {
             "updatedAt".to_string(),
         ],
         rows: vec![vec![
-            json!(1),
+            json!(UUID_1),
             json!("Tiling"),
             json!("tiles/root"),
             json!(256),
@@ -1757,7 +1758,7 @@ record Map {
     assert_eq!(
         messages[0].message.data[0].rows[0],
         vec![
-            json!(1),
+            json!(UUID_1),
             json!({
                 "_type": "Tiling",
                 "tileRootKey": "tiles/root",
@@ -1777,7 +1778,7 @@ async fn calculate_deltas_returns_no_messages_without_rows_or_sessions(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1793,7 +1794,7 @@ record Note {
             "body".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("one"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("one"), json!(10)]],
     }];
     let connected_sessions = ConnectedSessions::from([("a".to_string(), SyncSession::new())]);
 
@@ -1825,7 +1826,7 @@ async fn generated_insert_affected_rows_feed_native_deltas(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1835,18 +1836,21 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     let insert_query = r#"
-insert CreateNote($body: String) {
+insert CreateNote($id: Note.id, $body: String) {
     note {
+        id = $id
         body = $body
         updatedAt = 10
-        id
     }
 }
 "#;
     let result_sets = db
         .execute_insert_with_params(
             insert_query,
-            HashMap::from([("body".to_string(), libsql::Value::Text("one".to_string()))]),
+            HashMap::from([
+                ("id".to_string(), libsql::Value::Text(UUID_1.to_string())),
+                ("body".to_string(), libsql::Value::Text("one".to_string())),
+            ]),
         )
         .await?;
     let affected_rows = extract_affected_rows(result_sets).await?;
@@ -1878,7 +1882,7 @@ async fn native_deltas_send_sync_required_when_row_count_exceeds_cap(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1895,7 +1899,13 @@ record Note {
             "updatedAt".to_string(),
         ],
         rows: (0..=MAX_LIVE_SYNC_DELTA_ROWS)
-            .map(|index| vec![json!(index), json!("one"), json!(10)])
+            .map(|index| {
+                vec![
+                    json!(format!("01890f47-2f00-7000-8000-{index:012x}")),
+                    json!("one"),
+                    json!(10),
+                ]
+            })
             .collect(),
     }];
     let connected_sessions = ConnectedSessions::from([("a".to_string(), SyncSession::new())]);
@@ -1918,7 +1928,7 @@ async fn native_deltas_send_sync_required_when_payload_exceeds_cap(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1935,7 +1945,7 @@ record Note {
             "updatedAt".to_string(),
         ],
         rows: vec![vec![
-            json!(1),
+            json!(UUID_1),
             json!("x".repeat(MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES)),
             json!(10),
         ]],
@@ -1962,7 +1972,7 @@ async fn native_deltas_send_sync_required_when_recipient_count_exceeds_cap(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1978,7 +1988,7 @@ record Note {
             "body".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("one"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("one"), json!(10)]],
     }];
     let connected_sessions = (0..=MAX_LIVE_SYNC_FANOUT_RECIPIENTS)
         .map(|index| (format!("s{}", index), SyncSession::new()))
@@ -2010,7 +2020,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -2023,13 +2033,13 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into notes (id, ownerId, body, updatedAt) values (1, 1, 'old', 10);",
+        "insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 1, 'old', 10);",
     )
     .await?;
     let update_query = r#"
-update UpdateNote {
+update UpdateNote($id: Note.id) {
     note {
-        @where { id == 1 }
+        @where { id == $id }
         body = "new"
         updatedAt = 20
         id
@@ -2037,7 +2047,12 @@ update UpdateNote {
     }
 }
 "#;
-    let result_sets = db.execute_query(update_query).await?;
+    let result_sets = db
+        .execute_query_with_params(
+            update_query,
+            HashMap::from([("id".to_string(), libsql::Value::Text(UUID_1.to_string()))]),
+        )
+        .await?;
     let affected_rows = extract_affected_rows(result_sets).await?;
     let connected_sessions = ConnectedSessions::from([
         (
@@ -2074,7 +2089,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -2087,13 +2102,13 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into notes (id, ownerId, body, updatedAt) values (1, 1, 'doomed', 10);",
+        "insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 1, 'doomed', 10);",
     )
     .await?;
     let delete_query = r#"
-delete RemoveNote {
+delete RemoveNote($id: Note.id) {
     note {
-        @where { id == 1 }
+        @where { id == $id }
         id
         ownerId
         body
@@ -2101,7 +2116,12 @@ delete RemoveNote {
     }
 }
 "#;
-    let result_sets = db.execute_query(delete_query).await?;
+    let result_sets = db
+        .execute_query_with_params(
+            delete_query,
+            HashMap::from([("id".to_string(), libsql::Value::Text(UUID_1.to_string()))]),
+        )
+        .await?;
     let affected_rows = extract_affected_rows(result_sets).await?;
     let connected_sessions = ConnectedSessions::from([
         (
@@ -2124,7 +2144,7 @@ delete RemoveNote {
     assert_eq!(affected_rows[0].rows.len(), 1);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].session_id, "user-1");
-    assert_eq!(messages[0].message.data[0].rows[0][0], json!(1));
+    assert_eq!(messages[0].message.data[0].rows[0][0], json!(UUID_1));
 
     Ok(())
 }
@@ -2138,7 +2158,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -2151,8 +2171,8 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, ownerId, body, updatedAt) values (1, 1, 'one', 10);
-insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 1, 'one', 10);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 2, 'two', 20);
 "#,
     )
     .await?;
@@ -2183,7 +2203,7 @@ insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
             .iter()
             .map(|row| row["id"].clone())
             .collect::<Vec<_>>(),
-        vec![json!(1)]
+        vec![json!(UUID_1)]
     );
     assert_eq!(
         second_notes
@@ -2191,7 +2211,7 @@ insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
             .iter()
             .map(|row| row["id"].clone())
             .collect::<Vec<_>>(),
-        vec![json!(2)]
+        vec![json!(UUID_2)]
     );
     assert_ne!(first_notes.permission_hash, second_notes.permission_hash);
 
@@ -2204,15 +2224,15 @@ async fn linked_tables_have_parent_before_child_sync_layers(
     let db = TestDatabase::new(
         r#"
 record User {
-    id Int @id
+    id Id.Uuid @id
     name String
     updatedAt Int
     @public
 }
 
 record Post {
-    id Int @id
-    authorId Int
+    id Id.Uuid @id
+    authorId User.id
     title String
     author @link(authorId, User.id)
     updatedAt Int
@@ -2245,7 +2265,7 @@ async fn load_schema_from_database_returns_typechecked_context(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -2272,7 +2292,7 @@ async fn loaded_context_can_drive_catchup() -> Result<(), Box<dyn std::error::Er
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -2281,7 +2301,7 @@ record Note {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into notes (id, body, updatedAt) values (1, 'one', 10);")
+    conn.execute_batch("insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'one', 10);")
         .await?;
     let loaded = load_context_from_database(&conn).await?;
     let server = SyncServer::new(loaded.context()?);
@@ -2326,7 +2346,7 @@ async fn load_schema_reports_parse_errors() -> Result<(), Box<dyn std::error::Er
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -2356,7 +2376,7 @@ async fn load_schema_reports_typecheck_errors() -> Result<(), Box<dyn std::error
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -2370,7 +2390,7 @@ record Note {
         libsql::params_from_iter(vec![libsql::Value::Text(
             r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     missing MissingType
     @public
 }
@@ -2395,7 +2415,7 @@ async fn sync_payloads_serialize_to_client_contract() -> Result<(), Box<dyn std:
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -2404,7 +2424,7 @@ record Note {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into notes (id, body, updatedAt) values (1, 'one', 10);")
+    conn.execute_batch("insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'one', 10);")
         .await?;
 
     let catchup_result =
@@ -2425,7 +2445,7 @@ record Note {
     let message = DeltaMessage::delta(vec![AffectedRowTableGroup {
         table_name: "notes".to_string(),
         headers: vec!["id".to_string(), "body".to_string()],
-        rows: vec![vec![json!(1), json!("one")]],
+        rows: vec![vec![json!(UUID_1), json!("one")]],
     }]);
     let message_json = serde_json::to_value(&message)?;
 
@@ -2437,7 +2457,7 @@ record Note {
                 {
                     "table_name": "notes",
                     "headers": ["id", "body"],
-                    "rows": [[1, "one"]]
+                    "rows": [[UUID_1, "one"]]
                 }
             ]
         })
@@ -2458,7 +2478,7 @@ session {
 }
 
 record Feature {
-    id Int @id
+    id Id.Uuid @id
     role String
     enabled Bool
     region String?
@@ -2472,9 +2492,9 @@ record Feature {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into features (id, role, enabled, region, updatedAt) values (1, 'admin', 1, null, 10);
-insert into features (id, role, enabled, region, updatedAt) values (2, 'admin', 0, null, 20);
-insert into features (id, role, enabled, region, updatedAt) values (3, 'user', 1, null, 30);
+insert into features (id, role, enabled, region, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'admin', 1, null, 10);
+insert into features (id, role, enabled, region, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 'admin', 0, null, 20);
+insert into features (id, role, enabled, region, updatedAt) values ('01890f47-2f00-7000-8000-000000000003', 'user', 1, null, 30);
 "#,
     )
     .await?;
@@ -2496,7 +2516,7 @@ insert into features (id, role, enabled, region, updatedAt) values (3, 'user', 1
             .iter()
             .map(|row| row["id"].clone())
             .collect::<Vec<_>>(),
-        vec![json!(1)]
+        vec![json!(UUID_1)]
     );
 
     Ok(())

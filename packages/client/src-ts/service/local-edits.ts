@@ -150,7 +150,8 @@ export class LocalEditsRuntime {
     }
     if (!revision(config.minimumSafeRevision) || (config.timeoutMs !== undefined && (!Number.isFinite(config.timeoutMs) || config.timeoutMs <= 0 || config.timeoutMs > 2147483647))) throw new Error('Invalid edit configuration');
     this.manifest = new Map(config.operations.map(op => [op.id, Object.freeze({ ...op })]));
-    if (this.manifest.size !== config.operations.length || config.operations.some(op => !op.id || typeof op.parseInput !== 'function' || typeof op.decodeResult !== 'function')) throw new Error('Invalid edit manifest');
+    if (this.manifest.size !== config.operations.length || config.operations.some(op => !op.id || typeof op.parseInput !== 'function' || typeof op.decodeResult !== 'function'
+      || (op.generatedCreateUuidInput !== undefined && (typeof op.generatedCreateUuidInput !== 'string' || !op.generatedCreateUuidInput)))) throw new Error('Invalid edit manifest');
     this.connected = config.connected ?? (typeof navigator === 'undefined' || navigator.onLine !== false);
   }
   start(): void {
@@ -197,8 +198,14 @@ export class LocalEditsRuntime {
       pending.result = data.result;
       pending.operations = data.operations.map(({ definition, input, named }) => {
         const op = this.manifest.get(definition.id);
-        if (!op || op.parseInput !== definition.parseInput || op.decodeResult !== definition.decodeResult || op.predict !== definition.predict) throw new Error('InvalidOperation');
-        const captured = capture(op.parseInput(capture(input)));
+        if (!op || op.parseInput !== definition.parseInput || op.decodeResult !== definition.decodeResult || op.predict !== definition.predict
+          || op.generatedCreateUuidInput !== definition.generatedCreateUuidInput) throw new Error('InvalidOperation');
+        let materialized = capture(input);
+        if (op.generatedCreateUuidInput) {
+          if (!record(materialized) || Array.isArray(materialized) || Object.prototype.hasOwnProperty.call(materialized, op.generatedCreateUuidInput)) throw new Error('InvalidEdit');
+          materialized = { ...materialized, [op.generatedCreateUuidInput]: uuidv7() };
+        }
+        const captured = capture(op.parseInput(materialized));
         return { operation: op.id, input: captured, ...(op.predict && !named ? { prediction: capture(op.predict(captured)) } : {}) };
       });
       if (typeof navigator !== 'undefined' && navigator.onLine === false) this.setConnected(false);
@@ -430,4 +437,19 @@ export class LocalEditsRuntime {
 }
 function record(value: unknown): value is Record<string, any> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function revision(value: unknown): boolean { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0; }
+function uuidv7(): string {
+  const crypto = globalThis.crypto;
+  const timestamp = Date.now();
+  if (!crypto?.getRandomValues || !Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp >= 2 ** 48) throw new Error('UUIDv7 unavailable');
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let remaining = timestamp;
+  for (let index = 5; index >= 0; index--) {
+    bytes[index] = remaining % 256;
+    remaining = Math.floor(remaining / 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 function notify(callback: () => void): void { try { callback(); } catch (error) { console.error('[PyreClient] Local edit listener failed', error); } }

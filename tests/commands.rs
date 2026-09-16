@@ -45,6 +45,7 @@ fn write_basic_schema(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id   Int    @id
     name String
@@ -182,6 +183,7 @@ fn write_multi_namespace_schemas(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/App/schema.pyre"),
         r#"
+@syncable(false)
 record Project {
     id    Int    @id
     name  String
@@ -194,6 +196,7 @@ record Project {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Auth/schema.pyre"),
         r#"
+@syncable(false)
 record Account {
     id       Int    @id
     email    String
@@ -234,6 +237,7 @@ type AiSessionStatus
    | Completed
    | Failed
 
+@syncable(false)
 record AiSession {
     @public
     id              Id.Int        @id
@@ -293,6 +297,7 @@ type Content
        metadata Json<Dict<String>>
      }
 
+@syncable(false)
 record AiSession {
     @public
     id         Id.Int            @id
@@ -422,6 +427,7 @@ fn write_json_schema_and_query(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record Event {
     @public
     id      Id.Int @id
@@ -461,6 +467,7 @@ type Lifecycle
         reason String
      }
 
+@syncable(false)
 record Event {
     @public
     id      Id.Int @id
@@ -933,20 +940,21 @@ fn test_generate_command() {
 }
 
 #[test]
-fn test_generate_warns_and_omits_local_edits_for_unsupported_primary_keys() {
+fn test_generate_omits_local_edits_for_query_only_schemas() {
     let ctx = TestContext::new();
+    std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Legacy")).unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
-        "record Legacy {\n @public\n id String @id\n name String\n}\nrecord Current {\n @public\n id Id.Int @id\n name String\n}\n",
+        "record Current {\n @public\n id Id.Uuid @id\n name String\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema/Legacy/schema.pyre"),
+        "@syncable(false)\nrecord Legacy {\n @public\n id String @id\n name String\n}\n",
     )
     .unwrap();
 
-    ctx.run_command("generate")
-        .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "local-edit CRUD for record `_default.Legacy` was omitted because primary key `id` has unsupported type `String`",
-        ));
+    ctx.run_command("generate").assert().success();
 
     let edits = std::fs::read_to_string(
         ctx.workspace_path
@@ -955,6 +963,10 @@ fn test_generate_warns_and_omits_local_edits_for_unsupported_primary_keys() {
     .unwrap();
     assert!(edits.contains("\"Current\": Object.freeze"));
     assert!(!edits.contains("\"Legacy\": Object.freeze"));
+    assert!(!ctx
+        .workspace_path
+        .join("pyre/generated/typescript/edits/Legacy.ts")
+        .exists());
 }
 
 #[test]
@@ -985,6 +997,7 @@ record UuidRecord {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Other/schema.pyre"),
         r#"
+@syncable(false)
 record IntRecord {
     id Id.Int @id
     @public
@@ -1021,12 +1034,12 @@ fn test_generate_embeds_namespaced_database_initializers() {
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
-        "record User {\n    id Id.Int @id\n    @public\n}\n",
+        "@syncable(false)\nrecord User {\n    id Id.Int @id\n    @public\n}\n",
     )
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Campaign/schema.pyre"),
-        "record Encounter {\n    id Id.Int @id\n    userId Main.User.id\n    user @link(userId, Main.User.id)\n    @public\n}\n",
+        "@syncable(false)\nrecord Encounter {\n    id Id.Int @id\n    userId Main.User.id\n    user @link(userId, Main.User.id)\n    @public\n}\n",
     )
     .unwrap();
 
@@ -1076,12 +1089,12 @@ fn test_generate_embeds_shared_session_type_in_each_standalone_schema() {
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
-        "type MemberRole\n   = Admin\n   | Player\n\nrecord Member {\n    @public\n    id Id.Int @id\n    role MemberRole\n}\n",
+        "type MemberRole\n   = Admin\n   | Player\n\n@syncable(false)\nrecord Member {\n    @public\n    id Id.Int @id\n    role MemberRole\n}\n",
     )
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Child/schema.pyre"),
-        "record Document {\n    @allow(query) { Or(Session.role == Admin, Session.role == Player) }\n    @allow(insert, update, delete) { False }\n    id Id.Int @id\n}\n",
+        "@syncable(false)\nrecord Document {\n    @allow(query) { Or(Session.role == Admin, Session.role == Player) }\n    @allow(insert, update, delete) { False }\n    id Id.Int @id\n}\n",
     )
     .unwrap();
 
@@ -1106,6 +1119,7 @@ fn test_generated_seed_artifacts_include_typed_inputs() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id Id.Int @id
     name String
@@ -1273,6 +1287,7 @@ session {
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
 
+@syncable(false)
 record User {
     id Int @id
     ownerId Int
@@ -1441,7 +1456,8 @@ fn test_format_schema_file_adds_reverse_links_from_other_schema_files() {
 
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/App/schema.pyre"),
-        r#"record Rulebook {
+        r#"@syncable(false)
+record Rulebook {
     id Int @id
     name String
 }
@@ -1452,7 +1468,8 @@ fn test_format_schema_file_adds_reverse_links_from_other_schema_files() {
     std::fs::write(
         ctx.workspace_path
             .join("pyre/schema/App/schema_rulebook_version.pyre"),
-        r#"record RulebookVersion {
+        r#"@syncable(false)
+record RulebookVersion {
     id Int @id
     rulebookId Rulebook.id
 
@@ -1600,6 +1617,7 @@ type TaskStatus
    = Pending
    | InProgress
 
+@syncable(false)
 record Task {
     @public
     id     Int        @id
@@ -1664,7 +1682,7 @@ async fn test_migrate_push_reports_stored_schema_parse_errors() {
     let ctx = TestContext::new();
     write_clocktower_schema(
         &ctx,
-        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
     ctx.run_command("migrate")
@@ -1696,7 +1714,7 @@ async fn test_migrate_push_reports_stored_schema_typecheck_errors() {
     let ctx = TestContext::new();
     write_clocktower_schema(
         &ctx,
-        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
     ctx.run_command("migrate")
@@ -1708,7 +1726,7 @@ async fn test_migrate_push_reports_stored_schema_typecheck_errors() {
         .success();
     replace_stored_schema(
         &ctx,
-        "record Note {\n    id Int @id\n    missing MissingType\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    missing MissingType\n    @public\n}\n",
     )
     .await;
 
@@ -1737,7 +1755,7 @@ fn test_migrate_push_preserves_missing_current_source_namespace_error() {
     std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
-        "record User {\n    id Int @id\n    @public\n}\n",
+        "@syncable(false)\nrecord User {\n    id Int @id\n    @public\n}\n",
     )
     .unwrap();
 
@@ -1762,7 +1780,7 @@ fn test_migrate_push_with_valid_stored_schema_still_succeeds() {
         .join("pyre/schema/Clocktower/schema.pyre");
     write_clocktower_schema(
         &ctx,
-        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
     ctx.run_command("migrate")
@@ -1774,7 +1792,7 @@ fn test_migrate_push_with_valid_stored_schema_still_succeeds() {
         .success();
     std::fs::write(
         schema_path,
-        "record Note {\n    id Int @id\n    body String\n    summary String?\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    summary String?\n    @public\n}\n",
     )
     .unwrap();
 
@@ -1793,7 +1811,7 @@ async fn test_migrate_push_records_immutable_only_schema_change() {
     let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
     std::fs::write(
         &schema_path,
-        "record Document {\n    id Int @id\n    ownerId Int\n    title String\n    @public\n}\n",
+        "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int\n    title String\n    @public\n}\n",
     )
     .unwrap();
 
@@ -1804,7 +1822,7 @@ async fn test_migrate_push_records_immutable_only_schema_change() {
         .success();
     std::fs::write(
         &schema_path,
-        "record Document {\n    id Int @id\n    ownerId Int @immutable\n    title String\n    @public\n}\n",
+        "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int @immutable\n    title String\n    @public\n}\n",
     )
     .unwrap();
     ctx.run_command("migrate")
@@ -1871,7 +1889,7 @@ async fn test_migrate_push_applies_physical_and_immutable_changes_together() {
     let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
     std::fs::write(
         &schema_path,
-        "record Document {\n    id Int @id\n    ownerId Int\n    @public\n}\n",
+        "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int\n    @public\n}\n",
     )
     .unwrap();
     ctx.run_command("migrate")
@@ -1882,7 +1900,7 @@ async fn test_migrate_push_applies_physical_and_immutable_changes_together() {
 
     std::fs::write(
         &schema_path,
-        "record Document {\n    id Int @id\n    ownerId Int @immutable\n    summary String?\n    @public\n}\n",
+        "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int @immutable\n    summary String?\n    @public\n}\n",
     )
     .unwrap();
     ctx.run_command("migrate")
@@ -1962,7 +1980,7 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
     std::fs::write(
         ctx.workspace_path
             .join("pyre/schema/Clocktower/schema.pyre"),
-        "record Game {\n    @allow(query) { Or(Session.memberRole == GM, Session.memberRole == GamePlayer) }\n    @allow(insert, update, delete) { False }\n    id       Id.Int @id\n    memberId Main.Member.id\n}\n",
+        "@syncable(false)\nrecord Game {\n    @allow(query) { Or(Session.memberRole == GM, Session.memberRole == GamePlayer) }\n    @allow(insert, update, delete) { False }\n    id       Id.Int @id\n    memberId Main.Member.id\n}\n",
     )
     .unwrap();
 
@@ -2086,6 +2104,7 @@ fn test_migrate_refuses_automatic_destructive_reconciliation() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id Int @id
     @public
@@ -2201,6 +2220,7 @@ fn test_generate_schema_with_relationships() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     @public
     id   Int    @id
@@ -2552,6 +2572,7 @@ async fn test_generated_seed_data_decodes_through_generated_query() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record Token {
     id Id.Int @id
     name String

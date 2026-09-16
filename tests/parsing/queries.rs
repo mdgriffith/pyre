@@ -45,6 +45,8 @@ fn test_valid_query() {
 
 fn union_predicate_context() -> typecheck::Context {
     let source = r#"
+@syncable(false)
+
 type ProviderReason
    = ProviderRejected {
         code String
@@ -113,6 +115,8 @@ query Jobs($code: Int) {
 
 fn session_union_predicate_context() -> typecheck::Context {
     let source = r#"
+@syncable(false)
+
 type SessionScope
    = Workspace {
         id Int?
@@ -278,6 +282,8 @@ fn tagged_union_predicate_paths_reject_json_traversal() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
+
 type State
    = Failed {
         code String
@@ -311,6 +317,8 @@ fn tagged_union_predicate_paths_reject_document_terminal_fields() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
+
 type State
    = Failed {
         data Json
@@ -378,6 +386,8 @@ fn query_predicate_validates_function_return_type() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
+
 record Metric {
     id Int @id
     label String

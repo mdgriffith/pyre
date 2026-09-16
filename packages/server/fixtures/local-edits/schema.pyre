@@ -15,6 +15,6 @@ record Task {
 
 record Audit {
     @allow(*) { Session.userId == 7 }
-    id Id.Int @id
+    id Id.Uuid @id
     message String
 }

@@ -32,6 +32,7 @@ record Account {
 pub fn full_schema() -> String {
     format!(
         r#"
+@syncable(false)
 record User {{
     id   Int    @id
     name String

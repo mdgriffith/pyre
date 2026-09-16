@@ -465,7 +465,7 @@ mod tests {
         let mut schema = ast::Schema::default();
         crate::parser::run(
             "schema.pyre",
-            "record Legacy {\n @public\n id String @id\n name String\n}\nrecord Current {\n @public\n id Id.Int @id\n name String\n}",
+            "@syncable(false)\nrecord Legacy {\n @public\n id String @id\n name String\n}\nrecord Current {\n @public\n id Id.Int @id\n name String\n}",
             &mut schema,
         )
         .unwrap();

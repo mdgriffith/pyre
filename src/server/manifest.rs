@@ -252,6 +252,8 @@ impl ResultSchema {
 #[serde(rename_all = "camelCase")]
 pub struct GeneratedEdit {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_uuid_input: Option<String>,
     /// Zero-based indices in both `sql` and `syncSql`. Each is a direct target DML
     /// statement returning the raw authorized identity as `_pyreEditId`.
     pub write_statement_indices: Vec<usize>,
@@ -698,6 +700,13 @@ pub(crate) fn is_uuid(value: &str) -> bool {
                 byte.is_ascii_hexdigit()
             }
         })
+}
+
+pub(crate) fn is_canonical_uuid_v7(value: &str) -> bool {
+    is_uuid(value)
+        && value.bytes().all(|byte| !byte.is_ascii_uppercase())
+        && value.as_bytes()[14] == b'7'
+        && matches!(value.as_bytes()[19], b'8' | b'9' | b'a' | b'b')
 }
 
 fn validate_value(name: &str, value: &JsonValue, schema: &FieldSchema) -> Result<(), Error> {

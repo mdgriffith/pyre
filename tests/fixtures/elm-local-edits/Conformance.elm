@@ -37,15 +37,15 @@ type Msg
 type alias Model =
     { pyre : Pyre.Model
     , initialConfirmed : Bool
+    , created : Maybe Db.EditIds.DefaultIssue
     , pending : Maybe ( String, LocalEdits.Receipt { id : Db.EditIds.DefaultIssue } )
     }
 
 
 submission =
-    Batch.succeed (\issue audit command -> ( issue, audit, command ))
-        |> Batch.and (Issue.update (Db.Id.uuid "00000000-0000-4000-8000-000000000001") [ Issue.setTitle "first", Issue.setTitle "elm", Issue.setAssignee Nothing ])
+    Batch.succeed (\audit command -> ( audit, command ))
         |> Batch.and (Audit.create { message = "audit" })
-        |> Batch.and (NamedAudit.run { message = "named" })
+        |> Batch.and (NamedAudit.run { id = Db.Id.uuid "00000000-0000-4000-8000-000000000024", message = "named" })
         |> (\plan -> Pyre.batch (Database.fromString "one") plan (Pyre.init "conformance"))
 
 
@@ -58,7 +58,7 @@ main =
                     ( model, effect, _ ) =
                         submission
                 in
-                ( { pyre = model, initialConfirmed = False, pending = Nothing }
+                ( { pyre = model, initialConfirmed = False, created = Nothing, pending = Nothing }
                 , case effect of
                     Pyre.Send value ->
                         effectOut value
@@ -86,9 +86,9 @@ update msg model =
 
             else
                 case Pyre.outcome receipt next of
-                    Just (LocalEdits.Confirmed ( _, audit, command )) ->
+                    Just (LocalEdits.Confirmed ( audit, command )) ->
                         ( { model | pyre = next, initialConfirmed = True }
-                        , observed (E.object [ ( "auditId", Db.Id.encodeInt audit.id ), ( "timestamps", E.list (E.int << Time.posixToMillis << .updatedAt) command.audit ) ])
+                        , observed (E.object [ ( "auditId", Db.Id.encodeUuid audit.id ), ( "timestamps", E.list (E.int << Time.posixToMillis << .updatedAt) command.audit ) ])
                         )
 
                     _ ->
@@ -97,15 +97,12 @@ update msg model =
         Perform action ->
             let
                 id =
-                    Db.Id.uuid "00000000-0000-4000-8000-000000000010"
-
-                original =
-                    Db.Id.uuid "00000000-0000-4000-8000-000000000001"
+                    model.created |> Maybe.withDefault (Db.Id.uuid "00000000-0000-4000-8000-000000000010")
 
                 plan =
                     case action of
                         "create" ->
-                            Batch.succeed identity |> Batch.and (Issue.createWith { id = id, title = "elm related", owner = "me" } [ Issue.withAssignee (Just original) ])
+                            Batch.succeed identity |> Batch.and (Issue.create { title = "elm related", owner = "me" })
 
                         "nullable" ->
                             Batch.succeed identity |> Batch.and (Issue.update id [ Issue.setAssignee Nothing, Issue.setPayload (Just (Dict.fromList [ ( "items", [ Just 3, Nothing ] ) ])), Issue.setWatchers (Just [ "ABCDEFAB-CDEF-0123-4567-ABCDEFABCDEF" ]), Issue.setDueAt (Just (Time.millisToPosix 1767225600000)) ])
@@ -114,7 +111,7 @@ update msg model =
                             Batch.succeed identity |> Batch.and (Issue.delete id)
 
                         "invalidUuid" ->
-                            Batch.succeed identity |> Batch.and (Issue.create { id = Db.Id.uuid "00000000-0000-4000-8000-000000000010\n", title = "invalid", owner = "me" })
+                            Batch.succeed identity |> Batch.and (Issue.update (Db.Id.uuid "00000000-0000-4000-8000-000000000010\n") [ Issue.setTitle "invalid" ])
 
                         "invalidStructured" ->
                             Batch.succeed identity |> Batch.and (Issue.update id [ Issue.setWatchers (Just [ "invalid" ]) ])
@@ -124,8 +121,8 @@ update msg model =
 
                         "rollback" ->
                             Batch.succeed (\_ last -> last)
-                                |> Batch.and (Issue.create { id = id, title = "ghost", owner = "me" })
-                                |> Batch.and (Issue.create { id = Db.Id.uuid "00000000-0000-4000-8000-000000000011", title = "denied", owner = "other" })
+                                |> Batch.and (Issue.create { title = "ghost", owner = "me" })
+                                |> Batch.and (Issue.create { title = "denied", owner = "other" })
 
                         _ ->
                             Batch.succeed { id = id }
@@ -160,8 +157,20 @@ finish model =
 
                                 _ ->
                                     "unexpected"
+
+                        created =
+                            if action == "create" then
+                                case outcome of
+                                    LocalEdits.Confirmed result ->
+                                        Just result.id
+
+                                    _ ->
+                                        model.created
+
+                            else
+                                model.created
                     in
-                    ( { model | pending = Nothing }, completed (E.object [ ( "action", E.string action ), ( "state", E.string state ) ]) )
+                    ( { model | pending = Nothing, created = created }, completed (E.object [ ( "action", E.string action ), ( "state", E.string state ) ]) )
 
                 Nothing ->
                     ( model, Cmd.none )

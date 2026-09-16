@@ -63,7 +63,7 @@ main =
                 ( next
                 , case Pyre.outcome receipt next of
                     Just (LocalEdits.Confirmed ( _, audit, commandResult )) ->
-                        settled (audit.id == Db.Id.int 23 && List.map (.updatedAt >> Time.posixToMillis) commandResult.audit == [ 1700000000000 ])
+                        settled (audit.id == Db.Id.uuid "00000000-0000-4000-8000-000000000023" && List.map (.updatedAt >> Time.posixToMillis) commandResult.audit == [ 1700000000000 ])
 
                     _ ->
                         Cmd.none
@@ -78,7 +78,7 @@ bridgeSubmission =
             Batch.succeed (\issue audit command -> ( issue, audit, command ))
                 |> Batch.and (Issue.update (Db.Id.uuid "00000000-0000-4000-8000-000000000001") [ Issue.setTitle "elm", Issue.setAssignee Nothing ])
                 |> Batch.and (Audit.create { message = "audit" })
-                |> Batch.and (NamedAudit.run { message = "named" })
+                |> Batch.and (NamedAudit.run { id = Db.Id.uuid "00000000-0000-4000-8000-000000000024", message = "named" })
     in
     Pyre.batch (Database.fromString "one") plan (Pyre.init "fixture")
 
@@ -146,7 +146,7 @@ checks =
                                                 Db.Id.encodeUuid id
 
                                             else
-                                                E.int 17
+                                                E.string "00000000-0000-4000-8000-000000000017"
                                           )
                                         ]
                                   )
@@ -189,14 +189,14 @@ checks =
             Pyre.outcome receipt confirmed
 
         created =
-            Issue.createWith { id = id, title = "new", owner = "me" } [ Issue.withAssignee Nothing ]
+            Issue.createWith { title = "new", owner = "me" } [ Issue.withAssignee Nothing ]
                 |> Internal.single
                 |> Internal.operations
                 |> List.head
                 |> Maybe.withDefault E.null
 
         command =
-            NamedAudit.run { message = "named" } |> Internal.single
+            NamedAudit.run { id = Db.Id.uuid "00000000-0000-4000-8000-000000000018", message = "named" } |> Internal.single
 
         archived =
             Archive.create { title = "other namespace" } |> Internal.single
@@ -240,8 +240,8 @@ checks =
         == Ok "last"
         && D.decodeValue (D.at [ "input", "assignee" ] (D.nullable D.string)) fields
         == Ok Nothing
-        && D.decodeValue (D.at [ "input", "id" ] D.string) created
-        == Ok "00000000-0000-4000-8000-000000000001"
+        && (D.decodeValue (D.at [ "input", "id" ] D.value) created |> Result.toMaybe)
+        == Nothing
         && Pyre.outcome receipt accepted
         == Nothing
         && Pyre.outcome receipt foreign
@@ -268,7 +268,7 @@ checks =
         == Ok [ Just 1, Nothing ]
         && (case typed of
                 Just (LocalEdits.Confirmed ( issue, audit )) ->
-                    issue.id == id && audit.id == Db.Id.int 17
+                    issue.id == id && audit.id == Db.Id.uuid "00000000-0000-4000-8000-000000000017"
 
                 _ ->
                     False

@@ -559,8 +559,9 @@ fn to_query_metadata_file(
             crate::generate::manifest::generated_edit_metadata(context, query, info)
         {
             meta_block.push_str(&format!(
-                "  generatedEdit: {{ kind: {} as const, writeStatementIndices: {}, writableInputs: {} }},\n",
+                "  generatedEdit: {{ kind: {} as const, {}writeStatementIndices: {}, writableInputs: {} }},\n",
                 serde_json::to_string(&metadata.kind).expect("generated edit kind"),
+                metadata.create_uuid_input.as_ref().map(|input| format!("createUuidInput: {}, ", serde_json::to_string(input).expect("create UUID input"))).unwrap_or_default(),
                 serde_json::to_string(&metadata.write_statement_indices).expect("generated write indices"),
                 serde_json::to_string(&metadata.writable_inputs).expect("generated writable inputs")
             ));
