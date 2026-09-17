@@ -363,28 +363,30 @@ test("named mutations publish fenced replacement hints at their committed revisi
         ...authority, namespace: "Archive", manifest: "archive-m1", databaseEpoch: "e1",
       } }],
     ]);
-    const revoked = await runWithSync(db, manifest.queries, "revoke", {}, { userId: 7 }, recipients, authority.databaseId, "reader");
+    const sent = [];
+    const revoked = await runWithSync(db, manifest.queries, "revoke", {}, { userId: 7 }, recipients, authority.databaseId, "reader",
+      (id, message) => sent.push([id, message]));
     expect(revoked.kind).toBe("success");
-    expect(revoked.response).toEqual({});
+    expect(revoked.response).toEqual({ databaseEpoch: "e1", serverRevision: 1, result: {} });
     expect((await db.execute("select count(*) as n from memberships")).rows[0].n).toBe(0);
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
-    const sent = [];
-    await revoked.sync((id, message) => sent.push([id, message]));
+    await revoked.sync(() => {});
     expect(sent).toEqual([["reader", { ...authority, databaseEpoch: "e1", type: "syncRequired", serverRevision: 1,
       reconciliation: { kind: "replaceRequired", atLeast: 1, invalidate: true, minimumSafeRevision: 1 } }]]);
     expect(revoked.response).toEqual({ databaseEpoch: "e1", serverRevision: 1, result: {} });
     expect((await replace({ target: 1 })).response.tables.notes.rows.map(row => row.id)).toEqual([1]);
     await revoked.sync(() => {});
     expect(revoked.response).toEqual({ databaseEpoch: "e1", serverRevision: 1, result: {} });
-    const noop = await runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId);
     recipients.set("reader", { session: { userId: 8 }, fence: { ...authority, databaseEpoch: "e1", instance: "new", authGeneration: 3 } });
     const hints = [];
-    await noop.sync((id, message) => hints.push(message));
+    const noop = await runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined,
+      (id, message) => hints.push(message));
+    await noop.sync(() => {});
     expect(hints).toHaveLength(1);
     expect(hints[0]).toMatchObject({ instance: "new", authGeneration: 3, serverRevision: 2 });
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(2);
     await db.execute("create trigger deny_revision before update on _pyre_sync begin select raise(abort, 'revision denied'); end");
-    await expect(runWithSync(db, manifest.queries, "delete", { id: 1 }, { userId: 7 }, recipients, authority.databaseId)).rejects.toThrow();
+    await expect(runWithSync(db, manifest.queries, "delete", { id: 1 }, { userId: 7 }, recipients, authority.databaseId, undefined, () => {})).rejects.toThrow();
     expect((await db.execute("select id from notes where id = 1")).rows).toEqual([{ id: 1 }]);
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(2);
   });
@@ -420,10 +422,10 @@ test("replacement requires the manifest contract and restores its captured schem
 
 test("named no-op revision commits without subscribers, while declared reads allocate no revision", async () => {
   await replacementDatabase(async ({ db, manifest, authority }) => {
-    const result = await runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, undefined, authority.databaseId);
-    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
     const send = mock(() => {});
-    expect(await result.sync(send)).toEqual({ databaseEpoch: "e1", serverRevision: 1 });
+    const result = await runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, undefined, authority.databaseId, undefined, send);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
+    expect(await result.sync(() => {})).toEqual({ databaseEpoch: "e1", serverRevision: 1 });
     expect(send).not.toHaveBeenCalled();
     const read = { ...manifest.queries.noop, id: "read", operation: "query", sql: [
       { include: true, params: [], sql: "select json_object('count', count(*)) as notes from notes" },
@@ -435,20 +437,79 @@ test("named no-op revision commits without subscribers, while declared reads all
   });
 });
 
+test("named mutation publication is required and follows commit order", async () => {
+  await replacementDatabase(async ({ db, manifest, authority }) => {
+    await expect(runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, undefined, authority.databaseId))
+      .rejects.toThrow("requires sendToSession");
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(0);
+
+    const fence = { ...authority, databaseEpoch: "e1" };
+    const recipients = new Map([["reader", { session: { userId: 7 }, fence }]]);
+    const published: number[] = [];
+    let finishFirst!: () => void;
+    const firstDelivery = new Promise<void>(resolve => { finishFirst = resolve; });
+    const publish = (_id, message) => {
+      published.push(message.serverRevision);
+      if (message.serverRevision === 1) return firstDelivery;
+    };
+    const firstPromise = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined, publish);
+    const secondPromise = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined, publish);
+    while (published.length === 0) await Bun.sleep(0);
+    await Bun.sleep(0);
+    expect(published).toEqual([1]);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
+    finishFirst();
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+    expect(published).toEqual([1, 2]);
+    expect(first.response.serverRevision).toBe(1);
+    expect(second.response.serverRevision).toBe(2);
+    expect((await first.sync(() => {})).serverRevision).toBe(1);
+    expect((await second.sync(() => {})).serverRevision).toBe(2);
+  });
+});
+
+test("queued named mutations capture input and execution session at invocation", async () => {
+  await replacementDatabase(async ({ db, manifest, authority }) => {
+    const fence = { ...authority, databaseEpoch: "e1" };
+    const recipients = new Map([["reader", { session: { userId: 7 }, fence }]]);
+    let finishFirst!: () => void;
+    const firstDelivery = new Promise<void>(resolve => { finishFirst = resolve; });
+    const publish = (_id, message) => message.serverRevision === 1 ? firstDelivery : undefined;
+    const first = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined, publish);
+    const input = { id: 1, body: "captured" };
+    const update = runWithSync(db, manifest.queries, "update", input, { userId: 7 }, recipients, authority.databaseId, undefined, publish);
+    const session = { userId: 7 };
+    const revoke = runWithSync(db, manifest.queries, "revoke", {}, session, recipients, authority.databaseId, undefined, publish);
+    input.id = 3;
+    input.body = "mutated";
+    session.userId = 8;
+
+    while ((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision === 0) await Bun.sleep(0);
+    finishFirst();
+    await Promise.all([first, update, revoke]);
+
+    expect((await db.execute("select body from notes where id = 1")).rows[0].body).toBe("captured");
+    expect((await db.execute("select body from notes where id = 3")).rows[0].body).toBe("private");
+    expect((await db.execute("select * from memberships")).rows).toEqual([]);
+  });
+});
+
 test("named sync executes actual generated SQL, retains declared rows, and never sends deltas to fenced readers", async () => {
   await replacementDatabase(async ({ db, authority }) => {
     await db.execute("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer)");
     const query = { ...compiledCreateMetadata, sql: compiledCreateSql, syncSql: compiledCreateSyncSql };
     const input = { id: createUuidV7, release: "release", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
     const fence = { ...authority, namespace: query.primary_db, databaseEpoch: "e1", instance: "other-tab", authGeneration: 8 };
+    const sent = [];
     const result = await runWithSync(db, { [query.id]: query }, query.id, input,
       { userId: 7, role: { _type: "Member" }, unrelated: "required" },
-      new Map([["reader", { session: { userId: 9 }, fence }]]), authority.databaseId);
+      new Map([["reader", { session: { userId: 9 }, fence }]]), authority.databaseId, undefined,
+      (id, message) => sent.push(message));
     expect(result.kind).toBe("success");
-    expect(result.response.entry[0]).toMatchObject(input);
-    const original = structuredClone(result.response);
-    const sent = [];
-    await result.sync((id, message) => sent.push(message));
+    expect(result.response.result.entry[0]).toMatchObject(input);
+    const original = structuredClone(result.response.result);
+    await result.sync(() => {});
     expect(sent).toEqual([{ type: "syncRequired", ...fence, serverRevision: 1,
       reconciliation: { kind: "replaceRequired", atLeast: 1, invalidate: true, minimumSafeRevision: 1 } }]);
     expect(result.response).toEqual({ databaseEpoch: "e1", serverRevision: 1, result: original });
@@ -578,6 +639,7 @@ const schemaDb = {
 test("runWithSync sends reshaped sync deltas", async () => {
   await loadSchemaFromDatabase(schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: unknown }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -585,14 +647,14 @@ test("runWithSync sends reshaped sync deltas", async () => {
     {},
     {},
     new Map([["s1", { session: {} }]]),
+    undefined,
+    undefined,
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
   expect(result.kind).toBe("success");
 
-  const sent: Array<{ sessionId: string; message: unknown }> = [];
-  const syncResult = await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  const syncResult = await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(syncResult.serverRevision).toBe(1);
   expect(sent.map((entry) => ({ ...entry, message: withoutServerRevision(entry.message) }))).toEqual([
@@ -616,6 +678,7 @@ test("runWithSync stamps sync deltas with databaseId", async () => {
   introspectionResult = { schema_source: "campaign schema" };
   await loadSchemaFromDatabase("campaign:123", schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -624,12 +687,11 @@ test("runWithSync stamps sync deltas with databaseId", async () => {
     {},
     new Map([["s1", { session: {} }]]),
     "campaign:123",
+    undefined,
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent[0].message.databaseId).toBe("campaign:123");
   expect(typeof sent[0].message.serverRevision).toBe("number");
@@ -646,6 +708,9 @@ test("runWithSync allocates live sync revisions from _pyre_sync", async () => {
     {},
     {},
     new Map([["s1", { session: {} }]]),
+    undefined,
+    undefined,
+    () => {},
   );
 
   await result.sync(() => {});
@@ -659,6 +724,7 @@ test("runWithSync allocates a revision even with no live recipients", async () =
   sessionIds = [];
   await loadSchemaFromDatabase(schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: unknown }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -666,12 +732,12 @@ test("runWithSync allocates a revision even with no live recipients", async () =
     {},
     {},
     new Map(),
+    undefined,
+    undefined,
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
-  const sent: Array<{ sessionId: string; message: unknown }> = [];
-  const syncResult = await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  const syncResult = await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent).toHaveLength(0);
   expect(syncResult.serverRevision).toBe(1);
@@ -681,6 +747,7 @@ test("runWithSync skips the origin session when provided", async () => {
   sessionIds = ["s1", "s2"];
   await loadSchemaFromDatabase(schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: unknown }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -690,12 +757,10 @@ test("runWithSync skips the origin session when provided", async () => {
     new Map(sessionIds.map((sessionId) => [sessionId, { session: {} }])),
     undefined,
     "s1",
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
-  const sent: Array<{ sessionId: string; message: unknown }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent.map((entry) => entry.sessionId)).toEqual(["s2"]);
 });
@@ -704,6 +769,7 @@ test("runWithSync includes origin authoritative sync in mutation response envelo
   sessionIds = ["s1", "s2"];
   await loadSchemaFromDatabase(schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -713,12 +779,10 @@ test("runWithSync includes origin authoritative sync in mutation response envelo
     new Map(sessionIds.map((sessionId) => [sessionId, { session: {} }])),
     "campaign:123",
     "s1",
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent.map((entry) => entry.sessionId)).toEqual(["s2"]);
   expect((result.response as any).serverRevision).toBe(1);
@@ -730,6 +794,7 @@ test("runWithSync builds origin sync from executing session when origin is not l
   sessionIds = ["s1"];
   await loadSchemaFromDatabase(schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -739,12 +804,10 @@ test("runWithSync builds origin sync from executing session when origin is not l
     new Map(),
     "campaign:123",
     "s1",
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent).toHaveLength(0);
   expect((result.response as any).serverRevision).toBe(1);
@@ -767,6 +830,7 @@ test("runWithSync sends syncRequired when delta row count exceeds cap", async ()
   reshapedRows = Array.from({ length: MAX_LIVE_SYNC_DELTA_ROWS + 1 }, (_, index) => [index, "World", null]);
   await loadSchemaFromDatabase(schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -774,12 +838,12 @@ test("runWithSync sends syncRequired when delta row count exceeds cap", async ()
     {},
     {},
     new Map([["s1", { session: {} }]]),
+    undefined,
+    undefined,
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent).toHaveLength(1);
   expect(sent[0].sessionId).toBe("s1");
@@ -791,6 +855,7 @@ test("runWithSync sends syncRequired when fanout recipient count exceeds cap", a
   sessionIds = Array.from({ length: MAX_LIVE_SYNC_FANOUT_RECIPIENTS + 1 }, (_, index) => `s${index}`);
   await loadSchemaFromDatabase(schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -798,12 +863,12 @@ test("runWithSync sends syncRequired when fanout recipient count exceeds cap", a
     {},
     {},
     new Map(sessionIds.map((sessionId) => [sessionId, { session: {} }])),
+    undefined,
+    undefined,
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent).toHaveLength(MAX_LIVE_SYNC_FANOUT_RECIPIENTS + 1);
   expect(sent.every((entry) => entry.message.type === "syncRequired")).toBe(true);
@@ -813,6 +878,7 @@ test("runWithSync sends syncRequired when payload bytes exceed cap", async () =>
   reshapedRows = [[1, "x".repeat(MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES), null]];
   await loadSchemaFromDatabase(schemaDb as any);
 
+  const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
     syncDb() as any,
     queryMap,
@@ -821,12 +887,11 @@ test("runWithSync sends syncRequired when payload bytes exceed cap", async () =>
     {},
     new Map([["s1", { session: {} }]]),
     "campaign:123",
+    undefined,
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
 
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  await result.sync((sessionId, message) => {
-    sent.push({ sessionId, message });
-  });
+  await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent).toHaveLength(1);
   expect(sent[0].sessionId).toBe("s1");
@@ -839,6 +904,7 @@ test("runWithSync advances revision and requires catchup when delta calculation 
   deltaError = "Error: invalid connected session";
   await loadSchemaFromDatabase(schemaDb as any);
   const db = syncDb();
+  const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
     db as any,
     queryMap,
@@ -851,9 +917,9 @@ test("runWithSync advances revision and requires catchup when delta calculation 
     ]),
     undefined,
     "origin",
+    (sessionId, message) => { sent.push({ sessionId, message }); },
   );
-  const sent: Array<{ sessionId: string; message: any }> = [];
-  const syncResult = await result.sync((sessionId, message) => sent.push({ sessionId, message }));
+  const syncResult = await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(syncResult.serverRevision).toBe(1);
   expect(syncResult.originMessage.type).toBe("syncRequired");
@@ -874,6 +940,7 @@ test("runWithSync requires revisioned catchup for reshape failures, including th
   await replacementDatabase(async ({ db, manifest, authority }) => {
     sessionIds = ["origin", "first", "second"];
     reshapeError = "Error: invalid table groups";
+    const sent: Array<{ sessionId: string; message: any }> = [];
     const result = await runWithSync(
       db,
       manifest.queries,
@@ -883,10 +950,10 @@ test("runWithSync requires revisioned catchup for reshape failures, including th
       new Map(sessionIds.map((sessionId) => [sessionId, { session: { userId: 7 } }])),
       authority.databaseId,
       "origin",
+      (sessionId, message) => { sent.push({ sessionId, message }); },
     );
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
-    const sent: Array<{ sessionId: string; message: any }> = [];
-    const syncResult = await result.sync((sessionId, message) => sent.push({ sessionId, message }));
+    const syncResult = await result.sync(() => {});
     const fallback = {
       type: "syncRequired",
       serverRevision: 1,
@@ -906,6 +973,7 @@ test("runWithSync requires revisioned catchup for reshape failures, including th
 test("runWithSync isolates thrown and rejected recipient sends during fanout", async () => {
   await replacementDatabase(async ({ db, manifest, authority }) => {
     sessionIds = ["throws", "rejects", "later"];
+    const sent: Array<{ sessionId: string; message: any }> = [];
     const result = await runWithSync(
       db,
       manifest.queries,
@@ -914,13 +982,14 @@ test("runWithSync isolates thrown and rejected recipient sends during fanout", a
       { userId: 7 },
       new Map(sessionIds.map((sessionId) => [sessionId, { session: { userId: 7 } }])),
       authority.databaseId,
+      undefined,
+      (sessionId, message) => {
+        if (sessionId === "throws") throw new Error("disconnected");
+        if (sessionId === "rejects") return Promise.reject(new Error("closed asynchronously"));
+        sent.push({ sessionId, message });
+      },
     );
-    const sent: Array<{ sessionId: string; message: any }> = [];
-    const syncResult = await result.sync((sessionId, message) => {
-      if (sessionId === "throws") throw new Error("disconnected");
-      if (sessionId === "rejects") return Promise.reject(new Error("closed asynchronously"));
-      sent.push({ sessionId, message });
-    });
+    const syncResult = await result.sync(() => {});
 
     expect(syncResult.serverRevision).toBe(1);
     expect(sent).toEqual([{

@@ -255,24 +255,24 @@ for (const server of ['typescript', 'rust']) test.skipIf(!directory)(
 
       const completed = [];
       app.ports.completed.subscribe(value => completed.push(value));
-      const elmAction = async (action, state = 'confirmed') => {
+      const elmAction = async (action, state = 'confirmed', code) => {
         const before = completed.length;
         app.ports.perform.send(action);
         await until(() => completed.length > before);
-        expect(completed.at(-1)).toEqual({ action, state });
+        expect(completed.at(-1)).toEqual({ action, state, ...(code === undefined ? {} : { code }) });
       };
       await elmAction('create');
       const elmId = rows('issues').find(row => row.title === 'elm related').id;
       expect(rows('issues').find(row => row.id === elmId).assignee).toBeNull();
       const validWrites = writes.length;
-      for (const action of ['invalidUuid', 'invalidStructured', 'emptyUpdate']) await elmAction(action, 'rejected');
+      for (const action of ['invalidUuid', 'invalidStructured', 'emptyUpdate']) await elmAction(action, 'rejected', 'InvalidEdit');
       expect(writes).toHaveLength(validWrites);
       await elmAction('nullable');
       expect(rows('issues').find(row => row.id === elmId)).toMatchObject({ assignee: null, payload: { items: [3, null] }, watchers: [uppercase], dueAt: 1767225600 });
       await elmAction('delete');
       expect(rows('issues').some(row => row.id === elmId)).toBe(false);
       const elmRevision = await revision();
-      await elmAction('rollback', 'rejected');
+      await elmAction('rollback', 'rejected', 'TargetNotWritable');
       expect(rows('issues').some(row => row.id === elmId)).toBe(false);
       expect(Number((await db.execute({ sql: 'select count(*) as n from issues where id = ?', args: [elmId] })).rows[0].n)).toBe(0);
       expect(await revision()).toBe(elmRevision);

@@ -195,3 +195,75 @@ query GetRulebookVersionBundle($rulebookName: String, $versionTag: String) {
         }
     }
 }
+
+#[test]
+fn generated_local_query_shape_preserves_top_level_and_nested_sources() {
+    let schema_source = r#"
+@syncable(false)
+record Parent {
+    @public
+
+    children @link(Child.parentId)
+
+    id Id.Int @id
+}
+
+record Child {
+    @public
+
+    id       Id.Int @id
+    parentId Parent.id
+    score    Int
+}
+"#;
+    let query_source = r#"
+query GetRankedChildren {
+    aliasedParents: parent {
+        id
+        rankedChildren: children {
+            @where { score > 10 }
+            @sort(score, Desc)
+            @limit(2)
+            id
+        }
+    }
+}
+"#;
+
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let query_list = parser::parse_query("query.pyre", query_source).expect("query parses");
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    elm::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("client/elm"),
+        &mut files,
+    );
+
+    let content = &files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "Query/GetRankedChildren.elm"))
+        .expect("generated query elm file")
+        .contents;
+
+    assert!(
+        content.contains("(\"aliasedParents\", Encode.object\n            [ (\"@source\", Encode.string \"parent\")"),
+        "top-level aliases should identify their source query field. Generated:\n{}",
+        content
+    );
+    assert!(
+        content.contains("(\"rankedChildren\", Encode.object\n                [ (\"@source\", Encode.string \"children\")")
+            && content.contains("(\"@where\", Encode.object")
+            && content.contains("(\"@sort\", Encode.object")
+            && content.contains("(\"@limit\", Encode.int 2)"),
+        "nested aliases and directives should be represented in the local query shape. Generated:\n{}",
+        content
+    );
+}

@@ -83,7 +83,7 @@ withDb check =
 
 
 field selections =
-    { selections = Dict.fromList selections, where_ = Nothing, sort = Nothing, limit = Nothing }
+    { source = Nothing, selections = Dict.fromList selections, where_ = Nothing, sort = Nothing, limit = Nothing }
 
 
 projection =
@@ -178,7 +178,7 @@ suite =
                                 noteDelta [ "owner", "number", "label" ] [ [ StringValue bob, IntValue 2, StringValue "moved" ] ]
 
                             query =
-                                Dict.singleton "note" { selections = Dict.empty, where_ = Just (Dict.singleton "owner" (Query.FilterValueSimple (StringValue bob))), sort = Nothing, limit = Nothing }
+                                Dict.singleton "note" { source = Nothing, selections = Dict.empty, where_ = Just (Dict.singleton "owner" (Query.FilterValueSimple (StringValue bob))), sort = Nothing, limit = Nothing }
                         in
                         Db.applyDelta delta db
                             |> Result.map (\next -> (Db.executeQueryWithTracking schema next query).rowIds)

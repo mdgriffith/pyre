@@ -158,6 +158,14 @@ finish model =
                                 _ ->
                                     "unexpected"
 
+                        outcomeFields =
+                            case outcome of
+                                LocalEdits.Rejected code ->
+                                    [ ( "code", E.string code ) ]
+
+                                _ ->
+                                    []
+
                         created =
                             if action == "create" then
                                 case outcome of
@@ -170,7 +178,7 @@ finish model =
                             else
                                 model.created
                     in
-                    ( { model | pending = Nothing, created = created }, completed (E.object [ ( "action", E.string action ), ( "state", E.string state ) ]) )
+                    ( { model | pending = Nothing, created = created }, completed (E.object ([ ( "action", E.string action ), ( "state", E.string state ) ] ++ outcomeFields)) )
 
                 Nothing ->
                     ( model, Cmd.none )

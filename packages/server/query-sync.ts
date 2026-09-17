@@ -182,15 +182,16 @@ function singleOriginSession(
   return origin ? new Map([[originSessionId, origin]]) : undefined;
 }
 
-function sendBestEffort(
-  sendToSession: (sessionId: string, message: any) => void,
+async function sendBestEffort(
+  sendToSession: (sessionId: string, message: any) => void | Promise<void>,
   sessionId: string,
   message: unknown,
-): void {
-  try {
-    void Promise.resolve(sendToSession(sessionId, message)).catch(() => {});
-  } catch { /* Independent recipient delivery. */ }
+): Promise<void> {
+  try { await sendToSession(sessionId, message); }
+  catch { /* Independent recipient delivery. */ }
 }
+
+const namedMutationQueues = new WeakMap<Client, Promise<void>>();
 
 function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?: string): SyncDeltasFn {
   const normalizedDatabaseId = databaseId ? requireDatabaseId(databaseId) : undefined;
@@ -198,6 +199,10 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?
   return async (affectedRowGroups, connectedSessions, sendToSession, originSessionId, committedRevision) => {
     const revision = committedRevision ?? await nextLiveSyncRevision(db);
     const { databaseEpoch, serverRevision } = revision;
+    const sends: Promise<void>[] = [];
+    const queueSend = (sessionId: string, message: unknown) => {
+      sends.push(sendBestEffort(sendToSession, sessionId, message));
+    };
     // Replacement registrations never receive legacy deltas, including an origin registration.
     const legacySessions = new Map(connectedSessions);
     for (const [id, recipient] of connectedSessions) {
@@ -206,10 +211,13 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?
       const parsed = fenceValidator.safeParse(recipient.fence);
       if (!parsed.success || parsed.data.databaseId !== normalizedDatabaseId || parsed.data.databaseEpoch !== databaseEpoch
         || parsed.data.namespace !== namespace) continue;
-      sendBestEffort(sendToSession, id, { type: "syncRequired", ...parsed.data, serverRevision,
+      queueSend(id, { type: "syncRequired", ...parsed.data, serverRevision,
         reconciliation: { kind: "replaceRequired", atLeast: serverRevision, invalidate: true, minimumSafeRevision: serverRevision } });
     }
-    if (legacySessions.size === 0) return revision;
+    if (legacySessions.size === 0) {
+      await Promise.all(sends);
+      return revision;
+    }
     activateSchemaForDatabase(normalizedDatabaseId);
 
     const broadcastSessions = sessionsWithoutOrigin(legacySessions, originSessionId);
@@ -221,7 +229,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?
       ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
     };
     const requireSync = (sessionIds: Iterable<string>) => {
-      for (const sessionId of sessionIds) sendBestEffort(sendToSession, sessionId, syncRequiredMessage);
+      for (const sessionId of sessionIds) queueSend(sessionId, syncRequiredMessage);
     };
     const normalizeSessions = (sessions: typeof broadcastSessions) => new Map(
       Array.from(sessions, ([id, data]) => [
@@ -240,6 +248,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?
     } catch (error) {
       console.error("[SyncDeltas] Failed to calculate sync deltas:", error);
       requireSync(broadcastSessions.keys());
+      await Promise.all(sends);
       return {
         databaseEpoch,
         serverRevision,
@@ -248,6 +257,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?
     }
 
     if ((!Array.isArray(result.groups) || result.groups.length === 0) && !originSession) {
+      await Promise.all(sends);
       return { databaseEpoch, serverRevision };
     }
 
@@ -285,7 +295,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?
         : deltaMessage;
 
       for (const sessionId of group.session_ids) {
-        sendBestEffort(sendToSession, sessionId, message);
+        queueSend(sessionId, message);
       }
     }
 
@@ -337,6 +347,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?
       }
     }
 
+    await Promise.all(sends);
     return { databaseEpoch, serverRevision, ...(originMessage === undefined ? {} : { originMessage }) };
   };
 }
@@ -350,15 +361,39 @@ export async function runWithSync(
   connectedSessions?: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
   databaseId?: DatabaseId,
   originSessionId?: string,
+  sendToSession?: (sessionId: string, message: any) => void | Promise<void>,
 ): Promise<QueryResult> {
-  const originSession = structuredClone(executingSession);
+  const capturedArgs = structuredClone(args);
+  const capturedSession = structuredClone(executingSession);
+  const originSession = capturedSession;
   const publish = syncWithWasmForDatabase(db, databaseId, queryMap[queryId]?.primary_db);
   const sync: SyncDeltasFn = (rows, sessions, send, origin, revision) => {
     const current = new Map(sessions);
     if (origin && !current.has(origin)) current.set(origin, { session: originSession });
     return publish(rows, current, send, origin, revision);
   };
-  return run(db, queryMap, queryId, args, executingSession, connectedSessions, sync, originSessionId, {
-    mode: "sync", commitSyncRevision: ["insert", "update", "delete", "transaction"].includes(queryMap[queryId]?.operation ?? ""),
-  });
+  const namedMutation = ["insert", "update", "delete", "transaction"].includes(queryMap[queryId]?.operation ?? "");
+  if (namedMutation && !sendToSession) {
+    throw new Error("runWithSync requires sendToSession for named mutations");
+  }
+  const execute = async () => {
+    const result = await run(db, queryMap, queryId, capturedArgs, capturedSession, connectedSessions, sync, originSessionId, {
+      mode: "sync", commitSyncRevision: namedMutation,
+    });
+    if (!namedMutation || result.kind !== "success") return result;
+
+    let published: Awaited<ReturnType<QueryResult["sync"]>> = {};
+    try { published = await result.sync(sendToSession!); }
+    catch { /* Publication cannot change the committed mutation outcome. */ }
+    result.sync = async () => published;
+    return result;
+  };
+
+  if (!namedMutation) return execute();
+  const previous = namedMutationQueues.get(db) ?? Promise.resolve();
+  const execution = previous.then(execute);
+  const settled = execution.then(() => undefined, () => undefined);
+  namedMutationQueues.set(db, settled);
+  void settled.then(() => { if (namedMutationQueues.get(db) === settled) namedMutationQueues.delete(db); });
+  return execution;
 }

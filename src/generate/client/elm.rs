@@ -2745,11 +2745,16 @@ fn to_query_shape_json(context: &typecheck::Context, query: &ast::Query) -> Stri
                 result.push_str(&format!(
                     "({}, {})",
                     string::quote(&field_name),
-                    to_query_field_spec_json(
+                    to_query_field_spec_json_with_source(
                         context,
                         query_field,
                         context.tables.get(&query_field.name),
                         3,
+                        if field_name == query_field.name {
+                            None
+                        } else {
+                            Some(query_field.name.as_str())
+                        },
                     )
                 ));
             }

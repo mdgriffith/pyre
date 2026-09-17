@@ -86,7 +86,7 @@ export interface QueryResult {
      * });
      * ```
      */
-    sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult>;
+    sync(sendToSession: (sessionId: string, message: any) => void | Promise<void>): Promise<SyncResult>;
 }
 
 export interface SyncResult {
@@ -98,7 +98,7 @@ export interface SyncResult {
 export type SyncDeltasFn = (
     affectedRowGroups: any[],
     connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
-    sendToSession: (sessionId: string, message: any) => void,
+    sendToSession: (sessionId: string, message: any) => void | Promise<void>,
     originSessionId?: string,
     committedRevision?: SyncResult,
 ) => Promise<SyncResult | void>;
@@ -559,25 +559,44 @@ export async function run(
     // Execute query
     let resultSets;
     let committedRevision: SyncResult | undefined;
+    let affectedRowGroups: unknown[];
+    let response: unknown;
     if (options.commitSyncRevision) {
         if (db.protocol === "file") {
             const databases = await db.execute("pragma database_list");
             if (!databases.rows.find(row => row.name === "main")?.file) throw new Error("Unsupported in-memory transaction");
         }
         const tx = await db.transaction("write");
+        let committing = false;
         try {
             resultSets = await executeStatements({ execute: tx.execute.bind(tx) }, sqlStatements);
+            affectedRowGroups = extractAffectedRowGroups(activeSql, resultSets);
+            response = formatResultData(activeSql, resultSets);
+            if (query.ReturnData && !query.ReturnData.safeParse(response).success) {
+                throw new Error("Failed to decode return data");
+            }
             committedRevision = await nextLiveSyncRevision(tx);
+            committing = true;
             await tx.commit();
         } catch (error) {
             try { await tx.rollback(); } catch { /* Preserve the execution/commit failure. */ }
+            if (committing) {
+                return {
+                    kind: "error",
+                    error: { errorType: "OutcomeUnknown", message: "OutcomeUnknown" },
+                    async sync() { return {}; },
+                };
+            }
             throw error;
         } finally { try { tx.close(); } catch { /* Closing cannot erase a committed revision. */ } }
     } else {
         resultSets = await executeStatements(db, sqlStatements);
+        affectedRowGroups = extractAffectedRowGroups(activeSql, resultSets);
+        response = formatResultData(activeSql, resultSets);
+        if (query.ReturnData && !query.ReturnData.safeParse(response).success) {
+            throw new Error("Failed to decode return data");
+        }
     }
-    const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
-    const response = formatResultData(activeSql, resultSets);
 
     // Always create sync function - it will be a no-op if there's nothing to send
     /**
@@ -602,7 +621,7 @@ export async function run(
      * ]
      * ```
      */
-    async function sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
+    async function sync(sendToSession: (sessionId: string, message: any) => void | Promise<void>): Promise<SyncResult> {
         // Early return if nothing to sync
         if (affectedRowGroups.length === 0 && !committedRevision) {
             return {};

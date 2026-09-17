@@ -166,7 +166,7 @@ shouldReExecuteQuery schema _ subscription delta =
         tables =
             Dict.foldl
                 (\field query acc ->
-                    case Dict.get field schema.queryFieldToTable of
+                    case Dict.get (Maybe.withDefault field query.source) schema.queryFieldToTable of
                         Just table ->
                             Set.union acc (dependencies table query)
 

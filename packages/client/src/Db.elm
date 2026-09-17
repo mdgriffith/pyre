@@ -371,7 +371,7 @@ rowArrayToObject headers values =
 
 executeFieldQuery : SchemaMetadata -> Dict String TableData -> Dict ( String, String ) Db.Index.Index -> String -> Db.Query.FieldQuery -> List (Dict String Value)
 executeFieldQuery schema data indices queryFieldName fieldQuery =
-    case Dict.get queryFieldName schema.queryFieldToTable of
+    case Dict.get (Maybe.withDefault queryFieldName fieldQuery.source) schema.queryFieldToTable of
         Just tableName ->
             case Dict.get tableName data of
                 Just tableRows ->
@@ -389,7 +389,7 @@ executeFieldQuery schema data indices queryFieldName fieldQuery =
 
 executeFieldQueryWithTracking : SchemaMetadata -> Dict String TableData -> Dict ( String, String ) Db.Index.Index -> String -> Db.Query.FieldQuery -> ( List (Dict String Value), Set Key )
 executeFieldQueryWithTracking schema data indices queryFieldName fieldQuery =
-    case Dict.get queryFieldName schema.queryFieldToTable of
+    case Dict.get (Maybe.withDefault queryFieldName fieldQuery.source) schema.queryFieldToTable of
         Just tableName ->
             case Dict.get tableName data of
                 Just tableRows ->
@@ -754,7 +754,11 @@ projectNestedRows schema tableName fieldName nestedFieldQuery relatedRows data i
             getRelatedTableName schema tableName fieldName
 
         projected =
-            List.map (\r -> projectRow schema relatedTableName r nestedFieldQuery.selections data indices) relatedRows
+            relatedRows
+                |> List.filter (evaluateWhereOnRow nestedFieldQuery.where_)
+                |> applySort nestedFieldQuery.sort
+                |> applyLimit nestedFieldQuery.limit
+                |> List.map (\r -> projectRow schema relatedTableName r nestedFieldQuery.selections data indices)
     in
     Data.Value.ArrayValue (List.map Data.Value.ObjectValue projected)
 

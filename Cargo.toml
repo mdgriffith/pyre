@@ -12,6 +12,7 @@ serve = [
     "async-stream",
     "axum",
     "base64",
+    "getrandom",
     "hmac",
     "tokio/macros",
     "tokio/net",

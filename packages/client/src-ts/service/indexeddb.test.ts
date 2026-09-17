@@ -249,3 +249,68 @@ test('IndexedDbService reports invalid writes without publishing catchup entitie
     log.mockRestore();
   }
 });
+
+test('IndexedDbService does not advance queued progress after a delta write fails', async () => {
+  let receive;
+  const cursorWrites = [];
+  const revisionWrites = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  const service = new IndexedDbService({
+    init: async () => {},
+    putRows: async () => { throw new Error('row write failed'); },
+    putSyncCursor: async (cursor) => { cursorWrites.push(cursor); },
+    putServerRevision: async (revision) => { revisionWrites.push(revision); },
+  });
+  service.attachPorts({ ports: { indexedDbOut: { subscribe(callback) { receive = callback; } } } });
+  const cursor = { tables: { issues: { last_seen_updated_at: 10, permission_hash: 'p' } } };
+
+  try {
+    receive({ type: 'writeDelta', entityStreamSource: 'catchup', tableGroups: [
+      { table_name: 'issues', headers: ['id'], rows: [[1]] },
+    ] });
+    receive({ type: 'writeSyncCursor', cursor });
+    receive({ type: 'writeServerRevision', serverRevision: 10 });
+    await Bun.sleep(0);
+
+    expect(cursorWrites).toEqual([]);
+    expect(revisionWrites).toEqual([]);
+  } finally {
+    log.mockRestore();
+  }
+});
+
+test('IndexedDbService resumes progress writes after a successful epoch reset', async () => {
+  let receive;
+  const cursorWrites = [];
+  const revisionWrites = [];
+  const sent = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  const service = new IndexedDbService({
+    init: async () => {},
+    putRows: async () => { throw new Error('row write failed'); },
+    putSyncCursor: async (cursor) => { cursorWrites.push(cursor); },
+    putServerRevision: async (revision) => { revisionWrites.push(revision); },
+    resetForDatabaseEpoch: async () => {},
+  });
+  service.attachPorts({ ports: {
+    indexedDbOut: { subscribe(callback) { receive = callback; } },
+    receiveIndexedDbMessage: { send(message) { sent.push(message); } },
+  } });
+  const cursor = { tables: { issues: { last_seen_updated_at: 11, permission_hash: 'p' } } };
+
+  try {
+    receive({ type: 'writeDelta', tableGroups: [
+      { table_name: 'issues', headers: ['id'], rows: [[1]] },
+    ] });
+    receive({ type: 'resetForDatabaseEpoch', databaseEpoch: 'new-epoch' });
+    receive({ type: 'writeSyncCursor', cursor });
+    receive({ type: 'writeServerRevision', serverRevision: 11 });
+    for (let attempt = 0; revisionWrites.length === 0 && attempt < 100; attempt += 1) await Bun.sleep(0);
+
+    expect(sent).toEqual([{ type: 'databaseEpochResetCompleted', databaseEpoch: 'new-epoch' }]);
+    expect(cursorWrites).toEqual([cursor]);
+    expect(revisionWrites).toEqual([11]);
+  } finally {
+    log.mockRestore();
+  }
+});

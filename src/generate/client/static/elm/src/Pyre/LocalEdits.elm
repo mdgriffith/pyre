@@ -150,10 +150,28 @@ receive value (Model incarnation counter entries _) =
                 Model incarnation counter entries []
 
             else if field "type" == "failure" then
+                let
+                    code =
+                        field "code"
+
+                    certainty =
+                        field "certainty"
+
+                    matchesOutcome =
+                        (entry.state == "rejected" && certainty == "rejected")
+                            || (entry.state == "outcomeUnknown" && certainty == "unknown")
+
+                    nextEntries =
+                        if entry.code == "" && code /= "" && matchesOutcome then
+                            Dict.insert requestId { entry | code = code } entries
+
+                        else
+                            entries
+                in
                 Model incarnation
                     counter
-                    entries
-                    [ { requestId = requestId, databaseId = entry.databaseId, instance = field "instance", authGeneration = D.decodeValue (D.field "authGeneration" D.int) value |> Result.withDefault 0, namespace = field "namespace", manifest = field "manifest", databaseEpoch = field "databaseEpoch", phase = field "phase", code = field "code", certainty = field "certainty", operationIndex = D.decodeValue (D.field "operationIndex" D.int) value |> Result.toMaybe } ]
+                    nextEntries
+                    [ { requestId = requestId, databaseId = entry.databaseId, instance = field "instance", authGeneration = D.decodeValue (D.field "authGeneration" D.int) value |> Result.withDefault 0, namespace = field "namespace", manifest = field "manifest", databaseEpoch = field "databaseEpoch", phase = field "phase", code = code, certainty = certainty, operationIndex = D.decodeValue (D.field "operationIndex" D.int) value |> Result.toMaybe } ]
 
             else if field "type" /= "lifecycle" || List.member entry.state [ "confirmed", "rejected", "acceptedUnreconciled" ] then
                 Model incarnation counter entries []

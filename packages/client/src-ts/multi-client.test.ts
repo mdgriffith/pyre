@@ -303,6 +303,130 @@ test('PyreClient forwards initial entity batches from the internal client', asyn
   ]);
 });
 
+test('PyreClient query subscriptions rebind after local-edit client retirement', async () => {
+  const internals: Array<{
+    end(): void;
+    emit(result: unknown): void;
+    inputs: unknown[];
+    unsubscribed: boolean;
+  }> = [];
+  const results: unknown[] = [];
+  const client = await PyreClient.create({
+    schema,
+    server: { ...server, localEdits: () => ({}) },
+    cacheNamespace: 'user_42',
+    createInternalClient: async (config) => {
+      let resolveEnded!: () => void;
+      let queryCallback: (result: unknown) => void = () => {};
+      const internal = {
+        end: resolveEnded,
+        emit(result: unknown) { queryCallback(result); },
+        inputs: [] as unknown[],
+        unsubscribed: false,
+      };
+      const runtime = {
+        ended: new Promise<void>((resolve) => {
+          resolveEnded = resolve;
+          internal.end = resolve;
+        }),
+        dispose() {},
+      };
+      internals.push(internal);
+      return {
+        ...fakeInternalClient([], config.databaseId),
+        getLocalEdits: () => runtime,
+        run(_databaseId: string, _queryModule: unknown, input: unknown, callback: (result: unknown) => void) {
+          internal.inputs.push(input);
+          queryCallback = callback;
+          return {
+            update(updatedInput: unknown) { internal.inputs.push(updatedInput); },
+            unsubscribe() { internal.unsubscribed = true; },
+          };
+        },
+      };
+    },
+  });
+
+  const subscription = await client.run('campaign:123', { operation: 'query', queryShape: { posts: {} } }, { page: 1 }, (result) => {
+    results.push(result);
+  });
+  internals[0].emit('first');
+  internals[0].end();
+  subscription?.update({ page: 2 });
+  await Bun.sleep(0);
+  await Bun.sleep(0);
+
+  expect(internals).toHaveLength(2);
+  expect(internals[0].unsubscribed).toBe(true);
+  expect(internals[1].inputs).toEqual([{ page: 2 }]);
+  internals[0].emit('stale');
+  internals[1].emit('second');
+  expect(results).toEqual(['first', 'second']);
+
+  subscription?.unsubscribe();
+  expect(internals[1].unsubscribed).toBe(true);
+});
+
+test('PyreClient entity subscriptions rebind after local-edit client retirement', async () => {
+  const internals: Array<{
+    end(): void;
+    emit(sequence: number): void;
+    unsubscribed: boolean;
+  }> = [];
+  const sequences: number[] = [];
+  const client = await PyreClient.create({
+    schema,
+    server: { ...server, localEdits: () => ({}) },
+    cacheNamespace: 'user_42',
+    createInternalClient: async (config) => {
+      let resolveEnded!: () => void;
+      let entityCallback: (batch: any) => void = () => {};
+      const internal = {
+        end: resolveEnded,
+        emit(sequence: number) {
+          entityCallback({ type: 'entity-change-batch', databaseId: config.databaseId, sequence, source: 'live', changes: [] });
+        },
+        unsubscribed: false,
+      };
+      const runtime = {
+        ended: new Promise<void>((resolve) => {
+          resolveEnded = resolve;
+          internal.end = resolve;
+        }),
+        dispose() {},
+      };
+      internals.push(internal);
+      return {
+        ...fakeInternalClient([], config.databaseId),
+        getLocalEdits: () => runtime,
+        onEntityChanges(_subscription: unknown, callback: (batch: unknown) => void) {
+          entityCallback = callback;
+          return () => { internal.unsubscribed = true; };
+        },
+      };
+    },
+  });
+
+  const unsubscribe = await client.onEntityChanges(
+    'campaign:123',
+    { tables: [{ tableName: 'posts' }] },
+    (batch) => sequences.push(batch.sequence)
+  );
+  internals[0].emit(1);
+  internals[0].end();
+  await Bun.sleep(0);
+  await Bun.sleep(0);
+
+  expect(internals).toHaveLength(2);
+  expect(internals[0].unsubscribed).toBe(true);
+  internals[0].emit(2);
+  internals[1].emit(3);
+  expect(sequences).toEqual([1, 3]);
+
+  unsubscribe();
+  expect(internals[1].unsubscribed).toBe(true);
+});
+
 test('PyreClient derives readable separate IndexedDB names per databaseId', async () => {
   const client = await PyreClient.create({
     schema,

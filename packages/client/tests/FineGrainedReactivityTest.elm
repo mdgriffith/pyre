@@ -367,7 +367,8 @@ shouldReExecuteQueryTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ = Nothing
                                     , sort = Nothing
                                     , limit = Nothing
@@ -410,7 +411,8 @@ shouldReExecuteQueryTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ = Nothing
                                     , sort = Nothing
                                     , limit = Nothing
@@ -479,7 +481,8 @@ shouldReExecuteQueryTests =
                         }
 
                     nestedSelection =
-                        { selections = Dict.fromList [ ( "id", Db.Query.SelectField Nothing ) ]
+                        { source = Nothing
+                        , selections = Dict.fromList [ ( "id", Db.Query.SelectField Nothing ) ]
                         , where_ = Nothing
                         , sort = Nothing
                         , limit = Nothing
@@ -490,7 +493,8 @@ shouldReExecuteQueryTests =
                         , query =
                             Dict.fromList
                                 [ ( "game"
-                                  , { selections =
+                                  , { source = Nothing
+                                    , selections =
                                         Dict.fromList
                                             [ ( "id", Db.Query.SelectField Nothing )
                                             , ( "name", Db.Query.SelectField Nothing )
@@ -538,7 +542,8 @@ shouldReExecuteQueryTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ =
                                         Just
                                             (Dict.fromList
@@ -600,7 +605,8 @@ integrationTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ =
                                         Just
                                             (Dict.fromList
@@ -678,7 +684,8 @@ integrationTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ =
                                         Just
                                             (Dict.fromList

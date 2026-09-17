@@ -370,7 +370,7 @@ async fn sync_events(
         .ok_or_else(|| ServeError::Internal("missing _pyre_sync row".to_string()))?
         .get(0)
         .map_err(|error| ServeError::Internal(format!("database error: {}", error)))?;
-    let session_id = new_connection_id();
+    let session_id = new_connection_id()?;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     state.connections.lock().await.insert(
         session_id.clone(),
@@ -627,7 +627,10 @@ async fn replacement_events(
         Ok(snapshot) => snapshot,
         Err(error) => return with_cors(&state, &headers, replacement_failure(&request, error)),
     };
-    let session_id = new_connection_id();
+    let session_id = match new_connection_id() {
+        Ok(session_id) => session_id,
+        Err(error) => return with_cors(&state, &headers, replacement_failure(&request, error)),
+    };
     let (sender, mut receiver) = mpsc::unbounded_channel();
     state.connections.lock().await.insert(
         session_id.clone(),
@@ -700,6 +703,9 @@ async fn run_query(
 ) -> Result<Response, ServeError> {
     ensure_database_id(&state, query.database_id.as_deref())?;
     let session = pyre_session_from_request(&state, &headers)?;
+    let origin_connection_id =
+        validated_origin_connection_id(&state, query.connection_id.as_deref(), session.logical())
+            .await;
     let conn = state
         .db
         .connect()
@@ -749,7 +755,7 @@ async fn run_query(
                     &mut result,
                     &connected_sessions,
                     &state.database_id,
-                    query.connection_id.as_deref(),
+                    origin_connection_id.as_deref(),
                     &commit,
                 )
                 .map_err(|error| ServeError::Internal(error.to_string()))?;
@@ -781,6 +787,21 @@ async fn connected_sessions(state: &AppState) -> ConnectedSessions {
         .filter(|(_, connection)| connection.fence.is_none())
         .map(|(id, connection)| (id.clone(), connection.session.clone()))
         .collect()
+}
+
+async fn validated_origin_connection_id(
+    state: &AppState,
+    requested: Option<&str>,
+    session: &HashMap<String, pyre::sync::SessionValue>,
+) -> Option<String> {
+    let Some(requested) = requested else {
+        return None;
+    };
+    let connections = state.connections.lock().await;
+    let valid = connections
+        .get(requested)
+        .is_some_and(|connection| connection.fence.is_none() && connection.session == *session);
+    valid.then(|| requested.to_string())
 }
 
 async fn send_messages(state: &AppState, messages: Vec<pyre::server::sync::SessionDeltaMessage>) {
@@ -906,10 +927,17 @@ fn require_non_empty(value: &str, label: &str) -> io::Result<String> {
     }
 }
 
-fn new_connection_id() -> String {
-    static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let id = NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("conn_{}", id)
+fn new_connection_id() -> Result<String, ServeError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|_| ServeError::Internal("connection identity unavailable".into()))?;
+    let mut id = String::with_capacity(5 + bytes.len() * 2);
+    id.push_str("conn_");
+    for byte in bytes {
+        use std::fmt::Write;
+        write!(&mut id, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(id)
 }
 
 fn allowed_cors_origin<'a>(state: &'a AppState, headers: &HeaderMap) -> Option<&'a str> {
@@ -1716,6 +1744,56 @@ mod tests {
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn named_query_origin_connection_requires_the_authenticated_session() {
+        let (_dir, state) = batch_state().await;
+        let valid_id = new_connection_id().unwrap();
+        let foreign_id = new_connection_id().unwrap();
+        let (sender, _) = mpsc::unbounded_channel();
+        let (foreign_sender, _) = mpsc::unbounded_channel();
+        state.connections.lock().await.extend([
+            (
+                valid_id.clone(),
+                Connection {
+                    fence: None,
+                    session: HashMap::new(),
+                    sender,
+                },
+            ),
+            (
+                foreign_id.clone(),
+                Connection {
+                    fence: None,
+                    session: HashMap::from([(
+                        "userId".into(),
+                        pyre::sync::SessionValue::Integer(7),
+                    )]),
+                    sender: foreign_sender,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            validated_origin_connection_id(&state, Some(&valid_id), &HashMap::new()).await,
+            Some(valid_id)
+        );
+        for rejected in [foreign_id.as_str(), "conn_1", "unknown"] {
+            assert_eq!(
+                validated_origin_connection_id(&state, Some(rejected), &HashMap::new()).await,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn connection_ids_are_random_capabilities() {
+        let first = new_connection_id().unwrap();
+        let second = new_connection_id().unwrap();
+        assert_eq!(first.len(), 69);
+        assert!(first.starts_with("conn_") && first[5..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 
     #[tokio::test]

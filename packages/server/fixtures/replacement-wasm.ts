@@ -68,14 +68,14 @@ try {
     userId Int
 }
 record Membership {
-    id Int @id
-    workspaceId Int
+    id Id.Uuid @id
+    workspaceId Id.Uuid
     userId Int
     @allow(query) { False }
     @allow(insert, update, delete) { True }
 }
 record Workspace {
-    id Int @id
+    id Id.Uuid @id
     memberships @link(Membership.workspaceId)
     @allow(query) { exists memberships { userId == Session.userId } }
     @allow(insert, update, delete) { True }
@@ -84,26 +84,32 @@ record Workspace {
     await loadSchemaFromDatabase("linked", linked);
     const linkedManifest: BatchManifest = { version: 1, manifestVersion: "linked-manifest", replacementContracts: { _default: wasm.get_schema_compiled_contract() },
       SessionValidator: z.object({ userId: z.number().int() }), queries: {} };
-    await linked.execute("insert into workspaces(id,updatedAt) values(1,0),(2,0)");
-    await linked.execute("insert into memberships(id,workspaceId,userId,updatedAt) values(1,1,7,0),(2,2,8,0)");
+    const visibleWorkspaceId = "01890f6c-7b80-7000-8000-000000000010";
+    const hiddenWorkspaceId = "01890f6c-7b80-7000-8000-000000000011";
+    await linked.batch([
+      { sql: "insert into workspaces(id,updatedAt) values(?,0),(?,0)", args: [visibleWorkspaceId, hiddenWorkspaceId] },
+      { sql: "insert into memberships(id,workspaceId,userId,updatedAt) values(?,?,7,0),(?,?,8,0)", args: [
+        visibleWorkspaceId, visibleWorkspaceId, hiddenWorkspaceId, hiddenWorkspaceId,
+      ] },
+    ]);
     const linkedAuthority = { ...authority, databaseId: "linked", manifest: linkedManifest.manifestVersion };
     const linkedEpoch = (await linked.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch as string;
     const linkedRequest = { ...request, ...linkedAuthority, databaseEpoch: linkedEpoch, target: 0 };
     const before = await catchupReplacement(linked, linkedManifest, linkedAuthority, linkedRequest, { userId: 7 });
     assert.equal(before.kind, "success", JSON.stringify(before));
     if (before.kind !== "success") throw Error("No linked replacement");
-    assert.deepEqual(before.response.tables.workspaces.rows, [{ id: 1, updatedAt: 0 }]);
+    assert.deepEqual(before.response.tables.workspaces.rows, [{ id: visibleWorkspaceId, updatedAt: 0 }]);
     assert.deepEqual(before.response.tables.memberships.rows, []);
     await assert.rejects(catchup(linked, { tables: {} }, { userId: 7 }, 1000, "linked"), /ReplacementRequired|replacement/i);
     const command = { id: "revoke", operation: "delete", primary_db: "_default", session_args: ["userId"],
       optional_input_args: [], json_input_args: [], InputValidator: z.object({}), SessionValidator: linkedManifest.SessionValidator,
       sql: [{ include: false, params: ["session_userId"], sql: "delete from memberships where userId = $session_userId" }] };
     const fence = { ...linkedAuthority, databaseEpoch: linkedEpoch, instance: "reader", authGeneration: 9 };
+    const sent: any[] = [];
     const result = await runWithSync(linked, { revoke: command }, "revoke", {}, { userId: 7 }, new Map([
       ["legacy", { session: { userId: 7 } }], ["fenced", { session: { userId: 7 }, fence }],
-    ]), "linked");
-    const sent: any[] = [];
-    await result.sync((id, message) => sent.push({ id, message }));
+    ]), "linked", undefined, (id, message) => sent.push({ id, message }));
+    await result.sync(() => {});
     assert.equal(sent.length, 2);
     assert.equal(sent.find(item => item.id === "legacy").message.type, "syncRequired");
     assert.deepEqual(sent.find(item => item.id === "fenced").message, { ...fence, type: "syncRequired", serverRevision: 1,
@@ -138,14 +144,14 @@ record Workspace {
     value ${jsonType}?
 }
 record Membership {
-    id Int @id
-    workspaceId Int
+    id Id.Uuid @id
+    workspaceId Id.Uuid
     value ${jsonType}?
     @allow(query) { value ${operator} ${rhs} }
     @allow(insert, update, delete) { False }
 }
 record Workspace {
-    id Int @id
+    id Id.Uuid @id
     memberships @link(Membership.workspaceId)
     @allow(query) { exists memberships { value ${operator} ${rhs} } }
     @allow(insert, update, delete) { False }
@@ -154,8 +160,17 @@ record Workspace {
           await loadSchemaFromDatabase(id, permissions);
           const manifest: BatchManifest = { version: 1, manifestVersion: id, replacementContracts: { _default: wasm.get_schema_compiled_contract() },
             SessionValidator: z.object({ value: z.number().int().nullable() }), queries: {} };
-          await permissions.execute("insert into workspaces(id) values(1),(2),(3)");
-          await permissions.execute("insert into memberships(id,workspaceId,value) values(1,1,jsonb('7')),(2,2,jsonb('8')),(3,3,NULL)");
+          const ids = [
+            "01890f6c-7b80-7000-8000-000000000020",
+            "01890f6c-7b80-7000-8000-000000000021",
+            "01890f6c-7b80-7000-8000-000000000022",
+          ];
+          await permissions.batch([
+            { sql: "insert into workspaces(id) values(?),(?),(?)", args: ids },
+            { sql: "insert into memberships(id,workspaceId,value) values(?,?,jsonb('7')),(?,?,jsonb('8')),(?,?,NULL)", args: [
+              ids[0], ids[0], ids[1], ids[1], ids[2], ids[2],
+            ] },
+          ]);
           const binding = { ...authority, databaseId: id, manifest: id };
           const epoch = (await permissions.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch as string;
           for (const value of [7, null]) {
@@ -163,8 +178,8 @@ record Workspace {
               { ...request, ...binding, databaseEpoch: epoch, target: 0 }, { value });
             assert.equal(result.kind, "success", JSON.stringify(result));
             if (result.kind !== "success") throw Error("No JSON permission replacement");
-            const match = rhs === "null" || (rhs === "Session.value" && value === null) ? 3 : 1;
-            const expected = operator === "==" ? [match] : [1, 2, 3].filter(id => id !== match);
+            const matchIndex = rhs === "null" || (rhs === "Session.value" && value === null) ? 2 : 0;
+            const expected = operator === "==" ? [ids[matchIndex]] : ids.filter((_, index) => index !== matchIndex);
             for (const table of ["memberships", "workspaces"]) {
               assert.deepEqual(result.response.tables[table].rows.map((row: any) => row.id).sort(), expected,
                 `${jsonType}: ${operator} ${rhs}, session=${value}, ${table}`);
@@ -179,7 +194,7 @@ record Workspace {
   try {
     await ensureDatabase(strings, "_default", `type Payload = Text { value Json<String> }
 record Item {
-    id Int @id
+    id Id.Uuid @id
     label Json<String>
     raw Json
     optional Json<String?>
@@ -190,7 +205,10 @@ record Item {
     const manifest: BatchManifest = { version: 1, manifestVersion: "strings", replacementContracts: { _default: wasm.get_schema_compiled_contract() },
       SessionValidator: z.object({}), queries: {} };
     const values = ["hello", "7", "null", "true", "[1]", '{"x":1}', '"quoted"', "{invalid"];
-    for (const [id, value] of values.entries()) {
+    const valuesById = new Map<string, string>();
+    for (const [index, value] of values.entries()) {
+      const id = `01890f6c-7b80-7000-8000-${String(index).padStart(12, "0")}`;
+      valuesById.set(id, value);
       const encoded = JSON.stringify(value);
       await strings.execute({ sql: "insert into items(id,label,raw,optional,payload,payload__value) values(?,jsonb(?),jsonb(?),jsonb('null'),'Text',jsonb(?))",
         args: [id, encoded, encoded, encoded] });
@@ -204,7 +222,7 @@ record Item {
     assert.equal(result.response.complete, true);
     assert.equal(result.response.tables.items.rows.length, values.length);
     for (const row of result.response.tables.items.rows as any[]) {
-      const value = values[row.id];
+      const value = valuesById.get(row.id);
       assert.equal(row.label, value);
       assert.equal(row.raw, value);
       assert.equal(row.optional, null);

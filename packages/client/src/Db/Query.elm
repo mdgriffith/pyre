@@ -22,7 +22,8 @@ type alias Query =
 
 
 type alias FieldQuery =
-    { selections : Dict String Selection
+    { source : Maybe String
+    , selections : Dict String Selection
     , where_ : Maybe WhereClause
     , sort : Maybe (List SortClause)
     , limit : Maybe Int
@@ -99,7 +100,10 @@ type SessionReferenceContext
     | Operand
 
 
+
 -- Inspect raw shapes before permissive decoding, without treating JSON operands as predicates.
+
+
 containsSessionReference : SessionReferenceContext -> Decode.Value -> Bool
 containsSessionReference context value =
     case Decode.decodeValue (Decode.keyValuePairs Decode.value) value of
@@ -163,21 +167,23 @@ decodeFieldQuery =
 
 buildFieldQueryFromPairs : List ( String, Decode.Value ) -> Decode.Decoder FieldQuery
 buildFieldQueryFromPairs pairs =
-    buildFieldQueryFromPairsHelp Dict.empty Nothing Nothing Nothing pairs
+    buildFieldQueryFromPairsHelp Nothing Dict.empty Nothing Nothing Nothing pairs
 
 
 buildFieldQueryFromPairsHelp :
-    Dict String Selection
+    Maybe String
+    -> Dict String Selection
     -> Maybe WhereClause
     -> Maybe (List SortClause)
     -> Maybe Int
     -> List ( String, Decode.Value )
     -> Decode.Decoder FieldQuery
-buildFieldQueryFromPairsHelp selections where_ sort limit pairs =
+buildFieldQueryFromPairsHelp source selections where_ sort limit pairs =
     case pairs of
         [] ->
             Decode.succeed
-                { selections = selections
+                { source = source
+                , selections = selections
                 , where_ = where_
                 , sort = sort
                 , limit = limit
@@ -188,7 +194,7 @@ buildFieldQueryFromPairsHelp selections where_ sort limit pairs =
                 "@where" ->
                     case Decode.decodeValue decodeWhereClause value of
                         Ok whereClause ->
-                            buildFieldQueryFromPairsHelp selections (Just whereClause) sort limit rest
+                            buildFieldQueryFromPairsHelp source selections (Just whereClause) sort limit rest
 
                         Err _ ->
                             Decode.fail "Invalid @where clause"
@@ -196,7 +202,7 @@ buildFieldQueryFromPairsHelp selections where_ sort limit pairs =
                 "@sort" ->
                     case Decode.decodeValue decodeSortValue value of
                         Ok sortClauses ->
-                            buildFieldQueryFromPairsHelp selections where_ (Just sortClauses) limit rest
+                            buildFieldQueryFromPairsHelp source selections where_ (Just sortClauses) limit rest
 
                         Err _ ->
                             Decode.fail "Invalid @sort clause"
@@ -204,26 +210,31 @@ buildFieldQueryFromPairsHelp selections where_ sort limit pairs =
                 "@limit" ->
                     case Decode.decodeValue Decode.int value of
                         Ok limitValue ->
-                            buildFieldQueryFromPairsHelp selections where_ sort (Just limitValue) rest
+                            buildFieldQueryFromPairsHelp source selections where_ sort (Just limitValue) rest
 
                         Err _ ->
                             Decode.fail "Invalid @limit value"
 
                 "@source" ->
-                    buildFieldQueryFromPairsHelp selections where_ sort limit rest
+                    case Decode.decodeValue Decode.string value of
+                        Ok sourceName ->
+                            buildFieldQueryFromPairsHelp (Just sourceName) selections where_ sort limit rest
+
+                        Err _ ->
+                            Decode.fail "Invalid @source value"
 
                 "@select" ->
-                    buildFieldQueryFromPairsHelp selections where_ sort limit rest
+                    buildFieldQueryFromPairsHelp source selections where_ sort limit rest
 
                 _ ->
                     -- Regular field selection (bool or nested)
                     case Decode.decodeValue decodeSelection value of
                         Ok selection ->
-                            buildFieldQueryFromPairsHelp (Dict.insert key selection selections) where_ sort limit rest
+                            buildFieldQueryFromPairsHelp source (Dict.insert key selection selections) where_ sort limit rest
 
                         Err _ ->
                             -- Skip invalid selections
-                            buildFieldQueryFromPairsHelp selections where_ sort limit rest
+                            buildFieldQueryFromPairsHelp source selections where_ sort limit rest
 
 
 decodeSelection : Decode.Decoder Selection

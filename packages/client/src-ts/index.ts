@@ -271,6 +271,29 @@ interface EntityBridgeRegistration {
   unsubscribePromise: Promise<() => void>;
 }
 
+interface PublicQueryRegistration {
+  databaseId: DatabaseId;
+  queryModule: QueryModule<unknown>;
+  input: unknown;
+  callback: (result: unknown) => void;
+  active: boolean;
+  initializing: boolean;
+  binding: number;
+  generation?: number;
+  subscription?: QuerySubscription<unknown>;
+}
+
+interface PublicEntityRegistration {
+  databaseId: DatabaseId;
+  subscription: EntitySubscription;
+  callback: (batch: EntityChangeBatch) => void;
+  active: boolean;
+  initializing: boolean;
+  binding: number;
+  generation?: number;
+  unsubscribe?: () => void;
+}
+
 export type ElmBridgeIncomingMessage = ElmBridgeQueryMessage | ElmBridgeMutationMessage | ElmBridgeEntityStreamRegisterMessage | ElmBridgeEntityStreamUnregisterMessage;
 
 export interface ElmBridgeConfig {
@@ -935,6 +958,7 @@ class SingleDatabasePyreClient {
         });
       }
     }
+    if (message.type === 'disconnected') this.connectionId = null;
 
     if (message.type === 'syncProgress') {
       const nextState = {
@@ -1527,6 +1551,8 @@ export class PyreClient {
   private syncStateCallbacks: Set<(state: SyncState) => void> = new Set();
   private latestSyncStates: Map<DatabaseId, SyncState> = new Map();
   private internalDevtoolsUnsubscribers: Map<DatabaseId, () => void> = new Map();
+  private publicQueryRegistrations: Map<DatabaseId, Set<PublicQueryRegistration>> = new Map();
+  private publicEntityRegistrations: Map<DatabaseId, Set<PublicEntityRegistration>> = new Map();
   private bridgeCleanup: (() => void) | null = null;
   private devtoolsDebugValues: Record<string, unknown> = {};
   private devtoolsEventCounter = 0;
@@ -1573,9 +1599,44 @@ export class PyreClient {
     if (queryModule.operation !== 'query') {
       return this.runPublicMutation(databaseId, queryModule, input, callback);
     }
-    return this.getOrCreateClient(databaseId).then((client) => (
-      client.run(databaseId, queryModule, input, callback)
-    ));
+    const targetDatabaseId = requireDatabaseId(databaseId);
+    const registration: PublicQueryRegistration = {
+      databaseId: targetDatabaseId,
+      queryModule: queryModule as QueryModule<unknown>,
+      input,
+      callback,
+      active: true,
+      initializing: true,
+      binding: 0,
+    };
+    this.addPublicRegistration(this.publicQueryRegistrations, registration);
+    return this.getOrCreateClient(targetDatabaseId).then((client) => {
+      try {
+        registration.initializing = false;
+        this.bindPublicQueryRegistration(registration, this.clientGenerations.get(targetDatabaseId)!, client);
+      } catch (error) {
+        registration.active = false;
+        this.deletePublicRegistration(this.publicQueryRegistrations, registration);
+        throw error;
+      }
+      return {
+        update: (updatedInput: Input) => {
+          if (!registration.active) return;
+          registration.input = updatedInput;
+          if (registration.generation === this.clientGenerations.get(targetDatabaseId)) {
+            registration.subscription?.update(updatedInput);
+          }
+        },
+        unsubscribe: () => {
+          if (!registration.active) return;
+          registration.active = false;
+          registration.binding += 1;
+          registration.subscription?.unsubscribe();
+          registration.subscription = undefined;
+          this.deletePublicRegistration(this.publicQueryRegistrations, registration);
+        },
+      } satisfies QuerySubscription<Input>;
+    });
   }
 
   async getOrCreateClient(databaseId: DatabaseId): Promise<PyreInternalClient> {
@@ -1695,8 +1756,32 @@ export class PyreClient {
     const targetDatabaseId = requireDatabaseId(databaseId);
     validateEntitySubscription(subscription);
     this.markKnownDatabase(targetDatabaseId);
-    const client = await this.getOrCreateClient(targetDatabaseId);
-    return client.onEntityChanges(subscription, callback);
+    const registration: PublicEntityRegistration = {
+      databaseId: targetDatabaseId,
+      subscription,
+      callback,
+      active: true,
+      initializing: true,
+      binding: 0,
+    };
+    this.addPublicRegistration(this.publicEntityRegistrations, registration);
+    try {
+      const client = await this.getOrCreateClient(targetDatabaseId);
+      registration.initializing = false;
+      await this.bindPublicEntityRegistration(registration, this.clientGenerations.get(targetDatabaseId)!, client);
+    } catch (error) {
+      registration.active = false;
+      this.deletePublicRegistration(this.publicEntityRegistrations, registration);
+      throw error;
+    }
+    return () => {
+      if (!registration.active) return;
+      registration.active = false;
+      registration.binding += 1;
+      registration.unsubscribe?.();
+      registration.unsubscribe = undefined;
+      this.deletePublicRegistration(this.publicEntityRegistrations, registration);
+    };
   }
 
   async getDevtoolsSnapshot(): Promise<PyreDevtoolsSnapshot> {
@@ -2062,6 +2147,7 @@ export class PyreClient {
       }, () => {});
     });
     this.clients.clear();
+    this.clearPublicRegistrations();
     this.editRuntimes.clear();
     this.initializingEditSubmissions.clear();
     this.clientGenerations.forEach((generation, databaseId) => this.clientGenerations.set(databaseId, generation + 1));
@@ -2190,6 +2276,151 @@ export class PyreClient {
     }
   }
 
+  private addPublicRegistration<T extends { databaseId: DatabaseId }>(
+    registrations: Map<DatabaseId, Set<T>>,
+    registration: T
+  ): void {
+    const databaseRegistrations = registrations.get(registration.databaseId) ?? new Set<T>();
+    databaseRegistrations.add(registration);
+    registrations.set(registration.databaseId, databaseRegistrations);
+  }
+
+  private deletePublicRegistration<T extends { databaseId: DatabaseId }>(
+    registrations: Map<DatabaseId, Set<T>>,
+    registration: T
+  ): void {
+    const databaseRegistrations = registrations.get(registration.databaseId);
+    databaseRegistrations?.delete(registration);
+    if (databaseRegistrations?.size === 0) registrations.delete(registration.databaseId);
+  }
+
+  private bindPublicQueryRegistration(
+    registration: PublicQueryRegistration,
+    generation: number,
+    client: PyreInternalClient
+  ): void {
+    if (!registration.active || registration.generation === generation) return;
+    registration.subscription?.unsubscribe();
+    registration.subscription = undefined;
+    registration.generation = generation;
+    const binding = ++registration.binding;
+    let subscription: QuerySubscription<unknown> | void;
+    try {
+      subscription = client.run(
+        registration.databaseId,
+        registration.queryModule,
+        registration.input,
+        (result) => {
+          if (registration.active
+            && registration.binding === binding
+            && this.clientGenerations.get(registration.databaseId) === generation) {
+            registration.callback(result);
+          }
+        }
+      );
+    } catch (error) {
+      if (registration.binding === binding) registration.generation = undefined;
+      throw error;
+    }
+    if (!registration.active
+      || registration.binding !== binding
+      || this.clientGenerations.get(registration.databaseId) !== generation) {
+      subscription?.unsubscribe();
+      return;
+    }
+    registration.subscription = subscription || undefined;
+  }
+
+  private async bindPublicEntityRegistration(
+    registration: PublicEntityRegistration,
+    generation: number,
+    client: PyreInternalClient
+  ): Promise<void> {
+    if (!registration.active || registration.generation === generation) return;
+    registration.unsubscribe?.();
+    registration.unsubscribe = undefined;
+    registration.generation = generation;
+    const binding = ++registration.binding;
+    let unsubscribe: () => void;
+    try {
+      unsubscribe = await client.onEntityChanges(registration.subscription, (batch) => {
+        if (registration.active
+          && registration.binding === binding
+          && this.clientGenerations.get(registration.databaseId) === generation) {
+          registration.callback(batch);
+        }
+      });
+    } catch (error) {
+      if (registration.binding === binding) registration.generation = undefined;
+      throw error;
+    }
+    if (!registration.active
+      || registration.binding !== binding
+      || this.clientGenerations.get(registration.databaseId) !== generation) {
+      unsubscribe();
+      return;
+    }
+    registration.unsubscribe = unsubscribe;
+  }
+
+  private rebindPublicRegistrations(databaseId: DatabaseId, generation: number, client: PyreInternalClient): void {
+    this.publicQueryRegistrations.get(databaseId)?.forEach((registration) => {
+      if (registration.initializing) return;
+      try {
+        this.bindPublicQueryRegistration(registration, generation, client);
+      } catch (error) {
+        this.reportPublicRebindError(error);
+      }
+    });
+    this.publicEntityRegistrations.get(databaseId)?.forEach((registration) => {
+      if (registration.initializing) return;
+      void this.bindPublicEntityRegistration(registration, generation, client).catch((error) => {
+        this.reportPublicRebindError(error);
+      });
+    });
+  }
+
+  private reportPublicRebindError(error: unknown): void {
+    const resolvedError = error instanceof Error ? error : new Error(String(error));
+    if (this.config.onError) this.config.onError(resolvedError);
+    else console.error('[PyreClient] Failed to rebind subscription', resolvedError);
+  }
+
+  private hasPublicRegistrations(databaseId: DatabaseId): boolean {
+    return (this.publicQueryRegistrations.get(databaseId)?.size ?? 0) > 0
+      || (this.publicEntityRegistrations.get(databaseId)?.size ?? 0) > 0;
+  }
+
+  private unbindPublicRegistrations(databaseId: DatabaseId): void {
+    this.publicQueryRegistrations.get(databaseId)?.forEach((registration) => {
+      registration.binding += 1;
+      registration.generation = undefined;
+      registration.subscription?.unsubscribe();
+      registration.subscription = undefined;
+    });
+    this.publicEntityRegistrations.get(databaseId)?.forEach((registration) => {
+      registration.binding += 1;
+      registration.generation = undefined;
+      registration.unsubscribe?.();
+      registration.unsubscribe = undefined;
+    });
+  }
+
+  private clearPublicRegistrations(): void {
+    this.publicQueryRegistrations.forEach((registrations) => registrations.forEach((registration) => {
+      registration.active = false;
+      registration.binding += 1;
+      registration.subscription?.unsubscribe();
+    }));
+    this.publicEntityRegistrations.forEach((registrations) => registrations.forEach((registration) => {
+      registration.active = false;
+      registration.binding += 1;
+      registration.unsubscribe?.();
+    }));
+    this.publicQueryRegistrations.clear();
+    this.publicEntityRegistrations.clear();
+  }
+
   private watchInternalClient(
     databaseId: DatabaseId,
     generation: number,
@@ -2220,7 +2451,7 @@ export class PyreClient {
         this.clientGenerations.set(databaseId, retiredGeneration);
         client.disconnect();
         this.emitSyncState();
-        if (this.syncedDatabaseIds.includes(databaseId)
+        if ((this.syncedDatabaseIds.includes(databaseId) || this.hasPublicRegistrations(databaseId))
           && this.clientGenerations.get(databaseId) === retiredGeneration
           && !this.clients.has(databaseId)) {
           void this.getOrCreateClient(databaseId).catch(() => this.startNextSync());
@@ -2271,6 +2502,7 @@ export class PyreClient {
 
       this.startNextSync();
     });
+    this.rebindPublicRegistrations(databaseId, generation, client);
   }
 
   private disconnectInternalClient(databaseId: DatabaseId): void {
@@ -2282,6 +2514,7 @@ export class PyreClient {
     this.latestSyncStates.delete(databaseId);
     this.internalDevtoolsUnsubscribers.get(databaseId)?.();
     this.internalDevtoolsUnsubscribers.delete(databaseId);
+    this.unbindPublicRegistrations(databaseId);
     this.emitSyncState();
     this.clientGenerations.set(databaseId, (this.clientGenerations.get(databaseId) ?? 0) + 1);
     if (!clientPromise) {

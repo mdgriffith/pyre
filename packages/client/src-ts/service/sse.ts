@@ -112,18 +112,21 @@ export class SSEManager {
 
       eventSource.onerror = () => {
         const state = eventSource.readyState;
+        const disconnected = this.connectionId !== null;
         this.debugLog('[PyreClient] SSE connection state changed', {
           readyState: state,
           connectionId: this.connectionId,
           shouldReconnect: this.shouldReconnect,
         });
+        this.connectionId = null;
+        if (disconnected) this.onMessage?.({ type: 'disconnected' });
 
         if (state === EventSource.CLOSED) {
           console.warn('[PyreClient] SSE connection closed');
           if (this.shouldReconnect) {
             this.debugLog('[PyreClient] SSE waiting for EventSource auto-reconnect');
           }
-        } else if (state === EventSource.CONNECTING && !this.connectionId) {
+        } else if (state === EventSource.CONNECTING && !disconnected) {
           this.debugLog('[PyreClient] SSE failed before session established');
           const errorMessage = {
             type: 'error',

@@ -181,6 +181,30 @@ checks =
         failed =
             Pyre.update (Pyre.decodeIncomingDelta failure) model |> Tuple.first
 
+        rejected =
+            Pyre.update (Pyre.decodeIncomingDelta (lifecycle "one" "rejected" E.null)) model |> Tuple.first
+
+        preparationFailure =
+            E.object [ ( "type", E.string "failure" ), ( "requestId", E.string "elm:fixture:1" ), ( "databaseId", E.string "one" ), ( "phase", E.string "preparation" ), ( "code", E.string "PreparationFailed" ), ( "certainty", E.string "rejected" ) ]
+
+        rejectedWithCode =
+            Pyre.update (Pyre.decodeIncomingDelta preparationFailure) rejected |> Tuple.first
+
+        mismatchedFailure =
+            E.object [ ( "type", E.string "failure" ), ( "requestId", E.string "elm:fixture:1" ), ( "databaseId", E.string "one" ), ( "code", E.string "StaleUnknown" ), ( "certainty", E.string "unknown" ) ]
+
+        rejectedAfterMismatchedFailure =
+            Pyre.update (Pyre.decodeIncomingDelta mismatchedFailure) rejected |> Tuple.first
+
+        unknownFailure =
+            E.object [ ( "type", E.string "failure" ), ( "requestId", E.string "elm:fixture:1" ), ( "databaseId", E.string "one" ), ( "phase", E.string "transport" ), ( "code", E.string "ConnectionLost" ), ( "certainty", E.string "unknown" ) ]
+
+        unknownWithCode =
+            Pyre.update (Pyre.decodeIncomingDelta unknownFailure) unknown |> Tuple.first
+
+        confirmedAfterFailure =
+            Pyre.update (Pyre.decodeIncomingDelta preparationFailure) confirmed |> Tuple.first
+
         afterQuery =
             Pyre.update (Pyre.QueryUpdate (Pyre.ReadIssues (Database.fromString "one") "reader" {})) failed |> Tuple.first
 
@@ -254,6 +278,14 @@ checks =
         == Pyre.outcome receipt confirmed
         && List.map .code (Pyre.failures failed)
         == [ "Denied" ]
+        && Pyre.outcome receipt rejectedWithCode
+        == Just (LocalEdits.Rejected "PreparationFailed")
+        && Pyre.outcome receipt rejectedAfterMismatchedFailure
+        == Just (LocalEdits.Rejected "")
+        && Pyre.outcome receipt unknownWithCode
+        == Just (LocalEdits.OutcomeUnknown "ConnectionLost")
+        && Pyre.outcome receipt confirmedAfterFailure
+        == Pyre.outcome receipt confirmed
         && Pyre.failures afterQuery
         == []
         && List.length (Internal.operations command)

@@ -492,6 +492,7 @@ export class IndexedDbService {
   private onDatabaseEpochReset: (() => void) | null;
   private onDatabaseEpochStored: ((databaseEpoch: string) => void) | null;
   private operationQueue: Promise<void> = Promise.resolve();
+  private progressWritesBlocked = false;
   private initialData: Promise<{
     tables: Record<string, unknown[]>;
     cursor: SyncCursor;
@@ -610,6 +611,7 @@ export class IndexedDbService {
     }
     try {
       await this.storage.resetForDatabaseEpoch(databaseEpoch);
+      this.progressWritesBlocked = false;
       this.initialData = null;
       this.onDatabaseEpochReset?.();
       this.onDatabaseEpochStored?.(databaseEpoch);
@@ -642,11 +644,13 @@ export class IndexedDbService {
 
       this.notifyEntityDelta(tableGroups, entityStreamSource);
     } catch (error) {
+      this.progressWritesBlocked = true;
       console.error('[PyreClient] Failed to write delta:', error);
     }
   }
 
   private async writeSyncCursor(cursor: SyncCursor): Promise<void> {
+    if (this.progressWritesBlocked) return;
     try {
       await this.storage.init();
       await this.storage.putSyncCursor(cursor);
@@ -657,6 +661,7 @@ export class IndexedDbService {
   }
 
   private async writeServerRevision(serverRevision: number): Promise<void> {
+    if (this.progressWritesBlocked) return;
     try {
       await this.storage.init();
       await this.storage.putServerRevision(serverRevision);

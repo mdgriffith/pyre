@@ -338,6 +338,48 @@ test("lost commit response is unknown, never a definitive rollback", async () =>
   } finally { db.close(); }
 });
 
+test("named mutation result decoding fails before commit and rolls back", async () => {
+  const db = await batchDatabase();
+  try {
+    const query = {
+      ...editManifest().queries.named,
+      sql: [
+        { include: false, params: [], sql: "insert into notes(body, owner) values ('decode-failure', 7)" },
+        { include: true, params: [], sql: "select 'not-json' as notes" },
+      ],
+    };
+    await expect(run(db, { named: query }, "named", {}, { userId: 7 }, new Map(), async () => ({}), undefined,
+      { mode: "sync", commitSyncRevision: true })).rejects.toThrow();
+    expect((await db.execute("select count(*) as n from notes where body = 'decode-failure'")).rows[0].n).toBe(0);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(0);
+  } finally { db.close(); }
+});
+
+test("named mutation lost commit acknowledgement reports an unknown outcome", async () => {
+  const db = await batchDatabase();
+  try {
+    const transaction = db.transaction.bind(db);
+    db.transaction = async mode => {
+      const tx = await transaction(mode);
+      const commit = tx.commit.bind(tx);
+      tx.commit = async () => { await commit(); throw Error("connection lost after commit"); };
+      return tx;
+    };
+    const query = {
+      ...editManifest().queries.named,
+      sql: [
+        { include: false, params: [], sql: "insert into notes(body, owner) values ('named-committed', 7)" },
+        { include: true, params: [], sql: "select '[]' as notes" },
+      ],
+    };
+    const result = await run(db, { named: query }, "named", {}, { userId: 7 }, new Map(), async () => ({}), undefined,
+      { mode: "sync", commitSyncRevision: true });
+    expect(result).toEqual({ kind: "error", error: { errorType: "OutcomeUnknown", message: "OutcomeUnknown" }, sync: expect.any(Function) });
+    expect((await db.execute("select count(*) as n from notes where body = 'named-committed'")).rows[0].n).toBe(1);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
+  } finally { db.close(); }
+});
+
 test("batch accepts the exact operation and serialized UTF-8 payload limits", async () => {
   const db = await batchDatabase();
   try {

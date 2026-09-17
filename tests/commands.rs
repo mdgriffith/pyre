@@ -616,14 +616,14 @@ record GameInvite {
         ctx.workspace_path.join("pyre/queries.pyre"),
         r#"
 query GetGame($id: Game.id) {
-    game {
+    selectedGame: game {
         @where { id == $id }
 
         id
         name
         createdByUserId
         createdAt
-        gameMembers {
+        members: gameMembers {
             id
             userId
             role
@@ -634,7 +634,9 @@ query GetGame($id: Game.id) {
                 email
             }
         }
-        gameInvites {
+        invites: gameInvites {
+            @sort(createdAt, Desc)
+            @limit(2)
             id
             inviterUserId
             token
