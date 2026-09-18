@@ -64,10 +64,11 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   get_schema_manifest_contract: () => activeSchema?.manifestContract ?? activeSchema?.compiledContract ?? "contract-1",
   migrate_with_introspection: () => migrationResult,
   sql_introspect_uninitialized: () => "select uninitialized introspection",
+  process_introspection: (introspection: unknown) => introspection,
 }));
 
 const { catchup, rotateDatabaseEpoch } = await import("./sync");
-const { ensureDatabase, loadSchemaFromDatabase } = await import("./schema");
+const { ensureDatabase, loadSchemaFromDatabase, getIntrospectionJson } = await import("./schema");
 const { localEdits } = await import("./local-edits");
 const { runBatch } = await import("./query");
 
@@ -148,6 +149,22 @@ test("ensureDatabase reuses an unchanged database", async () => {
   expect(outcome).toBe("up-to-date");
   expect(database.batches).toEqual([]);
   expect(database.tx.rollback).toHaveBeenCalledTimes(1);
+});
+
+test("schema reads recognize bigint initialization flags", async () => {
+  const introspection = { tables: [{ name: "notes" }], schema_source: "record Note {}" };
+  const queries: string[] = [];
+  const db = { execute: mock(async (sql: string) => {
+    queries.push(sql);
+    if (sql.includes("is_initialized")) return { rows: [{ is_initialized: 1n }] };
+    return { rows: [{ result: JSON.stringify(introspection) }] };
+  }) };
+
+  await loadSchemaFromDatabase(db as any);
+  expect(queries).toEqual(["select 1 as is_initialized", "select introspection"]);
+  queries.length = 0;
+  expect(await getIntrospectionJson(db as any)).toEqual(introspection);
+  expect(queries).toEqual(["select 1 as is_initialized", "select introspection"]);
 });
 
 test("failed ensure refresh removes prior exact-client schema evidence", async () => {

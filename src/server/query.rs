@@ -188,6 +188,7 @@ mod codec_parity_tests {
 
 pub const MAX_BATCH_OPERATIONS: usize = 100;
 pub const MAX_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -244,9 +245,12 @@ pub async fn run_batch(
         || !manifest.authorizes_namespace(binding.namespace)
         || request.instance != binding.instance
         || request.auth_generation != binding.auth_generation
+        || request.auth_generation > MAX_JS_SAFE_INTEGER
+        || binding.auth_generation > MAX_JS_SAFE_INTEGER
         || request.request_id.is_empty()
         || request.instance.is_empty()
         || request.sequence == 0
+        || request.sequence > MAX_JS_SAFE_INTEGER
         || binding.namespace.is_empty()
         || binding.manifest.is_empty()
     {
@@ -566,6 +570,16 @@ async fn run_inner(
         .map_err(|error| Error::Database(error).execution("begin transaction", None))?;
     let execution = async {
         let result = execute_generated_sql(&tx, sql, &args, None).await?;
+        if commit_revision && query.generated_edit.is_none() {
+            query
+                .result_schema
+                .as_ref()
+                .ok_or_else(|| Error::InvalidInput("missing named result schema".into()))?
+                .validate(&result.response)
+                .map_err(|_| {
+                    Error::InvalidInput("named result does not match its compiled schema".into())
+                })?;
+        }
         let revision = if commit_revision {
             let (database_epoch, revision) =
                 crate::server::sync::next_server_revision(&tx)

@@ -365,7 +365,7 @@ test("named mutations publish fenced replacement hints at their committed revisi
     ]);
     const sent = [];
     const revoked = await runWithSync(db, manifest.queries, "revoke", {}, { userId: 7 }, recipients, authority.databaseId, "reader",
-      (id, message) => sent.push([id, message]));
+      (id, message) => sent.push([id, message]), manifest.manifestVersion);
     expect(revoked.kind).toBe("success");
     expect(revoked.response).toEqual({ databaseEpoch: "e1", serverRevision: 1, result: {} });
     expect((await db.execute("select count(*) as n from memberships")).rows[0].n).toBe(0);
@@ -380,14 +380,35 @@ test("named mutations publish fenced replacement hints at their committed revisi
     recipients.set("reader", { session: { userId: 8 }, fence: { ...authority, databaseEpoch: "e1", instance: "new", authGeneration: 3 } });
     const hints = [];
     const noop = await runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined,
-      (id, message) => hints.push(message));
+      (id, message) => hints.push(message), manifest.manifestVersion);
     await noop.sync(() => {});
     expect(hints).toHaveLength(1);
     expect(hints[0]).toMatchObject({ instance: "new", authGeneration: 3, serverRevision: 2 });
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(2);
     await db.execute("create trigger deny_revision before update on _pyre_sync begin select raise(abort, 'revision denied'); end");
-    await expect(runWithSync(db, manifest.queries, "delete", { id: 1 }, { userId: 7 }, recipients, authority.databaseId, undefined, () => {})).rejects.toThrow();
+    await expect(runWithSync(db, manifest.queries, "delete", { id: 1 }, { userId: 7 }, recipients, authority.databaseId, undefined,
+      () => {}, manifest.manifestVersion)).rejects.toThrow();
     expect((await db.execute("select id from notes where id = 1")).rows).toEqual([{ id: 1 }]);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(2);
+  });
+});
+
+test("named mutations suppress fenced hints without matching current manifest evidence", async () => {
+  await replacementDatabase(async ({ db, manifest, authority }) => {
+    const sent = [];
+    const stale = new Map([["stale", { session: { userId: 7 }, fence: {
+      ...authority, manifest: "stale-manifest", databaseEpoch: "e1",
+    } }]]);
+    await runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, stale, authority.databaseId, undefined,
+      (id, message) => sent.push([id, message]), manifest.manifestVersion);
+
+    const matching = new Map([["matching", { session: { userId: 7 }, fence: {
+      ...authority, databaseEpoch: "e1",
+    } }], ["s1", { session: { userId: 7 } }]]);
+    await runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, matching, authority.databaseId, undefined,
+      (id, message) => sent.push([id, message]));
+
+    expect(sent).toEqual([["s1", expect.objectContaining({ type: "delta", serverRevision: 2 })]]);
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(2);
   });
 });
@@ -452,8 +473,10 @@ test("named mutation publication is required and follows commit order", async ()
       published.push(message.serverRevision);
       if (message.serverRevision === 1) return firstDelivery;
     };
-    const firstPromise = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined, publish);
-    const secondPromise = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined, publish);
+    const firstPromise = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined,
+      publish, manifest.manifestVersion);
+    const secondPromise = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined,
+      publish, manifest.manifestVersion);
     while (published.length === 0) await Bun.sleep(0);
     await Bun.sleep(0);
     expect(published).toEqual([1]);
@@ -476,11 +499,14 @@ test("queued named mutations capture input and execution session at invocation",
     let finishFirst!: () => void;
     const firstDelivery = new Promise<void>(resolve => { finishFirst = resolve; });
     const publish = (_id, message) => message.serverRevision === 1 ? firstDelivery : undefined;
-    const first = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined, publish);
+    const first = runWithSync(db, manifest.queries, "noop", {}, { userId: 7 }, recipients, authority.databaseId, undefined,
+      publish, manifest.manifestVersion);
     const input = { id: 1, body: "captured" };
-    const update = runWithSync(db, manifest.queries, "update", input, { userId: 7 }, recipients, authority.databaseId, undefined, publish);
+    const update = runWithSync(db, manifest.queries, "update", input, { userId: 7 }, recipients, authority.databaseId, undefined,
+      publish, manifest.manifestVersion);
     const session = { userId: 7 };
-    const revoke = runWithSync(db, manifest.queries, "revoke", {}, session, recipients, authority.databaseId, undefined, publish);
+    const revoke = runWithSync(db, manifest.queries, "revoke", {}, session, recipients, authority.databaseId, undefined,
+      publish, manifest.manifestVersion);
     input.id = 3;
     input.body = "mutated";
     session.userId = 8;
@@ -505,7 +531,7 @@ test("named sync executes actual generated SQL, retains declared rows, and never
     const result = await runWithSync(db, { [query.id]: query }, query.id, input,
       { userId: 7, role: { _type: "Member" }, unrelated: "required" },
       new Map([["reader", { session: { userId: 9 }, fence }]]), authority.databaseId, undefined,
-      (id, message) => sent.push(message));
+      (id, message) => sent.push(message), authority.manifest);
     expect(result.kind).toBe("success");
     expect(result.response.result.entry[0]).toMatchObject(input);
     const original = structuredClone(result.response.result);

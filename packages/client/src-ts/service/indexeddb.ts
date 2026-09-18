@@ -50,22 +50,35 @@ export class IndexedDBStorage {
       return this.initPromise;
     }
 
-    this.initPromise = new Promise((resolve, reject) => {
+    let abandoned = false;
+    const initPromise = new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open(this.dbName, DB_VERSION);
 
       request.onerror = () => {
-        this.initPromise = null;
+        if (abandoned) return;
+        if (this.initPromise === initPromise) this.initPromise = null;
         reject(new Error(`Failed to open IndexedDB: ${request.error}`));
       };
 
+      request.onblocked = () => {
+        abandoned = true;
+        if (this.initPromise === initPromise) this.initPromise = null;
+        reject(new Error(`Failed to open IndexedDB: upgrade to version ${DB_VERSION} was blocked`));
+      };
+
       request.onsuccess = () => {
-        this.db = request.result;
-        this.db.onversionchange = () => {
-          this.db?.close();
-          this.db = null;
+        const db = request.result;
+        if (abandoned) {
+          db.close();
+          return;
+        }
+        this.db = db;
+        db.onversionchange = () => {
+          db.close();
+          if (this.db === db) this.db = null;
         };
-        this.initPromise = null;
-        resolve(this.db);
+        if (this.initPromise === initPromise) this.initPromise = null;
+        resolve(db);
       };
 
       request.onupgradeneeded = (event) => {
@@ -93,7 +106,8 @@ export class IndexedDBStorage {
       };
     });
 
-    return this.initPromise;
+    this.initPromise = initPromise;
+    return initPromise;
   }
 
   private async getDB(): Promise<IDBDatabase> {

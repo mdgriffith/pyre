@@ -100,6 +100,8 @@ impl<'a> SyncServer<'a> {
             || fence.instance.is_empty()
             || fence.instance != binding.instance
             || fence.auth_generation != binding.auth_generation
+            || fence.auth_generation > crate::server::query::MAX_JS_SAFE_INTEGER
+            || binding.auth_generation > crate::server::query::MAX_JS_SAFE_INTEGER
             || fence.namespace != binding.namespace
             || !self.context.valid_namespaces.contains(&fence.namespace)
             || fence.manifest != binding.manifest
@@ -314,6 +316,7 @@ impl<'a> SyncServer<'a> {
         for (session_id, fence) in recipients {
             if fence.instance.is_empty()
                 || fence.database_epoch.is_empty()
+                || fence.auth_generation > crate::server::query::MAX_JS_SAFE_INTEGER
                 || database_id != fence.database_id
                 || commit.database_epoch != fence.database_epoch
                 || namespace != fence.namespace

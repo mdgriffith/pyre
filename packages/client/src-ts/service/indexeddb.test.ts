@@ -1,7 +1,43 @@
 // @ts-nocheck
-import { expect, spyOn, test } from 'bun:test';
+import { expect, mock, spyOn, test } from 'bun:test';
 
-import { IndexedDbService, type SyncCursor } from './indexeddb';
+import { IndexedDBStorage, IndexedDbService, type SyncCursor } from './indexeddb';
+
+test('blocked v3 opens reject and late success cannot replace a retry', async () => {
+  const originalIndexedDB = globalThis.indexedDB;
+  const requests = [];
+  globalThis.indexedDB = { open: () => {
+    const request = {};
+    requests.push(request);
+    return request;
+  } };
+  const storage = new IndexedDBStorage('blocked', { tables: {}, queryFieldToTable: {} });
+
+  try {
+    const first = storage.init();
+    requests[0].onblocked();
+    let blockedError;
+    try { await first; } catch (error) { blockedError = error; }
+    expect(blockedError).toBeInstanceOf(Error);
+    expect(blockedError.message).toContain('upgrade to version 3 was blocked');
+
+    const second = storage.init();
+    expect(requests).toHaveLength(2);
+    const abandoned = { close: mock(() => {}) };
+    requests[0].result = abandoned;
+    requests[0].onsuccess();
+    expect(abandoned.close).toHaveBeenCalledTimes(1);
+
+    const opened = { close: mock(() => {}), onversionchange: null };
+    requests[1].result = opened;
+    requests[1].onsuccess();
+    expect(await second).toBe(opened);
+    expect(await storage.init()).toBe(opened);
+  } finally {
+    if (originalIndexedDB === undefined) delete globalThis.indexedDB;
+    else globalThis.indexedDB = originalIndexedDB;
+  }
+});
 
 test('invalid initial cache fails the shared load and never sends an empty fallback', async () => {
   const invalid = new Error('Invalid persisted identity');

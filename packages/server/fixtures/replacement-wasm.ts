@@ -108,7 +108,7 @@ record Workspace {
     const sent: any[] = [];
     const result = await runWithSync(linked, { revoke: command }, "revoke", {}, { userId: 7 }, new Map([
       ["legacy", { session: { userId: 7 } }], ["fenced", { session: { userId: 7 }, fence }],
-    ]), "linked", undefined, (id, message) => sent.push({ id, message }));
+    ]), "linked", undefined, (id, message) => sent.push({ id, message }), linkedManifest.manifestVersion);
     await result.sync(() => {});
     assert.equal(sent.length, 2);
     assert.equal(sent.find(item => item.id === "legacy").message.type, "syncRequired");

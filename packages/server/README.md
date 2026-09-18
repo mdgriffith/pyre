@@ -301,9 +301,11 @@ registration. Hints contain each recipient's fence, `type: "syncRequired"`,
 `serverRevision`, and conservative `reconciliation` invalidation metadata, never
 private rows or origin request IDs. Hints only raise required/security revision;
 they cannot advance covered revision. Named `runWithSync` mutations also commit
-their revision with the write and require the final `sendToSession` argument so
-publication completes in commit order before `runWithSync` resolves. The returned
-`sync()` method is idempotent and returns the already-published revision metadata.
+their revision with the write and require `sendToSession` so publication completes
+in commit order before `runWithSync` resolves. Pass the trusted current manifest
+fingerprint as the final optional argument to enable fenced hints; absent or stale
+manifest evidence suppresses fenced hints without changing legacy recipients. The
+returned `sync()` method is idempotent and returns the already-published revision metadata.
 Failed or delayed SSE delivery does not change known batch acceptance.
 
 The libraries register no routes. The built-in server exposes POST

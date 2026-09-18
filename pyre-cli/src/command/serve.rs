@@ -343,7 +343,7 @@ async fn sync(
             body.database_epoch.as_deref(),
         )
         .await
-        .map_err(|error| ServeError::Internal(error.to_string()))?;
+        .map_err(sync_error)?;
 
     Ok(with_cors(&state, &headers, Json(result).into_response()))
 }
@@ -540,43 +540,24 @@ async fn run_batch(
                         }
                     }
                 }
-                if result.response["status"] == "accepted" {
-                    if let (Some(revision), Some(database_epoch)) = (
-                        result.response["commitRevision"].as_i64(),
-                        result.response["databaseEpoch"].as_str(),
-                    ) {
-                        let mut query_result = query::QueryResult {
-                            response: JsonValue::Null,
-                            affected_rows: result.affected_rows.clone(),
-                        };
-                        let commit = query::CommittedRevision {
-                            database_epoch: database_epoch.to_string(),
-                            revision,
-                        };
-                        let messages = server.calculate_committed_deltas(
-                            &mut query_result,
-                            &connected_sessions(&state).await,
-                            &state.database_id,
-                            None,
-                            &commit,
-                        );
-                        if let Ok(messages) = messages {
-                            send_messages(&state, messages).await;
-                        } else {
-                            let connections = state.connections.lock().await;
-                            let hint = json!({
-                                "type": "syncRequired",
-                                "databaseId": state.database_id,
-                                "databaseEpoch": database_epoch,
-                                "serverRevision": revision,
-                            });
-                            for connection in connections
-                                .values()
-                                .filter(|connection| connection.fence.is_none())
-                            {
-                                let _ = connection.sender.send(hint.clone());
-                            }
-                        }
+            }
+            if result.response["status"] == "accepted" {
+                if let (Some(revision), Some(database_epoch)) = (
+                    result.response["commitRevision"].as_i64(),
+                    result.response["databaseEpoch"].as_str(),
+                ) {
+                    let connections = state.connections.lock().await;
+                    let hint = json!({
+                        "type": "syncRequired",
+                        "databaseId": state.database_id,
+                        "databaseEpoch": database_epoch,
+                        "serverRevision": revision,
+                    });
+                    for connection in connections
+                        .values()
+                        .filter(|connection| connection.fence.is_none())
+                    {
+                        let _ = connection.sender.send(hint.clone());
                     }
                 }
             }
@@ -823,6 +804,17 @@ fn named_query_error(error: query::Error) -> ServeError {
         ServeError::Internal(error.code().into())
     } else {
         ServeError::BadRequest(error.to_string())
+    }
+}
+
+fn sync_error(error: pyre::server::sync::Error) -> ServeError {
+    match error {
+        pyre::server::sync::Error::Sync(pyre::sync::SyncError::PermissionError(message))
+            if message == "ReplacementRequired" =>
+        {
+            ServeError::BadRequest("ReplacementRequired".into())
+        }
+        error => ServeError::Internal(error.to_string()),
     }
 }
 
@@ -1132,6 +1124,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_route_rejects_relational_permissions_as_replacement_required() {
+        let (_dir, mut state) = batch_state().await;
+        let conn = state.db.connect().unwrap();
+        pyre::server::schema::ensure_database(
+            &conn,
+            pyre::ast::DEFAULT_SCHEMANAME,
+            r#"
+record Item {
+    id Id.Uuid @id
+    name String
+    @public
+}
+record Membership {
+    id Id.Uuid @id
+    workspaceId Workspace.id
+    updatedAt Int
+    @allow(query) { False }
+    @allow(insert, update, delete) { True }
+}
+record Workspace {
+    id Id.Uuid @id
+    updatedAt Int
+    memberships @link(Membership.workspaceId)
+    @allow(query) { exists memberships { True } }
+    @allow(insert, update, delete) { True }
+}
+"#,
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().loaded_schema =
+            load_schema_from_database(&conn).await.unwrap();
+
+        let error = sync(
+            State(state.clone()),
+            origin_headers(),
+            Json(SyncRequest {
+                database_id: Some(state.database_id.clone()),
+                database_epoch: None,
+                sync_cursor: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        let response = with_cors(&state, &origin_headers(), error.into_response());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({"error": "ReplacementRequired"})
+        );
+    }
+
+    #[tokio::test]
     async fn batch_route_accepts_and_rolls_back_without_private_errors_or_prefix() {
         let (_dir, state) = batch_state().await;
         let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -1179,11 +1224,11 @@ mod tests {
             accepted["commitRevision"].as_i64().unwrap()
         );
         let hint = receiver.try_recv().unwrap();
-        assert_eq!(hint["type"], "delta", "{hint}");
+        assert_eq!(hint["type"], "syncRequired", "{hint}");
         assert_eq!(hint["databaseId"], state.database_id);
         assert_eq!(hint["databaseEpoch"], accepted["databaseEpoch"]);
         assert_eq!(hint["serverRevision"], accepted["commitRevision"]);
-        assert_eq!(hint["data"][0]["table_name"], "items");
+        assert!(hint.get("data").is_none());
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -1210,7 +1255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_route_sends_legacy_deletion_deltas_instead_of_incremental_catchup_hints() {
+    async fn batch_route_does_not_publish_intermediate_rows_to_legacy_connections() {
         let (_dir, state) = batch_state().await;
         let (sender, mut receiver) = mpsc::unbounded_channel();
         state.connections.lock().await.insert(
@@ -1222,24 +1267,18 @@ mod tests {
             },
         );
         let mut body = batch_body(&state).await;
-        let created =
-            response_json(submit(state.clone(), body.clone(), origin_headers()).await).await;
-        assert_eq!(created["status"], "accepted");
-        let _ = receiver.try_recv().unwrap();
-
-        body["requestId"] = json!("delete-request");
-        body["sequence"] = json!(2);
-        body["operations"] = json!([{"operation": "delete", "input": {}}]);
-        let deleted = response_json(submit(state.clone(), body, origin_headers()).await).await;
-        assert_eq!(deleted["status"], "accepted");
-        let delta = receiver.try_recv().unwrap();
-        assert_eq!(delta["type"], "delta", "{delta}");
-        assert_eq!(delta["serverRevision"], deleted["commitRevision"]);
-        assert_eq!(delta["data"][0]["table_name"], "items");
-        assert_eq!(
-            delta["data"][0]["rows"][0][0],
-            "01890f6c-7b80-7000-8000-000000000001"
-        );
+        body["operations"] = json!([
+            {"operation": "create", "input": {}},
+            {"operation": "delete", "input": {}}
+        ]);
+        let accepted = response_json(submit(state.clone(), body, origin_headers()).await).await;
+        assert_eq!(accepted["status"], "accepted");
+        let hint = receiver.try_recv().unwrap();
+        assert_eq!(hint["type"], "syncRequired", "{hint}");
+        assert_eq!(hint["databaseId"], state.database_id);
+        assert_eq!(hint["databaseEpoch"], accepted["databaseEpoch"]);
+        assert_eq!(hint["serverRevision"], accepted["commitRevision"]);
+        assert!(hint.get("data").is_none(), "{hint}");
         assert_eq!(
             state
                 .db
@@ -1491,11 +1530,12 @@ mod tests {
         assert!(hint.get("results").is_none());
         assert!(!hint.to_string().contains("private value"));
         let legacy_hint = legacy_receiver.try_recv().unwrap();
-        assert_eq!(legacy_hint["type"], "delta");
+        assert_eq!(legacy_hint["type"], "syncRequired");
         assert_eq!(legacy_hint["databaseId"], state.database_id);
         assert_eq!(legacy_hint["databaseEpoch"], accepted["databaseEpoch"]);
         assert_eq!(legacy_hint["serverRevision"], accepted["commitRevision"]);
-        assert_eq!(legacy_hint["data"][0]["rows"][0][1], "private value");
+        assert!(legacy_hint.get("data").is_none());
+        assert!(!legacy_hint.to_string().contains("private value"));
         let mut catchup = request.clone();
         catchup.target = accepted["commitRevision"].as_i64().unwrap();
         let snapshot =

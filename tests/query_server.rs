@@ -843,6 +843,130 @@ async fn named_batch_results_are_validated_before_revision_and_commit(
 }
 
 #[tokio::test]
+async fn revisioned_named_results_are_validated_before_revision_and_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db =
+        TestDatabase::new("record Item {\n id Id.Uuid @id\n name String\n @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    let mut manifest = manifest_for(
+        &db.context,
+        "insert Named($id: Item.id, $name: String) { item { id = $id name = $name } }",
+        false,
+    )?;
+    let named_id = only_query(&manifest).id.clone();
+    manifest.queries.get_mut(&named_id).unwrap().result_schema =
+        Some(pyre::server::manifest::ResultSchema::Array {
+            items: Box::new(pyre::server::manifest::ResultSchema::Object {
+                fields: std::collections::BTreeMap::new(),
+            }),
+        });
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+
+    let error = query::run_with_revision(
+        &conn,
+        &bind(&manifest, &db.context),
+        &named_id,
+        json!({
+            "id": "01890f6c-7b80-7000-8000-000000000004",
+            "name": "rolled back"
+        }),
+        &session,
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), "InvalidRequest");
+    let row = conn
+        .query(
+            "SELECT (SELECT count(*) FROM items), server_revision FROM _pyre_sync WHERE id = 1",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
+    assert_eq!(row.get::<i64>(1)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn js_protocol_counters_reject_values_above_max_safe_integer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    let db =
+        TestDatabase::new("record Item {\n id Id.Uuid @id\n name String\n @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = query_by_operation(&manifest, "insert");
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let bound = bind(&manifest, &db.context);
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let mut request = batch_request(&conn, &binding, Vec::new()).await;
+
+    request.sequence = MAX_SAFE_INTEGER + 1;
+    assert!(
+        query::run_batch(&conn, &bound, &binding, &request, &session)
+            .await
+            .is_err()
+    );
+    request.sequence = MAX_SAFE_INTEGER;
+    assert!(
+        query::run_batch(&conn, &bound, &binding, &request, &session)
+            .await
+            .is_ok()
+    );
+
+    request.auth_generation = MAX_SAFE_INTEGER + 1;
+    let unsafe_binding = query::BatchBinding {
+        auth_generation: MAX_SAFE_INTEGER + 1,
+        ..binding
+    };
+    assert!(
+        query::run_batch(&conn, &bound, &unsafe_binding, &request, &session)
+            .await
+            .is_err()
+    );
+
+    let replacement = ReplacementRequest {
+        version: 1,
+        fence: SyncFence {
+            database_id: unsafe_binding.database_id.into(),
+            instance: unsafe_binding.instance.into(),
+            auth_generation: MAX_SAFE_INTEGER + 1,
+            namespace: unsafe_binding.namespace.into(),
+            manifest: unsafe_binding.manifest.into(),
+            database_epoch: request.database_epoch.clone(),
+        },
+        request_id: "replacement".into(),
+        target: 0,
+    };
+    assert!(matches!(
+        SyncServer::new(&db.context)
+            .replacement(&conn, &bound, &unsafe_binding, &replacement, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    let recipients = HashMap::from([("unsafe".into(), replacement.fence)]);
+    assert!(SyncServer::new(&db.context)
+        .committed_replacement_messages(
+            &query::CommittedRevision {
+                database_epoch: request.database_epoch,
+                revision: 1,
+            },
+            unsafe_binding.database_id,
+            unsafe_binding.namespace,
+            unsafe_binding.manifest,
+            &recipients,
+        )
+        .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn batch_preflight_rejects_invalid_members_scopes_and_limits(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(

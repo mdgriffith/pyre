@@ -209,7 +209,7 @@ async function readDatabaseIntrospection(db: Client): Promise<unknown> {
         throw new Error("Failed to check if database is initialized");
     }
 
-    const isInitialized = isInitializedResult.rows[0].is_initialized === 1;
+    const isInitialized = Number(isInitializedResult.rows[0].is_initialized) === 1;
 
     let introspection;
     if (isInitialized) {
@@ -341,7 +341,7 @@ export async function getIntrospectionJson(db: Client): Promise<any> {
         throw new Error("Failed to check if database is initialized");
     }
 
-    const isInitialized = isInitializedResult.rows[0].is_initialized === 1;
+    const isInitialized = Number(isInitializedResult.rows[0].is_initialized) === 1;
 
     let introspection;
     if (isInitialized) {

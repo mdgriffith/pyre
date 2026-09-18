@@ -194,7 +194,12 @@ async function sendBestEffort(
 
 const namedMutationQueues = new WeakMap<Client, Promise<void>>();
 
-function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?: string): SyncDeltasFn {
+function syncWithWasmForDatabase(
+  db: Client,
+  databaseId?: DatabaseId,
+  namespace?: string,
+  currentManifest?: string,
+): SyncDeltasFn {
   const normalizedDatabaseId = databaseId ? requireDatabaseId(databaseId) : undefined;
 
   return async (affectedRowGroups, connectedSessions, sendToSession, originSessionId, committedRevision) => {
@@ -211,7 +216,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId, namespace?
       legacySessions.delete(id);
       const parsed = fenceValidator.safeParse(recipient.fence);
       if (!parsed.success || parsed.data.databaseId !== normalizedDatabaseId || parsed.data.databaseEpoch !== databaseEpoch
-        || parsed.data.namespace !== namespace) continue;
+        || parsed.data.namespace !== namespace || parsed.data.manifest !== currentManifest) continue;
       queueSend(id, { type: "syncRequired", ...parsed.data, serverRevision,
         reconciliation: { kind: "replaceRequired", atLeast: serverRevision, invalidate: true, minimumSafeRevision: serverRevision } });
     }
@@ -363,11 +368,13 @@ export async function runWithSync(
   databaseId?: DatabaseId,
   originSessionId?: string,
   sendToSession?: (sessionId: string, message: any) => void | Promise<void>,
+  /** Trusted manifest fingerprint for fenced recipients. Omit to suppress fenced hints. */
+  currentManifest?: string,
 ): Promise<QueryResult> {
   const capturedArgs = structuredClone(args);
   const capturedSession = structuredClone(executingSession);
   const originSession = capturedSession;
-  const publish = syncWithWasmForDatabase(db, databaseId, queryMap[queryId]?.primary_db);
+  const publish = syncWithWasmForDatabase(db, databaseId, queryMap[queryId]?.primary_db, currentManifest);
   const sync: SyncDeltasFn = (rows, sessions, send, origin, revision) => {
     const current = new Map(sessions);
     if (origin && !current.has(origin)) current.set(origin, { session: originSession });
