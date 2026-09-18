@@ -4,6 +4,7 @@ import { MAX_REPLACEMENT_PAYLOAD_BYTES, readReplacementTables } from "./sync";
 import * as wasm from "./wasm/pyre_wasm.js";
 import { normalizeForWasmJson } from "./wasm-json";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
+import { assertSupportedIntegerMode, internalSafeInteger } from "./runtime/libsql";
 import { activateSchemaForDatabase, captureReplacementSchema } from "./schema";
 import {
   run,
@@ -79,14 +80,14 @@ export async function catchupReplacement(
       const databases = await db.execute("pragma database_list");
       if (!databases.rows.find(row => row.name === "main")?.file) return failure("ReplacementUnavailable");
     }
+    await assertSupportedIntegerMode(db);
     tx = await db.transaction("read");
     const databases = await tx.execute("pragma database_list");
     if (databases.rows.some(row => row.name !== "main" && row.name !== "temp")) return failure("InvalidRequest");
     const state = (await tx.execute("select database_epoch, server_revision from _pyre_sync where id = 1")).rows[0];
     if (state?.database_epoch !== captured.databaseEpoch) return failure("InvalidRequest");
-    const revision = Number(state.server_revision);
-    if ((typeof state.server_revision !== "number" && typeof state.server_revision !== "bigint")
-      || !Number.isSafeInteger(revision) || revision < captured.target) return failure("ReplacementUnavailable");
+    const revision = internalSafeInteger(state.server_revision, "Pyre sync server revision");
+    if (revision < captured.target) return failure("ReplacementUnavailable");
     const tables = await readReplacementTables(tx, session, captured.namespace, restoreSchema);
     // Bound wire materialization without ever turning truncation into completeness.
     if (new TextEncoder().encode(JSON.stringify(tables)).byteLength > MAX_REPLACEMENT_PAYLOAD_BYTES)

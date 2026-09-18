@@ -3,6 +3,7 @@ import * as wasm from "./wasm/pyre_wasm.js";
 import { normalizeForWasmJson } from "./wasm-json";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
 import { activateSchemaForDatabase } from "./schema";
+import { internalSafeInteger } from "./runtime/libsql";
 
 export type SessionValue =
     | null
@@ -259,12 +260,9 @@ export async function readReplacementTables(
         const result = await db.execute({ sql: table.replacement_bounds_sql, args: normalizeParams(table.params?.[0]) as any[] });
         const rawRowCount = result.rows[0]?.[REPLACEMENT_ROW_COUNT_COLUMN];
         const rawByteCount = result.rows[0]?.[REPLACEMENT_BYTE_COUNT_COLUMN];
-        const rowCount = typeof rawRowCount === "bigint" ? Number(rawRowCount)
-            : typeof rawRowCount === "number" ? rawRowCount : Number.NaN;
-        const byteCount = typeof rawByteCount === "bigint" ? Number(rawByteCount)
-            : typeof rawByteCount === "number" ? rawByteCount : Number.NaN;
-        if (result.rows.length !== 1 || !Number.isSafeInteger(rowCount) || rowCount < 0
-            || !Number.isSafeInteger(byteCount) || byteCount < 0)
+        const rowCount = internalSafeInteger(rawRowCount, "replacement row count");
+        const byteCount = internalSafeInteger(rawByteCount, "replacement byte count");
+        if (result.rows.length !== 1 || rowCount < 0 || byteCount < 0)
             throw new Error("Invalid replacement bounds");
         const keyBytesPerRow = table.headers.reduce((total: number, header: string) =>
             total + new TextEncoder().encode(JSON.stringify(header)).byteLength + 1, 0);

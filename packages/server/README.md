@@ -275,6 +275,9 @@ Fixture generation uses the current compiler, with all output under `target/`.
 The typed binding supports the executor's existing file-backed SQLite/libSQL
 contract; remote libSQL is not covered by these tests. In-memory local databases
 are unsupported because that adapter detaches transaction connections.
+Configure `@libsql/client` with its default `intMode: "number"` or with
+`intMode: "bigint"`. Pyre does not support `intMode: "string"`: generated codecs
+must distinguish integer columns from numeric-looking text without guessing.
 
 ### Authoritative Replacement
 

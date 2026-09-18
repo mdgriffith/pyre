@@ -132,6 +132,7 @@ export class QueryClientService {
       state.result = update.result;
       state.revision = update.revision;
       notifications.push(() => {
+        if (this.queryStates.get(update.queryId) !== state) return;
         try { state.callback(update); } catch (error) { console.error('[PyreClient] Query listener failed', error); }
         try { this.onQueryResult?.(update.queryId); } catch (error) { console.error('[PyreClient] Query observer failed', error); }
       });

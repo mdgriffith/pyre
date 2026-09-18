@@ -65,9 +65,14 @@ export class EntityStreamService {
 
   subscribeVisible(subscription: EntitySubscription, callback: EntityChangeCallback, databaseId?: string): () => void {
     const unsubscribe = this.subscribe(subscription, callback);
-    callback(this.createBatchFromRows(subscription, this.visible, 'local-edits', databaseId) ?? {
-      type: 'entity-change-batch', databaseId, sequence: this.sequence, source: 'local-edits', changes: [],
-    });
+    try {
+      callback(this.createBatchFromRows(subscription, this.visible, 'local-edits', databaseId) ?? {
+        type: 'entity-change-batch', databaseId, sequence: this.sequence, source: 'local-edits', changes: [],
+      });
+    } catch (error) {
+      unsubscribe();
+      throw error;
+    }
     return unsubscribe;
   }
 

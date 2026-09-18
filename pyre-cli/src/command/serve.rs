@@ -354,6 +354,12 @@ async fn sync_events(
     Query(query): Query<RequestQuery>,
 ) -> Result<Response, ServeError> {
     ensure_database_id(&state, query.database_id.as_deref())?;
+    let context = state
+        .loaded_schema
+        .context()
+        .map_err(|error| ServeError::Internal(error.to_string()))?;
+    pyre::sync::require_legacy_sync(context)
+        .map_err(|_| ServeError::BadRequest("ReplacementRequired".to_string()))?;
     let session = pyre_session_from_request(&state, &headers)?;
     let conn = state
         .db
@@ -519,16 +525,19 @@ async fn run_batch(
     let response = match result {
         Ok(result) => {
             if let Ok(context) = state.loaded_schema.context() {
-                let connections = state.connections.lock().await;
-                let recipients = connections
-                    .iter()
-                    .filter_map(|(id, connection)| {
-                        connection.fence.clone().map(|fence| (id.clone(), fence))
-                    })
-                    .collect();
-                for hint in SyncServer::new(context).replacement_messages(&result, &recipients) {
-                    if let Some(connection) = connections.get(&hint.session_id) {
-                        let _ = connection.sender.send(hint.message);
+                let server = SyncServer::new(context);
+                {
+                    let connections = state.connections.lock().await;
+                    let recipients = connections
+                        .iter()
+                        .filter_map(|(id, connection)| {
+                            connection.fence.clone().map(|fence| (id.clone(), fence))
+                        })
+                        .collect();
+                    for hint in server.replacement_messages(&result, &recipients) {
+                        if let Some(connection) = connections.get(&hint.session_id) {
+                            let _ = connection.sender.send(hint.message);
+                        }
                     }
                 }
                 if result.response["status"] == "accepted" {
@@ -536,17 +545,37 @@ async fn run_batch(
                         result.response["commitRevision"].as_i64(),
                         result.response["databaseEpoch"].as_str(),
                     ) {
-                        let hint = json!({
-                            "type": "syncRequired",
-                            "databaseId": state.database_id,
-                            "databaseEpoch": database_epoch,
-                            "serverRevision": revision,
-                        });
-                        for connection in connections
-                            .values()
-                            .filter(|connection| connection.fence.is_none())
-                        {
-                            let _ = connection.sender.send(hint.clone());
+                        let mut query_result = query::QueryResult {
+                            response: JsonValue::Null,
+                            affected_rows: result.affected_rows.clone(),
+                        };
+                        let commit = query::CommittedRevision {
+                            database_epoch: database_epoch.to_string(),
+                            revision,
+                        };
+                        let messages = server.calculate_committed_deltas(
+                            &mut query_result,
+                            &connected_sessions(&state).await,
+                            &state.database_id,
+                            None,
+                            &commit,
+                        );
+                        if let Ok(messages) = messages {
+                            send_messages(&state, messages).await;
+                        } else {
+                            let connections = state.connections.lock().await;
+                            let hint = json!({
+                                "type": "syncRequired",
+                                "databaseId": state.database_id,
+                                "databaseEpoch": database_epoch,
+                                "serverRevision": revision,
+                            });
+                            for connection in connections
+                                .values()
+                                .filter(|connection| connection.fence.is_none())
+                            {
+                                let _ = connection.sender.send(hint.clone());
+                            }
                         }
                     }
                 }
@@ -1026,7 +1055,19 @@ mod tests {
                 "create": {
                     "id": "create", "operation": "insert", "primary_db": namespace,
                     "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
-                    "sql": [{"include": false, "params": [], "sql": "INSERT OR REPLACE INTO items (id, name) VALUES ('01890f6c-7b80-7000-8000-000000000001', 'private value')"}],
+                    "sql": [
+                        {"include": false, "params": [], "sql": "INSERT OR REPLACE INTO items (id, name) VALUES ('01890f6c-7b80-7000-8000-000000000001', 'private value')"},
+                        {"include": true, "params": [], "sql": "SELECT json('[{\"table_name\":\"items\",\"headers\":[\"id\",\"name\"],\"rows\":[[\"01890f6c-7b80-7000-8000-000000000001\",\"private value\"]]}]') AS _affectedRows"}
+                    ],
+                    "resultSchema": {"kind":"object","fields":{}}
+                },
+                "delete": {
+                    "id": "delete", "operation": "delete", "primary_db": namespace,
+                    "input_schema": {}, "session_args": [], "optional_input_args": [], "json_input_args": [],
+                    "sql": [
+                        {"include": false, "params": [], "sql": "DELETE FROM items WHERE id = '01890f6c-7b80-7000-8000-000000000001'"},
+                        {"include": true, "params": [], "sql": "SELECT json('[{\"table_name\":\"items\",\"headers\":[\"id\",\"name\"],\"rows\":[[\"01890f6c-7b80-7000-8000-000000000001\",\"private value\"]]}]') AS _affectedRows"}
+                    ],
                     "resultSchema": {"kind":"object","fields":{}}
                 },
                 "fail": {
@@ -1138,15 +1179,11 @@ mod tests {
             accepted["commitRevision"].as_i64().unwrap()
         );
         let hint = receiver.try_recv().unwrap();
-        assert_eq!(
-            hint,
-            json!({
-                "type": "syncRequired",
-                "databaseId": state.database_id,
-                "databaseEpoch": accepted["databaseEpoch"],
-                "serverRevision": accepted["commitRevision"],
-            })
-        );
+        assert_eq!(hint["type"], "delta", "{hint}");
+        assert_eq!(hint["databaseId"], state.database_id);
+        assert_eq!(hint["databaseEpoch"], accepted["databaseEpoch"]);
+        assert_eq!(hint["serverRevision"], accepted["commitRevision"]);
+        assert_eq!(hint["data"][0]["table_name"], "items");
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -1170,6 +1207,55 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
             assert_eq!(response_json(response).await["code"], "InvalidRequest");
         }
+    }
+
+    #[tokio::test]
+    async fn batch_route_sends_legacy_deletion_deltas_instead_of_incremental_catchup_hints() {
+        let (_dir, state) = batch_state().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        state.connections.lock().await.insert(
+            "legacy".into(),
+            Connection {
+                fence: None,
+                session: HashMap::new(),
+                sender,
+            },
+        );
+        let mut body = batch_body(&state).await;
+        let created =
+            response_json(submit(state.clone(), body.clone(), origin_headers()).await).await;
+        assert_eq!(created["status"], "accepted");
+        let _ = receiver.try_recv().unwrap();
+
+        body["requestId"] = json!("delete-request");
+        body["sequence"] = json!(2);
+        body["operations"] = json!([{"operation": "delete", "input": {}}]);
+        let deleted = response_json(submit(state.clone(), body, origin_headers()).await).await;
+        assert_eq!(deleted["status"], "accepted");
+        let delta = receiver.try_recv().unwrap();
+        assert_eq!(delta["type"], "delta", "{delta}");
+        assert_eq!(delta["serverRevision"], deleted["commitRevision"]);
+        assert_eq!(delta["data"][0]["table_name"], "items");
+        assert_eq!(
+            delta["data"][0]["rows"][0][0],
+            "01890f6c-7b80-7000-8000-000000000001"
+        );
+        assert_eq!(
+            state
+                .db
+                .connect()
+                .unwrap()
+                .query("SELECT count(*) FROM items", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1405,16 +1491,11 @@ mod tests {
         assert!(hint.get("results").is_none());
         assert!(!hint.to_string().contains("private value"));
         let legacy_hint = legacy_receiver.try_recv().unwrap();
-        assert_eq!(
-            legacy_hint,
-            json!({
-                "type": "syncRequired",
-                "databaseId": state.database_id,
-                "databaseEpoch": accepted["databaseEpoch"],
-                "serverRevision": accepted["commitRevision"],
-            })
-        );
-        assert!(!legacy_hint.to_string().contains("private value"));
+        assert_eq!(legacy_hint["type"], "delta");
+        assert_eq!(legacy_hint["databaseId"], state.database_id);
+        assert_eq!(legacy_hint["databaseEpoch"], accepted["databaseEpoch"]);
+        assert_eq!(legacy_hint["serverRevision"], accepted["commitRevision"]);
+        assert_eq!(legacy_hint["data"][0]["rows"][0][1], "private value");
         let mut catchup = request.clone();
         catchup.target = accepted["commitRevision"].as_i64().unwrap();
         let snapshot =

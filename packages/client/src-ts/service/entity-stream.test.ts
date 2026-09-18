@@ -263,3 +263,15 @@ test('missing metadata and malformed groups are explicit errors', () => {
   service.subscribe({ tables: [{ tableName: 'posts' }] }, () => {});
   expect(() => service.handleTableDelta([{ table_name: 'posts', headers: ['id'], rows: [[]] }], 'live')).toThrow('Invalid entity row');
 });
+
+test('throwing initial visible callback does not leave a registration', () => {
+  const service = new EntityStreamService(schema);
+  let calls = 0;
+  expect(() => service.subscribeVisible({ tables: [{ tableName: 'posts' }] }, () => {
+    calls += 1;
+    throw new Error('observer failed');
+  })).toThrow('observer failed');
+
+  service.installVisible({ posts: [{ id: 1 }] })();
+  expect(calls).toBe(1);
+});

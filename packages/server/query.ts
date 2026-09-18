@@ -2,6 +2,7 @@ import { Client, InStatement, type Transaction } from "@libsql/client";
 import type { LinkInfo, SchemaMetadata, TableMetadata } from "@pyre/core";
 import { z, type ZodType } from "zod";
 import { buildArgs, executeStatements, formatResultData, TargetNotWritable, toSqlStatements, type GeneratedEdit, type JsonSessionValidators, type SqlInfo } from "./runtime/sql";
+import { assertSupportedIntegerMode, internalSafeInteger } from "./runtime/libsql";
 import { bindSchemaManifest } from "./schema";
 
 export type SessionValue =
@@ -306,6 +307,7 @@ export function runBatch(
                 const file = databases.rows.find(row => row.name === "main")?.file;
                 if (typeof file !== "string" || file.length === 0) throw new BatchError("UnsupportedRuntime");
             }
+            await assertSupportedIntegerMode(db);
             tx = await db.transaction("write");
             if (capturedSchemaManifest) {
                 try { bindSchemaManifest(db, capturedAuthority.namespace, capturedSchemaManifest); }
@@ -387,9 +389,8 @@ export async function nextLiveSyncRevision(db: Pick<Client, "execute">): Promise
     const result = await db.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
     const databaseEpoch = result.rows[0]?.database_epoch;
     const rawRevision = result.rows[0]?.server_revision;
-    const serverRevision = Number(rawRevision);
-    if (typeof databaseEpoch !== "string" || (typeof rawRevision !== "number" && typeof rawRevision !== "bigint")
-        || !Number.isSafeInteger(serverRevision) || serverRevision < 1)
+    const serverRevision = internalSafeInteger(rawRevision, "Pyre sync server revision");
+    if (typeof databaseEpoch !== "string" || serverRevision < 1)
         throw new Error("Failed to allocate Pyre sync server revision");
     return { databaseEpoch, serverRevision };
 }
@@ -577,6 +578,7 @@ export async function run(
             const databases = await db.execute("pragma database_list");
             if (!databases.rows.find(row => row.name === "main")?.file) throw new Error("Unsupported in-memory transaction");
         }
+        await assertSupportedIntegerMode(db);
         const tx = await db.transaction("write");
         let committing = false;
         try {

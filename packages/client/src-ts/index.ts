@@ -2442,7 +2442,11 @@ export class PyreClient {
         this.clients.delete(databaseId);
         this.editRuntimes.delete(databaseId);
         this.initializingEditSubmissions.delete(databaseId);
-        this.latestSyncStates.set(databaseId, createInitialSyncState(this.config.schema));
+        const previous = this.latestSyncStates.get(databaseId);
+        this.latestSyncStates.set(databaseId, {
+          status: 'not_started',
+          tables: Object.fromEntries(Object.keys(previous?.tables ?? {}).map((table) => [table, 'waiting'])),
+        });
         this.completedSyncDatabaseIds.delete(databaseId);
         if (this.syncingDatabaseId === databaseId) this.syncingDatabaseId = null;
         this.internalDevtoolsUnsubscribers.get(databaseId)?.();
@@ -2646,8 +2650,12 @@ export class PyreClient {
     }
 
     const tables: Record<string, TableSyncStatus> = {};
-    Object.keys(this.config.schema.tables).forEach((tableName) => {
-      const tableStates = activeStates.map((state) => state.tables[tableName] ?? 'waiting');
+    const activeTableNames = new Set(activeStates.flatMap((state) => Object.keys(state.tables)));
+    activeTableNames.forEach((tableName) => {
+      const tableStates = activeStates.flatMap((state) => {
+        const status = state.tables[tableName];
+        return status === undefined ? [] : [status];
+      });
       if (tableStates.every((status) => status === 'live')) {
         tables[tableName] = 'live';
       } else if (tableStates.some((status) => status === 'catching_up')) {

@@ -8,6 +8,7 @@ import { z } from "zod";
 import { run, runBatch, seed, type BatchManifest, type BatchRequest, type QueryMetadata } from "./query";
 import { toRunner } from "./runtime/runner";
 import { buildArgs, toSqlStatements } from "./runtime/sql";
+import { assertSupportedIntegerMode } from "./runtime/libsql";
 import { meta as compiledCreate } from "./fixtures/compiled-batch/generated/queries/metadata/entryCreate";
 import { sql as compiledCreateSql } from "./fixtures/compiled-batch/generated/queries/sql/entryCreate";
 import { CoercedDate, Role, SessionValidator as compiledSession } from "./fixtures/compiled-batch/generated/decode";
@@ -126,6 +127,25 @@ test("file-backed databases with memory journals still commit batches", async ()
     expect(await runBatch(db, editManifest(), batchAuthority, batchRequest([{ operation: "update", input: { id: 1, body: "committed" } }]), { userId: 7 }))
       .toMatchObject({ kind: "success", response: { status: "accepted", commitRevision: 1 } });
     expect((await db.execute("select body from notes where id = 1")).rows[0].body).toBe("committed");
+  } finally { db.close(); }
+});
+
+test("libsql string integer mode is rejected before batch execution", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pyre-string-integers-"));
+  batchDirectories.push(directory);
+  const db = createClient({ url: `file:${join(directory, "test.db")}`, intMode: "string" });
+  try {
+    await db.execute("create table notes(id integer primary key, body text unique not null, owner integer not null)");
+    await db.execute("insert into notes values (1,'first',7)");
+    await db.execute("create table _pyre_sync(id integer primary key, database_epoch text not null, server_revision integer not null)");
+    await db.execute("insert into _pyre_sync values (1,'e1',0)");
+    await expect(assertSupportedIntegerMode(db)).rejects.toThrow('intMode "string" is unsupported');
+
+    expect(await runBatch(db, editManifest(), batchAuthority,
+      batchRequest([{ operation: "update", input: { id: 1, body: "changed" } }]), { userId: 7 }))
+      .toEqual({ kind: "error", error: { errorType: "TransactionFailed", message: "TransactionFailed" } });
+    expect((await db.execute("select body from notes where id = 1")).rows[0].body).toBe("first");
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe("0");
   } finally { db.close(); }
 });
 

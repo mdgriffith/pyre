@@ -125,6 +125,43 @@ test('connect and sync selection create session-free internal clients', async ()
   client.disconnect();
 });
 
+test('local-edit sync aggregation includes only tables active in each namespace', async () => {
+  const namespacedSchema = {
+    tables: {
+      accounts: { name: 'accounts', primaryKey: { name: 'id', kind: 'uuid' }, links: {}, indices: [] },
+      posts: { name: 'posts', primaryKey: { name: 'id', kind: 'uuid' }, links: {}, indices: [] },
+    },
+    queryFieldToTable: {},
+    namespaces: {
+      Main: { tables: { accounts: { name: 'accounts', primaryKey: { name: 'id', kind: 'uuid' }, links: {}, indices: [] } }, queryFieldToTable: {} },
+      Campaign: { tables: { posts: { name: 'posts', primaryKey: { name: 'id', kind: 'uuid' }, links: {}, indices: [] } }, queryFieldToTable: {} },
+    },
+  };
+  const states: unknown[] = [];
+  const client = await PyreClient.create({
+    schema: namespacedSchema,
+    server: { ...server, localEdits: () => ({}) },
+    cacheNamespace: 'user_42',
+    createInternalClient: async (config) => {
+      const internal = fakeInternalClient([], config.databaseId);
+      return {
+        ...internal,
+        getLocalEdits: () => ({ ended: new Promise(() => {}), dispose() {} }),
+        onSyncState(callback) {
+          callback({ status: 'live', tables: { posts: 'live' } });
+          return () => {};
+        },
+      };
+    },
+  });
+  client.onSyncState((state) => states.push(state));
+  await client.setSyncedDatabases(['campaign:1']);
+  await Bun.sleep(0);
+
+  expect(states.at(-1)).toEqual({ status: 'live', tables: { posts: 'live' }, error: undefined });
+  client.disconnect();
+});
+
 test('Elm bridge rejects templates and resolved inputs without replacing an existing query', async () => {
   const incoming = fakePort();
   const engineResults = fakePort();

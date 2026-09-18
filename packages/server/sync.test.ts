@@ -249,12 +249,15 @@ test("queued batch revalidates schema evidence after acquiring its write transac
     }),
     commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}),
   };
-  const firstDb = { transaction: mock(async () => firstTx) };
+  const integerMode = { rows: [{ _pyre_integer_mode: 1 }] };
+  const firstDb = { execute: mock(async () => integerMode), transaction: mock(async () => firstTx) };
 
   let schema = { schema_source: "old", compiledContract: "replacement-old", manifestContract: "manifest-old" };
-  const secondExecute = mock(async (sql: string) => sql.includes("is_initialized")
-    ? { rows: [{ is_initialized: 1 }] }
-    : { rows: [{ result: JSON.stringify(schema) }] });
+  const secondExecute = mock(async (sql: string) => sql.includes("_pyre_integer_mode")
+    ? integerMode
+    : sql.includes("is_initialized")
+      ? { rows: [{ is_initialized: 1 }] }
+      : { rows: [{ result: JSON.stringify(schema) }] });
   const secondTx = { execute: mock(async () => { throw new Error("captured SQL must not execute"); }),
     commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}) };
   const secondDb = { execute: secondExecute, transaction: mock(async () => secondTx) };
