@@ -490,4 +490,42 @@ suite =
                     ( Just (Value.StringValue "base"), [], [ Ok "lifecycle", Ok "failure" ] )
                     ( field "name" after, List.map .requestId after.pending, List.map (D.decodeValue (D.field "type" D.string)) events )
             )
+        , test "server unknown and standard rejection codes are preserved"
+            (\_ ->
+                let
+                    run status code =
+                        let
+                            sent =
+                                initial [ row "base" "original" ]
+                                    |> submit "a" [ operation "update" [ ( "name", E.string "local" ) ] ]
+
+                            (_, events) =
+                                Edits.receive
+                                    (message "response"
+                                        [ ( "requestId", E.string "a" )
+                                        , ( "response", E.object (fence ++ [ ( "requestId", E.string "a" ), ( "status", E.string status ), ( "code", E.string code ) ]) )
+                                        ]
+                                    )
+                                    sent
+                        in
+                        events
+                            |> List.filter (\event -> D.decodeValue (D.field "type" D.string) event == Ok "lifecycle")
+                            |> List.head
+                            |> Maybe.map
+                                (\event ->
+                                    ( D.decodeValue (D.field "state" D.string) event
+                                    , D.decodeValue (D.field "code" D.string) event
+                                    )
+                                )
+                in
+                Expect.equal
+                    [ Just ( Ok "outcomeUnknown", Ok "OutcomeUnknown" )
+                    , Just ( Ok "rejected", Ok "InvalidSession" )
+                    , Just ( Ok "rejected", Ok "InvalidRequest" )
+                    ]
+                    [ run "outcomeUnknown" "OutcomeUnknown"
+                    , run "rejected" "InvalidSession"
+                    , run "rejected" "InvalidRequest"
+                    ]
+            )
         ]

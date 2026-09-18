@@ -461,7 +461,10 @@ pub async fn run_with_revision(
             "query is outside authorized database scope".into(),
         ));
     }
-    run_inner(conn, manifest, query_id, input, session, sync_mode, true).await
+    let session = session
+        .revalidate(&manifest.session_schema)
+        .map_err(|error| Error::InvalidSession(error.to_string()))?;
+    run_inner(conn, manifest, query_id, input, &session, sync_mode, true).await
 }
 
 pub async fn explain(

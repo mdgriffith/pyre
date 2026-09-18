@@ -58,9 +58,13 @@ function harness(options = {}) {
     replacement: (request, signal) => { const response = deferred(); reads.push({ request, signal, ...response }); return response.promise; },
     ...options,
   }, {
-    send: message => { ingress.push(message.message); manager.sendLocalEdits(message); },
+    send: message => {
+      if (options.sendFailure?.(message.message)) throw Error('host send failed');
+      ingress.push(message.message); manager.sendLocalEdits(message);
+    },
     install: (publication, changes) => {
       const notifyQueries = queries.installPublication(changes);
+      if (options.installFailure?.(publication)) throw Error('host install failed');
       const notifyEntities = entities.installVisible(publication.tables, fence.databaseId);
       publications.push(publication);
       return () => { notifyQueries(); notifyEntities(); };
@@ -561,6 +565,106 @@ test('epoch mismatch ends the old lifetime instead of adopting foreign revision'
   h.runtime.receiveResponse(receipt.requestId, { ...fence, databaseEpoch: 'e2', requestId: receipt.requestId, status: 'rejected', code: 'PermissionDenied' });
   expect((await receipt.confirmed).kind).toBe('outcomeUnknown'); await tick(); expect(h.rows()).toEqual([]);
   expect(h.runtime.fence.databaseEpoch).toBe('e1');
+});
+
+test('epoch reset and disposal detach when the host send boundary throws', async () => {
+  let failedType;
+  const reset = await ready({ sendFailure: message => message.type === failedType });
+  failedType = 'reset';
+  reset.runtime.receiveHint({ ...fence, databaseEpoch: 'e2', type: 'syncRequired' });
+  await reset.runtime.ended;
+
+  failedType = undefined;
+  const disposed = await ready({ sendFailure: message => message.type === failedType });
+  failedType = 'dispose';
+  await disposed.runtime.dispose();
+  expect(disposed.ingress.some(message => message.type === 'dispose')).toBe(false);
+});
+
+test('failed disposal send settles queued, dispatched, and accepted receipts before detaching', async () => {
+  let failDispose = false;
+  const queued = await ready({ sendFailure: message => failDispose && message.type === 'dispose' });
+  queued.runtime.setConnected(false);
+  const rejected = queued.runtime.submitNamed(command.id, {});
+  failDispose = true;
+  await queued.runtime.dispose();
+  expect(await rejected.confirmed).toEqual({ kind: 'rejected', code: 'Fenced' });
+
+  failDispose = false;
+  const sent = await ready({ sendFailure: message => failDispose && message.type === 'dispose' });
+  const uncertain = sent.runtime.submitNamed(command.id, {});
+  await until(() => sent.writes.length === 1);
+  failDispose = true;
+  await sent.runtime.dispose();
+  expect(await uncertain.confirmed).toEqual({ kind: 'outcomeUnknown', code: 'Fenced' });
+
+  failDispose = false;
+  const accepted = await ready({ sendFailure: message => failDispose && message.type === 'dispose' });
+  const unreconciled = accepted.runtime.submitNamed(command.id, {});
+  await until(() => accepted.writes.length === 1);
+  accepted.accepted();
+  await until(() => accepted.reads.length === 2);
+  failDispose = true;
+  await accepted.runtime.dispose();
+  expect(await unreconciled.confirmed).toEqual({ kind: 'acceptedUnreconciled', result: 'named-result', commitRevision: 1 });
+});
+
+test('install failure preserves lifecycle effects, invalidates partial readers, and catches up without retrying writes', async () => {
+  let failInstall = false;
+  const h = await ready({ installFailure: () => {
+    if (!failInstall) return false;
+    failInstall = false;
+    return true;
+  } });
+  const first = h.runtime.submit(edit(update, { key, name: 'first' }));
+  const second = h.runtime.submitNamed(command.id, { order: 2 });
+  await until(() => h.writes.length === 1);
+  failInstall = true;
+  h.rejected();
+  expect(await first.confirmed).toEqual({ kind: 'rejected', code: 'TargetNotWritable' });
+  await until(() => h.reads.length === 2);
+  expect(h.failures).toContainEqual(expect.objectContaining({ phase: 'reconciliation', code: 'InstallationFailed' }));
+  expect(h.publications.at(-1)).toMatchObject({ invalid: true, tables: {} });
+  expect(h.entities.getVisibleTables()).toEqual({});
+  expect(h.writes).toHaveLength(1);
+  await h.replace([row], 0);
+  await until(() => h.writes.length === 2);
+  h.rejected(1);
+  expect((await second.confirmed).kind).toBe('rejected');
+});
+
+test('replacement installation failure cannot falsely confirm an accepted edit', async () => {
+  let failInstall = false;
+  const h = await ready({ installFailure: () => {
+    if (!failInstall) return false;
+    failInstall = false;
+    return true;
+  } });
+  const receipt = h.runtime.submitNamed(command.id, {});
+  await until(() => h.writes.length === 1);
+  h.accepted();
+  await until(() => h.reads.length === 2);
+  failInstall = true;
+  await h.replace([{ ...row, note: 'changed' }], 1);
+  expect(await receipt.confirmed).toEqual({ kind: 'acceptedUnreconciled', result: 'named-result', commitRevision: 1 });
+  expect(h.lifecycle.some(event => event.requestId === receipt.requestId && event.state === 'confirmed')).toBe(false);
+  expect(h.failures.filter(event => event.code === 'InstallationFailed')).toHaveLength(1);
+  await until(() => h.reads.length === 3);
+});
+
+test.each([
+  ['outcomeUnknown', { status: 'outcomeUnknown', code: 'OutcomeUnknown' }, 'outcomeUnknown', 'OutcomeUnknown'],
+  ['InvalidSession', { status: 'rejected', code: 'InvalidSession' }, 'rejected', 'InvalidSession'],
+  ['InvalidRequest', { status: 'rejected', code: 'InvalidRequest' }, 'rejected', 'InvalidRequest'],
+])('Elm response protocol preserves %s', async (_name, response, kind, code) => {
+  const h = await ready(), receipt = h.runtime.submitNamed(command.id, {});
+  await until(() => h.writes.length === 1);
+  h.writes[0].resolve({ ...fence, requestId: receipt.requestId, ...response });
+  expect(await receipt.confirmed).toEqual({ kind, code });
+  if (kind === 'outcomeUnknown') {
+    expect(h.failures).toContainEqual(expect.objectContaining({ phase: 'server', code }));
+    expect(h.publications.at(-1)).toMatchObject({ invalid: true, tables: {} });
+  }
 });
 
 test('epoch mismatch automatically recreates an enrolled lifetime and resumes sequential sync', async () => {

@@ -1873,6 +1873,7 @@ fn generate_local_edits(
         };
         if context.namespace_sync_modes.get(&query_info.primary_db)
             == Some(&ast::SyncMode::QueryOnly)
+            || !query_info.attached_dbs.is_empty()
         {
             continue;
         }
@@ -1935,9 +1936,13 @@ fn generate_local_edits(
             "update" => {
                 exposed.push("Patch".into());
                 body.push_str("type Patch\n    = Patch String Encode.Value\n\n\n");
+                let mut setters = HashSet::new();
                 for arg in query.args.iter().filter(|arg| writable.contains(&arg.name)) {
                     let (type_, encoder) = local_edit_arg(context, &lookup, table, arg, names);
-                    let setter = format!("set{}", elm_module_segment(&arg.name));
+                    let setter = unique_elm_name(
+                        format!("set{}", elm_module_segment(&arg.name)),
+                        &mut setters,
+                    );
                     exposed.push(setter.clone());
                     body.push_str(&format!("{} : {} -> Patch\n{} value =\n    Patch \"{}\" ({} value)\n\n\n", setter, type_, setter, arg.name, encoder));
                 }
@@ -1957,13 +1962,17 @@ fn generate_local_edits(
                     format!("{} : {}", arg.name, type_)
                 }).collect();
                 body.push_str(&format!("type alias Create =\n    {{ {} }}\n\n\ntype CreateOption\n    = CreateOption String Encode.Value\n\n\n", fields.join(", ")));
+                let mut setters = HashSet::new();
                 for arg in query
                     .args
                     .iter()
                     .filter(|arg| arg.omittable && Some(arg.name.as_str()) != generated_id)
                 {
                     let (type_, encoder) = local_edit_arg(context, &lookup, table, arg, names);
-                    let setter = format!("with{}", elm_module_segment(&arg.name));
+                    let setter = unique_elm_name(
+                        format!("with{}", elm_module_segment(&arg.name)),
+                        &mut setters,
+                    );
                     exposed.push(setter.clone());
                     body.push_str(&format!("{} : {} -> CreateOption\n{} value =\n    CreateOption \"{}\" ({} value)\n\n\n", setter, type_, setter, arg.name, encoder));
                 }

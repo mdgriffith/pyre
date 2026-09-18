@@ -531,6 +531,25 @@ async fn run_batch(
                         let _ = connection.sender.send(hint.message);
                     }
                 }
+                if result.response["status"] == "accepted" {
+                    if let (Some(revision), Some(database_epoch)) = (
+                        result.response["commitRevision"].as_i64(),
+                        result.response["databaseEpoch"].as_str(),
+                    ) {
+                        let hint = json!({
+                            "type": "syncRequired",
+                            "databaseId": state.database_id,
+                            "databaseEpoch": database_epoch,
+                            "serverRevision": revision,
+                        });
+                        for connection in connections
+                            .values()
+                            .filter(|connection| connection.fence.is_none())
+                        {
+                            let _ = connection.sender.send(hint.clone());
+                        }
+                    }
+                }
             }
             Json(result.response).into_response()
         }
@@ -1118,6 +1137,16 @@ mod tests {
             rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
             accepted["commitRevision"].as_i64().unwrap()
         );
+        let hint = receiver.try_recv().unwrap();
+        assert_eq!(
+            hint,
+            json!({
+                "type": "syncRequired",
+                "databaseId": state.database_id,
+                "databaseEpoch": accepted["databaseEpoch"],
+                "serverRevision": accepted["commitRevision"],
+            })
+        );
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -1319,7 +1348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_route_and_publication_use_recipient_fences() {
+    async fn batch_publication_notifies_legacy_and_fenced_recipients_without_private_data() {
         let (_dir, state) = batch_state().await;
         let body = batch_body(&state).await;
         let request = pyre::server::sync::ReplacementRequest {
@@ -1355,6 +1384,15 @@ mod tests {
                 sender,
             },
         );
+        let (legacy_sender, mut legacy_receiver) = mpsc::unbounded_channel();
+        state.connections.lock().await.insert(
+            "legacy".into(),
+            Connection {
+                fence: None,
+                session: HashMap::new(),
+                sender: legacy_sender,
+            },
+        );
         let accepted = response_json(submit(state.clone(), body, origin_headers()).await).await;
         let hint = receiver.try_recv().unwrap();
         assert_eq!(hint["instance"], "recipient");
@@ -1365,6 +1403,18 @@ mod tests {
             json!({"kind":"replaceRequired", "atLeast":accepted["commitRevision"], "invalidate":true, "minimumSafeRevision":accepted["commitRevision"]})
         );
         assert!(hint.get("results").is_none());
+        assert!(!hint.to_string().contains("private value"));
+        let legacy_hint = legacy_receiver.try_recv().unwrap();
+        assert_eq!(
+            legacy_hint,
+            json!({
+                "type": "syncRequired",
+                "databaseId": state.database_id,
+                "databaseEpoch": accepted["databaseEpoch"],
+                "serverRevision": accepted["commitRevision"],
+            })
+        );
+        assert!(!legacy_hint.to_string().contains("private value"));
         let mut catchup = request.clone();
         catchup.target = accepted["commitRevision"].as_i64().unwrap();
         let snapshot =

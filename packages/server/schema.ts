@@ -43,9 +43,11 @@ export async function ensureDatabase(
     schemaName: string,
     schemaSource: string,
 ): Promise<EnsureDatabaseOutcome> {
+    const tx = await db.transaction("write");
+    // An existing writer is ordered before this migration and may keep using the
+    // evidence it acquired. Invalidate as soon as this migration owns the writer.
     const knownKeys = [...(databaseKeysByClient.get(db) ?? [])];
     const refresh = beginSchemaRefresh(db, undefined, true);
-    const tx = await db.transaction("write");
     let outcome: EnsureDatabaseOutcome;
     let currentIntrospection: unknown;
     try {

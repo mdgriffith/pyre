@@ -106,7 +106,7 @@ fn collision_safe_namespace_and_edit_id_names_compile() {
         .unwrap();
     parser::run(
         "Foo/collisions.pyre",
-        "record FooBar {\n @public\n id Id.Uuid @id\n}\nrecord Foo_Bar {\n @public\n id Id.Uuid @id\n}\nrecord A {\n @public\n id Id.Uuid @id\n}\nrecord AIdentity {\n @public\n id Id.Uuid @id\n}\n",
+        "record FooBar {\n @public\n id Id.Uuid @id\n fooBar String @default(\"camel\")\n foo_bar String @default(\"snake\")\n}\nrecord Foo_Bar {\n @public\n id Id.Uuid @id\n}\nrecord A {\n @public\n id Id.Uuid @id\n}\nrecord AIdentity {\n @public\n id Id.Uuid @id\n}\n",
         foo,
     )
     .unwrap();
@@ -147,6 +147,15 @@ fn collision_safe_namespace_and_edit_id_names_compile() {
     assert!(files
         .iter()
         .any(|file| file.path.ends_with("Db/Foo/Edit/FooBarNamespace.elm")));
+    let foo_bar = generated("Db/Foo/Edit/FooBar.elm");
+    assert!(foo_bar.contains("setFooBar : (String) -> Patch"));
+    assert!(foo_bar.contains("setFooBarNamespace : (String) -> Patch"));
+    assert!(foo_bar.contains("withFooBar : (String) -> CreateOption"));
+    assert!(foo_bar.contains("withFooBarNamespace : (String) -> CreateOption"));
+    assert!(foo_bar.contains("Patch \"fooBar\""));
+    assert!(foo_bar.contains("Patch \"foo_bar\""));
+    assert!(foo_bar.contains("CreateOption \"fooBar\""));
+    assert!(foo_bar.contains("CreateOption \"foo_bar\""));
 
     for file in files {
         let path = temp.path().join(file.path);
@@ -196,6 +205,8 @@ all =
     , barBaz = BarBaz.delete fooId
     , baz = Baz.delete fooBarId
     , fooBar = FooBar.delete (Db.Id.uuid "00000000-0000-4000-8000-000000000007")
+    , setters = FooBar.update (Db.Id.uuid "00000000-0000-4000-8000-000000000007") [ FooBar.setFooBar "camel", FooBar.setFooBarNamespace "snake" ]
+    , options = [ FooBar.withFooBar "camel", FooBar.withFooBarNamespace "snake" ]
     , fooBarUnderscore = FooBarUnderscore.delete (Db.Id.uuid "00000000-0000-4000-8000-000000000008")
     , a = aId
     , aIdentity = aIdentityId
@@ -348,6 +359,52 @@ fn generated_local_edits_compile_and_run() {
         let output = Command::new("npx").args(["--yes", "--package", "elm@0.19.1-6", "elm", "make", "src/Bad.elm", "--output=/dev/null"]).current_dir(temp.path()).output().unwrap();
         assert!(!output.status.success(), "unexpected compile success: {expression}");
     }
+}
+
+#[test]
+fn commands_with_attached_databases_are_not_elm_local_edits() {
+    let mut app = ast::Schema {
+        namespace: "App".into(),
+        ..ast::Schema::default()
+    };
+    parser::run(
+        "App/schema.pyre",
+        "record Post {\n @public\n id Id.Uuid @id\n title String\n userId Auth.User.id\n user @link(userId, Auth.User.id)\n}\n",
+        &mut app,
+    )
+    .unwrap();
+    let mut auth = ast::Schema {
+        namespace: "Auth".into(),
+        ..ast::Schema::default()
+    };
+    parser::run(
+        "Auth/schema.pyre",
+        "record User {\n @public\n id Id.Uuid @id\n email String\n}\n",
+        &mut auth,
+    )
+    .unwrap();
+    let mut database = ast::Database {
+        schemas: vec![app, auth],
+    };
+    ast::resolve_id_brands(&mut database);
+    let context = typecheck::check_schema(&database).unwrap();
+    let queries = parser::parse_query(
+        "queries.pyre",
+        "update RenamePost($id: Post.id, $title: String) { post { @where { id == $id } title = $title } user { email } }",
+    )
+    .unwrap();
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    assert!(info["RenamePost"].attached_dbs.contains("Auth"));
+
+    let mut files = Vec::new();
+    elm::generate_queries(&context, &info, &queries, Path::new("src"), &mut files);
+
+    assert!(files
+        .iter()
+        .any(|file| file.path.ends_with("Query/RenamePost.elm")));
+    assert!(!files
+        .iter()
+        .any(|file| file.path.ends_with("Db/App/Edit/Command/RenamePost.elm")));
 }
 
 #[path = "helpers/local_edit_conformance.rs"]

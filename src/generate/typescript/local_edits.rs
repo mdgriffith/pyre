@@ -22,8 +22,9 @@ pub fn generate(
         if let ast::QueryDef::Query(q) = def {
             if q.operation != ast::QueryOperation::Query {
                 if let Some(i) = info.get(&q.name) {
-                    if context.namespace_sync_modes.get(&i.primary_db)
-                        != Some(&ast::SyncMode::QueryOnly)
+                    if i.attached_dbs.is_empty()
+                        && context.namespace_sync_modes.get(&i.primary_db)
+                            != Some(&ast::SyncMode::QueryOnly)
                     {
                         groups.entry(i.primary_db.clone()).or_default().push(q);
                     }
@@ -607,6 +608,63 @@ Url.Records.UrlThing.delete(null as unknown as Url.UrlThingId);
             .find(|file| file.path.ends_with("edits.ts"))
             .unwrap();
         assert_eq!(index.contents, "export * from './edits/Synced';\n");
+    }
+
+    #[test]
+    fn commands_with_attached_databases_are_not_local_edits() {
+        let mut app = ast::Schema {
+            namespace: "App".into(),
+            ..ast::Schema::default()
+        };
+        crate::parser::run(
+            "App/schema.pyre",
+            "record Post {\n @public\n id Id.Uuid @id\n title String\n userId Auth.User.id\n user @link(userId, Auth.User.id)\n}\n",
+            &mut app,
+        )
+        .unwrap();
+        let mut auth = ast::Schema {
+            namespace: "Auth".into(),
+            ..ast::Schema::default()
+        };
+        crate::parser::run(
+            "Auth/schema.pyre",
+            "record User {\n @public\n id Id.Uuid @id\n email String\n}\n",
+            &mut auth,
+        )
+        .unwrap();
+        let mut database = ast::Database {
+            schemas: vec![app, auth],
+        };
+        ast::resolve_id_brands(&mut database);
+        let context = typecheck::check_schema(&database).unwrap();
+        let mut queries = crate::parser::parse_query(
+            "queries.pyre",
+            "update RenamePost($id: Post.id, $title: String) { post { @where { id == $id } title = $title } user { email } }",
+        )
+        .unwrap();
+        crate::generated_queries::append_generated_crud_queries(&mut queries, &context);
+        let info = typecheck::check_queries(&queries, &context).unwrap();
+        assert_eq!(info["RenamePost"].primary_db, "App");
+        assert!(info["RenamePost"].attached_dbs.contains("Auth"));
+
+        let mut files = Vec::new();
+        super::super::core::generate_queries(
+            &context,
+            &info,
+            &queries,
+            Path::new("generated/core"),
+            &mut files,
+        );
+
+        assert!(files
+            .iter()
+            .any(|file| file.path.ends_with("core/queries/metadata/renamePost.ts")));
+        let edits = files
+            .iter()
+            .find(|file| file.path.ends_with("edits/App.ts"))
+            .unwrap();
+        assert!(!edits.contents.contains("metadata/renamePost"));
+        assert!(!edits.contents.contains("renamePost:"));
     }
 
     #[test]

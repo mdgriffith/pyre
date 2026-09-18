@@ -14,6 +14,8 @@ const compiled = readFileSync(`${temp}/main.js`, "utf8");
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
 
 function worker(primaryKey = { name: "id", kind: "int" }, autoPrepare = true) {
+    const primaryCodec = primaryKey.kind === "uuid" ? { kind: "uuid" } : { kind: "safeInt" };
+    const primaryType = primaryKey.kind === "uuid" ? "Id.Uuid<Users>" : "Int";
     const requests = [];
     class XMLHttpRequest {
         listeners = {};
@@ -36,7 +38,17 @@ function worker(primaryKey = { name: "id", kind: "int" }, autoPrepare = true) {
     vm.runInContext(compiled, context);
     const app = context.Elm.Main.init({ flags: {
         schema: {
-            tables: { users: { name: "users", links: {}, indices: [{ field: "name", unique: false, primary: false }], primaryKey } },
+            tables: { users: {
+                name: "users",
+                columns: [
+                    { name: primaryKey.name, type: primaryType, nullable: false, codec: primaryCodec },
+                    { name: "name", type: "String", nullable: false, codec: { kind: "string" } },
+                    { name: "note", type: "Json?", nullable: true, codec: { kind: "nullable", value: { kind: "json" } } },
+                ],
+                links: {},
+                indices: [{ field: "name", unique: false, primary: false }],
+                primaryKey,
+            } },
             queryFieldToTable: { users: "users" },
         },
         server: { baseUrl: "http://test", catchupPath: "/catchup" },
@@ -173,7 +185,7 @@ test("a fresh authenticated lifetime can recover revision-free security uncertai
     await w.send(wire("syncRequired"));
     assert.deepEqual(rows(w), []);
     await w.send(wire("configure", { instance: "fresh", minimumSafeRevision: 4 }));
-    await w.send(snapshot(w, 4, [{ id: 1, name: "safe" }], { instance: "fresh" }));
+    await w.send(snapshot(w, 4, [{ id: 1, name: "safe", note: null }], { instance: "fresh" }));
     assert.equal(rows(w)[0].name, "safe");
 });
 
@@ -239,12 +251,12 @@ test("actual unknown blocks dispatch across replacement and resolves only on def
 test("new hints do not move an in-flight replacement target; security minima do", async () => {
     const w = await configured();
     await w.send(wire("syncRequired", { reconciliation: hint(10) }));
-    const intermediate = snapshot(w, 10, [{ id: 1, name: "ten" }]);
+    const intermediate = snapshot(w, 10, [{ id: 1, name: "ten", note: null }]);
     await w.send(wire("syncRequired", { reconciliation: hint(12) }));
     await w.send(intermediate);
     assert.equal(rows(w)[0].name, "ten");
     assert.equal(last(editEvents(w, "catchup")).target, 12);
-    const twelve = snapshot(w, 12, [{ id: 1, name: "twelve" }]);
+    const twelve = snapshot(w, 12, [{ id: 1, name: "twelve", note: null }]);
     await w.send(wire("syncRequired", { reconciliation: hint(15, { invalidate: true, minimumSafeRevision: 15 }) }));
     assert.deepEqual(rows(w), [], "permission uncertainty clears the entire visible scope immediately");
     await w.send(twelve);
@@ -257,7 +269,7 @@ test("new hints do not move an in-flight replacement target; security minima do"
 test("unknown security barrier cannot be cleared by a complete snapshot or ordinary hint", async () => {
     const w = await configured();
     await w.send(wire("syncRequired", { reconciliation: hint(12, { invalidate: true, minimumSafeRevision: 12 }) }));
-    const outstanding = snapshot(w, 20, [{ id: 1, name: "unsafe" }]);
+    const outstanding = snapshot(w, 20, [{ id: 1, name: "unsafe", note: null }]);
     await w.send(wire("syncRequired", { reconciliation: { kind: "replaceRequired", atLeast: 20 } }));
     await w.send(outstanding);
     assert.deepEqual(rows(w), []);
@@ -265,7 +277,7 @@ test("unknown security barrier cannot be cleared by a complete snapshot or ordin
     await w.send(outstanding);
     assert.deepEqual(rows(w), []);
     await w.send(wire("syncRequired", { reconciliation: hint(20, { invalidate: true, minimumSafeRevision: 20 }) }));
-    await w.send(snapshot(w, 21, [{ id: 1, name: "unsafe" }]));
+    await w.send(snapshot(w, 21, [{ id: 1, name: "unsafe", note: null }]));
     assert.equal(rows(w)[0].name, "unsafe", "authenticated barrier now permits revision 20");
     assert.equal(last(editEvents(w, "catchup")).target, 21);
 });
@@ -387,7 +399,7 @@ test("catchup failures retain acceptance and report once across read-only retrie
     assert.equal(editEvents(w, "reconciliationFailure").length, 1);
     assert.equal(editEvents(w, "failure").length, 1);
     await w.send(wire("retryCatchup"));
-    await w.send(snapshot(w, 1, [{ id: 1, name: "server" }]));
+    await w.send(snapshot(w, 1, [{ id: 1, name: "server", note: null }]));
     assert.equal(last(lifecycle(w, "a")), "confirmed");
 });
 
@@ -406,7 +418,7 @@ test("acceptance after catchup failure reports accepted unreconciled certainty",
     );
 
     await w.send(wire("retryCatchup"));
-    await w.send(snapshot(w, 1, [{ id: 1, name: "server" }]));
+    await w.send(snapshot(w, 1, [{ id: 1, name: "server", note: null }]));
     assert.equal(last(lifecycle(w, "a")), "confirmed");
 });
 
@@ -416,7 +428,7 @@ test("fencing ends queued/sent/accepted work with distinct certainty and ignores
     await w.send(accepted("accepted", 3));
     await w.send(submit("sent", [op(1, { name: "second" })]));
     await w.send(submit("queued", [op(1, { note: "third" })]));
-    const old = snapshot(w, 3, [{ id: 1, name: "old" }]);
+    const old = snapshot(w, 3, [{ id: 1, name: "old", note: null }]);
     await w.send(wire("configure", { instance: "worker-2", authGeneration: 1, minimumSafeRevision: 0 }));
     assert.deepEqual(rows(w), []);
     assert.equal(last(lifecycle(w, "accepted")), "acceptedUnreconciled");
@@ -460,12 +472,8 @@ test("fenced publication combines query and entity state before dispatch in one 
     assert.deepEqual(last(w.events.queries).result.users, [], "replayed base rebuilds the index as well as rows");
 });
 
-test("updates never manufacture missing materialized fields, and JSON/null are whole-value setters", async () => {
-    const w = await configured([{ id: 1, name: "base" }]);
-    await w.send(submit("missing", [op(1, { note: "not-materialized" })]));
-    assert.equal(lifecycle(w, "missing")[0], "queued");
-    assert.deepEqual(rows(w), [{ id: 1, name: "base" }]);
-    await w.send(rejected("missing"));
+test("JSON and null are whole-value setters", async () => {
+    const w = await configured([{ id: 1, name: "base", note: null }]);
     await w.send(wire("syncRequired", { reconciliation: hint(1) }));
     await w.send(snapshot(w, 1, [{ id: 1, name: "base", note: { a: 1, b: 2 } }]));
     await w.send(submit("json", [op(1, { note: { a: 3 } })]));
@@ -505,7 +513,7 @@ test("worker ingress captures transport input and accepted results by value", as
     const result = accepted("a", 1);
     await w.send(result);
     result.response.results[0].value.id = 99;
-    await w.send(snapshot(w, 1, [{ id: 1, name: "server" }]));
+    await w.send(snapshot(w, 1, [{ id: 1, name: "server", note: null }]));
     const confirmation = last(editEvents(w, "lifecycle").filter((event) => event.state === "confirmed"));
     assert.equal(confirmation.results[0].value.id, 1);
 });

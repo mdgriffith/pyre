@@ -10,6 +10,7 @@ use pyre::server::sync::{
 use pyre::{ast, parser, typecheck};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -184,6 +185,38 @@ async fn revisioned_named_queries_stay_within_bound_namespace(
             .await
             .unwrap_err();
     assert!(matches!(error, query::Error::InvalidInput(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn revisioned_named_queries_revalidate_sessions_against_the_bound_manifest(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        "@syncable(false)\nsession {\n userId Int\n}\nrecord Item {\n id Int @id\n ownerId Int\n @allow(*) { ownerId == Session.userId }\n}\n",
+    )
+    .await?;
+    let manifest = manifest_for(&db.context, "query Items { item { id } }", false)?;
+    let weak_schema = HashMap::from([(
+        "userId".to_string(),
+        serde_json::from_value(json!({
+            "type": "String", "nullable": false, "omittable": false
+        }))?,
+    )]);
+    let session = PyreSession::new(json!({ "userId": "7" }), &weak_schema)?;
+    let conn = db.db.connect()?;
+
+    let error = query::run_with_revision(
+        &conn,
+        &bind(&manifest, &db.context),
+        &only_query(&manifest).id,
+        json!({}),
+        &session,
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, query::Error::InvalidSession(_)));
     Ok(())
 }
 

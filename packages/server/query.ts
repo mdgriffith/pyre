@@ -212,11 +212,18 @@ export function runBatch(
     captureDatabaseEpoch = false,
 ): Promise<BatchResult> {
     let prepared: { operation: string; query: QueryMetadata; statements: ReturnType<typeof toSqlStatements> }[];
+    let capturedSchemaManifest: Pick<BatchManifest, "compiledContract" | "replacementContracts"> | undefined;
     let capturedAuthority: BatchAuthority;
     let captured: BatchRequest;
     try {
         if (manifest.compiledContract !== undefined || manifest.replacementContracts !== undefined) {
-            bindSchemaManifest(db, authority.namespace, manifest);
+            capturedSchemaManifest = {
+                compiledContract: manifest.compiledContract,
+                replacementContracts: manifest.replacementContracts === undefined
+                    ? undefined
+                    : { ...manifest.replacementContracts },
+            };
+            bindSchemaManifest(db, authority.namespace, capturedSchemaManifest);
         }
         // Capture and validate synchronously, before queue/transaction acquisition or any I/O.
         capturedAuthority = structuredClone(authority);
@@ -300,6 +307,10 @@ export function runBatch(
                 if (typeof file !== "string" || file.length === 0) throw new BatchError("UnsupportedRuntime");
             }
             tx = await db.transaction("write");
+            if (capturedSchemaManifest) {
+                try { bindSchemaManifest(db, capturedAuthority.namespace, capturedSchemaManifest); }
+                catch { throw new BatchError("InvalidInput"); }
+            }
             const databases = await tx.execute("pragma database_list");
             if (databases.rows.some(row => row.name !== "main" && row.name !== "temp")) throw new BatchError("InvalidInput");
             const epoch = await tx.execute("select database_epoch from _pyre_sync where id = 1");

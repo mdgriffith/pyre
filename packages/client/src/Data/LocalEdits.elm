@@ -23,6 +23,7 @@ revisions and targets are nonnegative safe integers. Message variants:
   - syncRequired: reconciliation: { kind: "replaceRequired", atLeast,
     invalidate?, minimumSafeRevision? }
   - catchupFailed: requestId; retryCatchup: no additional fields
+  - installationFailed: invalidates reader state and starts a read-only catchup
   - connection: connected; dispose/reset: no additional fields
 
 Prediction is trusted manifest-derived bridge metadata, NOT public application
@@ -130,12 +131,13 @@ type alias Model =
     , catchupSequence : Int
     , catchupFailed : Bool
     , catchupErrorReported : Bool
+    , reconciliationErrorCode : Maybe String
     }
 
 
 init : Schema.SchemaMetadata -> Model
 init schema =
-    { authoritative = Db.init schema, fence = Nothing, retiredFences = Set.empty, pending = [], seen = Set.empty, sequence = 0, dispatchSequence = 0, coveredRevision = -1, requiredRevision = 0, minimumSafeRevision = Nothing, securityFloor = 0, securityBarrierRequired = False, invalid = True, connected = True, catchup = Nothing, catchupSequence = 0, catchupFailed = False, catchupErrorReported = False }
+    { authoritative = Db.init schema, fence = Nothing, retiredFences = Set.empty, pending = [], seen = Set.empty, sequence = 0, dispatchSequence = 0, coveredRevision = -1, requiredRevision = 0, minimumSafeRevision = Nothing, securityFloor = 0, securityBarrierRequired = False, invalid = True, connected = True, catchup = Nothing, catchupSequence = 0, catchupFailed = False, catchupErrorReported = False, reconciliationErrorCode = Nothing }
 
 
 visible : Model -> Db.Db
@@ -442,7 +444,7 @@ transition kind value model =
                                                                     ( next
                                                                     , lifecycle next requestId "accepted" [ ( "commitRevision", E.int revision ), ( "results", resultValue ) ]
                                                                         :: (if model.catchupErrorReported then
-                                                                                [ failure next requestId "reconciliation" "CatchupFailed" "acceptedUnreconciled" ]
+                                                                        [ failure next requestId "reconciliation" (Maybe.withDefault "CatchupFailed" model.reconciliationErrorCode) "acceptedUnreconciled" ]
 
                                                                             else
                                                                                 []
@@ -464,7 +466,7 @@ transition kind value model =
                                                         ( _, Ok code ) ->
                                                             let
                                                                 safeCode =
-                                                                    if List.member code [ "InvalidEdit", "TargetNotWritable", "InvalidBatch", "InvalidOperation", "ManifestMismatch", "NamespaceMismatch", "NotAuthenticated", "PermissionDenied", "TransactionFailed" ] then
+                                                                    if List.member code [ "InvalidEdit", "InvalidRequest", "InvalidSession", "TargetNotWritable", "InvalidBatch", "InvalidOperation", "ManifestMismatch", "NamespaceMismatch", "NotAuthenticated", "PermissionDenied", "TransactionFailed" ] then
                                                                         code
 
                                                                     else
@@ -489,6 +491,22 @@ transition kind value model =
                                                             )
 
                                                         _ ->
+                                                            unknown pending "MalformedResponse" model
+
+                                            Ok "outcomeUnknown" ->
+                                                if List.any (\name -> D.decodeValue (D.field name D.value) response |> Result.toMaybe |> (/=) Nothing) [ "commitRevision", "results", "reconciliation", "operationIndex" ] then
+                                                    unknown pending "MalformedResponse" (invalidateUnknown response model)
+
+                                                else
+                                                    case D.decodeValue (D.field "code" D.string) response of
+                                                        Ok code ->
+                                                            if code == "OutcomeUnknown" then
+                                                                unknownWithPhase "server" pending code (invalidateUnknown response model)
+
+                                                            else
+                                                                unknown pending "MalformedResponse" model
+
+                                                        Err _ ->
                                                             unknown pending "MalformedResponse" model
 
                                             _ ->
@@ -554,6 +572,7 @@ transition kind value model =
                                                 , catchup = Nothing
                                                 , catchupFailed = False
                                                 , catchupErrorReported = False
+                                                , reconciliationErrorCode = Nothing
                                                 , pending = List.map (\p -> { p | quarantined = p.quarantined || p.state == Sent || p.state == Unknown }) model.pending
                                             }
                                     in
@@ -584,6 +603,20 @@ transition kind value model =
 
             "retryCatchup" ->
                 ( { model | catchupFailed = False }, [] )
+
+            "installationFailed" ->
+                let
+                    next =
+                        { model
+                            | invalid = True
+                            , requiredRevision = max model.requiredRevision model.coveredRevision
+                            , catchup = Nothing
+                            , catchupFailed = False
+                            , catchupErrorReported = True
+                            , reconciliationErrorCode = Just "InstallationFailed"
+                        }
+                in
+                ( next, [] )
 
             "connection" ->
                 case D.decodeValue (D.field "connected" D.bool) value of
@@ -660,6 +693,11 @@ validResult schema ( index, operation, value ) ( expectedIndex, expected ) =
 
 unknown : Pending -> String -> Model -> ( Model, List E.Value )
 unknown pending code model =
+    unknownWithPhase "transport" pending code model
+
+
+unknownWithPhase : String -> Pending -> String -> Model -> ( Model, List E.Value )
+unknownWithPhase phase pending code model =
     case pending.state of
         Sent ->
             ( { model
@@ -674,7 +712,7 @@ unknown pending code model =
                         )
                         model.pending
               }
-            , [ lifecycle model pending.requestId "outcomeUnknown" [ ( "code", E.string code ) ], failure model pending.requestId "transport" code "unknown" ]
+            , [ lifecycle model pending.requestId "outcomeUnknown" [ ( "code", E.string code ) ], failure model pending.requestId phase code "unknown" ]
             )
 
         _ ->
@@ -729,7 +767,17 @@ dispose model =
 
 catchupFailure : Model -> ( Model, List E.Value )
 catchupFailure model =
-    ( { model | catchup = Nothing, catchupFailed = True, catchupErrorReported = True }
+    ( { model
+        | catchup = Nothing
+        , catchupFailed = True
+        , catchupErrorReported = True
+        , reconciliationErrorCode =
+            if model.catchupErrorReported then
+                model.reconciliationErrorCode
+
+            else
+                Just "CatchupFailed"
+      }
     , if model.catchupErrorReported then
         []
 

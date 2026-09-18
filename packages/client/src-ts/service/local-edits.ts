@@ -283,17 +283,35 @@ export class LocalEditsRuntime {
         const events = next.events.filter(e => this.active && this.sameFence(e));
         if (!events.length) continue;
         const visible = events.find(e => e.type === 'visible');
-        const publish = visible ? this.host.install(visible, next.queries) : () => {};
+        let publish = () => {};
+        let installationFailed = false;
+        if (visible) {
+          try { publish = this.host.install(visible, next.queries); }
+          catch { installationFailed = true; }
+        }
         for (const event of events) if (event.type === 'invalidate' || event.type === 'replacementInstalled' || event.type === 'lifetimeEnded') {
           const tables = event.type === 'replacementInstalled' ? capture(event.tables) : null;
           this.persistence = this.persistence.then(() => this.host.persist(tables, tables ? event.serverRevision : null, this.fence)).catch(() => {
             this.emitFailure({ ...this.fence, requestId: event.requestId ?? '', phase: 'persistence', code: 'PersistenceFailed' });
           });
         }
-        notify(publish);
-        if (events.some(event => event.type === 'catchup' || event.type === 'invalidate')) notify(() => this.host.syncState?.('catching_up'));
+        if (!installationFailed) notify(publish);
+        if (installationFailed || events.some(event => event.type === 'catchup' || event.type === 'invalidate')) notify(() => this.host.syncState?.('catching_up'));
         else if (events.some(event => event.type === 'replacementInstalled')) notify(() => this.host.syncState?.('live'));
-        for (const event of events) this.effect(event);
+        for (const event of events) {
+          if (installationFailed && event.type === 'lifecycle' && event.state === 'confirmed') {
+            this.effect({ ...event, state: 'acceptedUnreconciled', code: 'InstallationFailed' });
+          } else {
+            this.effect(event);
+          }
+        }
+        if (installationFailed) {
+          const confirmation = events.find(event => event.type === 'lifecycle' && event.state === 'confirmed');
+          this.emitFailure({ ...this.fence, requestId: confirmation?.requestId ?? visible?.requestId ?? '', phase: 'reconciliation', code: 'InstallationFailed' });
+          for (const key of [...this.flights.keys()]) if (key.startsWith('read:')) this.release(key);
+          try { this.send({ type: 'installationFailed' }); }
+          catch { this.settleBeforeDetach(); this.detach(); }
+        }
       }
     } finally { this.consuming = false; }
   }
@@ -402,7 +420,7 @@ export class LocalEditsRuntime {
     if (typeof value.databaseEpoch === 'string' && value.databaseEpoch && value.databaseEpoch !== this.fence.databaseEpoch
       && Object.entries(this.fence).every(([key, v]) => key === 'databaseEpoch' || value[key] === v)) {
       this.closing = true;
-      this.send({ type: 'reset' });
+      try { this.send({ type: 'reset' }); } catch { this.settleBeforeDetach(); this.detach(); }
     }
   }
   private send(message: object): void { if (this.active) this.host.send({ type: 'localEdits', message: { ...this.fence, ...message } }); }
@@ -418,10 +436,31 @@ export class LocalEditsRuntime {
     if (!this.active || this.closing) return this.ended;
     this.closing = true;
     if (!this.started) this.detach();
-    else this.send({ type: 'dispose' });
+    else try { this.send({ type: 'dispose' }); } catch { this.settleBeforeDetach(); this.detach(); }
     return this.ended;
   }
+  private settleBeforeDetach(): void {
+    for (const [requestId, pending] of [...this.pending]) {
+      const latest = pending.latest;
+      if (latest?.state === 'outcomeUnknown') continue;
+      if (!latest) {
+        const certainty = this.flights.get(`write:${requestId}`)?.dispatched ? 'outcomeUnknown' : 'rejected';
+        this.publishLifecycle({ ...this.fence, requestId, state: certainty, code: 'Fenced' });
+        this.emitFailure({ ...this.fence, requestId, phase: 'lifetime', code: 'Fenced', certainty: certainty === 'rejected' ? 'rejected' : 'unknown' });
+      } else if (latest.state === 'accepted') {
+        this.publishLifecycle({ ...latest, state: 'acceptedUnreconciled', code: 'Fenced' });
+        this.emitFailure({ ...this.fence, requestId, phase: 'lifetime', code: 'Fenced', certainty: 'acceptedUnreconciled' });
+      } else if (latest.state === 'sent') {
+        this.publishLifecycle({ ...latest, state: 'outcomeUnknown', code: 'Fenced' });
+        this.emitFailure({ ...this.fence, requestId, phase: 'lifetime', code: 'Fenced', certainty: 'unknown' });
+      } else {
+        this.publishLifecycle({ ...latest, state: 'rejected', code: 'Fenced' });
+        this.emitFailure({ ...this.fence, requestId, phase: 'lifetime', code: 'Fenced', certainty: 'rejected' });
+      }
+    }
+  }
   private detach(): void {
+    if (!this.active) return;
     this.active = false;
     for (const key of this.flights.keys()) this.release(key);
     notify(() => this.hintsCleanup?.());

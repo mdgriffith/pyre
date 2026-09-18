@@ -69,6 +69,7 @@ mock.module("./wasm/pyre_wasm.js", () => ({
 const { catchup, rotateDatabaseEpoch } = await import("./sync");
 const { ensureDatabase, loadSchemaFromDatabase } = await import("./schema");
 const { localEdits } = await import("./local-edits");
+const { runBatch } = await import("./query");
 
 afterEach(() => {
   getSyncSqlMock = defaultSyncSql;
@@ -217,6 +218,60 @@ test("schema manifest evidence is exact-client, rejects stale contracts, and cle
   failFirst = true;
   await expect(loadSchemaFromDatabase(first as any)).rejects.toThrow("refresh failed");
   expect(() => bind(first)).toThrow("InvalidRequest");
+});
+
+test("queued batch revalidates schema evidence after acquiring its write transaction", async () => {
+  const authority = { databaseId: "schema-race", namespace: "Main", manifest: "manifest-1", instance: "tab-1", authGeneration: 0 };
+  const request = { version: 1, ...authority, databaseEpoch: "epoch-1", requestId: "request-1", sequence: 1,
+    operations: [{ operation: "write", input: {} }] };
+  const query = { id: "write", operation: "transaction", primary_db: "Main", sql: [
+    { include: false, params: [], sql: "update notes set body = 'captured'" },
+  ], session_args: [], optional_input_args: [], json_input_args: [], InputValidator: z.object({}), SessionValidator: z.object({}) };
+  const oldManifest = { version: 1, manifestVersion: authority.manifest, compiledContract: "manifest-old",
+    replacementContracts: { Main: "replacement-old" }, queries: { write: query }, SessionValidator: z.object({}) };
+  const unboundManifest = { ...oldManifest, compiledContract: undefined, replacementContracts: undefined };
+
+  let releaseFirst: () => void;
+  let markFirstStarted: () => void;
+  const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve; });
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const firstTx = {
+    execute: mock(async (statement: any) => {
+      const sql = typeof statement === "string" ? statement : statement.sql;
+      if (sql === "pragma database_list") {
+        markFirstStarted();
+        await firstGate;
+        return { rows: [{ name: "main", file: "/tmp/schema-race.db" }], columns: ["name", "file"], rowsAffected: 0 };
+      }
+      if (sql.includes("select database_epoch")) return { rows: [{ database_epoch: "epoch-1" }], columns: ["database_epoch"], rowsAffected: 0 };
+      if (sql.includes("update _pyre_sync")) return { rows: [{ database_epoch: "epoch-1", server_revision: 1 }], columns: ["database_epoch", "server_revision"], rowsAffected: 1 };
+      return { rows: [], columns: [], rowsAffected: 1 };
+    }),
+    commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}),
+  };
+  const firstDb = { transaction: mock(async () => firstTx) };
+
+  let schema = { schema_source: "old", compiledContract: "replacement-old", manifestContract: "manifest-old" };
+  const secondExecute = mock(async (sql: string) => sql.includes("is_initialized")
+    ? { rows: [{ is_initialized: 1 }] }
+    : { rows: [{ result: JSON.stringify(schema) }] });
+  const secondTx = { execute: mock(async () => { throw new Error("captured SQL must not execute"); }),
+    commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}) };
+  const secondDb = { execute: secondExecute, transaction: mock(async () => secondTx) };
+
+  await loadSchemaFromDatabase(secondDb as any);
+  const first = runBatch(firstDb as any, unboundManifest as any, authority, request as any, {});
+  await firstStarted;
+  const queued = runBatch(secondDb as any, oldManifest as any, authority, request as any, {});
+  schema = { schema_source: "new", compiledContract: "replacement-new", manifestContract: "manifest-new" };
+  await loadSchemaFromDatabase(secondDb as any);
+  releaseFirst!();
+
+  expect((await first).kind).toBe("success");
+  expect(await queued).toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest" } });
+  expect(secondDb.transaction).toHaveBeenCalledWith("write");
+  expect(secondTx.execute).not.toHaveBeenCalled();
+  expect(secondTx.rollback).toHaveBeenCalledTimes(1);
 });
 
 test("ensureDatabase refreshes existing database-id schema registrations", async () => {
