@@ -84,6 +84,7 @@ type alias Model =
 type Msg
     = InitialDataLoaded Data.IndexedDb.SyncCursor (Maybe String)
     | CatchupRequired
+    | InvalidateRequired
     | CatchupResponseReceived (Result Http.Error CatchupResponse)
     | DatabaseEpochResetCompleted String
     | DatabaseEpochResetFailed String String
@@ -175,6 +176,14 @@ update msg model db =
             , error = Nothing
             , destructiveReset = False
             }
+
+        InvalidateRequired ->
+            case model.databaseEpoch of
+                Just currentEpoch ->
+                    destructiveReset currentEpoch model db
+
+                Nothing ->
+                    update CatchupRequired model db
 
         CatchupResponseReceived result ->
             handleCatchupResponse result model db
@@ -286,30 +295,7 @@ handleValidatedCatchupResponse result model db =
                     failedUpdate message model db
 
                 Nothing ->
-                    { model =
-                        { model
-                            | status =
-                                Syncing
-                                    { table = Nothing
-                                    , tablesSynced = 0
-                                    , totalTables = Nothing
-                                    , complete = False
-                                    , error = Nothing
-                                    }
-                            , cursor = Dict.empty
-                            , pendingResetEpoch = Just reset.databaseEpoch
-                            , inProgress = True
-                            , tablesSynced = 0
-                        }
-                    , db = Db.init db.schema
-                    , cmd = Cmd.none
-                    , dbCmds = [ Data.IndexedDb.resetForDatabaseEpoch reset.databaseEpoch ]
-                    , delta = Nothing
-                    , serverRevision = Nothing
-                    , touchedTables = []
-                    , error = Nothing
-                    , destructiveReset = True
-                    }
+                    destructiveReset reset.databaseEpoch model db
 
         Ok (CatchupPageReceived response) ->
             case validateResponseDatabaseId model.server.databaseId response.databaseId of
@@ -396,6 +382,34 @@ handleValidatedCatchupResponse result model db =
             , error = Just message
             , destructiveReset = False
             }
+
+
+destructiveReset : String -> Model -> Db.Db -> UpdateResult
+destructiveReset epoch model db =
+    { model =
+        { model
+            | status =
+                Syncing
+                    { table = Nothing
+                    , tablesSynced = 0
+                    , totalTables = Nothing
+                    , complete = False
+                    , error = Nothing
+                    }
+            , cursor = Dict.empty
+            , pendingResetEpoch = Just epoch
+            , inProgress = True
+            , tablesSynced = 0
+        }
+    , db = Db.init db.schema
+    , cmd = Cmd.none
+    , dbCmds = [ Data.IndexedDb.resetForDatabaseEpoch epoch ]
+    , delta = Nothing
+    , serverRevision = Nothing
+    , touchedTables = []
+    , error = Nothing
+    , destructiveReset = True
+    }
 
 
 emptyUpdate : Model -> Db.Db -> UpdateResult

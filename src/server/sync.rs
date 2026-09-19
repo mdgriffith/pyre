@@ -96,6 +96,7 @@ impl<'a> SyncServer<'a> {
                     .as_ref()
             || request.request_id.is_empty()
             || request.target < 0
+            || request.target.unsigned_abs() > crate::server::query::MAX_JS_SAFE_INTEGER
             || fence.database_id != binding.database_id
             || fence.instance.is_empty()
             || fence.instance != binding.instance
@@ -147,6 +148,9 @@ impl<'a> SyncServer<'a> {
             let epoch = row.get::<String>(0).map_err(Error::Database)?;
             let revision = row.get::<i64>(1).map_err(Error::Database)?;
             drop(rows);
+            if revision < 0 || revision.unsigned_abs() > crate::server::query::MAX_JS_SAFE_INTEGER {
+                return Err(Error::InvalidFence);
+            }
             if epoch != fence.database_epoch {
                 return Err(Error::InvalidFence);
             }

@@ -219,6 +219,44 @@ test('Elm live syncRequired starts catchup from the current cursor', async () =>
   }
 });
 
+test('Elm invalidating syncRequired clears persisted state before full catchup', async () => {
+  const { app, requests, restore } = await startSyncedElmApp();
+  const resets: unknown[] = [];
+
+  try {
+    app.ports.indexedDbOut.subscribe((message) => {
+      if (message?.type !== 'resetForDatabaseEpoch') return;
+      resets.push(message);
+      app.ports.receiveIndexedDbMessage.send({
+        type: 'databaseEpochResetCompleted',
+        databaseEpoch: message.databaseEpoch,
+      });
+    });
+    const requestCountAfterInitialCatchup = requests.length;
+
+    app.ports.receiveSSEMessage.send({
+      type: 'syncRequired',
+      databaseId: 'campaign:123',
+      databaseEpoch: 'test-epoch',
+      serverRevision: 1,
+      reconciliation: { kind: 'replaceRequired', atLeast: 1, invalidate: true, minimumSafeRevision: 1 },
+    });
+    await nextElmTurn();
+    await nextElmTurn();
+    await nextElmTurn();
+
+    expect(resets).toEqual([{ type: 'resetForDatabaseEpoch', databaseEpoch: 'test-epoch' }]);
+    expect(requests).toHaveLength(requestCountAfterInitialCatchup + 1);
+    expect(JSON.parse(requests.at(-1)?.body ?? '{}')).toEqual({
+      databaseId: 'campaign:123',
+      databaseEpoch: 'test-epoch',
+      syncCursor: { tables: {} },
+    });
+  } finally {
+    restore();
+  }
+});
+
 test('Elm live syncRequired ignores stale server revisions', async () => {
   const { app, requests, restore } = await startSyncedElmApp();
 

@@ -62,12 +62,13 @@ pub fn generate(
 
         files.push(generate_text_file(
             base_path.join(entity_stream_module_path(schema, namespace)),
-            to_entity_stream_module(schema, namespace, &records),
+            to_entity_stream_module(database, schema, namespace, &records),
         ));
     }
 }
 
 fn to_entity_stream_module(
+    database: &ast::Database,
     schema: &ast::Schema,
     namespace: &str,
     records: &[EntityStreamRecord],
@@ -134,6 +135,11 @@ fn to_entity_stream_module(
                 "{}{}Row {}.Row\n",
                 prefix, record.record_name, record.table_module_segment
             ));
+            result.push_str(&format!(
+                "    | {}Removed {}\n",
+                record.record_name,
+                entity_stream_id_type(&record.fields).unwrap().0
+            ));
         }
         result.push_str("    | EntityDecodeFailed String Decode.Value\n\n\n");
     }
@@ -199,23 +205,51 @@ fn to_entity_stream_module(
     result.push_str("entityChangeDecoder : Decode.Decoder EntityChange\n");
     result.push_str("entityChangeDecoder =\n");
     result.push_str("    Decode.map2 Tuple.pair\n");
+    result.push_str("        (Decode.field \"op\" Decode.string)\n");
     result.push_str("        (Decode.field \"tableName\" Decode.string)\n");
-    result.push_str("        (Decode.field \"row\" Decode.value)\n");
-    result.push_str("        |> Decode.map\n");
-    result.push_str("            (\\( tableName, row ) ->\n");
-    result.push_str("                case tableName of\n");
+    result.push_str("        |> Decode.andThen\n");
+    result.push_str("            (\\( operation, tableName ) ->\n");
+    result.push_str("                case operation of\n");
+    result.push_str("                    \"row\" ->\n");
+    result.push_str("                        Decode.field \"row\" Decode.value\n");
+    result.push_str("                            |> Decode.map\n");
+    result.push_str("                                (\\row ->\n");
+    result.push_str("                                    case tableName of\n");
     for record in records {
         result.push_str(&format!(
-            "                    \"{}\" ->\n",
+            "                                        \"{}\" ->\n",
             record.table_name
         ));
         result.push_str(&format!(
-            "                        decodeRow {}Row {}.decodeRow row\n\n",
+            "                                            decodeRow {}Row {}.decodeRow row\n\n",
             record.record_name, record.table_module_segment
         ));
     }
-    result.push_str("                    other ->\n");
-    result.push_str("                        EntityDecodeFailed other row\n");
+    result.push_str("                                        other ->\n");
+    result.push_str("                                            EntityDecodeFailed other row\n");
+    result.push_str("                                )\n\n");
+    result.push_str("                    \"remove\" ->\n");
+    result.push_str("                        case tableName of\n");
+    for record in records {
+        let primary_key = record
+            .fields
+            .iter()
+            .find_map(|field| match field {
+                ast::Field::Column(column) if ast::is_primary_key(column) => Some(column),
+                _ => None,
+            })
+            .expect("entity stream record has a primary key");
+        result.push_str(&format!(
+            "                            \"{}\" ->\n                                Decode.map {}Removed (Decode.field \"id\" {})\n\n",
+            record.table_name,
+            record.record_name,
+            entity_stream_decoder(database, &primary_key.type_)
+        ));
+    }
+    result.push_str("                            other ->\n");
+    result.push_str("                                Decode.map (EntityDecodeFailed other) (Decode.field \"id\" Decode.value)\n\n");
+    result.push_str("                    otherOperation ->\n");
+    result.push_str("                        Decode.fail (\"Unknown entity change operation: \" ++ otherOperation)\n");
     result.push_str("            )\n");
 
     result.push_str("\n\n");

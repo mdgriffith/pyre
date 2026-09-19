@@ -383,7 +383,7 @@ handleValidatedLiveSyncIncoming incoming model =
                     , emitSyncState (toSyncState updatedModel)
                     )
 
-        LiveSync.SyncRequiredReceived messageDatabaseId messageEpoch serverRevision ->
+        LiveSync.SyncRequiredReceived messageDatabaseId messageEpoch serverRevision invalidate ->
             case validateLiveSyncDatabaseId model messageDatabaseId "syncRequired" of
                 Just message ->
                     ( { model | syncError = Just message }
@@ -391,7 +391,10 @@ handleValidatedLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    if not (liveEpochMismatch model messageEpoch) then
+                    if invalidate then
+                        applyCatchupUpdate (Catchup.update Catchup.InvalidateRequired model.catchup model.db) model
+
+                    else if not (liveEpochMismatch model messageEpoch) then
                         if isStaleServerRevision serverRevision model.lastAppliedServerRevision then
                             ( model, Cmd.none )
 
@@ -1114,7 +1117,7 @@ liveSyncIncomingToString incoming =
         LiveSync.SyncCompleteReceived _ ->
             "syncComplete"
 
-        LiveSync.SyncRequiredReceived _ _ _ ->
+        LiveSync.SyncRequiredReceived _ _ _ _ ->
             "syncRequired"
 
 

@@ -470,10 +470,12 @@ record Post {
         content
     );
     assert!(
-        content.contains("type EntityChange\n    = CommentRow Comments.Row\n    | PostRow Posts.Row\n    | EntityDecodeFailed String Decode.Value")
-            && content.contains("\"comments\" ->\n                        decodeRow CommentRow Comments.decodeRow row")
-            && content.contains("\"posts\" ->\n                        decodeRow PostRow Posts.decodeRow row"),
-        "Db.Stream.elm should decode batches into typed table row variants. Generated:\n{}",
+        content.contains("type EntityChange\n    = CommentRow Comments.Row\n    | CommentRemoved String\n    | PostRow Posts.Row\n    | PostRemoved String\n    | EntityDecodeFailed String Decode.Value")
+            && content.contains("\"comments\" ->\n                                            decodeRow CommentRow Comments.decodeRow row")
+            && content.contains("\"posts\" ->\n                                            decodeRow PostRow Posts.decodeRow row")
+            && content.contains("Decode.map CommentRemoved (Decode.field \"id\" Db.Id.decodeUuidString)")
+            && content.contains("Decode.map PostRemoved (Decode.field \"id\" Db.Id.decodeUuidString)"),
+        "Db.Stream.elm should decode batches into typed row and removal variants. Generated:\n{}",
         content
     );
 

@@ -552,6 +552,12 @@ async fn run_batch(
                         "databaseId": state.database_id,
                         "databaseEpoch": database_epoch,
                         "serverRevision": revision,
+                        "reconciliation": {
+                            "kind": "replaceRequired",
+                            "atLeast": revision,
+                            "invalidate": true,
+                            "minimumSafeRevision": revision,
+                        },
                     });
                     for connection in connections
                         .values()
@@ -1228,6 +1234,11 @@ record Workspace {
         assert_eq!(hint["databaseId"], state.database_id);
         assert_eq!(hint["databaseEpoch"], accepted["databaseEpoch"]);
         assert_eq!(hint["serverRevision"], accepted["commitRevision"]);
+        assert_eq!(hint["reconciliation"]["invalidate"], true);
+        assert_eq!(
+            hint["reconciliation"]["minimumSafeRevision"],
+            accepted["commitRevision"]
+        );
         assert!(hint.get("data").is_none());
         assert!(matches!(
             receiver.try_recv(),
@@ -1278,6 +1289,7 @@ record Workspace {
         assert_eq!(hint["databaseId"], state.database_id);
         assert_eq!(hint["databaseEpoch"], accepted["databaseEpoch"]);
         assert_eq!(hint["serverRevision"], accepted["commitRevision"]);
+        assert_eq!(hint["reconciliation"]["invalidate"], true);
         assert!(hint.get("data").is_none(), "{hint}");
         assert_eq!(
             state

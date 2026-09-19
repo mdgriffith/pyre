@@ -9,6 +9,7 @@ type CachedIntrospection = { client: Client; introspection: unknown };
 
 const schemaEvidenceByClient = new WeakMap<Client, SchemaEvidence>();
 const schemaRefreshByClient = new WeakMap<Client, symbol>();
+const schemaMigrationByClient = new WeakMap<Client, symbol>();
 const databaseKeysByClient = new WeakMap<Client, Set<string>>();
 const introspectionsByDatabaseId = new Map<string, CachedIntrospection>();
 const schemaRefreshByDatabaseId = new Map<string, symbol>();
@@ -48,6 +49,7 @@ export async function ensureDatabase(
     // evidence it acquired. Invalidate as soon as this migration owns the writer.
     const knownKeys = [...(databaseKeysByClient.get(db) ?? [])];
     const refresh = beginSchemaRefresh(db, undefined, true);
+    schemaMigrationByClient.set(db, refresh);
     let outcome: EnsureDatabaseOutcome;
     let currentIntrospection: unknown;
     try {
@@ -85,6 +87,7 @@ export async function ensureDatabase(
             outcome = initialized ? "migrated" : "created";
         }
     } catch (error) {
+        if (schemaMigrationByClient.get(db) === refresh) schemaMigrationByClient.delete(db);
         if (!tx.closed) {
             await tx.rollback();
         }
@@ -92,8 +95,12 @@ export async function ensureDatabase(
     } finally {
         tx.close();
     }
-    establishSchemaEvidence(db, refresh, currentIntrospection);
-    for (const key of knownKeys) establishSchemaEvidence(db, refresh, currentIntrospection, key);
+    try {
+        establishSchemaEvidence(db, refresh, currentIntrospection, undefined, true);
+        for (const key of knownKeys) establishSchemaEvidence(db, refresh, currentIntrospection, key, true);
+    } finally {
+        if (schemaMigrationByClient.get(db) === refresh) schemaMigrationByClient.delete(db);
+    }
     return outcome;
 }
 
@@ -259,8 +266,14 @@ function establishSchemaEvidence(
     refresh: symbol,
     introspection: unknown,
     key?: string,
+    authoritative = false,
 ): void {
-    if (schemaRefreshByClient.get(db) !== refresh
+    if (authoritative) {
+        if (schemaMigrationByClient.get(db) !== refresh) return;
+        schemaRefreshByClient.set(db, refresh);
+        if (key !== undefined) schemaRefreshByDatabaseId.set(key, refresh);
+    } else if (schemaMigrationByClient.has(db)
+        || schemaRefreshByClient.get(db) !== refresh
         || (key !== undefined && schemaRefreshByDatabaseId.get(key) !== refresh)) return;
     const captured = structuredClone(introspection);
     wasm.set_schema(captured);

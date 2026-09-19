@@ -241,6 +241,13 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
         .replacement(&conn, &bound, &binding, &future, &session)
         .await
         .is_err());
+    future.target = 9_007_199_254_740_992;
+    assert!(matches!(
+        server
+            .replacement(&conn, &bound, &binding, &future, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
     future = replacement_request.clone();
     future.request_id.clear();
     assert!(server
@@ -259,6 +266,19 @@ async fn batch_publication_uses_committed_revision_without_origin_registration(
     assert!(server
         .replacement_messages(&result, &HashMap::new())
         .is_empty());
+    conn.execute(
+        "UPDATE _pyre_sync SET server_revision = 9007199254740992 WHERE id = 1",
+        (),
+    )
+    .await?;
+    assert!(matches!(
+        server
+            .replacement(&conn, &bound, &binding, &replacement_request, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    conn.execute("UPDATE _pyre_sync SET server_revision = 1 WHERE id = 1", ())
+        .await?;
     // Failure to allocate the next revision must roll back the write, not just its acknowledgement.
     conn.execute("CREATE TRIGGER fail_revision BEFORE UPDATE ON _pyre_sync BEGIN SELECT RAISE(ABORT, 'revision unavailable'); END", ()).await?;
     assert!(

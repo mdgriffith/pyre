@@ -237,6 +237,49 @@ test("schema manifest evidence is exact-client, rejects stale contracts, and cle
   expect(() => bind(first)).toThrow("InvalidRequest");
 });
 
+test("migration evidence supersedes an overlapping schema load", async () => {
+  const oldSchema = { tables: [{ name: "notes" }], schema_source: "old", compiledContract: "replacement-old", manifestContract: "manifest-old" };
+  const newSchema = { tables: [{ name: "notes" }], schema_source: "new", compiledContract: "replacement-new", manifestContract: "manifest-new" };
+  let migrated = false;
+  let releaseMigration!: () => void;
+  let markMigrationStarted!: () => void;
+  const migrationStarted = new Promise<void>(resolve => { markMigrationStarted = resolve; });
+  const migrationGate = new Promise<void>(resolve => { releaseMigration = resolve; });
+  let closed = false;
+  const tx = {
+    execute: mock(async (sql: string) => sql.includes("is_initialized")
+      ? { rows: [{ is_initialized: 1 }] }
+      : { rows: [{ result: JSON.stringify(migrated ? newSchema : oldSchema) }] }),
+    batch: mock(async () => { markMigrationStarted(); await migrationGate; migrated = true; }),
+    commit: mock(async () => { closed = true; }), rollback: mock(async () => { closed = true; }),
+    close: mock(() => { closed = true; }), get closed() { return closed; },
+  };
+  const db = {
+    transaction: mock(async () => tx),
+    execute: mock(async (sql: string) => sql.includes("is_initialized")
+      ? { rows: [{ is_initialized: 1 }] }
+      : { rows: [{ result: JSON.stringify(oldSchema) }] }),
+  };
+  migrationResult = { Ok: { sql: ["alter table notes add column title text"], mark_success: "record migration" } };
+  const scope = namespace<any>("Main", "manifest-1");
+  const bind = (compiledContract: string, replacementContract: string) => localEdits.bind({
+    database: db as any, databaseId: "main", namespace: scope,
+    manifest: { version: 1, manifestVersion: scope.manifest, compiledContract,
+      replacementContracts: { Main: replacementContract }, queries: {}, SessionValidator: z.object({}) },
+    session: {},
+  });
+
+  const migration = ensureDatabase(db as any, "Main", "new");
+  await migrationStarted;
+  await loadSchemaFromDatabase(db as any);
+  expect(() => bind("manifest-old", "replacement-old")).toThrow("InvalidRequest");
+  releaseMigration();
+  await migration;
+
+  expect(() => bind("manifest-new", "replacement-new")).not.toThrow();
+  expect(() => bind("manifest-old", "replacement-old")).toThrow("InvalidRequest");
+});
+
 test("queued batch revalidates schema evidence after acquiring its write transaction", async () => {
   const authority = { databaseId: "schema-race", namespace: "Main", manifest: "manifest-1", instance: "tab-1", authGeneration: 0 };
   const request = { version: 1, ...authority, databaseEpoch: "epoch-1", requestId: "request-1", sequence: 1,

@@ -212,11 +212,13 @@ Returned changes should decode to typed variants when possible:
 ```elm
 type EntityChange
     = PostRow Db.Post
+    | PostRemoved PostId
     | CommentRow Db.Comment
+    | CommentRemoved CommentId
     | EntityDecodeFailed String Decode.Value
 ```
 
-The generated Elm code does not need to store entity stream data. It only needs to register streams, decode batches, and route typed row events to the app. The consuming app owns any storage or derived data structures.
+Removal variants carry the schema primary-key type and no row payload. The generated Elm code does not need to store entity stream data. It only needs to register streams, decode batches, and route typed row and removal events to the app. The consuming app owns any storage or derived data structures.
 
 ## Conditions
 
