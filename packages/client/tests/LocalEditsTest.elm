@@ -368,6 +368,32 @@ suite =
                     ( ( False, Nothing ), ( 1, Just (Value.StringValue "server") ), [] )
                     ( ( accepted.invalid, accepted.catchup ), ( accepted.coveredRevision, field "name" accepted ), accepted.pending )
             )
+        , test "registration hint above existing coverage catches a commit missed before subscribing"
+            (\_ ->
+                let
+                    covered =
+                        initial [ row "base" "original" ]
+                            |> step "syncRequired" [ ( "reconciliation", hint 1 ) ]
+                            |> install 1 [ row "server" "current" ]
+
+                    staleHint =
+                        covered
+                            |> step "syncRequired" [ ( "serverRevision", E.int 1 ), ( "reconciliation", invalidatingHint 1 ) ]
+
+                    registered =
+                        staleHint
+                            |> step "syncRequired" [ ( "serverRevision", E.int 2 ), ( "reconciliation", invalidatingHint 2 ) ]
+
+                    caughtUp =
+                        install 2 [] registered
+                in
+                Expect.equal
+                    ( ( False, Nothing ), ( True, Just 2 ), ( 2, Nothing, False ) )
+                    ( ( staleHint.invalid, staleHint.catchup )
+                    , ( registered.invalid, Maybe.map Tuple.second registered.catchup )
+                    , ( caughtUp.coveredRevision, field "name" caughtUp, caughtUp.invalid )
+                    )
+            )
         , test "malformed complete replacement rows do not clear invalidation or advance coverage"
             (\_ ->
                 let

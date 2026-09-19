@@ -145,17 +145,17 @@ export function activateSchemaForDatabase(databaseId?: DatabaseId): void {
     wasm.set_schema(cached.introspection);
 }
 
-/** Capture once: later cache refreshes must not change an in-flight replacement's contract. */
-export function captureReplacementSchema(databaseId: DatabaseId, compiledContract: string): () => void {
+/** Capture once, then bind schemaSource to the replacement's database snapshot. */
+export function captureReplacementSchema(databaseId: DatabaseId, compiledContract: string): { restore(): void; schemaSource: string } {
     if (typeof compiledContract !== "string" || !compiledContract) throw new Error("Missing compiled contract");
-    const schema = structuredClone(introspectionsByDatabaseId.get(schemaKey(databaseId))?.introspection);
-    if (schema === undefined) throw new Error("Missing replacement schema");
+    const schema = structuredClone(introspectionsByDatabaseId.get(schemaKey(databaseId))?.introspection) as { schema_source?: unknown } | undefined;
+    if (typeof schema?.schema_source !== "string" || !schema.schema_source) throw new Error("Missing replacement schema");
     const restore = () => {
         wasm.set_schema(schema);
         if (wasm.get_schema_compiled_contract() !== compiledContract) throw new Error("Replacement contract mismatch");
     };
     restore();
-    return restore;
+    return { restore, schemaSource: schema.schema_source };
 }
 
 /** Authenticate a generated manifest against schema evidence captured for this exact client. */

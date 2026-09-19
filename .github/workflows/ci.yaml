@@ -63,6 +63,12 @@ jobs:
         working-directory: packages/client
         run: npm exec --yes --package=elm@0.19.1-6 -- bash ./scripts/build.sh --optimize
 
+      - name: Test Elm reconciliation
+        working-directory: packages/client
+        run: |
+          mkdir -p ../../target/tmp
+          TMPDIR="$PWD/../../target/tmp" npm exec --yes --package=elm@0.19.1-6 --package=elm-test@0.19.1-revision17 -- elm-test
+
       - name: Run tests
         run: cargo test --locked
 

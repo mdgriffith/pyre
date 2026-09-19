@@ -763,6 +763,202 @@ record Item {
 }
 
 #[tokio::test]
+async fn batch_wildcard_delete_matches_compiled_result_schema(
+) -> Result<(), Box<dyn std::error::Error>> {
+    wildcard_delete_matches_compiled_result_schema(true).await
+}
+
+#[tokio::test]
+async fn revisioned_wildcard_delete_matches_compiled_result_schema(
+) -> Result<(), Box<dyn std::error::Error>> {
+    wildcard_delete_matches_compiled_result_schema(false).await
+}
+
+async fn wildcard_delete_matches_compiled_result_schema(
+    batch: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const DELETED_ID: &str = "01890f6c-7b80-7000-8000-000000000001";
+    const RETAINED_ID: &str = "01890f6c-7b80-7000-8000-000000000002";
+    const UPDATED_AT: i64 = 1_767_225_600;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct DeletedItem {
+        id: String,
+        #[serde(rename = "updatedAt")]
+        updated_at: i64,
+        #[serde(alias = "label")]
+        name: String,
+        #[serde(alias = "active")]
+        enabled: bool,
+        #[serde(alias = "data")]
+        metadata: serde_json::Value,
+        #[serde(alias = "state")]
+        status: serde_json::Value,
+        note: Option<String>,
+    }
+
+    for selection in [
+        "*",
+        "* *",
+        "* id name",
+        "* label: name active: enabled",
+        "label: name active: enabled * *",
+        "* data: metadata state: status *",
+    ] {
+        let db = TestDatabase::new(
+            r#"
+type Status = Running | Stopped
+record Item {
+    @public
+    id Id.Uuid @id
+    name String
+    enabled Bool
+    metadata Json<List<Int>>
+    status Status
+    note String?
+}
+"#,
+        )
+        .await?;
+        let conn = db.db.connect()?;
+        conn.execute(
+            "INSERT INTO items (id, name, enabled, metadata, status, note, updatedAt) VALUES (?1, 'deleted', 1, '[1,2]', 'Running', NULL, ?3), (?2, 'retained', 0, '[]', 'Stopped', 'keep', ?3)",
+            libsql::params![DELETED_ID, RETAINED_ID, UPDATED_AT],
+        )
+        .await?;
+        let manifest = manifest_for(
+            &db.context,
+            &format!(
+                "delete Remove($id: Item.id) {{ removed: item {{ @where {{ id == $id }} {selection} }} }}"
+            ),
+            false,
+        )?;
+        let named = only_query(&manifest);
+        // JSON decoding alone would hide duplicate keys from repeated wildcards.
+        assert_eq!(named.sql[0].sql.matches("'note',").count(), 1);
+        let bound = bind(&manifest, &db.context);
+        let fingerprint = manifest.fingerprint();
+        let binding = batch_binding(&named.primary_db, &fingerprint);
+        let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+        let mut expected_row = json!({
+            "id": DELETED_ID,
+            "updatedAt": UPDATED_AT,
+            "name": "deleted",
+            "enabled": true,
+            "metadata": [1, 2],
+            "status": {"_type": "Running"},
+            "note": null
+        });
+        if selection.contains("label:") {
+            let fields = expected_row.as_object_mut().unwrap();
+            let name = fields.remove("name").unwrap();
+            let enabled = fields.remove("enabled").unwrap();
+            fields.insert("label".into(), name);
+            fields.insert("active".into(), enabled);
+        }
+        if selection.contains("data:") {
+            let fields = expected_row.as_object_mut().unwrap();
+            let metadata = fields.remove("metadata").unwrap();
+            let status = fields.remove("status").unwrap();
+            fields.insert("data".into(), metadata);
+            fields.insert("state".into(), status);
+        }
+
+        // SELECT and DELETE must agree on wildcard expansion and explicit aliases.
+        let read_manifest = manifest_for(
+            &db.context,
+            &format!(
+                "query Read($id: Item.id) {{ removed: item {{ @where {{ id == $id }} {selection} }} }}"
+            ),
+            false,
+        )?;
+        let selected = query::run(
+            &conn,
+            &read_manifest,
+            &only_query(&read_manifest).id,
+            json!({"id": DELETED_ID}),
+            &session,
+        )
+        .await?;
+        assert_eq!(
+            selected.response,
+            json!({"removed": [expected_row.clone()]})
+        );
+
+        // The second delete is a successful named no-op and still commits a revision.
+        for revision in 1..=2 {
+            let response = if batch {
+                let request = batch_request(
+                    &conn,
+                    &binding,
+                    vec![query::BatchOperation {
+                        operation: named.id.clone(),
+                        input: json!({"id": DELETED_ID}),
+                    }],
+                )
+                .await;
+                let result = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
+                assert_eq!(result.response["commitRevision"], revision);
+                assert_eq!(result.response["results"].as_array().unwrap().len(), 1);
+                result.response["results"][0]["value"].clone()
+            } else {
+                let (result, committed) = query::run_with_revision(
+                    &conn,
+                    &bound,
+                    &named.id,
+                    json!({"id": DELETED_ID}),
+                    &session,
+                    false,
+                )
+                .await?;
+                assert_eq!(committed.unwrap().revision, revision);
+                result.response
+            };
+            let expected = if revision == 1 {
+                json!({"removed": [expected_row.clone()]})
+            } else {
+                json!({"removed": []})
+            };
+            assert_eq!(response, expected, "selection: {selection}");
+            let decoded: Vec<DeletedItem> = serde_json::from_value(response["removed"].clone())?;
+            if revision == 1 {
+                assert_eq!(
+                    decoded,
+                    vec![DeletedItem {
+                        id: DELETED_ID.into(),
+                        updated_at: UPDATED_AT,
+                        name: "deleted".into(),
+                        enabled: true,
+                        metadata: json!([1, 2]),
+                        status: json!({"_type": "Running"}),
+                        note: None,
+                    }]
+                );
+            } else {
+                assert!(decoded.is_empty());
+            }
+
+            // A separate connection observes both the deletion and its committed revision.
+            let persisted = db.db.connect()?;
+            let row = persisted
+                .query(
+                    "SELECT (SELECT count(*) FROM items WHERE id = ?1), (SELECT name FROM items WHERE id = ?2), server_revision FROM _pyre_sync WHERE id = 1",
+                    libsql::params![DELETED_ID, RETAINED_ID],
+                )
+                .await?
+                .next()
+                .await?
+                .unwrap();
+            assert_eq!(row.get::<i64>(0)?, 0);
+            assert_eq!(row.get::<String>(1)?, "retained");
+            assert_eq!(row.get::<i64>(2)?, revision);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn named_batch_results_are_validated_before_revision_and_commit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db =

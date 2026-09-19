@@ -4,7 +4,6 @@ import { z } from "zod";
 import { createClient } from "@libsql/client";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { meta as compiledCreate } from "./fixtures/compiled-batch/generated/queries/metadata/entryCreate";
 import { sql as compiledCreateSql, syncSql as compiledCreateSyncSql } from "./fixtures/compiled-batch/generated/queries/sql/entryCreate";
@@ -38,6 +37,7 @@ mock.module("./wasm/pyre_wasm.js", () => ({
     },
   }),
   set_schema: schema => { activeSchema = schema; },
+  process_introspection: introspection => introspection,
   get_schema_compiled_contract: () => activeSchema?.compiledContract ?? "contract-1",
   get_schema_manifest_contract: () => activeSchema?.manifestContract ?? activeSchema?.compiledContract ?? "contract-1",
   validate_replacement_table_groups: () => {
@@ -96,7 +96,7 @@ test.skipIf(!existsSync(new URL("./wasm/pyre_wasm_bg.wasm", import.meta.url)))("
 }, 30000);
 
 test("batch sync publishes only after atomic commit and needs no registered origin", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "pyre-batch-sync-"));
+  const directory = mkdtempSync(new URL("../../target/pyre-batch-sync-", import.meta.url));
   const db = createClient({ url: `file:${join(directory, "test.db")}` });
   try {
     await db.execute("create table notes(id integer primary key)");
@@ -154,7 +154,7 @@ beforeEach(() => {
 });
 
 async function replacementDatabase(run: (fixture: any) => Promise<void>) {
-  const directory = mkdtempSync(join(tmpdir(), "pyre-replacement-"));
+  const directory = mkdtempSync(new URL("../../target/pyre-replacement-", import.meta.url));
   const url = `file:${join(directory, "test.db")}`;
   const db = createClient({ url });
   const authority = { databaseId: directory, namespace: "Main", manifest: "m1", instance: "tab", authGeneration: 2 };
@@ -188,6 +188,8 @@ async function replacementDatabase(run: (fixture: any) => Promise<void>) {
     await db.execute("pragma journal_mode = WAL");
     await db.execute("create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer)");
     await db.execute("insert into _pyre_sync values(1,'e1',0)");
+    await db.execute("create table _pyre_migrations(id integer primary key, finished_at integer, error text, schema text)");
+    await db.execute("insert into _pyre_migrations values(1,1,NULL,'test schema')");
     await db.execute("create table notes(id integer primary key, body text, owner integer, project integer, updatedAt integer)");
     await db.execute("insert into notes values(1,'own',7,1,0),(2,'linked',8,2,0),(3,'private',8,3,0)");
     await db.execute("create table memberships(project integer, userId integer)");
@@ -304,6 +306,19 @@ test("replacement errors never publish successful prefixes and read-only retry r
     replacementPlan = valid;
     expect((await replace({ target: 1 })).response.serverRevision).toBe(1);
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(1);
+  });
+});
+
+test("replacement rejects missing or changed snapshot schema before compiling row reads", async () => {
+  await replacementDatabase(async ({ db, replace }) => {
+    await db.execute("update _pyre_migrations set schema = 'revoked permissions'");
+    expect(await replace()).toMatchObject({ kind: "error", error: { errorType: "InvalidRequest" } });
+    expect(replacementSession).toBeUndefined();
+    await db.execute("delete from _pyre_migrations");
+    expect(await replace()).toMatchObject({ kind: "error", error: { errorType: "InvalidRequest" } });
+    expect(replacementSession).toBeUndefined();
+    await db.execute("insert into _pyre_migrations values(2,1,NULL,'test schema')");
+    expect((await replace()).kind).toBe("success");
   });
 });
 

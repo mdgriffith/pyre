@@ -6,7 +6,7 @@ import { createClient } from '@libsql/client';
 import { z } from 'zod';
 
 const { PyreClient, LocalEditsRuntime } = await import('../packages/client/src-ts/index.ts');
-const { runWithSync } = await import('../packages/server/query-sync.ts');
+const { runWithSync, runBatchWithSync, LIVE_SYNC_DELIVERY_TIMEOUT_MS } = await import('../packages/server/query-sync.ts');
 const { run } = await import('../packages/server/query.ts');
 const { ensureDatabase, loadSchemaFromDatabase } = await import('../packages/server/schema.ts');
 const { default: initWasm } = await import('../packages/server/wasm/pyre_wasm.js');
@@ -232,5 +232,143 @@ test('named publication is ordered across handles for the same database ID', asy
     delivery.resolve();
     await Promise.allSettled([pendingFirst, pendingSecond]);
     first.close(); second.close(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const fenced of [false, true]) for (const rejectRecovery of [false, true]) test(`stalled ${fenced ? 'fenced' : 'legacy'} publication recovers in order (${rejectRecovery ? 'failed' : 'successful'} recovery hint)`, async t => {
+  const directory = mkdtempSync(new URL('../target/publication-timeout-', import.meta.url));
+  const url = `file:${directory}/test.db`;
+  const first = createClient({ url });
+  const second = createClient({ url });
+  const delivery = deferred();
+  const delivering = deferred();
+  const sent = [];
+  const completed = [];
+  const messages = [];
+  let pendingFirst, pendingSecond;
+  try {
+    await ensureDatabase(first, 'Main', 'record Note {\n    @public\n    id Id.Uuid @id\n    body String\n}\n');
+    await loadSchemaFromDatabase(directory, first);
+    const epoch = (await first.execute('select database_epoch from _pyre_sync')).rows[0].database_epoch;
+    const registration = id => ({ session: {}, ...(fenced ? { fence: {
+      ...fence, databaseId: directory, databaseEpoch: epoch, instance: id,
+    } } : {}) });
+    const recipients = new Map([['slow', registration('slow')], ['healthy', registration('healthy')]]);
+    const query = { id: 'update', operation: 'transaction', primary_db: 'Main',
+      InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({}),
+      session_args: [], optional_input_args: [], json_input_args: [],
+      sql: [
+        { include: false, params: ['id'], sql: "insert into notes(id, body) values($id, 'changed')" },
+        { include: true, params: ['id'], sql: `select json_array(json_object(
+          'table_name', 'notes', 'headers', json_array('id', 'body', 'updatedAt'),
+          'rows', json_array(json_array(id, body, updatedAt)))) as _affectedRows from notes where id = $id` },
+      ],
+    };
+    const send = async (id, message) => {
+      sent.push([id, message.serverRevision]);
+      messages.push({ id, message });
+      if (id === 'slow' && message.serverRevision === 1) { delivering.resolve(); await delivery.promise; }
+      if (id === 'slow' && message.serverRevision === 4 && rejectRecovery) throw Error('recovery delivery failed');
+      completed.push([id, message.serverRevision]);
+    };
+    const run = (db, revision, registrations = recipients) => runWithSync(db, { update: query }, 'update',
+      { id: `00000000-0000-0000-0000-${String(revision).padStart(12, '0')}` }, {}, registrations,
+      directory, undefined, send, 'm1');
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    pendingFirst = run(first, 1);
+    await delivering.promise;
+    pendingSecond = run(second, 2, new Map());
+    await turn();
+    assert.equal((await second.execute('select server_revision from _pyre_sync')).rows[0].server_revision, 1);
+    t.mock.timers.tick(LIVE_SYNC_DELIVERY_TIMEOUT_MS - 1);
+    await turn();
+    assert.equal((await second.execute('select server_revision from _pyre_sync')).rows[0].server_revision, 1,
+      'unexpired delivery retains publication ordering');
+    t.mock.timers.tick(1);
+    const results = await Promise.all([pendingFirst, pendingSecond]);
+    assert.deepEqual(results.map(result => result.response.serverRevision), [1, 2]);
+    assert.deepEqual(completed, [['healthy', 1]], 'the stalled sender has not completed');
+    assert.equal((await run(second, 3)).response.serverRevision, 3);
+    assert.deepEqual(sent.filter(([id]) => id === 'slow'), [['slow', 1]],
+      'timed-out registrations receive no newer messages, but healthy subscribers progress');
+    assert.deepEqual(sent.filter(([id]) => id === 'healthy'), [['healthy', 1], ['healthy', 3]]);
+    assert.equal((await run(second, 4)).response.serverRevision, 4);
+    assert.deepEqual(sent.filter(([id]) => id === 'slow'), [['slow', 1]],
+      'writes keep progressing while the old delivery never settles');
+    delivery.resolve();
+    await turn();
+    const recovery = messages.filter(({ id }) => id === 'slow').at(-1).message;
+    assert.equal(recovery.type, 'syncRequired');
+    assert.equal(recovery.serverRevision, 4, 'missed publications coalesce to the newest revision');
+    assert.equal(recovery.data, undefined, 'recovery never publishes skipped row payloads');
+    assert.deepEqual(recovery.reconciliation,
+      { kind: 'replaceRequired', atLeast: 4, invalidate: true, minimumSafeRevision: 4 });
+    assert.deepEqual(completed.filter(([id]) => id === 'slow'), rejectRecovery ? [['slow', 1]] : [['slow', 1], ['slow', 4]]);
+    assert.equal((await run(second, 5)).response.serverRevision, 5);
+    assert.equal(messages.filter(({ id }) => id === 'slow').at(-1).message.type,
+      fenced || rejectRecovery ? 'syncRequired' : 'delta');
+    assert.equal((await run(second, 6)).response.serverRevision, 6);
+    assert.equal(messages.filter(({ id }) => id === 'slow').at(-1).message.type, fenced ? 'syncRequired' : 'delta',
+      'row deltas resume only after recovery evidence is delivered');
+    assert.deepEqual(sent.filter(([id]) => id === 'slow'), [['slow', 1], ['slow', 4], ['slow', 5], ['slow', 6]]);
+    assert.equal((await second.execute('select count(*) as count from notes')).rows[0].count, 6);
+  } finally {
+    delivery.resolve();
+    t.mock.timers.tick(LIVE_SYNC_DELIVERY_TIMEOUT_MS);
+    await Promise.allSettled([pendingFirst, pendingSecond]);
+    t.mock.timers.reset();
+    first.close(); second.close(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const retire of [false, true]) test(`batch hints share named delivery (${retire ? 'retired' : 'current'} registration)`, async t => {
+  const directory = mkdtempSync(new URL('../target/publication-batch-timeout-', import.meta.url));
+  const db = createClient({ url: `file:${directory}/test.db` });
+  const delivery = deferred();
+  const delivering = deferred();
+  const sent = [];
+  let pending;
+  try {
+    await ensureDatabase(db, 'Main', 'record Note {\n    @public\n    id Id.Uuid @id\n    body String\n}\n');
+    const epoch = (await db.execute('select database_epoch from _pyre_sync')).rows[0].database_epoch;
+    const authority = { databaseId: directory, instance: 'tab', authGeneration: 1, namespace: 'Main', manifest: 'm1' };
+    const query = { id: 'noop', operation: 'transaction', primary_db: 'Main',
+      InputValidator: z.object({}), SessionValidator: z.object({}), ReturnData: z.object({}),
+      session_args: [], optional_input_args: [], json_input_args: [],
+      sql: [{ include: false, params: [], sql: 'select 1' }],
+    };
+    const recipients = new Map([['reader', { session: {}, fence: { ...authority, databaseEpoch: epoch } }]]);
+    const send = async (_id, message) => {
+      if (message.serverRevision === 1) { delivering.resolve(); await delivery.promise; }
+      sent.push(message);
+    };
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    pending = runWithSync(db, { noop: query }, 'noop', {}, {}, recipients, directory, undefined, send, 'm1');
+    await delivering.promise;
+    t.mock.timers.tick(LIVE_SYNC_DELIVERY_TIMEOUT_MS);
+    assert.equal((await pending).response.serverRevision, 1);
+    const result = await runBatchWithSync(db,
+      { version: 1, manifestVersion: 'm1', SessionValidator: z.object({}), queries: { noop: query } }, authority,
+      { version: 1, ...authority, databaseEpoch: epoch, requestId: 'batch', sequence: 1,
+        operations: [{ operation: 'noop', input: {} }] }, {}, recipients, send);
+    assert.equal(result.response.commitRevision, 2);
+    assert.deepEqual(sent, [], 'batch acceptance does not wait, but its hint cannot overtake the named send');
+    if (retire) {
+      recipients.set('reader', { session: {}, fence: { ...authority, databaseEpoch: epoch, instance: 'reconnected' } });
+      const current = await runWithSync(db, { noop: query }, 'noop', {}, {}, recipients, directory, undefined, send, 'm1');
+      assert.equal(current.response.serverRevision, 3);
+      assert.deepEqual(sent.map(message => message.serverRevision), [3]);
+    }
+    delivery.resolve();
+    await turn();
+    assert.deepEqual(sent.map(message => message.serverRevision), retire ? [3, 1] : [1, 2],
+      'an already-started send can finish late, but retired queued work must not start');
+    assert.ok(sent.every(message => message.type === 'syncRequired' && message.reconciliation.invalidate));
+  } finally {
+    delivery.resolve();
+    t.mock.timers.tick(LIVE_SYNC_DELIVERY_TIMEOUT_MS);
+    await Promise.allSettled([pending]);
+    t.mock.timers.reset();
+    db.close(); rmSync(directory, { recursive: true, force: true });
   }
 });

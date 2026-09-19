@@ -662,6 +662,16 @@ async fn replacement_events(
         Ok(snapshot) => snapshot,
         Err(error) => return with_cors(&state, &headers, replacement_failure(&request, error)),
     };
+    register_replacement_events(state, headers, request, snapshot.fence).await
+}
+
+// Only called after materialize_replacement authenticates and validates the fence.
+async fn register_replacement_events(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    request: pyre::server::sync::ReplacementRequest,
+    fence: pyre::server::sync::SyncFence,
+) -> Response {
     let session_id = match new_connection_id() {
         Ok(session_id) => session_id,
         Err(error) => return with_cors(&state, &headers, replacement_failure(&request, error)),
@@ -670,24 +680,62 @@ async fn replacement_events(
     state.connections.lock().await.insert(
         session_id.clone(),
         Connection {
-            fence: Some(snapshot.fence.clone()),
+            fence: Some(fence.clone()),
             session: HashMap::new(),
             sender,
         },
     );
-    // Send a hint, not the pre-registration snapshot: the client fetches after
-    // registration, covering any commit between validation and registration.
-    let mut connected = serde_json::to_value(&snapshot.fence).expect("serializable fence");
-    connected["type"] = json!("syncRequired");
-    connected["serverRevision"] = json!(snapshot.revision);
-    connected["reconciliation"] = json!({
-        "kind": "replaceRequired", "atLeast": snapshot.revision,
-        "invalidate": true, "minimumSafeRevision": snapshot.revision
-    });
     let cleanup = ConnectionCleanup {
         state: Arc::clone(&state),
         session_id,
     };
+    // Read after registration on a fresh connection: earlier publications are
+    // covered by this revision, and later ones queue on the registered sender.
+    // A pre-registration revision may already be covered (and ignored) by Elm.
+    let revision = async {
+        let read = async {
+            let conn = state.db.connect()?;
+            let mut rows = conn
+                .query(
+                    "SELECT database_epoch, server_revision FROM _pyre_sync WHERE id = 1",
+                    (),
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)))
+                .transpose()
+        }
+        .await
+        .map_err(|_: libsql::Error| ServeError::Internal("ReplacementFailed".into()))?;
+        let (epoch, revision) =
+            read.ok_or_else(|| ServeError::BadRequest("InvalidFence".into()))?;
+        if epoch != fence.database_epoch
+            || revision < 0
+            || revision.unsigned_abs() > 9_007_199_254_740_991
+        {
+            return Err(ServeError::BadRequest("InvalidFence".into()));
+        }
+        if revision < request.target {
+            return Err(ServeError::BadRequest("TargetNotReached".into()));
+        }
+        Ok(revision)
+    }
+    .await;
+    let revision = match revision {
+        Ok(revision) => revision,
+        Err(error) => {
+            state.connections.lock().await.remove(&cleanup.session_id);
+            return with_cors(&state, &headers, replacement_failure(&request, error));
+        }
+    };
+    let mut connected = serde_json::to_value(&fence).expect("serializable fence");
+    connected["type"] = json!("syncRequired");
+    connected["serverRevision"] = json!(revision);
+    connected["reconciliation"] = json!({
+        "kind": "replaceRequired", "atLeast": revision,
+        "invalidate": true, "minimumSafeRevision": revision
+    });
     let stream = async_stream::stream! {
         let _cleanup = cleanup;
         yield Ok::<_, Infallible>(Event::default().json_data(connected).unwrap_or_else(|_| Event::default()));
@@ -1578,6 +1626,155 @@ record Workspace {
     }
 
     #[tokio::test]
+    async fn replacement_events_initial_hint_covers_commit_published_in_registration_gap() {
+        let (_dir, state) = batch_state().await;
+        let mut body = batch_body(&state).await;
+        let accepted =
+            response_json(submit(state.clone(), body.clone(), origin_headers()).await).await;
+        assert_eq!(accepted["status"], "accepted");
+        let mut request = pyre::server::sync::ReplacementRequest {
+            version: 1,
+            request_id: "subscribe".into(),
+            target: accepted["commitRevision"].as_i64().unwrap(),
+            fence: pyre::server::sync::SyncFence {
+                database_id: body["databaseId"].as_str().unwrap().into(),
+                namespace: body["namespace"].as_str().unwrap().into(),
+                manifest: body["manifest"].as_str().unwrap().into(),
+                database_epoch: body["databaseEpoch"].as_str().unwrap().into(),
+                instance: "recipient".into(),
+                auth_generation: 0,
+            },
+        };
+        // The client already covers R. Pause the handler at its validation /
+        // registration boundary, then complete both the R+1 commit and publication.
+        let covered = materialize_replacement(&state, &origin_headers(), &request)
+            .await
+            .unwrap();
+        assert_eq!(covered.revision, request.target);
+        assert_eq!(covered.tables["items"].rows.len(), 1);
+        body["requestId"] = json!("delete-in-gap");
+        body["sequence"] = json!(2);
+        body["operations"] = json!([{"operation":"delete", "input":{}}]);
+        let intervening =
+            response_json(submit(state.clone(), body.clone(), origin_headers()).await).await;
+        assert_eq!(intervening["status"], "accepted");
+        assert_eq!(intervening["commitRevision"], covered.revision + 1);
+        assert!(state.connections.lock().await.is_empty());
+
+        let response = register_replacement_events(
+            state.clone(),
+            origin_headers(),
+            request.clone(),
+            covered.fence,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.connections.lock().await.len(), 1);
+        let mut stream = response.into_body();
+        let first = stream.data().await.unwrap().unwrap();
+        let first = std::str::from_utf8(&first).unwrap();
+        let hint: JsonValue =
+            serde_json::from_str(first.trim().strip_prefix("data:").unwrap()).unwrap();
+        let mut expected = serde_json::to_value(&request.fence).unwrap();
+        expected["type"] = json!("syncRequired");
+        expected["serverRevision"] = intervening["commitRevision"].clone();
+        expected["reconciliation"] = json!({
+            "kind":"replaceRequired", "atLeast":intervening["commitRevision"],
+            "invalidate":true, "minimumSafeRevision":intervening["commitRevision"]
+        });
+        // Equality also rules out leaking the now-stale validated row payload.
+        assert_eq!(hint, expected);
+        assert!(
+            hint["reconciliation"]["minimumSafeRevision"]
+                .as_i64()
+                .unwrap()
+                > covered.revision
+        );
+        request.target = hint["serverRevision"].as_i64().unwrap();
+        let current = materialize_replacement(&state, &origin_headers(), &request)
+            .await
+            .unwrap();
+        assert_eq!(current.revision, request.target);
+        assert!(current.tables["items"].rows.is_empty());
+
+        body["requestId"] = json!("create-after-registration");
+        body["sequence"] = json!(3);
+        body["operations"] = json!([{"operation":"create", "input":{}}]);
+        let later = response_json(submit(state.clone(), body, origin_headers()).await).await;
+        assert_eq!(later["status"], "accepted");
+        let next = stream.data().await.unwrap().unwrap();
+        let next = std::str::from_utf8(&next).unwrap();
+        let hint: JsonValue =
+            serde_json::from_str(next.trim().strip_prefix("data:").unwrap()).unwrap();
+        assert_eq!(hint["serverRevision"], later["commitRevision"]);
+        assert!(hint.get("tables").is_none());
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert!(state.connections.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_events_rechecks_epoch_and_cleans_up_failed_registration() {
+        for (sql, status, error) in [
+            (
+                "UPDATE _pyre_sync SET database_epoch = 'new-epoch', server_revision = 99",
+                StatusCode::BAD_REQUEST,
+                "InvalidFence",
+            ),
+            (
+                "DELETE FROM _pyre_sync",
+                StatusCode::BAD_REQUEST,
+                "InvalidFence",
+            ),
+            (
+                "UPDATE _pyre_sync SET server_revision = 9007199254740992",
+                StatusCode::BAD_REQUEST,
+                "InvalidFence",
+            ),
+            (
+                "DROP TABLE _pyre_sync",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ReplacementFailed",
+            ),
+        ] {
+            let (_dir, state) = batch_state().await;
+            let body = batch_body(&state).await;
+            let request = pyre::server::sync::ReplacementRequest {
+                version: 1,
+                request_id: "subscribe".into(),
+                target: 0,
+                fence: pyre::server::sync::SyncFence {
+                    database_id: body["databaseId"].as_str().unwrap().into(),
+                    namespace: body["namespace"].as_str().unwrap().into(),
+                    manifest: body["manifest"].as_str().unwrap().into(),
+                    database_epoch: body["databaseEpoch"].as_str().unwrap().into(),
+                    instance: "recipient".into(),
+                    auth_generation: 0,
+                },
+            };
+            let validated = materialize_replacement(&state, &origin_headers(), &request)
+                .await
+                .unwrap();
+            state.db.connect().unwrap().execute(sql, ()).await.unwrap();
+            let response = register_replacement_events(
+                state.clone(),
+                origin_headers(),
+                request.clone(),
+                validated.fence,
+            )
+            .await;
+            assert_eq!(response.status(), status, "{sql}");
+            assert!(state.connections.lock().await.is_empty(), "{sql}");
+            let failure = response_json(response).await;
+            assert_eq!(failure["error"], error, "{sql}");
+            assert_eq!(failure["databaseEpoch"], request.fence.database_epoch);
+            assert_eq!(failure["requestId"], request.request_id);
+            assert!(failure.get("tables").is_none());
+            assert!(failure.get("serverRevision").is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn replacement_events_authenticate_registration_and_stream_fenced_hints() {
         let (_dir, mut state) = batch_state().await;
         Arc::get_mut(&mut state).unwrap().session_source = SessionSource::Header {
@@ -1613,6 +1810,17 @@ record Workspace {
             headers
         };
         let recipient_headers = signed_headers(json!({"instance":"recipient", "authGeneration":7}));
+        assert_eq!(
+            replacement_events(
+                State(state.clone()),
+                origin_headers(),
+                Json(request.clone())
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(state.connections.lock().await.is_empty());
         let mut wrong = request.clone();
         wrong.fence.auth_generation = 8;
         assert_eq!(
@@ -1622,8 +1830,12 @@ record Workspace {
             StatusCode::BAD_REQUEST
         );
         assert!(state.connections.lock().await.is_empty());
-        let response =
-            replacement_events(State(state.clone()), recipient_headers, Json(request)).await;
+        let response = replacement_events(
+            State(state.clone()),
+            recipient_headers.clone(),
+            Json(request.clone()),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let mut stream = response.into_body();
         let first = stream.data().await.unwrap().unwrap();
@@ -1653,6 +1865,17 @@ record Workspace {
         assert!(next.contains("\"serverRevision\":1"));
         assert!(next.contains("\"type\":\"syncRequired\""));
         assert!(!next.contains("origin"));
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert!(state.connections.lock().await.is_empty());
+
+        let unpolled =
+            replacement_events(State(state.clone()), recipient_headers, Json(request)).await;
+        assert_eq!(unpolled.status(), StatusCode::OK);
+        assert_eq!(state.connections.lock().await.len(), 1);
+        drop(unpolled);
+        tokio::task::yield_now().await;
+        assert!(state.connections.lock().await.is_empty());
     }
 
     #[tokio::test]

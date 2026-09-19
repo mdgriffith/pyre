@@ -292,8 +292,12 @@ A successful response has `type: "replacement"`, `scope: "database"`,
 the request's fences, ID, and target. All rows and the revision are read in one
 transaction. Install the whole scope atomically, deleting absent rows; an empty
 scope is not a no-op. Legacy timestamp catchup pages are not replacement evidence.
-The generated `compiledContract` must match the captured schema, and malformed
-stored rows reject the entire snapshot. Synced linked read permissions require
+The namespace's generated replacement contract must match the captured schema.
+Its schema source must also match the successful migration recorded inside the
+same read snapshot. A migration before snapshot acquisition rejects stale
+permission evidence; an already-pinned snapshot remains isolated from later
+migrations and cache refreshes. Malformed stored rows reject the entire snapshot.
+Synced linked read permissions require
 this replacement path; legacy catchup rejects them with `ReplacementRequired`.
 
 `runBatchWithSync` recipients contain `{ session, fence }` from authenticated
@@ -301,8 +305,22 @@ registration. Hints contain each recipient's fence, `type: "syncRequired"`,
 `serverRevision`, and conservative `reconciliation` invalidation metadata, never
 private rows or origin request IDs. Hints only raise required/security revision;
 they cannot advance covered revision. Named `runWithSync` mutations also commit
-their revision with the write and require `sendToSession` so publication completes
-in commit order before `runWithSync` resolves. Pass the trusted current manifest
+their revision with the write and require `sendToSession`. Delivery is ordered per
+registration, but a named request waits at most five seconds for publication before
+releasing the database's mutation queue. While a send remains unresolved, subsequent
+publications to that registration coalesce into one metadata-only invalidation.
+When delivery resumes, that hint requests authoritative catchup before normal row
+deltas resume. A rejected recovery hint is retained for the next publication;
+neither writes nor uncertain row deltas are retried. Batch publication shares this
+ordering without delaying batch acceptance.
+
+Keep registration objects stable for their connection lifetime and replace them
+on reconnect or authentication changes. Deferred delivery checks the current
+registration map before starting another send, so retired registrations cannot
+send queued hints to a replacement connection. Transport adapters remain responsible
+for terminating their own stalled I/O; Pyre cannot cancel a callback's pending promise.
+
+Pass the trusted current manifest
 fingerprint as the final optional argument to enable fenced hints; absent or stale
 manifest evidence suppresses fenced hints without changing legacy recipients. The
 returned `sync()` method is idempotent and returns the already-published revision metadata.
@@ -310,7 +328,10 @@ Failed or delayed SSE delivery does not change known batch acceptance.
 
 The libraries register no routes. The built-in server exposes POST
 `/sync/replacement` and POST `/sync/replacement/events` for replacement and fenced
-SSE registration, separately from its legacy sync routes. Signed sessions bind
+SSE registration, separately from its legacy sync routes. Registration reads its
+initial revision after enrolling the connection, covering commits that occurred
+during authentication even when a reconnecting client already covers the earlier
+validation snapshot. Signed sessions bind
 the instance and auth generation as they do for POST `/db`.
 
 Replacement currently materializes a complete scope in memory, not pinned pages.

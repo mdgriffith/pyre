@@ -1,7 +1,6 @@
 // Run in a fresh process so bun:test's WASM mocks cannot satisfy this integration check.
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { z } from "zod";
@@ -17,7 +16,7 @@ import { meta } from "./compiled-batch/generated/queries/metadata/entryCreate";
 import { sql, syncSql } from "./compiled-batch/generated/queries/sql/entryCreate";
 
 await initWasm({ module_or_path: readFileSync(new URL("../wasm/pyre_wasm_bg.wasm", import.meta.url)) });
-const directory = mkdtempSync(join(tmpdir(), "pyre-real-wasm-"));
+const directory = mkdtempSync(new URL("../../../target/pyre-real-wasm-", import.meta.url));
 const db = createClient({ url: `file:${join(directory, "test.db")}` });
 try {
   await ensureDatabase(db, "_default", databases._default.schemaSource);
@@ -133,6 +132,73 @@ record Workspace {
     assert.equal((await replace()).kind, "success");
     assert.deepEqual(await replace(), { kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest" } });
   } finally { linked.close(); }
+
+  for (const timing of ["beforeTransaction", "beforeSnapshot", "afterSnapshot"]) {
+    const id = `migration-${timing}`;
+    const url = `file:${join(directory, `${id}.db`)}`;
+    const reader = createClient({ url });
+    const writer = createClient({ url });
+    try {
+      const source = (allow: string) => `record Note {
+    id Id.Uuid @id
+    body String
+    @allow(query) { ${allow} }
+    @allow(insert, update, delete) { True }
+}`;
+      await reader.execute("pragma journal_mode = WAL");
+      await ensureDatabase(reader, "_default", source("True"));
+      await loadSchemaFromDatabase(id, reader);
+      const originalManifest: BatchManifest = { version: 1, manifestVersion: id,
+        replacementContracts: { _default: wasm.get_schema_compiled_contract() }, SessionValidator: z.object({}), queries: {} };
+      const binding = { ...authority, databaseId: id, manifest: id };
+      const epoch = (await reader.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch as string;
+      const originalRequest = { ...request, ...binding, databaseEpoch: epoch, target: 0 };
+      await reader.execute("insert into notes(id,body) values('01890f6c-7b80-7000-8000-000000000030','original')");
+      let migrated = false;
+      let currentManifest = originalManifest;
+      const migrate = async () => {
+        assert.equal(migrated, false);
+        migrated = true;
+        await ensureDatabase(writer, "_default", source("False"));
+        await writer.execute("insert into notes(id,body) values('01890f6c-7b80-7000-8000-000000000031','post-revocation secret')");
+        await loadSchemaFromDatabase(id, writer);
+        currentManifest = { ...originalManifest, manifestVersion: `${id}:new`,
+          replacementContracts: { _default: wasm.get_schema_compiled_contract() } };
+      };
+      const transaction = reader.transaction.bind(reader);
+      reader.transaction = async mode => {
+        if (!migrated && timing === "beforeTransaction") await migrate();
+        const tx = await transaction(mode);
+        const execute = tx.execute.bind(tx);
+        tx.execute = async statement => {
+          const snapshotRead = typeof statement === "string" && statement.startsWith("select database_epoch");
+          if (!migrated && snapshotRead && timing === "beforeSnapshot") await migrate();
+          const result = await execute(statement);
+          if (!migrated && snapshotRead && timing === "afterSnapshot") await migrate();
+          return result;
+        };
+        return tx;
+      };
+      const result = await catchupReplacement(reader, originalManifest, binding, originalRequest, {});
+      assert.equal(migrated, true, timing);
+      if (timing === "afterSnapshot") {
+        assert.equal(result.kind, "success", JSON.stringify(result));
+        if (result.kind !== "success") throw Error("No pinned replacement");
+        assert.deepEqual(result.response.tables.notes.rows.map((row: any) => row.body), ["original"]);
+      } else {
+        assert.deepEqual(result, { kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest" } }, timing);
+      }
+      assert.equal((await reader.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch, epoch,
+        "permission-only migrations need not rotate the epoch");
+      const currentBinding = { ...binding, manifest: currentManifest.manifestVersion };
+      const current = await catchupReplacement(reader, currentManifest, currentBinding,
+        { ...originalRequest, ...currentBinding }, {});
+      assert.equal(current.kind, "success", JSON.stringify(current));
+      if (current.kind !== "success") throw Error("No post-migration replacement");
+      assert.deepEqual(current.response.tables.notes.rows, []);
+      assert.equal((await writer.execute("select count(*) as count from notes")).rows[0].count, 2);
+    } finally { reader.close(); writer.close(); }
+  }
 
   for (const jsonType of ["Json<Int>", "Json"]) {
     for (const rhs of jsonType === "Json" ? ["Session.value"] : ["Session.value", "7", "null"]) {

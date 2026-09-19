@@ -24,6 +24,7 @@ import {
 export const MAX_LIVE_SYNC_DELTA_ROWS = 5000;
 export const MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES = 1024 * 1024;
 export const MAX_LIVE_SYNC_FANOUT_RECIPIENTS = 1000;
+export const LIVE_SYNC_DELIVERY_TIMEOUT_MS = 5000;
 
 const fenceValidator = z.strictObject({
   databaseId: z.string().min(1), instance: z.string().min(1),
@@ -61,7 +62,7 @@ export async function catchupReplacement(
     ({ kind: "error", error: { errorType, message: errorType } });
   let captured: ReplacementRequest;
   let session: Session;
-  let restoreSchema: () => void;
+  let schema: ReturnType<typeof captureReplacementSchema>;
   try {
     captured = replacementRequestValidator.parse(structuredClone(request));
     if (manifest.version !== 1 || manifest.manifestVersion !== authority.manifest
@@ -70,7 +71,7 @@ export async function catchupReplacement(
     const decoded = manifest.SessionValidator.safeParse(structuredClone(executingSession));
     if (!decoded.success) return failure("InvalidSession");
     session = decoded.data;
-    restoreSchema = captureReplacementSchema(captured.databaseId, manifest.replacementContracts?.[authority.namespace]!);
+    schema = captureReplacementSchema(captured.databaseId, manifest.replacementContracts?.[authority.namespace]!);
   } catch { return failure("InvalidRequest"); }
 
   let tx: Awaited<ReturnType<Client["transaction"]>> | undefined;
@@ -88,7 +89,11 @@ export async function catchupReplacement(
     if (state?.database_epoch !== captured.databaseEpoch) return failure("InvalidRequest");
     const revision = internalSafeInteger(state.server_revision, "Pyre sync server revision");
     if (revision < captured.target) return failure("ReplacementUnavailable");
-    const tables = await readReplacementTables(tx, session, captured.namespace, restoreSchema);
+    // Permission evidence and rows must belong to the same snapshot, not just
+    // to the same cache entry before asynchronous transaction acquisition.
+    const migration = (await tx.execute("SELECT schema FROM _pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL AND schema IS NOT NULL ORDER BY id DESC LIMIT 1")).rows[0];
+    if (migration?.schema !== schema.schemaSource) return failure("InvalidRequest");
+    const tables = await readReplacementTables(tx, session, captured.namespace, schema.restore);
     // Bound wire materialization without ever turning truncation into completeness.
     if (new TextEncoder().encode(JSON.stringify(tables)).byteLength > MAX_REPLACEMENT_PAYLOAD_BYTES)
       return failure("ReplacementUnavailable");
@@ -124,10 +129,9 @@ export function runBatchWithSync(
       const fence = parsed.data;
       if (fence.databaseId !== response.databaseId || fence.databaseEpoch !== response.databaseEpoch
         || fence.namespace !== response.namespace || fence.manifest !== response.manifest) continue;
-      try { void Promise.resolve(sendToSession(sessionId, { type: "syncRequired", ...fence,
-        serverRevision: response.commitRevision, reconciliation: structuredClone(response.reconciliation) }))
-        .catch(() => { /* Async delivery cannot delay or reject the origin response. */ });
-      } catch { /* A failed recipient must not suppress the others. */ }
+      void sendBestEffort(sendToSession, sessionId, recipient, { type: "syncRequired", ...fence,
+        serverRevision: response.commitRevision, reconciliation: structuredClone(response.reconciliation) },
+        response.databaseId, () => connectedSessions.get(sessionId) === recipient);
     }
   }, captureDatabaseEpoch);
 }
@@ -183,13 +187,86 @@ function singleOriginSession(
   return origin ? new Map([[originSessionId, origin]]) : undefined;
 }
 
+interface Publication {
+  send(sessionId: string, message: any): void | Promise<void>;
+  isCurrent(): boolean;
+  sessionId: string;
+  message: any;
+}
+interface DeliveryState { inFlight: boolean; next?: Publication }
+const recipientDeliveries = new WeakMap<object, Map<DatabaseId | Client, DeliveryState>>();
+
+// Drop row payloads when delivery is uncertain. A single coalesced invalidation
+// repairs all skipped revisions, without letting newer rows overtake an old send.
+function queueReplacement(state: DeliveryState, publication: Publication): void {
+  if (state.next && state.next.message.databaseEpoch === publication.message.databaseEpoch
+    && state.next.message.serverRevision > publication.message.serverRevision) return;
+  const { type: _type, data: _data, ...metadata } = publication.message;
+  const revision = metadata.serverRevision;
+  state.next = { ...publication, message: { ...metadata, type: "syncRequired",
+    reconciliation: { kind: "replaceRequired", atLeast: revision, invalidate: true, minimumSafeRevision: revision } } };
+}
+
 async function sendBestEffort(
   sendToSession: (sessionId: string, message: any) => void | Promise<void>,
   sessionId: string,
+  recipient: object,
   message: unknown,
+  database: DatabaseId | Client,
+  isCurrent: () => boolean,
 ): Promise<void> {
-  try { await sendToSession(sessionId, message); }
+  if (!isCurrent()) return;
+  const publication = { send: sendToSession, sessionId, message, isCurrent };
+  const deliveries = recipientDeliveries.get(recipient) ?? new Map<DatabaseId | Client, DeliveryState>();
+  recipientDeliveries.set(recipient, deliveries);
+  let state = deliveries.get(database);
+  if (state) {
+    queueReplacement(state, publication);
+    if (state.inFlight) return;
+  } else {
+    state = { inFlight: false };
+    deliveries.set(database, state);
+  }
+  const delivery = state;
+  let current: Publication | undefined = delivery.next ?? publication;
+  delivery.next = undefined;
+  delivery.inFlight = true;
+  const completed = (async () => {
+    try {
+      while (current) {
+        if (!current.isCurrent()) { delivery.next = undefined; return; }
+        try { await current.send(current.sessionId, current.message); }
+        catch {
+          // Retry only a replacement hint on a future publication, never a write
+          // or a row delta whose delivery outcome is unknown.
+          queueReplacement(delivery, current);
+          return;
+        }
+        current = delivery.next;
+        delivery.next = undefined;
+      }
+    } finally {
+      delivery.inFlight = false;
+      if (!delivery.next) {
+        deliveries.delete(database);
+        if (!deliveries.size) recipientDeliveries.delete(recipient);
+      }
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      completed,
+      new Promise<void>(resolve => {
+        timer = setTimeout(() => {
+          if (current) queueReplacement(delivery, current);
+          resolve();
+        }, LIVE_SYNC_DELIVERY_TIMEOUT_MS);
+      }),
+    ]);
+  }
   catch { /* Independent recipient delivery. */ }
+  finally { clearTimeout(timer); }
 }
 
 // Database IDs coordinate pooled handles in this process; legacy callers without
@@ -201,6 +278,7 @@ function syncWithWasmForDatabase(
   databaseId?: DatabaseId,
   namespace?: string,
   currentManifest?: string,
+  registrations?: Map<string, object>,
 ): SyncDeltasFn {
   const normalizedDatabaseId = databaseId ? requireDatabaseId(databaseId) : undefined;
 
@@ -209,7 +287,9 @@ function syncWithWasmForDatabase(
     const { databaseEpoch, serverRevision } = revision;
     const sends: Promise<void>[] = [];
     const queueSend = (sessionId: string, message: unknown) => {
-      sends.push(sendBestEffort(sendToSession, sessionId, message));
+      const recipient = connectedSessions.get(sessionId);
+      if (recipient) sends.push(sendBestEffort(sendToSession, sessionId, recipient, message,
+        normalizedDatabaseId ?? db, () => !registrations || registrations.get(sessionId) === recipient));
     };
     // Replacement registrations never receive legacy deltas, including an origin registration.
     const legacySessions = new Map(connectedSessions);
@@ -375,7 +455,7 @@ export async function runWithSync(
   const capturedArgs = structuredClone(args);
   const capturedSession = structuredClone(executingSession);
   const originSession = capturedSession;
-  const publish = syncWithWasmForDatabase(db, databaseId, queryMap[queryId]?.primary_db, currentManifest);
+  const publish = syncWithWasmForDatabase(db, databaseId, queryMap[queryId]?.primary_db, currentManifest, connectedSessions);
   const sync: SyncDeltasFn = (rows, sessions, send, origin, revision) => {
     const current = new Map(sessions);
     if (origin && !current.has(origin)) current.set(origin, { session: originSession });
