@@ -6,15 +6,15 @@ interface Client {
   name: string
   connected: boolean
   sessionId: string | null
-  userId: number | null
-  requestedUserId: number | null
+  userId: string | null
+  requestedUserId: string | null
 }
 
 interface ClientListProps {
   clients: Client[]
   selectedClientId: string
   onSelectClient: (clientId: string) => void
-  onUpdateUserId: (clientId: string, userId: number | null) => void
+  onUpdateUserId: (clientId: string, userId: string | null) => void
 }
 
 export default function ClientList({
@@ -37,8 +37,8 @@ export default function ClientList({
   const handleUserIdSubmit = (e: React.FormEvent, clientId: string) => {
     e.preventDefault()
     e.stopPropagation()
-    const userId = userIdInput.trim() === '' ? null : parseInt(userIdInput, 10)
-    if (userId === null || (!isNaN(userId) && userId > 0)) {
+    const userId = userIdInput.trim() || null
+    if (userId === null || /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(userId)) {
       onUpdateUserId(clientId, userId)
       setEditingUserId(null)
     }
@@ -79,8 +79,7 @@ export default function ClientList({
                 {editingUserId === client.id && !client.connected ? (
                   <form onSubmit={(e) => handleUserIdSubmit(e, client.id)}>
                     <input
-                      type="number"
-                      min="1"
+                      type="text"
                       value={userIdInput}
                       onChange={(e) => setUserIdInput(e.target.value)}
                       onKeyDown={(e) => handleUserIdKeyDown(e, client.id)}

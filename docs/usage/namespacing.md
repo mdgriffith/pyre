@@ -83,7 +83,11 @@ cross-database SQLite foreign-key constraint.
 
 ## Sync Policy
 
-Namespaces sync by default. Add `@syncable(false)` at the top of a schema file when a namespace should be queryable through Pyre but excluded from catchup/live sync. You can use `@syncable(true)` to be explicit about the default synced behavior.
+Namespaces sync by default. Every record in a synced namespace must have exactly one
+non-null `Id.Uuid @id` primary key. Add `@syncable(false)` at the top of a schema
+file when a namespace should be queryable through Pyre but excluded from
+catchup/live sync. Query-only namespaces may retain integer or other primary-key
+types. You can use `@syncable(true)` to be explicit about the default synced behavior.
 
 ```pyre
 @syncable(false)
@@ -104,4 +108,6 @@ For a main/campaign split, mark the `Main` namespace with `@syncable(false)` and
 - Use `@link(..., Namespace.Table.field)` for cross-namespace links.
 - Use `Namespace.Table.field` for cross-namespace foreign-key column types.
 - Use `@syncable(false)` for namespaces that should be queried but not stored in frontend sync state.
+- When enabling sync on an existing namespace, migrate every record primary key and
+  its foreign keys to `Id.Uuid`; Pyre does not provide a synchronized integer-ID fallback.
 - When migrating multi-namespace projects, always pass `--namespace`.

@@ -81,6 +81,11 @@ pub enum ErrorType {
         record: String,
         field: String,
     },
+    SyncablePrimaryKeyMustBeUuid {
+        record: String,
+        field: String,
+        found: String,
+    },
     MultipleTableNames {
         record: String,
     },
@@ -1086,6 +1091,19 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
             result
         }
 
+        ErrorType::SyncablePrimaryKeyMustBeUuid {
+            record,
+            field,
+            found,
+        } => format!(
+            "{}.{} is a {} primary key, but synchronized records require an {} primary key. Use {} on the namespace if it is query-only.",
+            cyan_if(in_color, record),
+            cyan_if(in_color, field),
+            cyan_if(in_color, found),
+            cyan_if(in_color, "Id.Uuid"),
+            cyan_if(in_color, "@syncable(false)"),
+        ),
+
         ErrorType::MultipleTableNames { record } => {
             let mut result = "".to_string();
 
@@ -1640,6 +1658,7 @@ pub fn to_error_title(error_type: &ErrorType) -> String {
         ErrorType::InvalidTypeUsage { .. } => "Invalid Type Usage",
         ErrorType::NoPrimaryKey { .. } => "No Primary Key",
         ErrorType::MultiplePrimaryKeys { .. } => "Multiple Primary Keys",
+        ErrorType::SyncablePrimaryKeyMustBeUuid { .. } => "Synchronized Primary Key Must Be UUID",
         ErrorType::MultipleTableNames { .. } => "Multiple table names",
         ErrorType::MultiplePermissions { .. } => "Multiple Permissions",
         ErrorType::MissingPermissions { .. } => "Missing Permissions",

@@ -1,6 +1,35 @@
 # Seeding Data
 
-Pyre provides a server-side seed helper for creating fixture or import data without writing one-off mutation queries.
+## Explicit-Session Local Edits
+
+For permission-checked seeds that maintain sync revisions, use generated local-edit
+builders with `localEdits.bind` from `@pyre/server/local-edits`. Bind an authorized
+database and an explicit effective `session`, including `{}` for sessionless
+schemas. See [binding and outcomes](local-edits.md#server-seeds).
+
+The runnable [seed example](../../packages/server/fixtures/local-edits/seed.ts)
+creates a UUID-linked project/task, an integer-ID audit and a named command in one
+transaction. It creates and cleans up a temporary database under `target/`.
+From the repository root, with the server WASM artifact built:
+
+```sh
+cargo build --bin pyre
+bun packages/server/fixtures/local-edits/generate.ts
+bun packages/server/fixtures/local-edits/seed.ts
+```
+
+Results are available only on `confirmed`. A committed result-codec failure is
+`acceptedUnreconciled` with `code: "InvalidResult"` and a commit revision, not a
+rejection or a fabricated result. `outcomeUnknown` may have committed. Neither
+outcome authorizes automatic replay; creates are inserts, not rerunnable upserts.
+Server binding needs no browser worker, cache or SSE registration.
+
+## Legacy Seed Helper
+
+The separate legacy server-side `seed` helper creates fixture/import data without
+query permission checks or sync metadata. Use it only for trusted setup/import
+before synced clients depend on the data, not as an implicit-admin local-edit path.
+The remainder of this page describes that legacy helper.
 
 Seed data is shaped like the database schema. Top-level keys are table names, and nested keys are links declared in the Pyre schema.
 

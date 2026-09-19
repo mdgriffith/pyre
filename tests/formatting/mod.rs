@@ -1342,6 +1342,8 @@ session {
 
 fn create_id_type_database() -> ast::Database {
     let schema_source = r#"
+@syncable(false)
+
 record Task {
     @public
     id Id.Int @id
@@ -1358,6 +1360,8 @@ record Task {
 
 fn create_typed_literal_database() -> ast::Database {
     let schema_source = r#"
+@syncable(false)
+
 type Dimensions = Dimensions { width Int, height Int }
 
 type Mode

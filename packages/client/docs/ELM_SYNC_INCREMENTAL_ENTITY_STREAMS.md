@@ -34,9 +34,13 @@ Returned rows decode to typed variants:
 ```elm
 type EntityChange
     = PostRow PostEntity
+    | PostRemoved PostId
     | CommentRow CommentEntity
+    | CommentRemoved CommentId
     | EntityDecodeFailed String Decode.Value
 ```
+
+Removal variants carry the schema primary-key type and no row payload.
 
 ## Elm Ports
 

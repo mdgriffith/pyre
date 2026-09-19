@@ -175,9 +175,13 @@ type Effect
 
 The host app should map `Send`/`LogError` to its own outgoing ports.
 
-For standard writes, prefer the generated mutation modules in `Query.*`.
+For fenced local edits, prefer `Db.<Namespace>.Edit.<Record>` and
+`Pyre.submit`/`Pyre.batch`: see [opaque patches, create options, receipts and ordered
+bridge wiring](local-edits.md#generated-elm). Nullable setters use `Maybe`, not
+`Db.Updates`. That is a separate API; existing `Query.*` calls remain available.
 
-Pyre generates default CRUD mutations for writable tables:
+Pyre compiles default CRUD operations for tables; server permissions determine
+whether a particular execution is writable:
 
 - `{Table}Create`
 - `{Table}Update`
@@ -185,9 +189,14 @@ Pyre generates default CRUD mutations for writable tables:
 
 That means Elm app code can usually initiate writes through generated modules like `Query.DocumentCreate`, `Query.DocumentUpdate`, and `Query.DocumentDelete` without authoring custom mutation queries first.
 
-Reach for a handwritten mutation query only when the write is not simple CRUD, such as nested inserts or other custom write behavior.
+Keep handwritten commands for domain invariants, nested inserts or other custom
+behavior. Generated CRUD does not run checks encoded only in those commands;
+MEC-117 remains the enforcement/discoverability follow-up. Empty generated updates
+reject as `InvalidEdit`; successful CRUD results contain the affected `{ id }`,
+not a guaranteed readable row.
 
-Generated update mutation modules use `Db.Updates` for nullable update fields so Elm can distinguish:
+The existing `Query.*` update modules use `Db.Updates` for nullable update fields
+so Elm can distinguish:
 
 - set a value
 - leave the field unchanged

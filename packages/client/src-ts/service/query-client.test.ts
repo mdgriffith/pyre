@@ -126,3 +126,21 @@ test('JSON operands remain literal through registration, input updates and refre
     expect(sent.at(-1).querySource.posts['@where']).toEqual({ json: { $eq: json } });
   }
 });
+
+test('publication skips a query unregistered by an earlier callback', () => {
+  const { service } = harness();
+  const calls: string[] = [];
+  service.registerQuery({ queryId: 'first', querySource: {}, input: {} }, () => {
+    calls.push('first');
+    service.unregisterQuery('second');
+  });
+  service.registerQuery({ queryId: 'second', querySource: {}, input: {} }, () => calls.push('second'));
+
+  service.installPublication([
+    { queryId: 'first', revision: 1, result: 'a' },
+    { queryId: 'second', revision: 1, result: 'b' },
+  ])();
+
+  expect(calls).toEqual(['first']);
+  expect(service.getRegisteredQueryIds()).toEqual(['first']);
+});

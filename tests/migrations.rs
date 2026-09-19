@@ -172,7 +172,9 @@ async fn create_migration_diff(
 #[tokio::test]
 async fn migration_creates_single_pyre_sync_revision_row() -> Result<(), TestError> {
     let db = MigrationDatabase::new(
-        r#"record Note {
+        r#"@syncable(false)
+
+record Note {
     id Int @id
     body String
     @public
@@ -237,7 +239,9 @@ async fn migration_creates_single_pyre_sync_revision_row() -> Result<(), TestErr
 
 #[tokio::test]
 async fn test_introspection_captures_index_metadata() -> Result<(), TestError> {
-    let schema = r#"record Membership {
+    let schema = r#"@syncable(false)
+
+record Membership {
     id        Int @id
     orgId     Int
     userId    Int
@@ -357,7 +361,7 @@ record Event {
 async fn explicit_composite_cursor_index_is_not_duplicated() -> Result<(), TestError> {
     let db = MigrationDatabase::new(
         r#"record Event {
-    id        Int @id
+    id        Id.Uuid @id
     updatedAt DateTime
     @index(updatedAt, id)
     @public
@@ -393,13 +397,13 @@ async fn explicit_composite_cursor_index_is_not_duplicated() -> Result<(), TestE
 #[tokio::test]
 async fn sync_mode_migrations_add_and_remove_composite_cursor_indexes() -> Result<(), TestError> {
     let synced = r#"record Event {
-    id Int @id
+    id Id.Uuid @id
     @public
 }"#;
     let query_only = r#"@syncable(false)
 
 record Event {
-    id Int @id
+    id Id.Uuid @id
     @public
 }"#;
 
@@ -424,7 +428,7 @@ record Event {
 async fn migration_replaces_legacy_timestamp_index_with_composite_cursor_index(
 ) -> Result<(), TestError> {
     let schema_source = r#"record Note {
-    id Int @id
+    id Id.Uuid @id
     @public
 }"#;
     let db = MigrationDatabase::new(schema_source).await?;
@@ -472,7 +476,9 @@ create index "idx_notes_updatedAt" on "notes" ("updatedAt");
 #[tokio::test]
 async fn singleton_record_rejects_a_second_row_and_is_introspected() -> Result<(), TestError> {
     let db = MigrationDatabase::new(
-        r#"record ApplicationSettings {
+        r#"@syncable(false)
+
+record ApplicationSettings {
     @singleton
     @public
 
@@ -521,11 +527,15 @@ async fn singleton_record_rejects_a_second_row_and_is_introspected() -> Result<(
 
 #[tokio::test]
 async fn singleton_migrations_add_and_remove_the_constant_unique_index() -> Result<(), TestError> {
-    let regular = r#"record ApplicationSettings {
+    let regular = r#"@syncable(false)
+
+record ApplicationSettings {
     @public
     id Int @id
 }"#;
-    let singleton = r#"record ApplicationSettings {
+    let singleton = r#"@syncable(false)
+
+record ApplicationSettings {
     @singleton
     @public
     id Int @id
@@ -557,12 +567,16 @@ async fn singleton_migrations_add_and_remove_the_constant_unique_index() -> Resu
 
 #[tokio::test]
 async fn immutable_changes_produce_no_sql_migration() -> Result<(), TestError> {
-    let mutable = r#"record Document {
+    let mutable = r#"@syncable(false)
+
+record Document {
     id      Int @id
     ownerId Int
     @public
 }"#;
-    let immutable = r#"record Document {
+    let immutable = r#"@syncable(false)
+
+record Document {
     id      Int @id
     ownerId Int @immutable
     @public
@@ -579,12 +593,16 @@ async fn immutable_changes_produce_no_sql_migration() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn immutable_and_physical_changes_produce_only_physical_sql() -> Result<(), TestError> {
-    let old = r#"record Document {
+    let old = r#"@syncable(false)
+
+record Document {
     id      Int @id
     ownerId Int
     @public
 }"#;
-    let new = r#"record Document {
+    let new = r#"@syncable(false)
+
+record Document {
     id      Int @id
     ownerId Int @immutable
     summary String?
@@ -606,13 +624,17 @@ async fn immutable_and_physical_changes_produce_only_physical_sql() -> Result<()
 
 #[tokio::test]
 async fn test_migration_add_table() -> Result<(), TestError> {
-    let old_schema = r#"record User {
+    let old_schema = r#"@syncable(false)
+
+record User {
     id   Int    @id
     name String
     @public
 }"#;
 
-    let new_schema = r#"record User {
+    let new_schema = r#"@syncable(false)
+
+record User {
     id   Int    @id
     name String
     @public
@@ -648,13 +670,17 @@ record Post {
 
 #[tokio::test]
 async fn test_migration_add_column() -> Result<(), TestError> {
-    let old_schema = r#"record User {
+    let old_schema = r#"@syncable(false)
+
+record User {
     id   Int    @id
     name String
     @public
 }"#;
 
-    let new_schema = r#"record User {
+    let new_schema = r#"@syncable(false)
+
+record User {
     id    Int    @id
     name  String
     email String
@@ -686,7 +712,9 @@ async fn test_migration_add_column() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn test_migration_adds_composite_unique_and_partial_ordered_index() -> Result<(), TestError> {
-    let old_schema = r#"record Membership {
+    let old_schema = r#"@syncable(false)
+
+record Membership {
     id        Int @id
     orgId     Int
     userId    Int
@@ -695,7 +723,9 @@ async fn test_migration_adds_composite_unique_and_partial_ordered_index() -> Res
     @public
 }"#;
 
-    let new_schema = r#"record Membership {
+    let new_schema = r#"@syncable(false)
+
+record Membership {
     id        Int @id
     orgId     Int
     userId    Int
@@ -744,14 +774,18 @@ async fn test_migration_adds_composite_unique_and_partial_ordered_index() -> Res
 
 #[tokio::test]
 async fn test_migration_remove_column() -> Result<(), TestError> {
-    let old_schema = r#"record User {
+    let old_schema = r#"@syncable(false)
+
+record User {
     id    Int    @id
     name  String
     email String
     @public
 }"#;
 
-    let new_schema = r#"record User {
+    let new_schema = r#"@syncable(false)
+
+record User {
     id   Int    @id
     name String
     @public
@@ -781,13 +815,17 @@ async fn test_migration_remove_column() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn test_migration_change_column_type() -> Result<(), TestError> {
-    let old_schema = r#"record User {
+    let old_schema = r#"@syncable(false)
+
+record User {
     id   Int    @id
     age  Int
     @public
 }"#;
 
-    let new_schema = r#"record User {
+    let new_schema = r#"@syncable(false)
+
+record User {
     id   Int     @id
     age  String
     @public

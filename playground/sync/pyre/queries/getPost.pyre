@@ -1,4 +1,4 @@
-query GetPost($id: Int) {
+query GetPost($id: Post.id) {
     post {
         @where { id == $id  }
 
@@ -15,5 +15,4 @@ query GetPost($id: Int) {
         }
     }
 }
-
 

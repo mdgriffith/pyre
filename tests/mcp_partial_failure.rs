@@ -13,7 +13,7 @@ fn workspace() -> TempDir {
     std::fs::write(dir.path().join("pyre/session.pyre"), "session {}\n").unwrap();
     std::fs::write(
         dir.path().join("pyre/schema.pyre"),
-        "record User {\n id Int @id\n name String\n @public\n}\n",
+        "@syncable(false)\nrecord User {\n id Int @id\n name String\n @public\n}\n",
     )
     .unwrap();
     assert_cmd::Command::cargo_bin("pyre")
@@ -219,10 +219,6 @@ async fn runtime_reports_statement_index_and_transaction_stages() {
     statements[0].sql = "INSERT INTO children VALUES (99)".to_string();
     let error = query::run(&conn, &manifest, "Test", json!({}), &session)
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("commit transaction: database error"),
-        "{error}"
-    );
+        .unwrap_err();
+    assert!(matches!(error, query::Error::OutcomeUnknown));
 }

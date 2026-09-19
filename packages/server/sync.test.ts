@@ -1,5 +1,7 @@
 // @ts-nocheck
 import { afterEach, expect, mock, test } from "bun:test";
+import { namespace } from "@pyre/core/local-edits";
+import { z } from "zod";
 
 const defaultSyncSql = () => ({
   tables: [
@@ -48,6 +50,7 @@ let reshapeSyncTableGroupsMock = defaultReshapeSyncTableGroups;
 let introspectionResult = { schema_source: "" };
 let setSchemaCalls: unknown[] = [];
 let migrationResult: any = { Ok: { sql: [], mark_success: "record migration" } };
+let activeSchema: any;
 
 mock.module("./wasm/pyre_wasm.js", () => ({
   sql_is_initialized: () => "select 1 as is_initialized",
@@ -56,13 +59,18 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   get_sync_sql: (...args: unknown[]) => getSyncSqlMock(...args),
   calculate_sync_deltas: () => ({ groups: [] }),
   reshape_sync_table_groups: (groups: any) => reshapeSyncTableGroupsMock(groups),
-  set_schema: (introspection: unknown) => setSchemaCalls.push(introspection),
+  set_schema: (introspection: unknown) => { activeSchema = introspection; setSchemaCalls.push(introspection); },
+  get_schema_compiled_contract: () => activeSchema?.compiledContract ?? "contract-1",
+  get_schema_manifest_contract: () => activeSchema?.manifestContract ?? activeSchema?.compiledContract ?? "contract-1",
   migrate_with_introspection: () => migrationResult,
   sql_introspect_uninitialized: () => "select uninitialized introspection",
+  process_introspection: (introspection: unknown) => introspection,
 }));
 
 const { catchup, rotateDatabaseEpoch } = await import("./sync");
-const { ensureDatabase, loadSchemaFromDatabase } = await import("./schema");
+const { ensureDatabase, loadSchemaFromDatabase, getIntrospectionJson } = await import("./schema");
+const { localEdits } = await import("./local-edits");
+const { runBatch } = await import("./query");
 
 afterEach(() => {
   getSyncSqlMock = defaultSyncSql;
@@ -71,6 +79,7 @@ afterEach(() => {
   introspectionResult = { schema_source: "" };
   setSchemaCalls = [];
   migrationResult = { Ok: { sql: [], mark_success: "record migration" } };
+  activeSchema = undefined;
 });
 
 function initializationDatabase(initialized: boolean, introspection: any) {
@@ -93,7 +102,10 @@ function initializationDatabase(initialized: boolean, introspection: any) {
     get closed() { return closed; },
   };
   return {
-    db: { transaction: mock(async () => tx) },
+    db: {
+      transaction: mock(async () => tx),
+      execute: tx.execute,
+    },
     tx,
     batches,
   };
@@ -139,6 +151,39 @@ test("ensureDatabase reuses an unchanged database", async () => {
   expect(database.tx.rollback).toHaveBeenCalledTimes(1);
 });
 
+test("schema reads recognize bigint initialization flags", async () => {
+  const introspection = { tables: [{ name: "notes" }], schema_source: "record Note {}" };
+  const queries: string[] = [];
+  const db = { execute: mock(async (sql: string) => {
+    queries.push(sql);
+    if (sql.includes("is_initialized")) return { rows: [{ is_initialized: 1n }] };
+    return { rows: [{ result: JSON.stringify(introspection) }] };
+  }) };
+
+  await loadSchemaFromDatabase(db as any);
+  expect(queries).toEqual(["select 1 as is_initialized", "select introspection"]);
+  queries.length = 0;
+  expect(await getIntrospectionJson(db as any)).toEqual(introspection);
+  expect(queries).toEqual(["select 1 as is_initialized", "select introspection"]);
+});
+
+test("failed ensure refresh removes prior exact-client schema evidence", async () => {
+  const database = initializationDatabase(true, {
+    tables: [{ name: "notes" }], schema_source: "record Note {}", compiledContract: "contract-1",
+  });
+  const scope = namespace<any>("Main", "manifest-1");
+  const manifest = { version: 1 as const, manifestVersion: scope.manifest, compiledContract: "contract-1",
+    replacementContracts: { Main: "contract-1" }, queries: {}, SessionValidator: z.object({}) };
+  const bind = () => localEdits.bind({ database: database.db as any, databaseId: "main",
+    namespace: scope, manifest, session: {} });
+
+  await ensureDatabase(database.db as any, "Campaign", "record Note {}");
+  expect(bind).not.toThrow();
+  migrationResult = { Err: ["invalid"] };
+  await expect(ensureDatabase(database.db as any, "Campaign", "changed")).rejects.toThrow("Schema migration failed");
+  expect(bind).toThrow("InvalidRequest");
+});
+
 test("ensureDatabase rejects unmanaged tables", async () => {
   const database = initializationDatabase(false, {
     tables: [{ name: "legacy" }],
@@ -151,6 +196,160 @@ test("ensureDatabase rejects unmanaged tables", async () => {
     ensureDatabase(database.db as any, "Campaign", "record Note {}"),
   ).rejects.toThrow("not managed by Pyre");
   expect(database.tx.rollback).toHaveBeenCalledTimes(1);
+});
+
+test("schema manifest evidence is exact-client, rejects stale contracts, and clears on failed refresh", async () => {
+  const firstSchema: any = { schema_source: "first", compiledContract: "replacement-1", manifestContract: "contract-1" };
+  const secondSchema: any = { schema_source: "second", compiledContract: "replacement-2", manifestContract: "contract-2" };
+  let failFirst = false;
+  const client = (schema: () => any, fails: () => boolean) => ({
+    execute: mock(async (sql: string) => {
+      if (fails()) throw new Error("refresh failed");
+      if (sql.includes("is_initialized")) return { rows: [{ is_initialized: 1 }] };
+      return { rows: [{ result: JSON.stringify(schema()) }] };
+    }),
+  });
+  const first = client(() => firstSchema, () => failFirst);
+  const second = client(() => secondSchema, () => false);
+  const unproven = client(() => firstSchema, () => false);
+  const scope = namespace<any>("Main", "manifest-1");
+  const matching = { version: 1 as const, manifestVersion: scope.manifest, compiledContract: "contract-1",
+    replacementContracts: { Main: "replacement-1" }, queries: {}, SessionValidator: z.object({}) };
+  const bind = (database: any, manifest: any = matching) => localEdits.bind({
+    database, databaseId: "main", namespace: scope, manifest, session: {},
+  });
+
+  await loadSchemaFromDatabase(first as any);
+  expect(() => bind(first)).not.toThrow();
+  expect(() => bind(unproven)).toThrow("InvalidRequest");
+  expect(() => bind(first, { ...matching, compiledContract: "application-contract",
+    replacementContracts: { ...matching.replacementContracts, Other: "replacement-other" } })).not.toThrow();
+  expect(() => bind(first, { ...matching, compiledContract: "stale" })).toThrow("InvalidRequest");
+  expect(() => bind(first, { ...matching, replacementContracts: { Main: "stale" } })).toThrow("InvalidRequest");
+  expect(() => bind(first, { ...matching, compiledContract: undefined })).toThrow("InvalidRequest");
+
+  await loadSchemaFromDatabase(second as any);
+  expect(() => bind(second)).toThrow("InvalidRequest");
+  expect(() => bind(first)).not.toThrow();
+
+  failFirst = true;
+  await expect(loadSchemaFromDatabase(first as any)).rejects.toThrow("refresh failed");
+  expect(() => bind(first)).toThrow("InvalidRequest");
+});
+
+test("migration evidence supersedes an overlapping schema load", async () => {
+  const oldSchema = { tables: [{ name: "notes" }], schema_source: "old", compiledContract: "replacement-old", manifestContract: "manifest-old" };
+  const newSchema = { tables: [{ name: "notes" }], schema_source: "new", compiledContract: "replacement-new", manifestContract: "manifest-new" };
+  let migrated = false;
+  let releaseMigration!: () => void;
+  let markMigrationStarted!: () => void;
+  const migrationStarted = new Promise<void>(resolve => { markMigrationStarted = resolve; });
+  const migrationGate = new Promise<void>(resolve => { releaseMigration = resolve; });
+  let closed = false;
+  const tx = {
+    execute: mock(async (sql: string) => sql.includes("is_initialized")
+      ? { rows: [{ is_initialized: 1 }] }
+      : { rows: [{ result: JSON.stringify(migrated ? newSchema : oldSchema) }] }),
+    batch: mock(async () => { markMigrationStarted(); await migrationGate; migrated = true; }),
+    commit: mock(async () => { closed = true; }), rollback: mock(async () => { closed = true; }),
+    close: mock(() => { closed = true; }), get closed() { return closed; },
+  };
+  const db = {
+    transaction: mock(async () => tx),
+    execute: mock(async (sql: string) => sql.includes("is_initialized")
+      ? { rows: [{ is_initialized: 1 }] }
+      : { rows: [{ result: JSON.stringify(oldSchema) }] }),
+  };
+  migrationResult = { Ok: { sql: ["alter table notes add column title text"], mark_success: "record migration" } };
+  const scope = namespace<any>("Main", "manifest-1");
+  const bind = (compiledContract: string, replacementContract: string) => localEdits.bind({
+    database: db as any, databaseId: "main", namespace: scope,
+    manifest: { version: 1, manifestVersion: scope.manifest, compiledContract,
+      replacementContracts: { Main: replacementContract }, queries: {}, SessionValidator: z.object({}) },
+    session: {},
+  });
+
+  const migration = ensureDatabase(db as any, "Main", "new");
+  await migrationStarted;
+  await loadSchemaFromDatabase(db as any);
+  expect(() => bind("manifest-old", "replacement-old")).toThrow("InvalidRequest");
+  releaseMigration();
+  await migration;
+
+  expect(() => bind("manifest-new", "replacement-new")).not.toThrow();
+  expect(() => bind("manifest-old", "replacement-old")).toThrow("InvalidRequest");
+});
+
+test("queued batch revalidates schema evidence after acquiring its write transaction", async () => {
+  const authority = { databaseId: "schema-race", namespace: "Main", manifest: "manifest-1", instance: "tab-1", authGeneration: 0 };
+  const request = { version: 1, ...authority, databaseEpoch: "epoch-1", requestId: "request-1", sequence: 1,
+    operations: [{ operation: "write", input: {} }] };
+  const query = { id: "write", operation: "transaction", primary_db: "Main", sql: [
+    { include: false, params: [], sql: "update notes set body = 'captured'" },
+  ], session_args: [], optional_input_args: [], json_input_args: [], InputValidator: z.object({}), SessionValidator: z.object({}) };
+  const oldManifest = { version: 1, manifestVersion: authority.manifest, compiledContract: "manifest-old",
+    replacementContracts: { Main: "replacement-old" }, queries: { write: query }, SessionValidator: z.object({}) };
+  const unboundManifest = { ...oldManifest, compiledContract: undefined, replacementContracts: undefined };
+
+  let releaseFirst: () => void;
+  let markFirstStarted: () => void;
+  const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve; });
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const firstTx = {
+    execute: mock(async (statement: any) => {
+      const sql = typeof statement === "string" ? statement : statement.sql;
+      if (sql === "pragma database_list") {
+        markFirstStarted();
+        await firstGate;
+        return { rows: [{ name: "main", file: "/tmp/schema-race.db" }], columns: ["name", "file"], rowsAffected: 0 };
+      }
+      if (sql.includes("select database_epoch")) return { rows: [{ database_epoch: "epoch-1" }], columns: ["database_epoch"], rowsAffected: 0 };
+      if (sql.includes("update _pyre_sync")) return { rows: [{ database_epoch: "epoch-1", server_revision: 1 }], columns: ["database_epoch", "server_revision"], rowsAffected: 1 };
+      return { rows: [], columns: [], rowsAffected: 1 };
+    }),
+    commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}),
+  };
+  const integerMode = { rows: [{ _pyre_integer_mode: 1 }] };
+  const firstDb = { execute: mock(async () => integerMode), transaction: mock(async () => firstTx) };
+
+  let schema = { schema_source: "old", compiledContract: "replacement-old", manifestContract: "manifest-old" };
+  const secondExecute = mock(async (sql: string) => sql.includes("_pyre_integer_mode")
+    ? integerMode
+    : sql.includes("is_initialized")
+      ? { rows: [{ is_initialized: 1 }] }
+      : { rows: [{ result: JSON.stringify(schema) }] });
+  const secondTx = { execute: mock(async () => { throw new Error("captured SQL must not execute"); }),
+    commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}) };
+  const secondDb = { execute: secondExecute, transaction: mock(async () => secondTx) };
+
+  await loadSchemaFromDatabase(secondDb as any);
+  const first = runBatch(firstDb as any, unboundManifest as any, authority, request as any, {});
+  await firstStarted;
+  const queued = runBatch(secondDb as any, oldManifest as any, authority, request as any, {});
+  schema = { schema_source: "new", compiledContract: "replacement-new", manifestContract: "manifest-new" };
+  await loadSchemaFromDatabase(secondDb as any);
+  releaseFirst!();
+
+  expect((await first).kind).toBe("success");
+  expect(await queued).toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest" } });
+  expect(secondDb.transaction).toHaveBeenCalledWith("write");
+  expect(secondTx.execute).not.toHaveBeenCalled();
+  expect(secondTx.rollback).toHaveBeenCalledTimes(1);
+});
+
+test("ensureDatabase refreshes existing database-id schema registrations", async () => {
+  const introspection = {
+    tables: [{ name: "notes" }], schema_source: "record Note {}", compiledContract: "contract-1",
+  };
+  const database = initializationDatabase(true, introspection);
+  await loadSchemaFromDatabase("main", database.db as any);
+  await ensureDatabase(database.db as any, "Main", introspection.schema_source);
+  getSyncSqlMock = () => ({ tables: [] });
+
+  await catchup({ execute: mock(async () => ({ rows: [{ database_epoch: "epoch" }] })), batch: mock(async () => []) } as any,
+    { tables: {} }, {}, 1000, "main");
+
+  expect(setSchemaCalls.at(-1)).toEqual(introspection);
 });
 
 test("catchup activates the schema loaded for its databaseId", async () => {

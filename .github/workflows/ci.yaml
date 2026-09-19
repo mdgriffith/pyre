@@ -25,6 +25,11 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Set up wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
         with:
@@ -48,8 +53,18 @@ jobs:
       - name: Typecheck TypeScript packages
         run: bun run typecheck
 
+      - name: Build compiler for server fixtures
+        run: cargo build --locked --bin pyre
+
       - name: Test server package
         run: bun run --cwd packages/server test
 
+      - name: Build client engine for Rust integration tests
+        working-directory: packages/client
+        run: npm exec --yes --package=elm@0.19.1-6 -- bash ./scripts/build.sh --optimize
+
       - name: Run tests
         run: cargo test --locked
+
+      - name: Test local-edit lifecycle and publication boundaries
+        run: node --test tests/local-edit-boundaries.test.mjs

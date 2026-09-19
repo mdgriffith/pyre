@@ -2,7 +2,7 @@
 mod helpers;
 
 use helpers::test_database::TestDatabase;
-use pyre::server::manifest::{FieldSchema, PyreSession};
+use pyre::server::manifest::{BoundManifest, FieldSchema, PyreSession};
 use pyre::server::query::QueryResult;
 use pyre::server::schema::{
     load_context_from_database, load_schema_from_database, Error as SchemaError,
@@ -15,6 +15,12 @@ use pyre::sync::{SyncCursor, TableCursor, TableSyncData};
 use pyre::sync_deltas::AffectedRowTableGroup;
 use serde_json::json;
 use std::collections::HashMap;
+
+const UUID_1: &str = "01890f47-2f00-7000-8000-000000000001";
+const UUID_2: &str = "01890f47-2f00-7000-8000-000000000002";
+const UUID_3: &str = "01890f47-2f00-7000-8000-000000000003";
+const UUID_4: &str = "01890f47-2f00-7000-8000-000000000004";
+const UUID_30: &str = "01890f47-2f00-7000-8000-00000000001e";
 
 const UNION_PREDICATE_PARITY_SCHEMA: &str = r#"
 type ProviderReason
@@ -30,7 +36,7 @@ type JobState
    | Ready
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     state JobState
     updatedAt Int
     @allow(query) { state.Failed.reason.ProviderRejected.code != "blocked" }
@@ -46,6 +52,670 @@ fn query_result(affected_rows: Vec<AffectedRowTableGroup>) -> QueryResult {
 }
 
 #[tokio::test]
+async fn batch_publication_uses_committed_revision_without_origin_registration(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::{manifest::Manifest, query};
+    let db =
+        TestDatabase::new("record Item {\n    id Id.Uuid @id\n    name String\n    @public\n}\n")
+            .await?;
+    let conn = db.db.connect()?;
+    let mut queries = pyre::ast::QueryList {
+        queries: Vec::new(),
+    };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &db.context);
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|f| f.path == std::path::Path::new("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|q| q.operation == "insert")
+        .unwrap();
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let mut rows = conn
+        .query("SELECT database_epoch FROM _pyre_sync WHERE id=1", ())
+        .await?;
+    let epoch = rows.next().await?.unwrap().get::<String>(0)?;
+    drop(rows);
+    let fingerprint = manifest.fingerprint();
+    let binding = query::BatchBinding {
+        database_id: "main",
+        namespace: &create.primary_db,
+        manifest: &fingerprint,
+        instance: "test",
+        auth_generation: 1,
+    };
+    let request = query::BatchRequest {
+        version: 1,
+        database_id: "main".into(),
+        namespace: create.primary_db.clone(),
+        manifest: fingerprint.clone(),
+        instance: "test".into(),
+        auth_generation: 1,
+        database_epoch: epoch.clone(),
+        request_id: "r1".into(),
+        sequence: 1,
+        operations: vec![query::BatchOperation {
+            operation: create.id.clone(),
+            input: json!({"id":UUID_1,"name":"committed"}),
+        }],
+    };
+    let bound = pyre::server::manifest::BoundManifest::new(manifest.clone(), &db.context)?;
+    let result = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
+    let server = SyncServer::new(&db.context);
+    assert_eq!(result.response["commitRevision"], 1);
+    assert_eq!(result.response["reconciliation"]["atLeast"], 1);
+    use pyre::server::sync::{ReplacementRequest, SyncFence};
+    let fence = SyncFence {
+        database_id: "main".into(),
+        instance: "test".into(),
+        auth_generation: 1,
+        namespace: create.primary_db.clone(),
+        manifest: fingerprint.clone(),
+        database_epoch: epoch.clone(),
+    };
+    let replacement_request = ReplacementRequest {
+        version: 1,
+        fence: fence.clone(),
+        request_id: "catchup-1".into(),
+        target: 1,
+    };
+    let wire = serde_json::to_value(&replacement_request)?;
+    let _: ReplacementRequest = serde_json::from_value(wire.clone())?;
+    for field in [
+        "version",
+        "databaseId",
+        "instance",
+        "authGeneration",
+        "namespace",
+        "manifest",
+        "databaseEpoch",
+        "requestId",
+        "target",
+    ] {
+        let mut incomplete = wire.clone();
+        incomplete.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<ReplacementRequest>(incomplete).is_err(),
+            "{field}"
+        );
+    }
+    let mut extra = wire;
+    extra["sql"] = json!("SELECT secret");
+    assert!(serde_json::from_value::<ReplacementRequest>(extra).is_err());
+    let snapshot = server
+        .replacement(&conn, &bound, &binding, &replacement_request, &session)
+        .await?;
+    assert!(snapshot.complete);
+    assert_eq!(snapshot.revision, 1);
+    assert_eq!(snapshot.target, 1);
+    assert_eq!(snapshot.request_id, "catchup-1");
+    assert_eq!(snapshot.tables["items"].rows[0]["name"], "committed");
+    let serialized = serde_json::to_value(&snapshot)?;
+    let mut expected = serde_json::to_value(&fence)?;
+    expected["requestId"] = json!("catchup-1");
+    expected["target"] = json!(1);
+    expected["serverRevision"] = json!(1);
+    expected["type"] = json!("replacement");
+    expected["scope"] = json!("database");
+    expected["complete"] = json!(true);
+    expected["tables"] = json!({"items":{"rows":snapshot.tables["items"].rows}});
+    assert_eq!(serialized, expected);
+    let mut mismatched = serde_json::to_value(&manifest)?;
+    mismatched["replacementContracts"][binding.namespace] = json!("different-schema");
+    let mismatched: Manifest = serde_json::from_value(mismatched)?;
+    assert!(BoundManifest::new(mismatched, &db.context).is_err());
+    assert_eq!(
+        result.response["results"][0],
+        json!({"index":0,"operation":create.id,"value":{"id":UUID_1}})
+    );
+    let before = result.response.clone();
+    let mut recipient = fence.clone();
+    recipient.instance = "other-tab".into();
+    recipient.auth_generation = 42;
+    let mut wrong_database = recipient.clone();
+    wrong_database.database_id = "other".into();
+    let mut wrong_epoch = recipient.clone();
+    wrong_epoch.database_epoch = "old".into();
+    let recipients = HashMap::from([
+        ("subscriber".into(), recipient.clone()),
+        ("wrong-db".into(), wrong_database),
+        ("wrong-epoch".into(), wrong_epoch),
+    ]);
+    for _ in 0..2 {
+        let hints = server.replacement_messages(&result, &recipients);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].message["instance"], "other-tab");
+        assert_eq!(hints[0].message["authGeneration"], 42);
+        let mut expected = serde_json::to_value(&recipient)?;
+        expected["type"] = json!("syncRequired");
+        expected["serverRevision"] = json!(1);
+        expected["reconciliation"] = json!({"kind":"replaceRequired", "atLeast":1, "invalidate":true, "minimumSafeRevision":1});
+        assert_eq!(hints[0].message, expected);
+        assert!(hints[0].message.get("requestId").is_none());
+        assert!(hints[0].message.get("data").is_none());
+    }
+    assert_eq!(result.response, before);
+    for field in [
+        "databaseId",
+        "instance",
+        "authGeneration",
+        "namespace",
+        "manifest",
+        "databaseEpoch",
+    ] {
+        let mut invalid = serde_json::to_value(&replacement_request)?;
+        invalid[field] = if field == "authGeneration" {
+            json!(999)
+        } else {
+            json!("wrong")
+        };
+        let invalid = serde_json::from_value(invalid)?;
+        assert!(
+            matches!(
+                server
+                    .replacement(&conn, &bound, &binding, &invalid, &session)
+                    .await,
+                Err(pyre::server::sync::Error::InvalidFence)
+            ),
+            "{field}"
+        );
+    }
+    let mut future = replacement_request.clone();
+    future.target = 2;
+    assert!(matches!(
+        server
+            .replacement(&conn, &bound, &binding, &future, &session)
+            .await,
+        Err(pyre::server::sync::Error::TargetNotReached)
+    ));
+    future.target = -1;
+    assert!(server
+        .replacement(&conn, &bound, &binding, &future, &session)
+        .await
+        .is_err());
+    future.target = 9_007_199_254_740_992;
+    assert!(matches!(
+        server
+            .replacement(&conn, &bound, &binding, &future, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    future = replacement_request.clone();
+    future.request_id.clear();
+    assert!(server
+        .replacement(&conn, &bound, &binding, &future, &session)
+        .await
+        .is_err());
+    conn.execute("ATTACH DATABASE ':memory:' AS other", ())
+        .await?;
+    assert!(matches!(
+        server
+            .replacement(&conn, &bound, &binding, &replacement_request, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    conn.execute("DETACH DATABASE other", ()).await?;
+    assert!(server
+        .replacement_messages(&result, &HashMap::new())
+        .is_empty());
+    conn.execute(
+        "UPDATE _pyre_sync SET server_revision = 9007199254740992 WHERE id = 1",
+        (),
+    )
+    .await?;
+    assert!(matches!(
+        server
+            .replacement(&conn, &bound, &binding, &replacement_request, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    conn.execute("UPDATE _pyre_sync SET server_revision = 1 WHERE id = 1", ())
+        .await?;
+    // Failure to allocate the next revision must roll back the write, not just its acknowledgement.
+    conn.execute("CREATE TRIGGER fail_revision BEFORE UPDATE ON _pyre_sync BEGIN SELECT RAISE(ABORT, 'revision unavailable'); END", ()).await?;
+    assert!(
+        query::run_batch(&conn, &bound, &binding, &request, &session)
+            .await
+            .is_err()
+    );
+    let mut rows = conn
+        .query(
+            "SELECT (SELECT count(*) FROM items), server_revision FROM _pyre_sync WHERE id=1",
+            (),
+        )
+        .await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<i64>(0)?, 1);
+    assert_eq!(row.get::<i64>(1)?, 1);
+    assert_eq!(result.response["status"], "accepted");
+    drop(rows);
+    conn.execute("UPDATE items SET updatedAt = 'invalid'", ())
+        .await?;
+    assert!(
+        matches!(server.replacement(&conn, &bound, &binding, &replacement_request, &session).await,
+        Err(pyre::server::sync::Error::Sync(pyre::sync::SyncError::SqlGenerationError(message))) if message == "InvalidReplacementTable")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_removes_deleted_revoked_and_old_keys_and_coalesces_commits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::{
+        manifest::Manifest,
+        query,
+        sync::{ReplacementRequest, SyncFence},
+    };
+    let db = TestDatabase::new(
+        r#"
+session {
+    userId Int
+}
+record Note {
+    id Id.Uuid @id
+    ownerId Int
+    body String
+    @allow(query) { ownerId == Session.userId }
+    @allow(insert, update, delete) { True }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let mut queries = pyre::parser::parse_query(
+        "commands.pyre",
+        r#"
+update MoveKey($id: Note.id, $next: Note.id) {
+    note {
+        @where { id == $id }
+        id = $next
+    }
+}
+"#,
+    )
+    .unwrap();
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &db.context);
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|f| f.path.ends_with("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let fingerprint = manifest.fingerprint();
+    let namespace = db.context.valid_namespaces.iter().next().unwrap();
+    let binding = query::BatchBinding {
+        database_id: "main",
+        namespace,
+        manifest: &fingerprint,
+        instance: "tab",
+        auth_generation: 0,
+    };
+    let session = PyreSession::new(json!({"userId":1}), &manifest.session_schema)?;
+    let epoch = conn
+        .query("SELECT database_epoch FROM _pyre_sync", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<String>(0)?;
+    let fence = SyncFence {
+        database_id: "main".into(),
+        namespace: namespace.clone(),
+        manifest: fingerprint.clone(),
+        instance: "tab".into(),
+        auth_generation: 0,
+        database_epoch: epoch.clone(),
+    };
+    let mut request = query::BatchRequest {
+        version: 1,
+        database_id: "main".into(),
+        namespace: namespace.clone(),
+        manifest: fingerprint.clone(),
+        instance: "tab".into(),
+        auth_generation: 0,
+        database_epoch: epoch,
+        request_id: "write".into(),
+        sequence: 1,
+        operations: vec![],
+    };
+    let operation = |kind: &str, input| query::BatchOperation {
+        operation: manifest
+            .queries
+            .values()
+            .find(|q| q.generated_edit.as_ref().is_some_and(|e| e.kind == kind))
+            .unwrap()
+            .id
+            .clone(),
+        input,
+    };
+    request.operations = [UUID_1, UUID_2, UUID_3]
+        .into_iter()
+        .map(|id| operation("create", json!({"id":id,"ownerId":1,"body":"visible"})))
+        .collect();
+    let bound = pyre::server::manifest::BoundManifest::new(manifest.clone(), &db.context)?;
+    query::run_batch(&conn, &bound, &binding, &request, &session).await?;
+    let server = SyncServer::new(&db.context);
+    let catchup = ReplacementRequest {
+        version: 1,
+        fence,
+        request_id: "read".into(),
+        target: 1,
+    };
+    let first = server
+        .replacement(&conn, &bound, &binding, &catchup, &session)
+        .await?;
+    assert_eq!(first.tables["notes"].rows.len(), 3);
+    request.operations = vec![
+        operation("delete", json!({"id":UUID_1})),
+        operation("update", json!({"id":UUID_2,"ownerId":2})),
+    ];
+    let removed = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
+    assert_eq!(removed.response["commitRevision"], 2);
+    request.operations = vec![query::BatchOperation {
+        operation: manifest
+            .queries
+            .values()
+            .find(|q| q.generated_edit.is_none())
+            .unwrap()
+            .id
+            .clone(),
+        input: json!({"id":UUID_3,"next":UUID_30}),
+    }];
+    let moved = query::run_batch(&conn, &bound, &binding, &request, &session).await?;
+    assert_eq!(moved.response["commitRevision"], 3);
+    // A fixed old target may return a newer complete revision, without replaying intermediate deltas.
+    let final_snapshot = server
+        .replacement(&conn, &bound, &binding, &catchup, &session)
+        .await?;
+    assert_eq!(final_snapshot.target, 1);
+    assert_eq!(final_snapshot.revision, 3);
+    assert_eq!(final_snapshot.tables["notes"].rows.len(), 1);
+    assert_eq!(final_snapshot.tables["notes"].rows[0]["id"], UUID_30);
+    request.operations = vec![operation("delete", json!({"id":UUID_30}))];
+    query::run_batch(&conn, &bound, &binding, &request, &session).await?;
+    let empty = server
+        .replacement(&conn, &bound, &binding, &catchup, &session)
+        .await?;
+    assert_eq!(empty.revision, 4);
+    assert!(empty.complete);
+    assert!(empty.tables["notes"].rows.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_rechecks_linked_permissions_and_does_not_truncate_scope(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::{
+        manifest::Manifest,
+        query::BatchBinding,
+        sync::{ReplacementRequest, SyncFence},
+    };
+    let db = TestDatabase::new(
+        r#"
+session {
+    userId Int
+}
+record Membership {
+    id Id.Uuid @id
+    workspaceId Workspace.id
+    userId Int
+    updatedAt Int
+    @allow(query) { False }
+    @allow(insert, update, delete) { True }
+}
+record Workspace {
+    id Id.Uuid @id
+    name String
+    updatedAt Int
+    memberships @link(Membership.workspaceId)
+    @allow(query) { exists memberships { userId == Session.userId } }
+    @allow(insert, update, delete) { True }
+}
+"#,
+    )
+    .await?;
+    let namespace = db.context.valid_namespaces.iter().next().unwrap().clone();
+    let mut files = vec![];
+    let queries = pyre::ast::QueryList { queries: vec![] };
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|f| f.path.ends_with("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let bound = BoundManifest::new(manifest.clone(), &db.context)?;
+    let fingerprint = manifest.fingerprint();
+    let session = PyreSession::new(json!({"userId":1}), &manifest.session_schema)?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<5002) INSERT INTO workspaces SELECT format('01890f47-2f00-7000-8000-%012x', x), 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces;").await?;
+    let epoch = conn
+        .query("SELECT database_epoch FROM _pyre_sync", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<String>(0)?;
+    let binding = BatchBinding {
+        database_id: "main",
+        namespace: &namespace,
+        manifest: &fingerprint,
+        instance: "tab",
+        auth_generation: 0,
+    };
+    let request = ReplacementRequest {
+        version: 1,
+        request_id: "linked".into(),
+        target: 0,
+        fence: SyncFence {
+            database_id: "main".into(),
+            namespace: namespace.clone(),
+            manifest: fingerprint.clone(),
+            instance: "tab".into(),
+            auth_generation: 0,
+            database_epoch: epoch,
+        },
+    };
+    let server = SyncServer::new(&db.context);
+    let before = server
+        .replacement(&conn, &bound, &binding, &request, &session)
+        .await?;
+    assert_eq!(before.tables["workspaces"].rows.len(), 5002);
+    assert!(before.tables["memberships"].rows.is_empty());
+    conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 5003 UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO workspaces SELECT format('01890f47-2f00-7000-8000-%012x', x), 'visible', 0 FROM n; INSERT INTO memberships SELECT id, id, 1, 0 FROM workspaces WHERE id > '01890f47-2f00-7000-8000-00000000138a';").await?;
+    assert!(matches!(
+        server
+            .replacement(&conn, &bound, &binding, &request, &session)
+            .await,
+        Err(pyre::server::sync::Error::ReplacementTooLarge)
+    ));
+    conn.execute_batch(
+        "DELETE FROM memberships WHERE id > '01890f47-2f00-7000-8000-00000000138a'; DELETE FROM workspaces WHERE id > '01890f47-2f00-7000-8000-00000000138a';",
+    )
+    .await?;
+    // Only the linked permission table changes, not the visible table or its timestamp.
+    conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM memberships; UPDATE _pyre_sync SET server_revision=server_revision+1; COMMIT;").await?;
+    let after = server
+        .replacement(&conn, &bound, &binding, &request, &session)
+        .await?;
+    assert_eq!(after.revision, 1);
+    assert!(after.tables["workspaces"].rows.is_empty());
+    assert!(after.tables["memberships"].rows.is_empty());
+    // Neither recipient can read the affected permission rows. Both still need
+    // invalidation, including the origin's embedded legacy sync response.
+    let sessions = ConnectedSessions::from([
+        ("origin".into(), session.logical().clone()),
+        (
+            "other".into(),
+            HashMap::from([("userId".into(), pyre::sync::SessionValue::Integer(2))]),
+        ),
+    ]);
+    let affected = vec![AffectedRowTableGroup {
+        table_name: "memberships".into(),
+        headers: vec![
+            "id".into(),
+            "workspaceId".into(),
+            "userId".into(),
+            "updatedAt".into(),
+        ],
+        rows: vec![vec![json!(UUID_1), json!(UUID_1), json!(1), json!(0)]],
+    }];
+    let commit = pyre::server::query::CommittedRevision {
+        database_epoch: request.fence.database_epoch.clone(),
+        revision: 1,
+    };
+    for groups in [affected.clone(), vec![]] {
+        let mut result = QueryResult {
+            response: json!({"named":[]}),
+            affected_rows: groups,
+        };
+        let messages = server.calculate_committed_deltas(
+            &mut result,
+            &sessions,
+            "main",
+            Some("origin"),
+            &commit,
+        )?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "other");
+        let expected = json!({"type":"syncRequired", "databaseId":"main", "databaseEpoch":commit.database_epoch,
+            "serverRevision":1, "reconciliation":{"kind":"replaceRequired","invalidate":true,"atLeast":1,"minimumSafeRevision":1}});
+        assert_eq!(serde_json::to_value(&messages[0].message)?, expected);
+        assert_eq!(result.response["sync"], expected);
+        assert_eq!(result.response["result"], json!({"named":[]}));
+    }
+    assert_eq!(
+        conn.query("SELECT server_revision FROM _pyre_sync", ())
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get::<i64>(0)?,
+        1
+    );
+    let mut legacy = QueryResult {
+        response: json!({"named":[]}),
+        affected_rows: affected,
+    };
+    let messages = server
+        .calculate_deltas(&conn, &mut legacy, &sessions, "main", None)
+        .await?;
+    assert_eq!(messages.len(), 2);
+    for message in messages {
+        assert_eq!(message.message.type_, "syncRequired");
+        assert!(message.message.data.is_empty());
+        assert_eq!(
+            message.message.reconciliation.unwrap()["minimumSafeRevision"],
+            2
+        );
+    }
+    let invalid_session = PyreSession::new(json!({}), &HashMap::new())?;
+    assert!(matches!(
+        server
+            .replacement(&conn, &bound, &binding, &request, &invalid_session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidSession)
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_pins_all_tables_and_revision_during_concurrent_commits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::{
+        manifest::Manifest,
+        query::BatchBinding,
+        sync::{ReplacementRequest, SyncFence},
+    };
+    let db = TestDatabase::new("record Alpha {\n    id Id.Uuid @id\n    marker Int\n    @public\n}\nrecord Beta {\n    id Id.Uuid @id\n    marker Int\n    @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO alphas(id,marker) VALUES('01890f47-2f00-7000-8000-000000000001',0); INSERT INTO betas(id,marker) VALUES('01890f47-2f00-7000-8000-000000000001',0);").await?;
+    let queries = pyre::ast::QueryList { queries: vec![] };
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = vec![];
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|f| f.path.ends_with("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let bound = BoundManifest::new(manifest.clone(), &db.context)?;
+    let fingerprint = manifest.fingerprint();
+    let namespace = db.context.valid_namespaces.iter().next().unwrap();
+    let binding = BatchBinding {
+        database_id: "main",
+        namespace,
+        manifest: &fingerprint,
+        instance: "tab",
+        auth_generation: 0,
+    };
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let epoch = conn
+        .query("SELECT database_epoch FROM _pyre_sync", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<String>(0)?;
+    let request = ReplacementRequest {
+        version: 1,
+        request_id: "consistent".into(),
+        target: 0,
+        fence: SyncFence {
+            database_id: "main".into(),
+            namespace: namespace.clone(),
+            manifest: fingerprint.clone(),
+            instance: "tab".into(),
+            auth_generation: 0,
+            database_epoch: epoch,
+        },
+    };
+    let writer = db.db.connect()?;
+    let commits = tokio::spawn(async move {
+        for _ in 0..100 {
+            writer.execute_batch("BEGIN IMMEDIATE; UPDATE alphas SET marker=marker+1; UPDATE betas SET marker=marker+1; UPDATE _pyre_sync SET server_revision=server_revision+1; COMMIT;").await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+    let server = SyncServer::new(&db.context);
+    for _ in 0..100 {
+        let snapshot = server
+            .replacement(&conn, &bound, &binding, &request, &session)
+            .await?;
+        assert_eq!(
+            snapshot.tables["alphas"].rows[0]["marker"],
+            snapshot.revision
+        );
+        assert_eq!(
+            snapshot.tables["betas"].rows[0]["marker"],
+            snapshot.revision
+        );
+    }
+    commits.await?;
+    let final_snapshot = server
+        .replacement(&conn, &bound, &binding, &request, &session)
+        .await?;
+    assert_eq!(final_snapshot.revision, 100);
+    Ok(())
+}
+
+#[tokio::test]
 async fn qualified_union_permission_has_query_catchup_and_live_delta_parity(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(UNION_PREDICATE_PARITY_SCHEMA).await?;
@@ -54,10 +724,10 @@ async fn qualified_union_permission_has_query_catchup_and_live_delta_parity(
         r#"
 insert into jobs (id, state, state__reason, state__reason__code, updatedAt)
 values
-    (1, 'Failed', 'ProviderRejected', 'allowed', 10),
-    (2, 'Failed', 'ProviderRejected', 'blocked', 20),
-    (3, 'Failed', 'ProviderRejected', null, 30),
-    (4, 'Ready', 'ProviderRejected', 'allowed', 40);
+    ('01890f47-2f00-7000-8000-000000000001', 'Failed', 'ProviderRejected', 'allowed', 10),
+    ('01890f47-2f00-7000-8000-000000000002', 'Failed', 'ProviderRejected', 'blocked', 20),
+    ('01890f47-2f00-7000-8000-000000000003', 'Failed', 'ProviderRejected', null, 30),
+    ('01890f47-2f00-7000-8000-000000000004', 'Ready', 'ProviderRejected', 'allowed', 40);
 "#,
     )
     .await?;
@@ -108,28 +778,28 @@ query VisibleJobs {
         ],
         rows: vec![
             vec![
-                json!(1),
+                json!(UUID_1),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!("allowed"),
                 json!(10),
             ],
             vec![
-                json!(2),
+                json!(UUID_2),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!("blocked"),
                 json!(20),
             ],
             vec![
-                json!(3),
+                json!(UUID_3),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!(null),
                 json!(30),
             ],
             vec![
-                json!(4),
+                json!(UUID_4),
                 json!("Ready"),
                 json!("ProviderRejected"),
                 json!("allowed"),
@@ -146,7 +816,7 @@ query VisibleJobs {
         .map(|row| row[0].clone())
         .collect::<Vec<_>>();
 
-    assert_eq!(query_ids, vec![json!(1), json!(3)]);
+    assert_eq!(query_ids, vec![json!(UUID_1), json!(UUID_3)]);
     assert_eq!(catchup_ids, query_ids);
     assert_eq!(live_ids, query_ids);
     Ok(())
@@ -194,7 +864,7 @@ async fn catchup_paginates_rows_with_equal_timestamps() -> Result<(), Box<dyn st
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -205,9 +875,9 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, body, updatedAt) values (1, 'one', 10);
-insert into notes (id, body, updatedAt) values (2, 'two', 10);
-insert into notes (id, body, updatedAt) values (3, 'three', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'one', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 'two', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000003', 'three', 10);
 "#,
     )
     .await?;
@@ -218,10 +888,10 @@ insert into notes (id, body, updatedAt) values (3, 'three', 10);
 
     assert!(first.has_more);
     assert_eq!(notes.rows.len(), 2);
-    assert_eq!(notes.rows[0]["id"], json!(1));
-    assert_eq!(notes.rows[1]["id"], json!(2));
+    assert_eq!(notes.rows[0]["id"], json!(UUID_1));
+    assert_eq!(notes.rows[1]["id"], json!(UUID_2));
     assert_eq!(notes.last_seen_updated_at, Some(10));
-    assert_eq!(notes.last_seen_primary_key, Some(json!(2)));
+    assert_eq!(notes.last_seen_primary_key, Some(json!(UUID_2)));
 
     let mut cursor = SyncCursor::new();
     cursor.insert(
@@ -241,9 +911,9 @@ insert into notes (id, body, updatedAt) values (3, 'three', 10);
 
     assert!(!second.has_more);
     assert_eq!(notes.rows.len(), 1);
-    assert_eq!(notes.rows[0]["id"], json!(3));
+    assert_eq!(notes.rows[0]["id"], json!(UUID_3));
     assert_eq!(notes.last_seen_updated_at, Some(10));
-    assert_eq!(notes.last_seen_primary_key, Some(json!(3)));
+    assert_eq!(notes.last_seen_primary_key, Some(json!(UUID_3)));
 
     cursor.insert(
         "notes".to_string(),
@@ -277,9 +947,9 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000001', 'one', 10);
-insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000002', 'two', 10);
-insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000003', 'three', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'one', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 'two', 10);
+insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000003', 'three', 10);
 "#,
     )
     .await?;
@@ -289,10 +959,7 @@ insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-0000000
     let notes = first.tables.get("notes").expect("notes should sync");
     assert!(first.has_more);
     assert_eq!(notes.rows.len(), 2);
-    assert_eq!(
-        notes.last_seen_primary_key,
-        Some(json!("00000000-0000-0000-0000-000000000002"))
-    );
+    assert_eq!(notes.last_seen_primary_key, Some(json!(UUID_2)));
 
     let cursor = SyncCursor::from([(
         "notes".to_string(),
@@ -309,10 +976,7 @@ insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-0000000
         .expect("remaining note should sync");
     assert!(!second.has_more);
     assert_eq!(notes.rows.len(), 1);
-    assert_eq!(
-        notes.rows[0]["id"],
-        json!("00000000-0000-0000-0000-000000000003")
-    );
+    assert_eq!(notes.rows[0]["id"], json!(UUID_3));
 
     Ok(())
 }
@@ -343,7 +1007,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -356,9 +1020,9 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, ownerId, body, updatedAt) values (1, 1, 'one', 10);
-insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
-insert into notes (id, ownerId, body, updatedAt) values (3, 1, 'three', 30);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 1, 'one', 10);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 2, 'two', 20);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000003', 1, 'three', 30);
 "#,
     )
     .await?;
@@ -377,7 +1041,7 @@ insert into notes (id, ownerId, body, updatedAt) values (3, 1, 'three', 30);
         .map(|row| row["id"].clone())
         .collect::<Vec<_>>();
 
-    assert_eq!(ids, vec![json!(1), json!(3)]);
+    assert_eq!(ids, vec![json!(UUID_1), json!(UUID_3)]);
     assert_eq!(result.database_id.as_deref(), Some("main"));
     assert_eq!(result.server_revision, Some(0));
     assert_eq!(notes.last_seen_updated_at, Some(30));
@@ -393,7 +1057,7 @@ insert into notes (id, ownerId, body, updatedAt) values (3, 1, 'three', 30);
         .map(|row| row["id"].clone())
         .collect::<Vec<_>>();
 
-    assert_eq!(ids, vec![json!(2)]);
+    assert_eq!(ids, vec![json!(UUID_2)]);
     assert_eq!(notes.last_seen_updated_at, Some(20));
 
     Ok(())
@@ -408,7 +1072,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     tenant String
     body String
     updatedAt Int
@@ -421,8 +1085,8 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, tenant, body, updatedAt) values (1, 'safe', 'one', 10);
-insert into notes (id, tenant, body, updatedAt) values (2, 'x'' OR 1=1 --', 'two', 20);
+insert into notes (id, tenant, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'safe', 'one', 10);
+insert into notes (id, tenant, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 'x'' OR 1=1 --', 'two', 20);
 "#,
     )
     .await?;
@@ -437,7 +1101,7 @@ insert into notes (id, tenant, body, updatedAt) values (2, 'x'' OR 1=1 --', 'two
     let notes = result.tables.get("notes").expect("notes should sync");
 
     assert_eq!(notes.rows.len(), 1);
-    assert_eq!(notes.rows[0]["id"], json!(2));
+    assert_eq!(notes.rows[0]["id"], json!(UUID_2));
 
     Ok(())
 }
@@ -456,7 +1120,7 @@ type CampaignRole
    | CampaignObserver
 
 record World {
-    id Int @id
+    id Id.Uuid @id
     name String
     updatedAt Int
     @allow(query) { Session.campaignRole == CampaignGM }
@@ -466,7 +1130,7 @@ record World {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into worlds (id, name, updatedAt) values (1, 'Allowed', 10);")
+    conn.execute_batch("insert into worlds (id, name, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'Allowed', 10);")
         .await?;
     let session_schema = HashMap::from([(
         "campaignRole".to_string(),
@@ -514,7 +1178,7 @@ record World {
     let worlds = result.tables.get("worlds").expect("worlds should sync");
 
     assert_eq!(worlds.rows.len(), 1);
-    assert_eq!(worlds.rows[0]["id"], json!(1));
+    assert_eq!(worlds.rows[0]["id"], json!(UUID_1));
 
     let affected = vec![AffectedRowTableGroup {
         table_name: "worlds".to_string(),
@@ -523,7 +1187,7 @@ record World {
             "name".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("Allowed"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("Allowed"), json!(10)]],
     }];
     let sessions = HashMap::from([("session".to_string(), session.logical().clone())]);
     let deltas = pyre::sync_deltas::calculate_sync_deltas(&affected, &sessions, &db.context)
@@ -550,7 +1214,7 @@ type Tiling
      }
 
 record Map {
-    id Int @id
+    id Id.Uuid @id
     name String
     attrs Json
     tiling Tiling?
@@ -573,7 +1237,7 @@ insert into maps (
     tiling__format,
     updatedAt
 ) values (
-    1,
+    '01890f47-2f00-7000-8000-000000000001',
     'World',
     json_object('theme', 'forest', 'danger', 4),
     'Tiling',
@@ -628,7 +1292,7 @@ type EventPayload
    = Secret { secretEvent Json<SecretEvent> }
 
 record Event {
-    id Int @id
+    id Id.Uuid @id
     payload EventPayload?
     createdAt Int
     updatedAt Int
@@ -640,8 +1304,8 @@ record Event {
     let conn = db.db.connect()?;
     let secret_event = r#"{"_type":"SetupRecorded","setup":{"_type":"Started","script":{"_type":"TroubleBrewing"},"seats":[]}}"#;
     conn.execute(
-        "insert into events (id, payload, payload__secretEvent, createdAt, updatedAt) values (1, 'Secret', ?1, 10, 10)",
-        [secret_event],
+        "insert into events (id, payload, payload__secretEvent, createdAt, updatedAt) values (?1, 'Secret', ?2, 10, 10)",
+        [UUID_1, secret_event],
     )
     .await?;
 
@@ -658,7 +1322,7 @@ record Event {
             "updatedAt".to_string(),
         ],
         rows: vec![vec![
-            json!(1),
+            json!(UUID_1),
             json!("Secret"),
             json!(secret_event),
             json!(10),
@@ -708,7 +1372,7 @@ async fn catchup_rejects_zero_page_size() -> Result<(), Box<dyn std::error::Erro
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -733,7 +1397,7 @@ async fn calculate_deltas_sends_public_rows_to_all_sessions(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -749,7 +1413,7 @@ record Note {
             "body".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("one"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("one"), json!(10)]],
     }];
     let connected_sessions = ConnectedSessions::from([
         ("a".to_string(), SyncSession::new()),
@@ -767,7 +1431,7 @@ record Note {
     assert_eq!(messages[0].message.data[0].table_name, "notes");
     assert_eq!(
         messages[0].message.data[0].rows[0],
-        vec![json!(1), json!("one"), json!(10)]
+        vec![json!(UUID_1), json!("one"), json!(10)]
     );
     assert_eq!(messages[1].session_id, "b");
 
@@ -779,7 +1443,7 @@ async fn native_sync_revision_persists_in_pyre_sync() -> Result<(), Box<dyn std:
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -796,7 +1460,7 @@ record Note {
             "body".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("one"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("one"), json!(10)]],
     }];
     let connected_sessions = ConnectedSessions::from([
         ("a".to_string(), SyncSession::new()),
@@ -840,7 +1504,7 @@ async fn database_epoch_mismatch_returns_explicit_replacement(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -875,7 +1539,7 @@ async fn matching_database_epoch_returns_sync_page() -> Result<(), Box<dyn std::
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -909,7 +1573,7 @@ async fn rotating_database_epoch_resets_the_revision() -> Result<(), Box<dyn std
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -952,7 +1616,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -972,8 +1636,8 @@ record Note {
             "updatedAt".to_string(),
         ],
         rows: vec![
-            vec![json!(1), json!(1), json!("one"), json!(10)],
-            vec![json!(2), json!(2), json!("two"), json!(20)],
+            vec![json!(UUID_1), json!(1), json!("one"), json!(10)],
+            vec![json!(UUID_2), json!(2), json!("two"), json!(20)],
         ],
     }];
     let connected_sessions = ConnectedSessions::from([
@@ -995,9 +1659,9 @@ record Note {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].session_id, "user-1");
     assert_eq!(messages[0].message.database_id.as_deref(), Some("main"));
-    assert_eq!(messages[0].message.data[0].rows[0][0], json!(1));
+    assert_eq!(messages[0].message.data[0].rows[0][0], json!(UUID_1));
     assert_eq!(messages[1].session_id, "user-2");
-    assert_eq!(messages[1].message.data[0].rows[0][0], json!(2));
+    assert_eq!(messages[1].message.data[0].rows[0][0], json!(UUID_2));
 
     Ok(())
 }
@@ -1008,11 +1672,11 @@ async fn calculate_deltas_supports_json_session_membership_lists(
     let db = TestDatabase::new(
         r#"
 session {
-    gameIds Json<List<String>>
+    gameIds Json<List<Game.id>>
 }
 
 record Game {
-    id String @id
+    id Id.Uuid @id
     updatedAt Int
     @allow(query) { id in Session.gameIds }
     @allow(insert, update, delete) { False }
@@ -1024,21 +1688,21 @@ record Game {
     let affected_rows = vec![AffectedRowTableGroup {
         table_name: "games".to_string(),
         headers: vec!["id".to_string(), "updatedAt".to_string()],
-        rows: vec![vec![json!("game-1"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!(10)]],
     }];
     let connected_sessions = ConnectedSessions::from([
         (
             "allowed".to_string(),
             SyncSession::from([(
                 "gameIds".to_string(),
-                pyre::sync::SessionValue::Text(r#"["game-1"]"#.to_string()),
+                pyre::sync::SessionValue::Text(format!(r#"["{UUID_1}"]"#)),
             )]),
         ),
         (
             "denied".to_string(),
             SyncSession::from([(
                 "gameIds".to_string(),
-                pyre::sync::SessionValue::Text(r#"["game-2"]"#.to_string()),
+                pyre::sync::SessionValue::Text(format!(r#"["{UUID_2}"]"#)),
             )]),
         ),
     ]);
@@ -1050,7 +1714,7 @@ record Game {
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].session_id, "allowed");
-    assert_eq!(messages[0].message.data[0].rows[0][0], json!("game-1"));
+    assert_eq!(messages[0].message.data[0].rows[0][0], json!(UUID_1));
 
     Ok(())
 }
@@ -1071,7 +1735,7 @@ type Tiling
      }
 
 record Map {
-    id Int @id
+    id Id.Uuid @id
     tiling Tiling?
     updatedAt Int
     @public
@@ -1091,7 +1755,7 @@ record Map {
             "updatedAt".to_string(),
         ],
         rows: vec![vec![
-            json!(1),
+            json!(UUID_1),
             json!("Tiling"),
             json!("tiles/root"),
             json!(256),
@@ -1114,7 +1778,7 @@ record Map {
     assert_eq!(
         messages[0].message.data[0].rows[0],
         vec![
-            json!(1),
+            json!(UUID_1),
             json!({
                 "_type": "Tiling",
                 "tileRootKey": "tiles/root",
@@ -1134,7 +1798,7 @@ async fn calculate_deltas_returns_no_messages_without_rows_or_sessions(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1150,7 +1814,7 @@ record Note {
             "body".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("one"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("one"), json!(10)]],
     }];
     let connected_sessions = ConnectedSessions::from([("a".to_string(), SyncSession::new())]);
 
@@ -1182,7 +1846,7 @@ async fn generated_insert_affected_rows_feed_native_deltas(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1192,18 +1856,21 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     let insert_query = r#"
-insert CreateNote($body: String) {
+insert CreateNote($id: Note.id, $body: String) {
     note {
+        id = $id
         body = $body
         updatedAt = 10
-        id
     }
 }
 "#;
     let result_sets = db
         .execute_insert_with_params(
             insert_query,
-            HashMap::from([("body".to_string(), libsql::Value::Text("one".to_string()))]),
+            HashMap::from([
+                ("id".to_string(), libsql::Value::Text(UUID_1.to_string())),
+                ("body".to_string(), libsql::Value::Text("one".to_string())),
+            ]),
         )
         .await?;
     let affected_rows = extract_affected_rows(result_sets).await?;
@@ -1235,7 +1902,7 @@ async fn native_deltas_send_sync_required_when_row_count_exceeds_cap(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1252,7 +1919,13 @@ record Note {
             "updatedAt".to_string(),
         ],
         rows: (0..=MAX_LIVE_SYNC_DELTA_ROWS)
-            .map(|index| vec![json!(index), json!("one"), json!(10)])
+            .map(|index| {
+                vec![
+                    json!(format!("01890f47-2f00-7000-8000-{index:012x}")),
+                    json!("one"),
+                    json!(10),
+                ]
+            })
             .collect(),
     }];
     let connected_sessions = ConnectedSessions::from([("a".to_string(), SyncSession::new())]);
@@ -1275,7 +1948,7 @@ async fn native_deltas_send_sync_required_when_payload_exceeds_cap(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1292,7 +1965,7 @@ record Note {
             "updatedAt".to_string(),
         ],
         rows: vec![vec![
-            json!(1),
+            json!(UUID_1),
             json!("x".repeat(MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES)),
             json!(10),
         ]],
@@ -1319,7 +1992,7 @@ async fn native_deltas_send_sync_required_when_recipient_count_exceeds_cap(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1335,7 +2008,7 @@ record Note {
             "body".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("one"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("one"), json!(10)]],
     }];
     let connected_sessions = (0..=MAX_LIVE_SYNC_FANOUT_RECIPIENTS)
         .map(|index| (format!("s{}", index), SyncSession::new()))
@@ -1367,7 +2040,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -1380,13 +2053,13 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into notes (id, ownerId, body, updatedAt) values (1, 1, 'old', 10);",
+        "insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 1, 'old', 10);",
     )
     .await?;
     let update_query = r#"
-update UpdateNote {
+update UpdateNote($id: Note.id) {
     note {
-        @where { id == 1 }
+        @where { id == $id }
         body = "new"
         updatedAt = 20
         id
@@ -1394,7 +2067,12 @@ update UpdateNote {
     }
 }
 "#;
-    let result_sets = db.execute_query(update_query).await?;
+    let result_sets = db
+        .execute_query_with_params(
+            update_query,
+            HashMap::from([("id".to_string(), libsql::Value::Text(UUID_1.to_string()))]),
+        )
+        .await?;
     let affected_rows = extract_affected_rows(result_sets).await?;
     let connected_sessions = ConnectedSessions::from([
         (
@@ -1431,7 +2109,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -1444,13 +2122,13 @@ record Note {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into notes (id, ownerId, body, updatedAt) values (1, 1, 'doomed', 10);",
+        "insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 1, 'doomed', 10);",
     )
     .await?;
     let delete_query = r#"
-delete RemoveNote {
+delete RemoveNote($id: Note.id) {
     note {
-        @where { id == 1 }
+        @where { id == $id }
         id
         ownerId
         body
@@ -1458,7 +2136,12 @@ delete RemoveNote {
     }
 }
 "#;
-    let result_sets = db.execute_query(delete_query).await?;
+    let result_sets = db
+        .execute_query_with_params(
+            delete_query,
+            HashMap::from([("id".to_string(), libsql::Value::Text(UUID_1.to_string()))]),
+        )
+        .await?;
     let affected_rows = extract_affected_rows(result_sets).await?;
     let connected_sessions = ConnectedSessions::from([
         (
@@ -1481,7 +2164,7 @@ delete RemoveNote {
     assert_eq!(affected_rows[0].rows.len(), 1);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].session_id, "user-1");
-    assert_eq!(messages[0].message.data[0].rows[0][0], json!(1));
+    assert_eq!(messages[0].message.data[0].rows[0][0], json!(UUID_1));
 
     Ok(())
 }
@@ -1495,7 +2178,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     body String
     updatedAt Int
@@ -1508,8 +2191,8 @@ record Note {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into notes (id, ownerId, body, updatedAt) values (1, 1, 'one', 10);
-insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 1, 'one', 10);
+insert into notes (id, ownerId, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 2, 'two', 20);
 "#,
     )
     .await?;
@@ -1540,7 +2223,7 @@ insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
             .iter()
             .map(|row| row["id"].clone())
             .collect::<Vec<_>>(),
-        vec![json!(1)]
+        vec![json!(UUID_1)]
     );
     assert_eq!(
         second_notes
@@ -1548,7 +2231,7 @@ insert into notes (id, ownerId, body, updatedAt) values (2, 2, 'two', 20);
             .iter()
             .map(|row| row["id"].clone())
             .collect::<Vec<_>>(),
-        vec![json!(2)]
+        vec![json!(UUID_2)]
     );
     assert_ne!(first_notes.permission_hash, second_notes.permission_hash);
 
@@ -1561,15 +2244,15 @@ async fn linked_tables_have_parent_before_child_sync_layers(
     let db = TestDatabase::new(
         r#"
 record User {
-    id Int @id
+    id Id.Uuid @id
     name String
     updatedAt Int
     @public
 }
 
 record Post {
-    id Int @id
-    authorId Int
+    id Id.Uuid @id
+    authorId User.id
     title String
     author @link(authorId, User.id)
     updatedAt Int
@@ -1602,7 +2285,7 @@ async fn load_schema_from_database_returns_typechecked_context(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1629,7 +2312,7 @@ async fn loaded_context_can_drive_catchup() -> Result<(), Box<dyn std::error::Er
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1638,7 +2321,7 @@ record Note {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into notes (id, body, updatedAt) values (1, 'one', 10);")
+    conn.execute_batch("insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'one', 10);")
         .await?;
     let loaded = load_context_from_database(&conn).await?;
     let server = SyncServer::new(loaded.context()?);
@@ -1683,7 +2366,7 @@ async fn load_schema_reports_parse_errors() -> Result<(), Box<dyn std::error::Er
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1713,7 +2396,7 @@ async fn load_schema_reports_typecheck_errors() -> Result<(), Box<dyn std::error
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1727,7 +2410,7 @@ record Note {
         libsql::params_from_iter(vec![libsql::Value::Text(
             r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     missing MissingType
     @public
 }
@@ -1752,7 +2435,7 @@ async fn sync_payloads_serialize_to_client_contract() -> Result<(), Box<dyn std:
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1761,7 +2444,7 @@ record Note {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into notes (id, body, updatedAt) values (1, 'one', 10);")
+    conn.execute_batch("insert into notes (id, body, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'one', 10);")
         .await?;
 
     let catchup_result =
@@ -1782,7 +2465,7 @@ record Note {
     let message = DeltaMessage::delta(vec![AffectedRowTableGroup {
         table_name: "notes".to_string(),
         headers: vec!["id".to_string(), "body".to_string()],
-        rows: vec![vec![json!(1), json!("one")]],
+        rows: vec![vec![json!(UUID_1), json!("one")]],
     }]);
     let message_json = serde_json::to_value(&message)?;
 
@@ -1794,7 +2477,7 @@ record Note {
                 {
                     "table_name": "notes",
                     "headers": ["id", "body"],
-                    "rows": [[1, "one"]]
+                    "rows": [[UUID_1, "one"]]
                 }
             ]
         })
@@ -1815,7 +2498,7 @@ session {
 }
 
 record Feature {
-    id Int @id
+    id Id.Uuid @id
     role String
     enabled Bool
     region String?
@@ -1829,9 +2512,9 @@ record Feature {
     let conn = db.db.connect()?;
     conn.execute_batch(
         r#"
-insert into features (id, role, enabled, region, updatedAt) values (1, 'admin', 1, null, 10);
-insert into features (id, role, enabled, region, updatedAt) values (2, 'admin', 0, null, 20);
-insert into features (id, role, enabled, region, updatedAt) values (3, 'user', 1, null, 30);
+insert into features (id, role, enabled, region, updatedAt) values ('01890f47-2f00-7000-8000-000000000001', 'admin', 1, null, 10);
+insert into features (id, role, enabled, region, updatedAt) values ('01890f47-2f00-7000-8000-000000000002', 'admin', 0, null, 20);
+insert into features (id, role, enabled, region, updatedAt) values ('01890f47-2f00-7000-8000-000000000003', 'user', 1, null, 30);
 "#,
     )
     .await?;
@@ -1853,7 +2536,7 @@ insert into features (id, role, enabled, region, updatedAt) values (3, 'user', 1
             .iter()
             .map(|row| row["id"].clone())
             .collect::<Vec<_>>(),
-        vec![json!(1)]
+        vec![json!(UUID_1)]
     );
 
     Ok(())

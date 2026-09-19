@@ -6,6 +6,19 @@ use std::collections::HashSet;
 pub fn standalone_schema_to_string(context: &typecheck::Context, schema: &ast::Schema) -> String {
     let mut standalone = schema.clone();
     standalone.session = context.session.clone();
+    // A shared session cannot depend on tables absent from this database.
+    // Persist resolved scalar references, retaining UUID validation rather than
+    // letting standalone typechecking fall back to an unresolved integer key.
+    if let Some(session) = &mut standalone.session {
+        standalone_codec_fields(&mut session.fields, &standalone.namespace, context);
+        for file in &mut standalone.files {
+            for definition in &mut file.definitions {
+                if let ast::Definition::Session(stored) = definition {
+                    *stored = session.clone();
+                }
+            }
+        }
+    }
 
     let local_types = standalone
         .files
@@ -73,7 +86,78 @@ pub fn standalone_schema_to_string(context: &typecheck::Context, schema: &ast::S
         );
     }
 
-    schema_to_string("", &standalone)
+    for file in &mut standalone.files {
+        for definition in &mut file.definitions {
+            if let ast::Definition::Tagged { name, variants, .. } = definition {
+                if let Some((_, typecheck::Type::OneOf { variants: resolved })) =
+                    context.types.get(name)
+                {
+                    *variants = resolved.clone();
+                }
+                for variant in variants {
+                    if let Some(fields) = &mut variant.fields {
+                        standalone_codec_fields(fields, &standalone.namespace, context);
+                    }
+                }
+            }
+        }
+    }
+    let source = schema_to_string("", &standalone);
+    if standalone.namespace == ast::DEFAULT_SCHEMANAME {
+        source
+    } else {
+        // Namespace is not otherwise represented in standalone schema syntax.
+        // Persist it even for databases without links from which to infer it.
+        let source = source
+            .lines()
+            .filter(|line| !line.starts_with("// @pyre.namespace "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("// @pyre.namespace {}\n{}\n", standalone.namespace, source)
+    }
+}
+
+fn standalone_codec_fields(
+    fields: &mut [ast::Field],
+    namespace: &str,
+    context: &typecheck::Context,
+) {
+    fn concrete(type_: &mut ast::ColumnType, namespace: &str, context: &typecheck::Context) {
+        match type_ {
+            ast::ColumnType::JsonTyped(inner)
+            | ast::ColumnType::List(inner)
+            | ast::ColumnType::Dict(inner)
+            | ast::ColumnType::Nullable(inner) => concrete(inner, namespace, context),
+            ast::ColumnType::ForeignKey {
+                schema,
+                table,
+                serialization_type: Some(_),
+                ..
+            } => {
+                // Retain local identity brands used in permission comparisons.
+                if schema.as_deref().is_none_or(|schema| schema == namespace)
+                    && context
+                        .tables
+                        .values()
+                        .any(|local| local.schema == namespace && local.record.name == *table)
+                {
+                    *schema = None;
+                    return;
+                }
+                *type_ = ast::ColumnType::from_str(&type_.query_type_string());
+                if let ast::ColumnType::IdInt { table } | ast::ColumnType::IdUuid { table } = type_
+                {
+                    table.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+    for field in fields {
+        if let ast::Field::Column(column) = field {
+            concrete(&mut column.type_, namespace, context);
+        }
+    }
 }
 
 fn collect_field_type_names(fields: &[ast::Field], names: &mut Vec<String>) {

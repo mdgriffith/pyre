@@ -2,12 +2,15 @@
 mod helpers;
 
 use helpers::test_database::TestDatabase;
-use pyre::server::manifest::{Manifest, PyreSession, QueryManifest};
+use pyre::server::manifest::{BoundManifest, Manifest, PyreSession, QueryManifest};
 use pyre::server::query;
-use pyre::server::sync::{ConnectedSessions, SyncServer, SyncSession};
+use pyre::server::sync::{
+    ConnectedSessions, ReplacementRequest, SyncFence, SyncServer, SyncSession,
+};
 use pyre::{ast, parser, typecheck};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -50,10 +53,1183 @@ fn only_query(manifest: &Manifest) -> &QueryManifest {
         .expect("manifest should contain a query")
 }
 
+fn bind(manifest: &Manifest, context: &pyre::typecheck::Context) -> BoundManifest {
+    BoundManifest::new(manifest.clone(), context).unwrap()
+}
+
+#[test]
+fn non_unique_relationship_results_are_arrays() -> Result<(), Box<dyn std::error::Error>> {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "@syncable(false)\nrecord Parent {\n @public\n id Id.Int @id\n code String\n matches @link(code, Target.code)\n}\nrecord Target {\n @public\n id Id.Int @id\n code String\n}\n",
+        &mut schema,
+    )
+    .unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).unwrap();
+    let manifest = manifest_for(
+        &context,
+        "query Parents { parent { id matches { id } } }",
+        false,
+    )?;
+    let result = only_query(&manifest).result_schema.as_ref().unwrap();
+    let pyre::server::manifest::ResultSchema::Object { fields } = result else {
+        panic!("top-level query result should be an object");
+    };
+    let pyre::server::manifest::ResultSchema::Array { items } = &fields["parent"] else {
+        panic!("top-level field should be an array");
+    };
+    let pyre::server::manifest::ResultSchema::Object { fields } = items.as_ref() else {
+        panic!("parent rows should be objects");
+    };
+    assert!(matches!(
+        &fields["matches"],
+        pyre::server::manifest::ResultSchema::Array { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn revisioned_named_queries_stay_within_bound_namespace(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut main = ast::Schema {
+        namespace: "Main".into(),
+        ..Default::default()
+    };
+    parser::run(
+        "Main/schema.pyre",
+        "record MainItem {\n @public\n id Id.Uuid @id\n}\n",
+        &mut main,
+    )
+    .unwrap();
+    let mut archive = ast::Schema {
+        namespace: "Archive".into(),
+        ..Default::default()
+    };
+    parser::run(
+        "Archive/schema.pyre",
+        "record ArchiveItem {\n @public\n id Id.Uuid @id\n}\n",
+        &mut archive,
+    )
+    .unwrap();
+    let mut database = ast::Database {
+        schemas: vec![main, archive],
+    };
+    ast::resolve_id_brands(&mut database);
+    let context = typecheck::check_schema(&database).unwrap();
+    let manifest = manifest_for(
+        &context,
+        "query ReadMain { mainItem { id } }\nquery ReadArchive { archiveItem { id } }",
+        false,
+    )?;
+
+    let standalone_source =
+        pyre::generate::to_string::standalone_schema_to_string(&context, &database.schemas[0]);
+    let loaded = pyre::db::introspect::from_raw(pyre::db::introspect::IntrospectionRaw {
+        tables: vec![],
+        migration_state: pyre::db::introspect::MigrationState::NoMigrationTable,
+        schema_source: standalone_source,
+        links: vec![],
+    });
+    let pyre::db::introspect::SchemaResult::Success {
+        context: standalone_context,
+        ..
+    } = loaded.schema
+    else {
+        panic!("standalone schema should load");
+    };
+    let bound = BoundManifest::new(manifest.clone(), &standalone_context)?;
+    assert!(bound.authorizes_namespace("Main"));
+    assert!(!bound.authorizes_namespace("Archive"));
+
+    let archive_query = manifest
+        .queries
+        .values()
+        .find(|query| query.primary_db == "Archive")
+        .unwrap();
+    let db = libsql::Builder::new_local(":memory:").build().await?;
+    let conn = db.connect()?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let fingerprint = bound.fingerprint().to_string();
+    let binding = query::BatchBinding {
+        database_id: "main",
+        namespace: "Archive",
+        manifest: &fingerprint,
+        instance: "test",
+        auth_generation: 0,
+    };
+    let replacement = ReplacementRequest {
+        version: 1,
+        fence: SyncFence {
+            database_id: "main".into(),
+            instance: "test".into(),
+            auth_generation: 0,
+            namespace: "Archive".into(),
+            manifest: fingerprint.clone(),
+            database_epoch: "epoch".into(),
+        },
+        request_id: "replacement".into(),
+        target: 0,
+    };
+    assert!(matches!(
+        SyncServer::new(&standalone_context)
+            .replacement(&conn, &bound, &binding, &replacement, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    let error =
+        query::run_with_revision(&conn, &bound, &archive_query.id, json!({}), &session, false)
+            .await
+            .unwrap_err();
+    assert!(matches!(error, query::Error::InvalidInput(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn revisioned_named_queries_revalidate_sessions_against_the_bound_manifest(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        "@syncable(false)\nsession {\n userId Int\n}\nrecord Item {\n id Int @id\n ownerId Int\n @allow(*) { ownerId == Session.userId }\n}\n",
+    )
+    .await?;
+    let manifest = manifest_for(&db.context, "query Items { item { id } }", false)?;
+    let weak_schema = HashMap::from([(
+        "userId".to_string(),
+        serde_json::from_value(json!({
+            "type": "String", "nullable": false, "omittable": false
+        }))?,
+    )]);
+    let session = PyreSession::new(json!({ "userId": "7" }), &weak_schema)?;
+    let conn = db.db.connect()?;
+
+    let error = query::run_with_revision(
+        &conn,
+        &bind(&manifest, &db.context),
+        &only_query(&manifest).id,
+        json!({}),
+        &session,
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, query::Error::InvalidSession(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn typed_json_session_enums_match_compiled_bundle_writes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = format!(
+        "{}\n{}",
+        include_str!("../packages/server/fixtures/compiled-batch/session.pyre"),
+        include_str!("../packages/server/fixtures/compiled-batch/schema.pyre")
+    );
+    let db = TestDatabase::new(&source).await?;
+    let manifest = manifest_for(
+        &db.context,
+        include_str!("../packages/server/fixtures/compiled-batch/queries.pyre"),
+        true,
+    )?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|query| {
+            query
+                .generated_edit
+                .as_ref()
+                .is_some_and(|edit| edit.kind == "create")
+        })
+        .unwrap();
+    let lookup = manifest
+        .queries
+        .values()
+        .find(|query| query.operation == "query")
+        .unwrap();
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let conn = db.db.connect()?;
+    let details = json!({"_type":"Bundle","when":"2026-01-01T00:00:00Z","role":"Member","children":[{"_type":"Note","count":2,"enabled":false},{"_type":"Bundle","when":1767225600,"role":{"_type":"Admin"},"children":[],"byName":{},"note":null}],"byName":{"empty":{"_type":"Empty"}},"note":null});
+    let mut session_value =
+        json!({"userId":7,"role":"Member","unrelated":"value","context":details});
+    let session = PyreSession::new(session_value.clone(), &manifest.session_schema)?;
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
+    let request = batch_request(&conn, &binding, vec![query::BatchOperation { operation:create.id.clone(), input:json!({"id":"01890f6c-7b80-7000-8000-000000000009","release":"00000000-0000-4000-8000-000000000002","enabled":true,"count":1,"role":"Member","details":details}) }]).await;
+    for invalid_id in [
+        Some(json!("01890f6c-7b80-4000-8000-000000000009")),
+        Some(json!("01890F6C-7B80-7000-8000-000000000009")),
+        Some(json!("01890f6c-7b80-7000-7000-000000000009")),
+        Some(json!("not-a-uuid")),
+        Some(json!(7)),
+        None,
+    ] {
+        let mut invalid = request.clone();
+        let input = invalid.operations[0].input.as_object_mut().unwrap();
+        match invalid_id {
+            Some(value) => {
+                input.insert("id".into(), value);
+            }
+            None => {
+                input.remove("id");
+            }
+        }
+        assert!(query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &invalid,
+            &session,
+        )
+        .await
+        .is_err());
+    }
+    let untouched = conn
+        .query(
+            "select (select count(*) from entries), server_revision from _pyre_sync",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(untouched.get::<i64>(0)?, 0);
+    assert_eq!(untouched.get::<i64>(1)?, 0);
+    query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    let row = conn
+        .query(
+            "select json(details) from entries where id = '01890f6c-7b80-7000-8000-000000000009'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    let stored: serde_json::Value = serde_json::from_str(&row.get::<String>(0)?)?;
+    assert_eq!(stored["role"], json!({"_type":"Member"}));
+    for role in [json!("Member"), json!({"_type":"Member"})] {
+        session_value["role"] = role.clone();
+        session_value["context"]["role"] = role;
+        let session = PyreSession::new(session_value.clone(), &manifest.session_schema)?;
+        assert_eq!(session.sql_args()["session_role"], json!("Member"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                session.sql_args()["session_context"].as_str().unwrap()
+            )?,
+            stored
+        );
+        let found = query::run(&conn, &manifest, &lookup.id, json!({}), &session).await?;
+        assert_eq!(
+            found.response,
+            json!({"entry":[{"id":"01890f6c-7b80-7000-8000-000000000009"}]})
+        );
+    }
+    session_value["context"]["role"] = json!("Admin");
+    let different = PyreSession::new(session_value, &manifest.session_schema)?;
+    let found = query::run(&conn, &manifest, &lookup.id, json!({}), &different).await?;
+    assert_eq!(found.response, json!({"entry":[]}));
+    Ok(())
+}
+
+#[tokio::test]
+async fn compiler_provenance_is_not_inferred_from_named_query_hashes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db =
+        TestDatabase::new("record Item {\n    id Id.Uuid @id\n    name String\n    @public\n}\n")
+            .await?;
+    let mut queries = ast::QueryList {
+        queries: Vec::new(),
+    };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &db.context);
+    let mut named = queries
+        .queries
+        .iter()
+        .find_map(|q| match q {
+            ast::QueryDef::Query(q) if q.operation == ast::QueryOperation::Update => {
+                Some(q.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    // Same name, contents, hashes, and absent locations as compiler CRUD, but explicitly named.
+    named.generated_crud = false;
+    let queries = ast::QueryList {
+        queries: vec![ast::QueryDef::Query(named)],
+    };
+    let info = typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: Manifest = serde_json::from_str(&files[0].contents)?;
+    let named = only_query(&manifest);
+    assert!(named.generated_edit.is_none());
+    assert!(named.sql.iter().all(|sql| !sql.sql.contains("_pyreEditId")));
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&named.primary_db, &fingerprint);
+    let conn = db.db.connect()?;
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![query::BatchOperation {
+            operation: named.id.clone(),
+            input: json!({"id":"00000000-0000-0000-0000-000000000999"}),
+        }],
+    )
+    .await;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    assert_eq!(result.response["results"][0]["value"], json!({"item":[]}));
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_fingerprint_covers_permissions_sql_and_codecs_and_matches_ts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = "@syncable(false)\nrecord Item {\n    id Id.Int @id\n    name String\n    @allow(query) { True }\n    @allow(insert, update, delete) { True }\n}\n";
+    let db = TestDatabase::new(source).await?;
+    let query_source = "update Rename($name: String) {\n    item { name = $name }\n}\n";
+    let manifest = manifest_for(&db.context, query_source, true)?;
+    let fingerprint = manifest.fingerprint();
+    for _ in 0..3 {
+        assert_eq!(
+            manifest_for(&db.context, query_source, true)?.fingerprint(),
+            fingerprint
+        );
+    }
+    let mut reordered = manifest.clone();
+    let mut entries = reordered.queries.drain().collect::<Vec<_>>();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    reordered.queries.extend(entries);
+    assert_eq!(reordered.fingerprint(), fingerprint);
+    let id = manifest.queries.keys().next().unwrap();
+    let mut changed = manifest.clone();
+    changed.queries.get_mut(id).unwrap().sql[0]
+        .sql
+        .push_str(" /* changed */");
+    assert_ne!(changed.fingerprint(), fingerprint);
+    let mut changed = manifest.clone();
+    changed
+        .queries
+        .get_mut(id)
+        .unwrap()
+        .compiled_contract
+        .push('x');
+    assert_ne!(changed.fingerprint(), fingerprint);
+    let denied =
+        TestDatabase::new(&source.replace("@allow(query) { True }", "@allow(query) { False }"))
+            .await?;
+    let denied_manifest = manifest_for(&denied.context, query_source, true)?;
+    assert_ne!(denied_manifest.fingerprint(), fingerprint);
+    assert_eq!(
+        denied_manifest
+            .queries
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        manifest
+            .queries
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_ne!(
+        manifest_for(&db.context, "", false)?.fingerprint(),
+        manifest_for(&denied.context, "", false)?.fingerprint()
+    );
+    let nullable = TestDatabase::new(&source.replace("name String", "name String?")).await?;
+    assert_ne!(
+        manifest_for(&nullable.context, query_source, true)?.fingerprint(),
+        fingerprint
+    );
+    let mut queries = parser::parse_query("query.pyre", query_source).unwrap();
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &db.context);
+    let info = typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::typescript::targets::server::generate_queries(
+        &db.context,
+        &info,
+        &queries,
+        Path::new("typescript"),
+        &mut files,
+    );
+    let server = files
+        .iter()
+        .find(|file| file.path == Path::new("typescript/server.ts"))
+        .unwrap();
+    assert!(server.contents.contains(&format!(
+        "export const manifestVersion = \"{}\";",
+        fingerprint
+    )));
+    Ok(())
+}
+
+async fn batch_request(
+    conn: &libsql::Connection,
+    binding: &query::BatchBinding<'_>,
+    operations: Vec<query::BatchOperation>,
+) -> query::BatchRequest {
+    let mut rows = conn
+        .query("SELECT database_epoch FROM _pyre_sync WHERE id = 1", ())
+        .await
+        .unwrap();
+    let epoch = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    query::BatchRequest {
+        version: 1,
+        database_id: "main".into(),
+        namespace: binding.namespace.into(),
+        manifest: binding.manifest.into(),
+        instance: "test".into(),
+        auth_generation: 1,
+        database_epoch: epoch,
+        request_id: "r1".into(),
+        sequence: 1,
+        operations,
+    }
+}
+
+fn batch_binding<'a>(namespace: &'a str, fingerprint: &'a str) -> query::BatchBinding<'a> {
+    query::BatchBinding {
+        database_id: "main",
+        namespace,
+        manifest: fingerprint,
+        instance: "test",
+        auth_generation: 1,
+    }
+}
+
+#[tokio::test]
+async fn generated_nullable_boolean_keeps_explicit_null() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db =
+        TestDatabase::new("record Item {\n    id Id.Uuid @id\n    enabled Bool?\n    @public\n}\n")
+            .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|query| {
+            query.operation == "insert"
+                && query
+                    .generated_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.kind == "create")
+        })
+        .unwrap();
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![query::BatchOperation {
+            operation: create.id.clone(),
+            input: json!({"id":"01890f6c-7b80-7000-8000-000000000001","enabled":null}),
+        }],
+    )
+    .await;
+    query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    let mut rows = conn
+        .query(
+            "SELECT enabled IS NULL FROM items WHERE id='01890f6c-7b80-7000-8000-000000000001'",
+            (),
+        )
+        .await?;
+    assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_generated_edits_are_ordered_atomic_and_use_direct_cardinality(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Item {
+    id Id.Uuid @id
+    name String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let create = query_by_operation(&manifest, "insert");
+    let update = query_by_operation(&manifest, "update");
+    let delete = query_by_operation(&manifest, "delete");
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
+    assert_eq!(
+        update
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .write_statement_indices,
+        vec![0]
+    );
+    assert_eq!(
+        update.generated_edit.as_ref().unwrap().writable_inputs,
+        vec!["name"]
+    );
+    let op = |q: &QueryManifest, input| query::BatchOperation {
+        operation: q.id.clone(),
+        input,
+    };
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![
+            op(
+                create,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"first"}),
+            ),
+            op(
+                create,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000002","name":"second"}),
+            ),
+            op(
+                update,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"final"}),
+            ),
+        ],
+    )
+    .await;
+    // Trigger-side writes do not inflate direct write cardinality.
+    conn.execute("CREATE TABLE audit (message TEXT)", ())
+        .await?;
+    conn.execute("CREATE TRIGGER item_audit AFTER UPDATE ON items BEGIN INSERT INTO audit VALUES ('a'); INSERT INTO audit VALUES ('b'); END", ()).await?;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    assert_eq!(result.response["commitRevision"], 1);
+    assert_eq!(
+        result.response["results"],
+        json!([
+            {"index":0,"operation":create.id,"value":{"id":"01890f6c-7b80-7000-8000-000000000001"}},
+            {"index":1,"operation":create.id,"value":{"id":"01890f6c-7b80-7000-8000-000000000002"}},
+            {"index":2,"operation":update.id,"value":{"id":"01890f6c-7b80-7000-8000-000000000001"}},
+        ])
+    );
+    let mut request = request;
+    request.operations = vec![
+        op(
+            update,
+            json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"rolled back"}),
+        ),
+        op(delete, json!({"id":"00000000-0000-0000-0000-000000000999"})),
+    ];
+    let error = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("operation 1"));
+    assert!(error.to_string().contains("TargetNotWritable"));
+    let mut rows = conn.query("SELECT name, (SELECT server_revision FROM _pyre_sync WHERE id=1) FROM items WHERE id='01890f6c-7b80-7000-8000-000000000001'", ()).await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<String>(0)?, "final");
+    assert_eq!(row.get::<i64>(1)?, 1);
+    drop(rows);
+    conn.execute(
+        "UPDATE items SET updatedAt = 1 WHERE id = '01890f6c-7b80-7000-8000-000000000001'",
+        (),
+    )
+    .await?;
+    request.operations = vec![op(
+        update,
+        json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"final"}),
+    )];
+    assert_eq!(
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await?
+        .response["commitRevision"],
+        2
+    );
+    let mut rows = conn
+        .query(
+            "SELECT updatedAt FROM items WHERE id = '01890f6c-7b80-7000-8000-000000000001'",
+            (),
+        )
+        .await?;
+    assert!(rows.next().await?.unwrap().get::<i64>(0)? > 1);
+    drop(rows);
+    request.operations = vec![op(
+        update,
+        json!({"id":"01890f6c-7b80-7000-8000-000000000001","name":"protected","updatedAt":1}),
+    )];
+    assert_eq!(
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "InvalidRequest"
+    );
+    request.operations = vec![op(
+        update,
+        json!({"id":"01890f6c-7b80-7000-8000-000000000001"}),
+    )];
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("InvalidEdit"));
+    request.operations.clear();
+    let empty = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    assert_eq!(empty.response["results"], json!([]));
+    assert!(empty.response.get("commitRevision").is_none());
+    assert!(SyncServer::new(&db.context)
+        .replacement_messages(&empty, &std::collections::HashMap::new())
+        .is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn named_batch_results_are_validated_before_revision_and_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db =
+        TestDatabase::new("record Item {\n id Id.Uuid @id\n name String\n @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    let mut manifest = manifest_for(
+        &db.context,
+        "insert Named($id: Item.id, $name: String) { item { id = $id name = $name } }",
+        true,
+    )?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|query| {
+            query.operation == "insert"
+                && query
+                    .generated_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.kind == "create")
+        })
+        .unwrap();
+    let create_id = create.id.clone();
+    let namespace = create.primary_db.clone();
+    let named_id = manifest
+        .queries
+        .values()
+        .find(|query| query.generated_edit.is_none())
+        .unwrap()
+        .id
+        .clone();
+    manifest.queries.get_mut(&named_id).unwrap().result_schema =
+        Some(pyre::server::manifest::ResultSchema::Array {
+            items: Box::new(pyre::server::manifest::ResultSchema::Object {
+                fields: std::collections::BTreeMap::new(),
+            }),
+        });
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&namespace, &fingerprint);
+    let request = batch_request(
+        &conn,
+        &binding,
+        vec![
+            query::BatchOperation {
+                operation: create_id,
+                input: json!({"id":"01890f6c-7b80-7000-8000-000000000003","name":"prefix"}),
+            },
+            query::BatchOperation {
+                operation: named_id,
+                input: json!({"id":"00000000-0000-0000-0000-000000000004","name":"named"}),
+            },
+        ],
+    )
+    .await;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let error = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "InvalidRequest");
+    assert_eq!(error.operation_index(), Some(1));
+    let row = conn
+        .query(
+            "SELECT count(*), (SELECT server_revision FROM _pyre_sync) FROM items",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
+    assert_eq!(row.get::<i64>(1)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn revisioned_named_results_are_validated_before_revision_and_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db =
+        TestDatabase::new("record Item {\n id Id.Uuid @id\n name String\n @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    let mut manifest = manifest_for(
+        &db.context,
+        "insert Named($id: Item.id, $name: String) { item { id = $id name = $name } }",
+        false,
+    )?;
+    let named_id = only_query(&manifest).id.clone();
+    manifest.queries.get_mut(&named_id).unwrap().result_schema =
+        Some(pyre::server::manifest::ResultSchema::Array {
+            items: Box::new(pyre::server::manifest::ResultSchema::Object {
+                fields: std::collections::BTreeMap::new(),
+            }),
+        });
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+
+    let error = query::run_with_revision(
+        &conn,
+        &bind(&manifest, &db.context),
+        &named_id,
+        json!({
+            "id": "01890f6c-7b80-7000-8000-000000000004",
+            "name": "rolled back"
+        }),
+        &session,
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), "InvalidRequest");
+    let row = conn
+        .query(
+            "SELECT (SELECT count(*) FROM items), server_revision FROM _pyre_sync WHERE id = 1",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
+    assert_eq!(row.get::<i64>(1)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn js_protocol_counters_reject_values_above_max_safe_integer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    let db =
+        TestDatabase::new("record Item {\n id Id.Uuid @id\n name String\n @public\n}\n").await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = query_by_operation(&manifest, "insert");
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let bound = bind(&manifest, &db.context);
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let mut request = batch_request(&conn, &binding, Vec::new()).await;
+
+    request.sequence = MAX_SAFE_INTEGER + 1;
+    assert!(
+        query::run_batch(&conn, &bound, &binding, &request, &session)
+            .await
+            .is_err()
+    );
+    request.sequence = MAX_SAFE_INTEGER;
+    assert!(
+        query::run_batch(&conn, &bound, &binding, &request, &session)
+            .await
+            .is_ok()
+    );
+
+    request.auth_generation = MAX_SAFE_INTEGER + 1;
+    let unsafe_binding = query::BatchBinding {
+        auth_generation: MAX_SAFE_INTEGER + 1,
+        ..binding
+    };
+    assert!(
+        query::run_batch(&conn, &bound, &unsafe_binding, &request, &session)
+            .await
+            .is_err()
+    );
+
+    let replacement = ReplacementRequest {
+        version: 1,
+        fence: SyncFence {
+            database_id: unsafe_binding.database_id.into(),
+            instance: unsafe_binding.instance.into(),
+            auth_generation: MAX_SAFE_INTEGER + 1,
+            namespace: unsafe_binding.namespace.into(),
+            manifest: unsafe_binding.manifest.into(),
+            database_epoch: request.database_epoch.clone(),
+        },
+        request_id: "replacement".into(),
+        target: 0,
+    };
+    assert!(matches!(
+        SyncServer::new(&db.context)
+            .replacement(&conn, &bound, &unsafe_binding, &replacement, &session)
+            .await,
+        Err(pyre::server::sync::Error::InvalidFence)
+    ));
+    let recipients = HashMap::from([("unsafe".into(), replacement.fence)]);
+    assert!(SyncServer::new(&db.context)
+        .committed_replacement_messages(
+            &query::CommittedRevision {
+                database_epoch: request.database_epoch,
+                revision: 1,
+            },
+            unsafe_binding.database_id,
+            unsafe_binding.namespace,
+            unsafe_binding.manifest,
+            &recipients,
+        )
+        .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_preflight_rejects_invalid_members_scopes_and_limits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Item {
+    id Id.Uuid @id
+    name String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = query_by_operation(&manifest, "insert");
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let operation = query::BatchOperation {
+        operation: create.id.clone(),
+        input: json!({"id":"01890f6c-7b80-7000-8000-000000000005","name":"ok"}),
+    };
+    let mut request = batch_request(&conn, &binding, vec![operation.clone()]).await;
+    let mut invalid = operation.clone();
+    invalid.input = json!({"id":"01890f6c-7b80-7000-8000-000000000006","name":"bad","unknown":7});
+    request.operations.push(invalid);
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.operations = vec![operation.clone(); 101];
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.operations = vec![operation.clone()];
+    request.operations[0].input = json!({"name":"a".repeat(query::MAX_BATCH_PAYLOAD_BYTES)});
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.operations = vec![operation];
+    request.namespace = "Unauthorized".into();
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.namespace = binding.namespace.into();
+    let mut attached = manifest.clone();
+    attached.queries.get_mut(&create.id).unwrap().attached_dbs = vec!["Other".into()];
+    let attached_fingerprint = attached.fingerprint();
+    let attached_binding = batch_binding(binding.namespace, &attached_fingerprint);
+    request.manifest = attached_fingerprint.clone();
+    assert!(query::run_batch(
+        &conn,
+        &bind(&attached, &db.context),
+        &attached_binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    let forged_binding = batch_binding(binding.namespace, "forged-version");
+    request.manifest = "forged-version".into();
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &forged_binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    request.manifest = fingerprint.clone();
+    conn.execute("ATTACH DATABASE ':memory:' AS other", ())
+        .await?;
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    conn.execute("DETACH DATABASE other", ()).await?;
+    request.database_epoch = "stale".into();
+    assert!(query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session
+    )
+    .await
+    .is_err());
+    let mut rows = conn
+        .query(
+            "SELECT (SELECT count(*) FROM items), server_revision FROM _pyre_sync WHERE id=1",
+            (),
+        )
+        .await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
+    assert_eq!(row.get::<i64>(1)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_hidden_identities_named_noops_and_many_targets(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Item {
+    id Id.Uuid @id
+    name String
+    @allow(query) { False }
+    @allow(insert, update, delete) { True }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+update RenameAll($allName: String) {
+    item { name = $allName }
+}
+update Noop($noopName: String, $missingId: Item.id) {
+    item { @where { id == $missingId } name = $noopName }
+}
+"#,
+        true,
+    )?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let create = query_by_operation(&manifest, "insert");
+    let update = manifest
+        .queries
+        .values()
+        .find(|q| q.operation == "update" && q.generated_edit.is_some())
+        .unwrap();
+    let all = query_by_input_names(&manifest, &["allName"]);
+    let noop = query_by_input_names(&manifest, &["noopName", "missingId"]);
+    assert!(all.generated_edit.is_none());
+    let fingerprint = manifest.fingerprint();
+    let binding = batch_binding(&create.primary_db, &fingerprint);
+    let op = |q: &QueryManifest, input| query::BatchOperation {
+        operation: q.id.clone(),
+        input,
+    };
+    let mut request = batch_request(
+        &conn,
+        &binding,
+        vec![
+            op(
+                create,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000007","name":"a"}),
+            ),
+            op(
+                create,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000008","name":"b"}),
+            ),
+            op(
+                update,
+                json!({"id":"01890f6c-7b80-7000-8000-000000000007","name":"unreadable"}),
+            ),
+            op(all, json!({"allName":"both"})),
+            op(
+                noop,
+                json!({"noopName":"unused", "missingId":"00000000-0000-0000-0000-000000000999"}),
+            ),
+        ],
+    )
+    .await;
+    let result = query::run_batch(
+        &conn,
+        &bind(&manifest, &db.context),
+        &binding,
+        &request,
+        &session,
+    )
+    .await?;
+    assert_eq!(
+        result.response["results"][2]["value"],
+        json!({"id":"01890f6c-7b80-7000-8000-000000000007"})
+    );
+    assert_eq!(
+        result.response["results"][3]["value"],
+        json!({"item":[{"name":"both"},{"name":"both"}]})
+    );
+    assert_eq!(result.response["results"][4]["value"], json!({"item":[]}));
+    assert_eq!(result.response["reconciliation"]["minimumSafeRevision"], 1);
+    request.operations = vec![op(
+        noop,
+        json!({"noopName":"unused", "missingId":"00000000-0000-0000-0000-000000000999"}),
+    )];
+    assert_eq!(
+        query::run_batch(
+            &conn,
+            &bind(&manifest, &db.context),
+            &binding,
+            &request,
+            &session
+        )
+        .await?
+        .response["commitRevision"],
+        2
+    );
+    // Simulate a faulty compiled target predicate: read visibility and trigger totals must not mask >1.
+    let mut broad = manifest.clone();
+    broad.queries.get_mut(&update.id).unwrap().sql[0].sql =
+        "UPDATE items SET name = 'bad' RETURNING id AS _pyreEditId".into();
+    request.operations = vec![op(
+        update,
+        json!({"id":"01890f6c-7b80-7000-8000-000000000007","name":"bad"}),
+    )];
+    let broad_fingerprint = broad.fingerprint();
+    let broad_binding = batch_binding(&create.primary_db, &broad_fingerprint);
+    request.manifest = broad_fingerprint.clone();
+    let error = query::run_batch(
+        &conn,
+        &bind(&broad, &db.context),
+        &broad_binding,
+        &request,
+        &session,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "TargetNotWritable");
+    assert_eq!(error.operation_index(), Some(0));
+    let mut rows = conn
+        .query("SELECT count(*) FROM items WHERE name = 'both'", ())
+        .await?;
+    assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 2);
+    Ok(())
+}
+
 #[tokio::test]
 async fn run_insert_roundtrips_nested_zero_field_union() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type VoteHandState
    = HandLowered
    | HandRaised
@@ -108,6 +1284,21 @@ insert CreateEvent($payload: EventPayload) {
     .await?;
 
     assert_eq!(result.response["event"][0]["payload"], payload);
+    for invalid in [
+        json!({"_type":"Unknown"}),
+        json!({"_type":"PlayerVoteHandStateChanged","authorParticipantId":1.5,"voteId":"v","state":{"_type":"HandRaised"}}),
+        json!({"_type":"PlayerVoteHandStateChanged","authorParticipantId":1,"voteId":"v","state":{"_type":"Invalid"}}),
+    ] {
+        assert!(query::run(
+            &conn,
+            &manifest,
+            &only_query(&manifest).id,
+            json!({"payload":invalid}),
+            &session
+        )
+        .await
+        .is_err());
+    }
     Ok(())
 }
 
@@ -252,6 +1443,7 @@ async fn generated_manifest_distinguishes_bool_from_unit_enum(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Status
     = Running
     | Stopped
@@ -317,6 +1509,7 @@ fn generated_rust_crud_omits_immutable_update_input_but_returns_field() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -772,6 +1965,7 @@ struct ClocktowerParticipantCreateOutput {
 async fn run_mutations_roundtrip_tagged_union_variants() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type ClocktowerGameStatus
     = ClocktowerRunning
     | ClocktowerStopped
@@ -1309,6 +2503,7 @@ transaction ReplaceTask($id: Task.id, $action: Action) {
 async fn run_query_binds_tagged_enum_session_values() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Role
     = Admin
     | Member
@@ -1425,6 +2620,7 @@ delete DeleteNote($id: Note.id) {
 async fn run_query_binds_tagged_union_session_paths() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type SessionScope
     = Workspace {
         id Int
@@ -1523,6 +2719,7 @@ async fn run_query_binds_recursive_tagged_union_session_paths(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type SessionScope
     = Leaf {
         id Int
@@ -1585,6 +2782,7 @@ async fn generated_update_roundtrips_omittable_unit_enum_input(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Status
     = Running
     | Stopped
@@ -1666,6 +2864,7 @@ async fn run_mutation_roundtrips_recursive_union_json_payloads(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Action
     = Create { title String }
     | Delete { id Int }
@@ -1722,6 +2921,7 @@ insert CreateTreeDocument($tree: Tree) {
 async fn run_select_query_formats_response() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -1769,7 +2969,7 @@ async fn run_insert_mutation_returns_result_and_extracts_affected_rows_in_sync_m
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1781,11 +2981,11 @@ record Note {
     let manifest = manifest_for(
         &db.context,
         r#"
-insert CreateNote($body: String) {
+insert CreateNote($id: Note.id, $body: String) {
     note {
+        id = $id
         body = $body
         updatedAt = 10
-        id
     }
 }
 "#,
@@ -1796,12 +2996,15 @@ insert CreateNote($body: String) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "body": "one" }),
+        json!({ "id": "00000000-0000-0000-0000-000000000101", "body": "one" }),
         &session,
     )
     .await?;
 
-    assert_eq!(result.response["note"][0]["id"], json!(1));
+    assert_eq!(
+        result.response["note"][0]["id"],
+        json!("00000000-0000-0000-0000-000000000101")
+    );
     assert_eq!(result.response["note"][0]["body"], json!("one"));
     assert_eq!(result.affected_rows.len(), 1);
     assert_eq!(result.affected_rows[0].table_name, "notes");
@@ -1816,19 +3019,19 @@ async fn run_transaction_returns_all_steps_and_aggregates_affected_rows(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
 }
 record Counter {
-    id Int @id
+    id Id.Uuid @id
     value Int
     updatedAt Int
     @public
 }
 record Pending {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -1837,26 +3040,26 @@ record Pending {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into counters (id, value, updatedAt) values (1, 0, 10);\n\
-         insert into pendings (id, updatedAt) values (1, 10);",
+        "insert into counters (id, value, updatedAt) values ('00000000-0000-0000-0000-000000000102', 0, 10);\n\
+         insert into pendings (id, updatedAt) values ('00000000-0000-0000-0000-000000000103', 10);",
     )
     .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-transaction Apply($body: String, $value: Int) {
+transaction Apply($noteId: Note.id, $counterId: Counter.id, $pendingId: Pending.id, $body: String, $value: Int) {
     insert created: note {
+        id = $noteId
         body = $body
         updatedAt = 10
-        id
     }
     update changed: counter {
-        @where { id == 1 }
+        @where { id == $counterId }
         value = $value
         id
     }
     delete removed: pending {
-        @where { id == 1 }
+        @where { id == $pendingId }
         id
     }
 }
@@ -1871,14 +3074,23 @@ transaction Apply($body: String, $value: Int) {
         &conn,
         &manifest,
         &transaction.id,
-        json!({ "body": "one", "value": 2 }),
+        json!({
+            "noteId": "00000000-0000-0000-0000-000000000104",
+            "counterId": "00000000-0000-0000-0000-000000000102",
+            "pendingId": "00000000-0000-0000-0000-000000000103",
+            "body": "one",
+            "value": 2
+        }),
         &session,
     )
     .await?;
 
     assert_eq!(result.response["created"][0]["body"], json!("one"));
     assert_eq!(result.response["changed"][0]["value"], json!(2));
-    assert_eq!(result.response["removed"][0]["id"], json!(1));
+    assert_eq!(
+        result.response["removed"][0]["id"],
+        json!("00000000-0000-0000-0000-000000000103")
+    );
     assert_eq!(result.affected_rows.len(), 3);
     assert_eq!(result.affected_rows[0].table_name, "notes");
     assert_eq!(result.affected_rows[1].table_name, "counters");
@@ -1891,6 +3103,7 @@ async fn run_transaction_preserves_aliases_zero_rows_and_shared_session_permissi
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -1967,6 +3180,7 @@ async fn run_transaction_rolls_back_on_late_unique_constraint_failure(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String @unique
@@ -2024,7 +3238,7 @@ async fn failed_nested_transaction_rolls_back_without_sync_publication(
     let db = TestDatabase::new(
         r#"
 record Parent {
-    id Int @id
+    id Id.Uuid @id
     name String
     updatedAt Int
     children @link(Child.parentId)
@@ -2032,8 +3246,8 @@ record Parent {
 }
 
 record Child {
-    id Int @id
-    parentId Int
+    id Id.Uuid @id
+    parentId Parent.id
     slug String @unique
     updatedAt Int
     parent @link(parentId, Parent.id)
@@ -2044,26 +3258,30 @@ record Child {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into parents (id, name, updatedAt) values (1, 'baseline', 10);\n\
-         insert into children (id, parentId, slug, updatedAt) values (1, 1, 'taken', 10);",
+        "insert into parents (id, name, updatedAt) values ('00000000-0000-0000-0000-000000000105', 'baseline', 10);\n\
+         insert into children (id, parentId, slug, updatedAt) values ('00000000-0000-0000-0000-000000000106', '00000000-0000-0000-0000-000000000105', 'taken', 10);",
     )
     .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-transaction CreateParents {
+transaction CreateParents($firstParentId: Parent.id, $firstChildId: Child.id, $secondParentId: Parent.id, $secondChildId: Child.id) {
     insert first: parent {
+        id = $firstParentId
         name = "first"
         updatedAt = 10
         children {
+            id = $firstChildId
             slug = "ok"
             updatedAt = 10
         }
     }
     insert second: parent {
+        id = $secondParentId
         name = "second"
         updatedAt = 10
         children {
+            id = $secondChildId
             slug = "taken"
             updatedAt = 10
         }
@@ -2079,7 +3297,12 @@ transaction CreateParents {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({}),
+        json!({
+            "firstParentId": "00000000-0000-0000-0000-000000000107",
+            "firstChildId": "00000000-0000-0000-0000-000000000108",
+            "secondParentId": "00000000-0000-0000-0000-000000000109",
+            "secondChildId": "00000000-0000-0000-0000-000000000110"
+        }),
         &session,
     )
     .await
@@ -2124,7 +3347,11 @@ transaction CreateParents {
 
 #[tokio::test]
 async fn run_nested_insert_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
-    let db = TestDatabase::new(&helpers::schema::full_schema()).await?;
+    let db = TestDatabase::new(&format!(
+        "@syncable(false)\n{}",
+        helpers::schema::full_schema()
+    ))
+    .await?;
     let conn = db.db.connect()?;
     let query_source = r#"
 insert CreateUserWithPost($name: String, $status: Status) {
@@ -2168,7 +3395,11 @@ insert CreateUserWithPost($name: String, $status: Status) {
 #[tokio::test]
 async fn run_nested_insert_rolls_back_parent_after_child_failure(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db = TestDatabase::new(&helpers::schema::full_schema()).await?;
+    let db = TestDatabase::new(&format!(
+        "@syncable(false)\n{}",
+        helpers::schema::full_schema()
+    ))
+    .await?;
     let conn = db.db.connect()?;
     let query_source = r#"
 insert CreateUserWithPost($name: String, $status: Status) {
@@ -2221,7 +3452,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     attrs Json
     updatedAt Int
@@ -2234,12 +3465,12 @@ record Note {
     let manifest = manifest_for(
         &db.context,
         r#"
-insert CreateNote($attrs: Json) {
+insert CreateNote($id: Note.id, $attrs: Json) {
     note {
+        id = $id
         ownerId = Session.userId
         attrs = $attrs
         updatedAt = 10
-        id
     }
 }
 "#,
@@ -2250,7 +3481,10 @@ insert CreateNote($attrs: Json) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "attrs": { "theme": "forest" } }),
+        json!({
+            "id": "00000000-0000-0000-0000-000000000111",
+            "attrs": { "theme": "forest" }
+        }),
         &session,
     )
     .await?;
@@ -2271,6 +3505,7 @@ async fn generated_update_respects_omitted_vs_null_optional_args(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String?
@@ -2334,6 +3569,7 @@ query GetNotes {
 async fn run_query_reports_unknown_and_invalid_input() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -2384,6 +3620,7 @@ query GetNote($id: Int) {
 async fn run_query_reports_invalid_session() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -2438,6 +3675,7 @@ async fn run_query_handles_parameter_names_with_shared_prefixes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     id2 Int
@@ -2487,7 +3725,7 @@ async fn run_delete_mutation_extracts_affected_rows_in_sync_mode(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -2496,12 +3734,12 @@ record Note {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into notes (id, body, updatedAt) values (1, 'one', 10);")
+    conn.execute_batch("insert into notes (id, body, updatedAt) values ('00000000-0000-0000-0000-000000000112', 'one', 10);")
         .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-delete DeleteNote($id: Int) {
+delete DeleteNote($id: Note.id) {
     note {
         @where { id == $id }
         id
@@ -2517,14 +3755,17 @@ delete DeleteNote($id: Int) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "id": 1 }),
+        json!({ "id": "00000000-0000-0000-0000-000000000112" }),
         &session,
     )
     .await?;
 
     assert_eq!(result.affected_rows.len(), 1);
     assert_eq!(result.affected_rows[0].table_name, "notes");
-    assert_eq!(result.affected_rows[0].rows[0][0], json!(1));
+    assert_eq!(
+        result.affected_rows[0].rows[0][0],
+        json!("00000000-0000-0000-0000-000000000112")
+    );
     let mut rows = conn.query("select count(*) from notes", ()).await?;
     let row = rows.next().await?.expect("count row should exist");
     assert_eq!(row.get::<i64>(0)?, 0);
@@ -2538,7 +3779,7 @@ async fn generated_crud_create_and_delete_run_through_manifest_runtime(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt DateTime @default(now)
     @public
@@ -2562,12 +3803,24 @@ query GetNotes {
     let session = PyreSession::new(json!({}), &manifest.session_schema)?;
     let create = query_by_operation(&manifest, "insert");
     let delete = query_by_operation(&manifest, "delete");
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
 
     let created = query::run(
         &conn,
         &manifest,
         &create.id,
-        json!({ "body": "generated" }),
+        json!({
+            "id": "01890f6c-7b80-7000-8000-000000000010",
+            "body": "generated"
+        }),
         &session,
     )
     .await?;
@@ -2601,6 +3854,7 @@ async fn generated_crud_runtime_excludes_immutable_update_inputs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Document {
     id      Int @id
     ownerId Int @immutable
@@ -2667,7 +3921,7 @@ type ActionState
 
 record Action {
     @public
-    id    Int @id
+    id    Id.Uuid @id
     state ActionState @immutable
     title String
 }
@@ -2681,6 +3935,15 @@ record Action {
     let update = query_by_operation(&manifest, "update");
 
     assert!(create.input_schema.contains_key("state"));
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
     assert_eq!(create.json_input_args, vec!["state"]);
     assert!(!update.input_schema.contains_key("state"));
     assert!(!update.json_input_args.contains(&"state".to_string()));
@@ -2690,6 +3953,7 @@ record Action {
         &manifest,
         &create.id,
         json!({
+            "id": "01890f6c-7b80-7000-8000-000000000011",
             "state": { "_type": "Open", "startedAt": "now" },
             "title": "first"
         }),
@@ -2717,14 +3981,14 @@ async fn nested_insert_populates_immutable_parent_foreign_key(
         r#"
 record Parent {
     @public
-    id       Id.Int @id
+    id       Id.Uuid @id
     name     String
     children @link(Child.parentId)
 }
 
 record Child {
     @public
-    id       Int @id
+    id       Id.Uuid @id
     parentId Parent.id @immutable
     body     String
 }
@@ -2735,13 +3999,14 @@ record Child {
     let manifest = manifest_for(
         &db.context,
         r#"
-insert CreateParent($name: String, $body: String) {
+insert CreateParent($parentId: Parent.id, $childId: Child.id, $name: String, $body: String) {
     parent {
+        id = $parentId
         name = $name
         children {
+            id = $childId
             body = $body
         }
-        id
     }
 }
 "#,
@@ -2752,19 +4017,24 @@ insert CreateParent($name: String, $body: String) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "name": "parent", "body": "child" }),
+        json!({
+            "parentId": "00000000-0000-0000-0000-000000000113",
+            "childId": "00000000-0000-0000-0000-000000000114",
+            "name": "parent",
+            "body": "child"
+        }),
         &session,
     )
     .await?;
     let parent_id = inserted.response["parent"][0]["id"]
-        .as_i64()
+        .as_str()
         .expect("parent id is returned");
 
     let mut rows = conn
         .query("select parentId, body from children", ())
         .await?;
     let row = rows.next().await?.expect("nested child exists");
-    assert_eq!(row.get::<i64>(0)?, parent_id);
+    assert_eq!(row.get::<String>(0)?, parent_id);
     assert_eq!(row.get::<String>(1)?, "child");
     Ok(())
 }
@@ -2774,6 +4044,7 @@ async fn generated_crud_create_enforces_insert_permission() -> Result<(), Box<dy
 {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -2812,6 +4083,7 @@ async fn run_insert_mutation_binds_repeated_json_union_parameter(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Visibility
    = Hidden
    | Everyone
@@ -2882,6 +4154,7 @@ async fn literal_union_insert_binds_null_for_omitted_nullable_fields(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -3105,7 +4378,7 @@ type ActionState
 
 record Action {
     @public
-    id    Int @id
+    id    Id.Uuid @id
     state ActionState
 }
 "#,
@@ -3118,6 +4391,15 @@ record Action {
     let update = query_by_operation(&manifest, "update");
 
     assert_eq!(create.json_input_args, vec!["state"]);
+    assert_eq!(
+        create
+            .generated_edit
+            .as_ref()
+            .unwrap()
+            .create_uuid_input
+            .as_deref(),
+        Some("id")
+    );
     assert_eq!(update.json_input_args, vec!["state"]);
     assert!(!create.sql[0]
         .sql
@@ -3128,7 +4410,10 @@ record Action {
         &conn,
         &manifest,
         &create.id,
-        json!({ "state": { "_type": "Open", "startedAt": "first" } }),
+        json!({
+            "id": "01890f6c-7b80-7000-8000-000000000012",
+            "state": { "_type": "Open", "startedAt": "first" }
+        }),
         &session,
     )
     .await?;
@@ -3147,7 +4432,7 @@ record Action {
         &manifest,
         &update.id,
         json!({
-            "id": 1,
+            "id": "01890f6c-7b80-7000-8000-000000000012",
             "state": {
                 "_type": "Completed",
                 "startedAt": "first",
@@ -3177,6 +4462,7 @@ async fn run_multi_top_level_query_formats_all_response_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record User {
     id Int @id
     name String
@@ -3234,6 +4520,8 @@ query Dashboard {
 #[test]
 fn manifest_load_reads_generated_manifest_file() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = Manifest {
+        replacement_contracts: Default::default(),
+        compiled_contract: String::new(),
         version: 1,
         session_schema: Default::default(),
         queries: Default::default(),
@@ -3255,6 +4543,7 @@ fn generated_manifest_validates_integer_session_foreign_keys() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 session {
     userId User.id
 }
@@ -3294,4 +4583,47 @@ record Item {
         .starts_with("Id.Int"));
     assert!(PyreSession::new(json!({ "userId": 7 }), &manifest.session_schema).is_ok());
     assert!(PyreSession::new(json!({ "userId": 7.5 }), &manifest.session_schema).is_err());
+}
+
+#[test]
+fn session_validation_preserves_extra_claims_and_supported_codec_values() {
+    let schema: std::collections::HashMap<String, pyre::server::manifest::FieldSchema> =
+        serde_json::from_value(json!({
+            "count": {"type":"Int", "nullable":false, "omittable":false},
+            "enabled": {"type":"Bool", "nullable":false, "omittable":false},
+            "date": {"type":"Date", "nullable":false, "omittable":false},
+            "timestamp": {"type":"DateTime", "nullable":false, "omittable":false},
+            "ids": {"type":"Json<List<Int>>", "nullable":true, "omittable":true},
+            "scope": {"type":"Scope", "nullable":false, "omittable":false,
+                "tagged_union_variants": {"Member": {
+                    "id": {"type":"Int", "nullable":false, "omittable":false},
+                    "note": {"type":"String", "nullable":true, "omittable":false}
+                }}
+            }
+        }))
+        .unwrap();
+    let input = json!({"count":1.0,"enabled":1.0,"date":"date-valued-string", "timestamp":1.0,
+        "scope":{"_type":"Member","id":7,"extra":"ignored"}, "applicationClaim":"not a SQL arg"});
+    let session = PyreSession::new(input.clone(), &schema).unwrap();
+    assert_eq!(session.sql_args()["session_count"], json!(1));
+    assert_eq!(session.sql_args()["session_enabled"], json!(1));
+    assert_eq!(session.sql_args()["session_timestamp"], json!(1));
+    assert_eq!(session.sql_args()["session_scope__note"], json!(null));
+    assert!(!session.sql_args().contains_key("session_applicationClaim"));
+    assert!(!session.sql_args().contains_key("session_scope__extra"));
+    assert!(session.revalidate(&schema).is_ok());
+    for (key, value) in [
+        ("count", json!(1.5)),
+        ("count", json!(9_007_199_254_740_992_i64)),
+        ("enabled", json!(2)),
+        ("date", json!(1)),
+        ("timestamp", json!(8_640_000_000_001_i64)),
+        ("timestamp", json!("2016-12-31T23:59:60Z")),
+        ("ids", json!([1, "bad"])),
+        ("scope", json!({"_type":"Member"})),
+    ] {
+        let mut invalid = input.clone();
+        invalid[key] = value;
+        assert!(PyreSession::new(invalid, &schema).is_err(), "invalid {key}");
+    }
 }

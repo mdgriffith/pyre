@@ -164,6 +164,14 @@ fn reshape_table_group(
         return table_group.clone();
     };
 
+    reshape_table_group_with_table(table_group, context, table)
+}
+
+pub(crate) fn reshape_table_group_with_table(
+    table_group: &AffectedRowTableGroup,
+    context: &typecheck::Context,
+    table: &typecheck::Table,
+) -> AffectedRowTableGroup {
     let output_headers = table
         .record
         .fields
@@ -230,13 +238,38 @@ fn reshape_column_value(
 ) -> JsonValue {
     let value = row.get(prefix).cloned().unwrap_or(JsonValue::Null);
 
-    let Some(type_name) = column_type.get_custom_type_name() else {
+    if value.is_null() {
+        return value;
+    }
+
+    match column_type {
+        ast::ColumnType::Nullable(inner) => {
+            return reshape_column_value(context, row, prefix, inner);
+        }
+        ast::ColumnType::JsonTyped(inner) => {
+            return reshape_json_value(context, value, inner);
+        }
+        ast::ColumnType::List(inner) => {
+            return reshape_json_list(context, value, inner);
+        }
+        ast::ColumnType::Dict(inner) => {
+            return reshape_json_dict(context, value, inner);
+        }
+        ast::ColumnType::Bool => return canonical_storage_bool(value),
+        ast::ColumnType::DateTime => return canonical_datetime(value),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(ast::ConcreteSerializationType::DateTime),
+            ..
+        } => return canonical_datetime(value),
+        _ => {}
+    }
+
+    let ast::ColumnType::Custom(type_name) = column_type else {
         return value;
     };
 
     match value {
-        JsonValue::Null => JsonValue::Null,
-        JsonValue::Object(_) => value,
+        JsonValue::Object(_) => reshape_custom_value(context, value, type_name),
         JsonValue::String(variant_name) => {
             let Some((_definfo, type_)) = context.types.get(type_name) else {
                 return JsonValue::String(variant_name);
@@ -267,6 +300,121 @@ fn reshape_column_value(
 
             JsonValue::Object(object)
         }
+        _ => value,
+    }
+}
+
+fn reshape_json_value(
+    context: &typecheck::Context,
+    value: JsonValue,
+    column_type: &ast::ColumnType,
+) -> JsonValue {
+    if value.is_null() {
+        return value;
+    }
+
+    match column_type {
+        ast::ColumnType::Nullable(inner) | ast::ColumnType::JsonTyped(inner) => {
+            reshape_json_value(context, value, inner)
+        }
+        ast::ColumnType::List(inner) => reshape_json_list(context, value, inner),
+        ast::ColumnType::Dict(inner) => reshape_json_dict(context, value, inner),
+        ast::ColumnType::DateTime => canonical_datetime(value),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(ast::ConcreteSerializationType::DateTime),
+            ..
+        } => canonical_datetime(value),
+        ast::ColumnType::Custom(type_name) => reshape_custom_value(context, value, type_name),
+        _ => value,
+    }
+}
+
+fn reshape_json_list(
+    context: &typecheck::Context,
+    value: JsonValue,
+    item_type: &ast::ColumnType,
+) -> JsonValue {
+    match value {
+        JsonValue::Array(items) => JsonValue::Array(
+            items
+                .into_iter()
+                .map(|item| reshape_json_value(context, item, item_type))
+                .collect(),
+        ),
+        _ => value,
+    }
+}
+
+fn reshape_json_dict(
+    context: &typecheck::Context,
+    value: JsonValue,
+    item_type: &ast::ColumnType,
+) -> JsonValue {
+    match value {
+        JsonValue::Object(items) => JsonValue::Object(
+            items
+                .into_iter()
+                .map(|(key, item)| (key, reshape_json_value(context, item, item_type)))
+                .collect(),
+        ),
+        _ => value,
+    }
+}
+
+fn reshape_custom_value(
+    context: &typecheck::Context,
+    value: JsonValue,
+    type_name: &str,
+) -> JsonValue {
+    let Some((_definfo, typecheck::Type::OneOf { variants })) = context.types.get(type_name) else {
+        return value;
+    };
+    let tag = value
+        .as_str()
+        .or_else(|| value.get("_type").and_then(JsonValue::as_str));
+    let Some(variant) = tag.and_then(|tag| variants.iter().find(|variant| variant.name == tag))
+    else {
+        return value;
+    };
+
+    if variants.iter().all(|variant| variant.fields.is_none()) {
+        return match value {
+            JsonValue::String(tag) => JsonValue::Object(Map::from_iter([(
+                "_type".to_string(),
+                JsonValue::String(tag),
+            )])),
+            _ => value,
+        };
+    }
+
+    let JsonValue::Object(mut object) = value else {
+        return value;
+    };
+    if let Some(fields) = &variant.fields {
+        for field in fields {
+            if let ast::Field::Column(column) = field {
+                if let Some(field_value) = object.remove(&column.name) {
+                    object.insert(
+                        column.name.clone(),
+                        reshape_json_value(context, field_value, &column.type_),
+                    );
+                }
+            }
+        }
+    }
+    JsonValue::Object(object)
+}
+
+fn canonical_datetime(value: JsonValue) -> JsonValue {
+    crate::server::manifest::datetime_to_epoch_seconds(&value)
+        .map(JsonValue::from)
+        .unwrap_or(value)
+}
+
+fn canonical_storage_bool(value: JsonValue) -> JsonValue {
+    match value.as_i64() {
+        Some(0) => JsonValue::Bool(false),
+        Some(1) => JsonValue::Bool(true),
         _ => value,
     }
 }

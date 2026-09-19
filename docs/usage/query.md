@@ -166,9 +166,18 @@ A query whose only `Session` dependency is in schema permissions, such as `@allo
 
 ## Generated CRUD
 
-Pyre can expose schema-derived CRUD mutations for writable tables. Generated create inputs retain `@immutable` fields when they are otherwise insertable, while generated update inputs omit them.
+Pyre compiles schema-derived CRUD operations for tables; their presence does not
+grant write permission. Generated create inputs retain `@immutable` fields when
+otherwise insertable; update inputs omit them and primary-key setters. Empty
+updates reject as `InvalidEdit`. CRUD results contain the affected `{ id }`, not
+a guaranteed readable row. See [generated local edits](local-edits.md) for typed
+builders, nullable patches and atomic batches.
 
 Use handwritten queries when you need custom filters, nested writes, business rules, or a response shape that differs from the default generated operation. Handwritten updates remain subject to `@immutable` checking.
+
+Generated CRUD can bypass business rules implemented only in a named command.
+Keep invariant-bearing writes on that command; MEC-117 tracks the remaining
+enforcement/discoverability work.
 
 ## Validation Flow
 

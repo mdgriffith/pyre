@@ -4,7 +4,15 @@ import { requireDatabaseId, type DatabaseId } from "./database-id";
 
 const DEFAULT_SCHEMA_KEY = "__default__";
 const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync"]);
-const introspectionsByDatabaseId = new Map<string, unknown>();
+type SchemaEvidence = { compiledContract: string; replacementContract: string };
+type CachedIntrospection = { client: Client; introspection: unknown };
+
+const schemaEvidenceByClient = new WeakMap<Client, SchemaEvidence>();
+const schemaRefreshByClient = new WeakMap<Client, symbol>();
+const schemaMigrationByClient = new WeakMap<Client, symbol>();
+const databaseKeysByClient = new WeakMap<Client, Set<string>>();
+const introspectionsByDatabaseId = new Map<string, CachedIntrospection>();
+const schemaRefreshByDatabaseId = new Map<string, symbol>();
 const INTERNAL_SETUP_SQL: InStatement[] = [
     `create table if not exists _pyre_migrations (
         id integer not null primary key autoincrement,
@@ -37,6 +45,13 @@ export async function ensureDatabase(
     schemaSource: string,
 ): Promise<EnsureDatabaseOutcome> {
     const tx = await db.transaction("write");
+    // An existing writer is ordered before this migration and may keep using the
+    // evidence it acquired. Invalidate as soon as this migration owns the writer.
+    const knownKeys = [...(databaseKeysByClient.get(db) ?? [])];
+    const refresh = beginSchemaRefresh(db, undefined, true);
+    schemaMigrationByClient.set(db, refresh);
+    let outcome: EnsureDatabaseOutcome;
+    let currentIntrospection: unknown;
     try {
         const { initialized, introspection } = await introspectDatabase(tx);
         if (!initialized && introspection.tables.length > 0) {
@@ -60,16 +75,19 @@ export async function ensureDatabase(
             && introspection.schema_source === schemaSource
         ) {
             await tx.rollback();
-            return "up-to-date";
+            outcome = "up-to-date";
+            currentIntrospection = introspection;
+        } else {
+            const setup = !initialized && result.Ok.sql.length === 0
+                ? INTERNAL_SETUP_SQL
+                : [];
+            await tx.batch([...setup, ...result.Ok.sql, result.Ok.mark_success]);
+            currentIntrospection = (await introspectDatabase(tx)).introspection;
+            await tx.commit();
+            outcome = initialized ? "migrated" : "created";
         }
-
-        const setup = !initialized && result.Ok.sql.length === 0
-            ? INTERNAL_SETUP_SQL
-            : [];
-        await tx.batch([...setup, ...result.Ok.sql, result.Ok.mark_success]);
-        await tx.commit();
-        return initialized ? "migrated" : "created";
     } catch (error) {
+        if (schemaMigrationByClient.get(db) === refresh) schemaMigrationByClient.delete(db);
         if (!tx.closed) {
             await tx.rollback();
         }
@@ -77,6 +95,13 @@ export async function ensureDatabase(
     } finally {
         tx.close();
     }
+    try {
+        establishSchemaEvidence(db, refresh, currentIntrospection, undefined, true);
+        for (const key of knownKeys) establishSchemaEvidence(db, refresh, currentIntrospection, key, true);
+    } finally {
+        if (schemaMigrationByClient.get(db) === refresh) schemaMigrationByClient.delete(db);
+    }
+    return outcome;
 }
 
 async function introspectDatabase(tx: Transaction): Promise<{
@@ -106,8 +131,8 @@ function schemaKey(databaseId?: DatabaseId): string {
 }
 
 export function activateSchemaForDatabase(databaseId?: DatabaseId): void {
-    const introspection = introspectionsByDatabaseId.get(schemaKey(databaseId));
-    if (introspection === undefined) {
+    const cached = introspectionsByDatabaseId.get(schemaKey(databaseId));
+    if (cached === undefined) {
         if (!databaseId) {
             return;
         }
@@ -117,7 +142,43 @@ export function activateSchemaForDatabase(databaseId?: DatabaseId): void {
         );
     }
 
-    wasm.set_schema(introspection);
+    wasm.set_schema(cached.introspection);
+}
+
+/** Capture once: later cache refreshes must not change an in-flight replacement's contract. */
+export function captureReplacementSchema(databaseId: DatabaseId, compiledContract: string): () => void {
+    if (typeof compiledContract !== "string" || !compiledContract) throw new Error("Missing compiled contract");
+    const schema = structuredClone(introspectionsByDatabaseId.get(schemaKey(databaseId))?.introspection);
+    if (schema === undefined) throw new Error("Missing replacement schema");
+    const restore = () => {
+        wasm.set_schema(schema);
+        if (wasm.get_schema_compiled_contract() !== compiledContract) throw new Error("Replacement contract mismatch");
+    };
+    restore();
+    return restore;
+}
+
+/** Authenticate a generated manifest against schema evidence captured for this exact client. */
+export function bindSchemaManifest(
+    db: Client,
+    namespace: string,
+    manifest: { compiledContract?: string; replacementContracts?: Readonly<Record<string, string>> },
+): void {
+    const evidence = schemaEvidenceByClient.get(db);
+    const compiledContract = manifest.compiledContract;
+    const replacementContracts = manifest.replacementContracts;
+    const replacementContract = replacementContracts?.[namespace];
+    if (!evidence || typeof compiledContract !== "string" || !compiledContract
+        || typeof replacementContract !== "string" || !replacementContract
+        || replacementContract !== evidence.replacementContract) {
+        throw new Error("Schema manifest mismatch");
+    }
+
+    const namespaces = Object.keys(replacementContracts!);
+    if (namespaces.length === 1 && namespaces[0] === namespace
+        && compiledContract !== evidence.compiledContract) {
+        throw new Error("Schema manifest mismatch");
+    }
 }
 
 /**
@@ -141,6 +202,13 @@ export async function loadSchemaFromDatabase(
 ): Promise<void> {
     const databaseId = maybeDb ? requireDatabaseId(databaseOrDb as DatabaseId) : undefined;
     const db = maybeDb ?? (databaseOrDb as Client);
+    const key = schemaKey(databaseId);
+    const refresh = beginSchemaRefresh(db, key);
+    const introspection = await readDatabaseIntrospection(db);
+    establishSchemaEvidence(db, refresh, introspection, key);
+}
+
+async function readDatabaseIntrospection(db: Client): Promise<unknown> {
     const isInitializedQuery = wasm.sql_is_initialized();
     const isInitializedResult = await db.execute(isInitializedQuery);
 
@@ -148,7 +216,7 @@ export async function loadSchemaFromDatabase(
         throw new Error("Failed to check if database is initialized");
     }
 
-    const isInitialized = isInitializedResult.rows[0].is_initialized === 1;
+    const isInitialized = Number(isInitializedResult.rows[0].is_initialized) === 1;
 
     let introspection;
     if (isInitialized) {
@@ -167,8 +235,60 @@ export async function loadSchemaFromDatabase(
         introspection = filterInternalTables(JSON.parse(introspectionResult.rows[0].result as string));
     }
 
-    introspectionsByDatabaseId.set(schemaKey(databaseId), introspection);
-    wasm.set_schema(introspection);
+    return introspection;
+}
+
+function beginSchemaRefresh(db: Client, key?: string, invalidateAllKeys = false): symbol {
+    const refresh = Symbol();
+    schemaEvidenceByClient.delete(db);
+    schemaRefreshByClient.set(db, refresh);
+
+    if (invalidateAllKeys) {
+        for (const existingKey of databaseKeysByClient.get(db) ?? []) {
+            if (introspectionsByDatabaseId.get(existingKey)?.client === db) {
+                introspectionsByDatabaseId.delete(existingKey);
+                schemaRefreshByDatabaseId.set(existingKey, refresh);
+            }
+        }
+    }
+
+    if (key !== undefined) {
+        const previous = introspectionsByDatabaseId.get(key);
+        if (previous) databaseKeysByClient.get(previous.client)?.delete(key);
+        introspectionsByDatabaseId.delete(key);
+        schemaRefreshByDatabaseId.set(key, refresh);
+    }
+    return refresh;
+}
+
+function establishSchemaEvidence(
+    db: Client,
+    refresh: symbol,
+    introspection: unknown,
+    key?: string,
+    authoritative = false,
+): void {
+    if (authoritative) {
+        if (schemaMigrationByClient.get(db) !== refresh) return;
+        schemaRefreshByClient.set(db, refresh);
+        if (key !== undefined) schemaRefreshByDatabaseId.set(key, refresh);
+    } else if (schemaMigrationByClient.has(db)
+        || schemaRefreshByClient.get(db) !== refresh
+        || (key !== undefined && schemaRefreshByDatabaseId.get(key) !== refresh)) return;
+    const captured = structuredClone(introspection);
+    wasm.set_schema(captured);
+    const replacementContract = wasm.get_schema_compiled_contract();
+    const compiledContract = wasm.get_schema_manifest_contract();
+    if (typeof replacementContract !== "string" || !replacementContract
+        || typeof compiledContract !== "string" || !compiledContract) {
+        throw new Error("Invalid schema contract");
+    }
+    schemaEvidenceByClient.set(db, { compiledContract, replacementContract });
+    if (key === undefined) return;
+    introspectionsByDatabaseId.set(key, { client: db, introspection: captured });
+    const keys = databaseKeysByClient.get(db) ?? new Set<string>();
+    keys.add(key);
+    databaseKeysByClient.set(db, keys);
 }
 
 function filterInternalTables(introspection: any): any {
@@ -234,7 +354,7 @@ export async function getIntrospectionJson(db: Client): Promise<any> {
         throw new Error("Failed to check if database is initialized");
     }
 
-    const isInitialized = isInitializedResult.rows[0].is_initialized === 1;
+    const isInitialized = Number(isInitializedResult.rows[0].is_initialized) === 1;
 
     let introspection;
     if (isInitialized) {

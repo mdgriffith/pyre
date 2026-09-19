@@ -46,7 +46,7 @@ type Incoming
     | LiveSyncConnected (Maybe String) (Maybe String) String
     | LiveSyncError String
     | SyncCompleteReceived (Maybe String)
-    | SyncRequiredReceived (Maybe String) (Maybe String) (Maybe Int)
+    | SyncRequiredReceived (Maybe String) (Maybe String) (Maybe Int) Bool
 
 
 port sseOut : Encode.Value -> Cmd msg
@@ -130,20 +130,30 @@ decodeIncoming =
                             |> Decode.map SyncCompleteReceived
 
                     "syncRequired" ->
-                        Decode.map3 SyncRequiredReceived
+                        Decode.map4 SyncRequiredReceived
                             (Decode.maybe (Decode.field "databaseId" Decode.string))
                             (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
                             (Decode.maybe (Decode.field "serverRevision" Decode.int))
+                            decodeInvalidate
 
                     "catchupRequired" ->
-                        Decode.map3 SyncRequiredReceived
+                        Decode.map4 SyncRequiredReceived
                             (Decode.maybe (Decode.field "databaseId" Decode.string))
                             (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
                             (Decode.maybe (Decode.field "serverRevision" Decode.int))
+                            decodeInvalidate
 
                     _ ->
                         Decode.fail ("Unknown live sync incoming type: " ++ type_)
             )
+
+
+decodeInvalidate : Decode.Decoder Bool
+decodeInvalidate =
+    Decode.oneOf
+        [ Decode.at [ "reconciliation", "invalidate" ] Decode.bool
+        , Decode.succeed False
+        ]
 
 
 decodeConfig : Decode.Decoder Config

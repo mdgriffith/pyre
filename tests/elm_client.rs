@@ -3,7 +3,7 @@ use pyre::filesystem::GeneratedFile;
 use pyre::generate::client::elm;
 use pyre::parser;
 use pyre::typecheck;
-use std::path::Path;
+use std::{fs, path::Path, process::Command};
 
 fn path_ends_with(path: &Path, suffix: &str) -> bool {
     path.ends_with(Path::new(suffix))
@@ -12,6 +12,7 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 #[test]
 fn generated_elm_update_groups_list_input_types() {
     let schema_source = r#"
+@syncable(false)
 record MapEntityTrail {
     @public
 
@@ -62,6 +63,7 @@ type ChoiceStorage
         values Json<List<String>>
      }
 
+@syncable(false)
 record LegacyChoice {
     @public
 
@@ -125,6 +127,7 @@ fn generated_elm_crud_omits_immutable_update_encoder_but_returns_field() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -180,6 +183,7 @@ record Document {
 #[test]
 fn generated_pyre_elm_uses_query_upserts() {
     let schema_source = r#"
+@syncable(false)
 record Rulebook {
     @public
 
@@ -243,18 +247,18 @@ query GetGameWorld($slug: String) {
     let content = &generated.contents;
 
     assert!(
-        content.contains("module Pyre exposing (DatabaseId, Default, QueryId, Model, QueryModel, Query(..), Msg(..), Effect(..), init, update, decodeIncomingDelta, getResult)"),
+        content.contains("module Pyre exposing (DatabaseId, Default, QueryId, Model, QueryModel, Query(..), Msg(..), Effect(..), init, update, decodeIncomingDelta, getResult,"),
         "Pyre.elm should expose QueryModel and Query constructors. Generated:\n{}",
         content
     );
     assert!(
         content.contains("type alias DatabaseId namespace =\n    Db.Database.DatabaseId namespace\n\n\ntype alias Default =\n    Db.Database.Default\n\n\ntype alias QueryId =\n    String")
-            && content.contains("type Query\n    = GetRulebookByName (DatabaseId Default) QueryId Query.GetRulebookByName.Input\n    | GetGameWorld (DatabaseId Default) QueryId Query.GetGameWorld.Input"),
+            && content.contains("type Query\n    = GetRulebookByName (DatabaseId Default) QueryId GeneratedQueryGetRulebookByName.Input\n    | GetGameWorld (DatabaseId Default) QueryId GeneratedQueryGetGameWorld.Input"),
         "Pyre.elm should generate a Query type for outbound upserts. Generated:\n{}",
         content
     );
     assert!(
-        content.contains("type Msg\n    = QueryUpdate Query\n    | GetRulebookByName_DataReceived QueryId Query.GetRulebookByName.QueryDelta\n    | GetRulebookByName_Unregistered (DatabaseId Default) QueryId\n    | GetGameWorld_DataReceived QueryId Query.GetGameWorld.QueryDelta\n    | GetGameWorld_Unregistered (DatabaseId Default) QueryId"),
+        content.contains("type Msg\n    = QueryUpdate Query\n    | GetRulebookByName_DataReceived QueryId GeneratedQueryGetRulebookByName.QueryDelta\n    | GetRulebookByName_Unregistered (DatabaseId Default) QueryId\n    | GetGameWorld_DataReceived QueryId GeneratedQueryGetGameWorld.QueryDelta\n    | GetGameWorld_Unregistered (DatabaseId Default) QueryId"),
         "Pyre.elm should collapse register/update into QueryUpdate. Generated:\n{}",
         content
     );
@@ -274,21 +278,21 @@ query GetGameWorld($slug: String) {
         content
     );
     assert!(
-        content.contains("update msg model =\n    case msg of\n        QueryUpdate query ->\n            updateQuery query model")
+        content.contains("updateHelp msg model =\n    case msg of\n        QueryUpdate query ->\n            updateQuery query model")
             && content.contains("updateQuery : Query -> Model -> ( Model, Effect )\nupdateQuery query model =\n    case query of\n        GetRulebookByName databaseId queryId input ->")
             && content.contains("        GetGameWorld databaseId queryId input ->"),
         "Pyre.elm should delegate QueryUpdate handling to updateQuery. Generated:\n{}",
         content
     );
     assert!(
-        content.contains("incomingDeltaDecoder =\n    Decode.map2 Tuple.pair\n        (Decode.field \"queryName\" Decode.string)\n        (Decode.field \"queryId\" Decode.string)")
+        content.contains("queryDeltaDecoder =\n    Decode.map2 Tuple.pair\n        (Decode.field \"queryName\" Decode.string)\n        (Decode.field \"queryId\" Decode.string)")
             && !content.contains("Decode.field \"querySource\" Decode.string"),
         "Pyre.elm should decode queryName, not querySource, for inbound result routing. Generated:\n{}",
         content
     );
     assert!(
-        content.contains("Just queryModel ->\n                    ( { model | getRulebookByName = Dict.insert queryId { queryModel | input = input } model.getRulebookByName }\n                    , Send (encodeUpdateInput databaseId queryId Query.GetRulebookByName.queryShape (Query.GetRulebookByName.encode input))")
-            && content.contains("Nothing ->\n                    let\n                        queryModel =\n                            { input = input, result = Query.GetRulebookByName.ReturnData [], revision = 0 }\n                    in\n                    ( { model | getRulebookByName = Dict.insert queryId queryModel model.getRulebookByName }\n                    , Send (encodeRegister databaseId \"GetRulebookByName\" Query.GetRulebookByName.queryShape queryId (Query.GetRulebookByName.encode input))")
+        content.contains("Just queryModel ->\n                    ( { model | queryGetRulebookByName = Dict.insert queryId { queryModel | input = input } model.queryGetRulebookByName }\n                    , Send (encodeUpdateInput databaseId queryId GeneratedQueryGetRulebookByName.queryShape (GeneratedQueryGetRulebookByName.encode input))")
+            && content.contains("Nothing ->\n                    let\n                        queryModel =\n                            { input = input, result = GeneratedQueryGetRulebookByName.ReturnData [], revision = 0 }\n                    in\n                    ( { model | queryGetRulebookByName = Dict.insert queryId queryModel model.queryGetRulebookByName }\n                    , Send (encodeRegister databaseId \"GetRulebookByName\" GeneratedQueryGetRulebookByName.queryShape queryId (GeneratedQueryGetRulebookByName.encode input))")
             && content.contains("encodeRegister : DatabaseId namespace -> String -> Encode.Value -> QueryId -> Encode.Value -> Encode.Value\nencodeRegister databaseId queryName queryShape queryId input =\n    Encode.object\n        [ ( \"type\", Encode.string \"register\" )\n        , ( \"databaseId\", Db.Database.encode databaseId )\n        , ( \"queryName\", Encode.string queryName )\n        , ( \"querySource\", queryShape )")
             && content.contains("encodeUpdateInput : DatabaseId namespace -> QueryId -> Encode.Value -> Encode.Value -> Encode.Value\nencodeUpdateInput databaseId queryId queryShape input =\n    Encode.object\n        [ ( \"type\", Encode.string \"update-input\" )\n        , ( \"databaseId\", Db.Database.encode databaseId )\n        , ( \"queryId\", Encode.string queryId )\n        , ( \"querySource\", queryShape )"),
         "Pyre.elm should upsert queries by id. Generated:\n{}",
@@ -299,6 +303,7 @@ query GetGameWorld($slug: String) {
 #[test]
 fn generated_elm_mutation_modules_include_bridge_metadata() {
     let schema_source = r#"
+@syncable(false)
 record Post {
     @public
 
@@ -344,7 +349,7 @@ insert CreatePost($title: String) {
     let content = &generated.contents;
 
     assert!(
-        content.contains("module Query.CreatePost exposing (encode, DatabaseId, Default, RequestId, id, name, mutationRequest, decodeMutationResult, MutationResult, Input, Post, ReturnData)"),
+        content.contains("module Query.CreatePost exposing (encode, DatabaseId, Default, RequestId, id, name, mutationRequest, decodeMutationResult, decodeReturnData, MutationResult, Input, Post, ReturnData)"),
         "Mutation modules should expose bridge metadata helpers. Generated:\n{}",
         content
     );
@@ -368,7 +373,7 @@ fn generated_schema_scoped_entity_stream_modules_encode_id_filtered_streams() {
 record Post {
     @public
 
-    id    Id.Int @id
+    id    Id.Uuid @id
     title String
 }
 
@@ -384,7 +389,7 @@ record Comment {
 record Post {
     @public
 
-    id    Id.Int @id
+    id    Id.Uuid @id
     title String
 }
 "#;
@@ -465,10 +470,12 @@ record Post {
         content
     );
     assert!(
-        content.contains("type EntityChange\n    = CommentRow Comments.Row\n    | PostRow Posts.Row\n    | EntityDecodeFailed String Decode.Value")
-            && content.contains("\"comments\" ->\n                        decodeRow CommentRow Comments.decodeRow row")
-            && content.contains("\"posts\" ->\n                        decodeRow PostRow Posts.decodeRow row"),
-        "Db.Stream.elm should decode batches into typed table row variants. Generated:\n{}",
+        content.contains("type EntityChange\n    = CommentRow Comments.Row\n    | CommentRemoved String\n    | PostRow Posts.Row\n    | PostRemoved String\n    | EntityDecodeFailed String Decode.Value")
+            && content.contains("\"comments\" ->\n                                            decodeRow CommentRow Comments.decodeRow row")
+            && content.contains("\"posts\" ->\n                                            decodeRow PostRow Posts.decodeRow row")
+            && content.contains("Decode.map CommentRemoved (Decode.field \"id\" Db.Id.decodeUuidString)")
+            && content.contains("Decode.map PostRemoved (Decode.field \"id\" Db.Id.decodeUuidString)"),
+        "Db.Stream.elm should decode batches into typed row and removal variants. Generated:\n{}",
         content
     );
 
@@ -482,18 +489,18 @@ record Post {
             .contains("module Db.Table.Posts exposing (Row, Stream, decodeRow, stream, idIn)")
             && post_table
                 .contents
-                .contains("type alias Row =\n    { id : Int\n    , title : String\n    }")
+                .contains("type alias Row =\n    { id : String\n    , title : String\n    }")
             && post_table
                 .contents
                 .contains("stream : StreamInternal.TableSubscription Stream\nstream =\n    StreamInternal.table \"posts\"")
-            && post_table.contents.contains("idIn : List Int -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream")
-            && post_table.contents.contains("StreamInternal.addCondition \"id\" (Encode.object [ ( \"$in\", Encode.list Encode.int values ) ]) subscription")
+            && post_table.contents.contains("idIn : List String -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream")
+            && post_table.contents.contains("StreamInternal.addCondition \"id\" (Encode.object [ ( \"$in\", Encode.list Encode.string values ) ]) subscription")
             && post_table
                 .contents
                 .contains("decodeRow : Decode.Decoder Row\ndecodeRow =\n    Decode.succeed Row")
             && post_table
                 .contents
-                .contains("|> Db.Decode.andField \"id\" Decode.int"),
+                .contains("|> Db.Decode.andField \"id\" Db.Id.decodeUuidString"),
         "Db.Table.Posts should expose the row type and decoder. Generated:\n{}",
         post_table.contents
     );
@@ -507,11 +514,11 @@ record Post {
             .contents
             .contains("module Db.Table.Comments exposing (Row, Stream, decodeRow, stream, idIn, postIdIn)")
             && comment_table.contents.contains(
-            "type alias Row =\n    { id : String\n    , postId : Int\n    , body : String\n    }"
+            "type alias Row =\n    { id : String\n    , postId : String\n    , body : String\n    }"
         ) && comment_table
             .contents
-            .contains("|> Db.Decode.andField \"postId\" Decode.int")
-            && comment_table.contents.contains("postIdIn : List Int -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream"),
+            .contains("|> Db.Decode.andField \"postId\" Db.Id.decodeUuidString")
+            && comment_table.contents.contains("postIdIn : List String -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream"),
         "Db.Table.Comments should expose the row type and decoder. Generated:\n{}",
         comment_table.contents
     );
@@ -544,6 +551,168 @@ record Post {
         ),
         "named schema should generate schema-scoped table modules. Generated:\n{}",
         campaign_post_table.contents
+    );
+}
+
+#[test]
+fn fixed_namespace_and_entity_stream_name_collisions_compile() {
+    let fixed_names = [
+        "DatabaseId",
+        "Input",
+        "ReturnData",
+        "RequestId",
+        "MutationResult",
+        "Model",
+        "QueryModel",
+        "Query",
+        "Msg",
+        "Effect",
+        "QueryId",
+        "Receipt",
+        "Outcome",
+        "EditFailure",
+        "Lifecycle",
+        "StreamId",
+        "EntityChange",
+        "EntityChangeBatch",
+        "EntityChangeBatchSource",
+        "EntitySubscription",
+    ];
+    let mut schemas = Vec::new();
+    for namespace in fixed_names {
+        let mut schema = ast::Schema {
+            namespace: namespace.to_string(),
+            ..ast::Schema::default()
+        };
+        let source = if namespace == "StreamId" {
+            r#"
+@syncable(false)
+record Register {
+    @public
+    id Int @id
+}
+
+record Unregister {
+    @public
+    id Int @id
+}
+
+record DecodeIncomingBatch {
+    @public
+    id Int @id
+}
+
+record FooBarRecord {
+    @public
+    @tablename("fooBar")
+    id Int @id
+}
+
+record FooUnderscoreRecord {
+    @public
+    @tablename("foo_bar")
+    id Int @id
+}
+"#
+            .to_string()
+        } else {
+            format!("@syncable(false)\nrecord {namespace}Thing {{\n @public\n id Int @id\n}}\n")
+        };
+        parser::run(&format!("{namespace}.pyre"), &source, &mut schema).unwrap();
+        schemas.push(schema);
+    }
+
+    let database = ast::Database { schemas };
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut queries = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = Vec::new();
+    elm::generate(Path::new("src"), &database, &mut files);
+    elm::generate_queries(&context, &info, &queries, Path::new("src"), &mut files);
+
+    let database_ids = &files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "Db/Database.elm"))
+        .unwrap()
+        .contents;
+    for namespace in fixed_names {
+        assert!(database_ids.contains(&format!("type {namespace}Namespace\n")));
+    }
+    let stream = &files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "Db/StreamIdNamespace/Stream.elm"))
+        .unwrap()
+        .contents;
+    assert!(stream.contains("registerNamespace :"));
+    assert!(stream.contains("unregisterNamespace :"));
+    assert!(stream.contains("decodeIncomingBatchNamespace :"));
+    assert!(stream.contains("import Db.StreamIdNamespace.Table.FooBar as FooBar"));
+    assert!(stream.contains("import Db.StreamIdNamespace.Table.FooBarNamespace as FooBarNamespace"));
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir_in(root.join("target")).unwrap();
+    for file in files {
+        let path = temp.path().join(file.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, file.contents).unwrap();
+    }
+    fs::write(
+        temp.path().join("elm.json"),
+        include_str!("fixtures/elm-local-edits/elm.json"),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("src/Collision.elm"),
+        r#"module Collision exposing (all)
+
+import Db.Database
+import Db.StreamIdNamespace.Stream as Stream
+import Db.StreamIdNamespace.Table.DecodeIncomingBatches as DecodeIncomingBatches
+import Db.StreamIdNamespace.Table.FooBar as FooBar
+import Db.StreamIdNamespace.Table.FooBarNamespace as FooBarNamespace
+import Db.StreamIdNamespace.Table.Registers as Registers
+import Db.StreamIdNamespace.Table.Unregisters as Unregisters
+import Pyre
+import Query.InputThingCreate as InputMutation
+
+databaseId : Db.Database.DatabaseId Db.Database.StreamIdNamespace
+databaseId =
+    Db.Database.fromString "stream"
+
+all =
+    { model = Pyre.init "collision"
+    , mutationId = InputMutation.id
+    , stream =
+        Stream.register databaseId "collision"
+            [ Stream.registerNamespace Registers.stream
+            , Stream.unregisterNamespace Unregisters.stream
+            , Stream.decodeIncomingBatchNamespace DecodeIncomingBatches.stream
+            , Stream.fooBarRecord FooBar.stream
+            , Stream.fooUnderscoreRecord FooBarNamespace.stream
+            ]
+    }
+"#,
+    )
+    .unwrap();
+    let output = Command::new("npx")
+        .args([
+            "--yes",
+            "--package",
+            "elm@0.19.1-6",
+            "elm",
+            "make",
+            "src/Collision.elm",
+            "--output=/dev/null",
+        ])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

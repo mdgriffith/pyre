@@ -19,6 +19,7 @@ record User {
 pub fn schema_v1_complete() -> String {
     format!(
         r#"
+@syncable(false)
 {}
 
 {}

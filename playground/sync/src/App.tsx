@@ -6,6 +6,7 @@ import { discoverQueries, QueryMetadata } from './queryDiscovery'
 import { PyreClient } from '@pyre/client'
 import { mountPyreDevtools, type PyreDevtoolsHandle } from '@pyre/client/devtools'
 import { schemaMetadata } from '../pyre/generated/typescript/core/schema'
+import { userIdForIndex } from './userIds'
 import './App.css'
 
 const DATABASE_ID = 'main'
@@ -15,8 +16,8 @@ interface Client {
   name: string
   pyreClient: PyreClient | null
   connected: boolean
-  userId: number | null
-  requestedUserId: number | null // User-specified userId for connection
+  userId: string | null
+  requestedUserId: string | null
   sessionId: string | null
   indexedDbName: string | null
 }
@@ -38,14 +39,14 @@ function App() {
       sessionId: null,
       connected: false,
       userId: null,
-      requestedUserId: 1, // First client always starts as userId 1
+      requestedUserId: userIdForIndex(1),
       indexedDbName: 'pyre-sync-playground-1',
     },
   ])
   const [activeTab, setActiveTab] = useState<'messages' | 'clients'>('clients')
   const clientsRef = useRef<Client[]>([])
   const initialClientConnectedRef = useRef(false)
-  const nextUserIdRef = useRef<number>(2) // Next userId to assign (starts at 2 since 1 is taken)
+  const nextUserIndexRef = useRef(2)
   const nextClientNumberRef = useRef<number>(2)
   const pyreClientsRef = useRef<Map<string, PyreClient>>(new Map())
   const connectingClientIdsRef = useRef<Set<string>>(new Set())
@@ -95,21 +96,20 @@ function App() {
       return
     }
 
-    // Use requestedUserId if set, otherwise use nextUserId
-    let userId: number
+    let userId: string
     if (client.requestedUserId != null) {
       userId = client.requestedUserId
     } else {
       if (clientId === '1') {
-        userId = 1
+        userId = userIdForIndex(1)
         setClients((prev) =>
           prev.map((c) =>
-            c.id === clientId ? { ...c, requestedUserId: 1 } : c
+            c.id === clientId ? { ...c, requestedUserId: userId } : c
           )
         )
       } else {
-        userId = nextUserIdRef.current
-        nextUserIdRef.current = userId + 1
+        userId = userIdForIndex(nextUserIndexRef.current)
+        nextUserIndexRef.current += 1
         setClients((prev) =>
           prev.map((c) =>
             c.id === clientId ? { ...c, requestedUserId: userId } : c
@@ -251,8 +251,8 @@ function App() {
   const addNewClient = useCallback(() => {
     // Get the next user ID and increment BEFORE adding to state
     // This ensures we don't have race conditions with React batching
-    const newUserId = nextUserIdRef.current
-    nextUserIdRef.current = newUserId + 1
+    const newUserId = userIdForIndex(nextUserIndexRef.current)
+    nextUserIndexRef.current += 1
     const newId = `${nextClientNumberRef.current}`
     nextClientNumberRef.current += 1
 
@@ -419,13 +419,13 @@ function App() {
         sessionId: null,
         connected: false,
         userId: null,
-        requestedUserId: 1,
+        requestedUserId: userIdForIndex(1),
         indexedDbName: 'pyre-sync-playground-1',
       },
     ])
     setSelectedClientId('1')
     setEvents([])
-    nextUserIdRef.current = 2
+    nextUserIndexRef.current = 2
     nextClientNumberRef.current = 2
     connectingClientIdsRef.current.clear()
     initialClientConnectedRef.current = false

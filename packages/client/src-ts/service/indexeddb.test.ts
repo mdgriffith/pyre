@@ -1,7 +1,69 @@
 // @ts-nocheck
-import { expect, test } from 'bun:test';
+import { expect, mock, spyOn, test } from 'bun:test';
 
-import { IndexedDbService, type SyncCursor } from './indexeddb';
+import { IndexedDBStorage, IndexedDbService, type SyncCursor } from './indexeddb';
+
+test('blocked v3 opens reject and late success cannot replace a retry', async () => {
+  const originalIndexedDB = globalThis.indexedDB;
+  const requests = [];
+  globalThis.indexedDB = { open: () => {
+    const request = {};
+    requests.push(request);
+    return request;
+  } };
+  const storage = new IndexedDBStorage('blocked', { tables: {}, queryFieldToTable: {} });
+
+  try {
+    const first = storage.init();
+    requests[0].onblocked();
+    let blockedError;
+    try { await first; } catch (error) { blockedError = error; }
+    expect(blockedError).toBeInstanceOf(Error);
+    expect(blockedError.message).toContain('upgrade to version 3 was blocked');
+
+    const second = storage.init();
+    expect(requests).toHaveLength(2);
+    const abandoned = { close: mock(() => {}) };
+    requests[0].result = abandoned;
+    requests[0].onsuccess();
+    expect(abandoned.close).toHaveBeenCalledTimes(1);
+
+    const opened = { close: mock(() => {}), onversionchange: null };
+    requests[1].result = opened;
+    requests[1].onsuccess();
+    expect(await second).toBe(opened);
+    expect(await storage.init()).toBe(opened);
+  } finally {
+    if (originalIndexedDB === undefined) delete globalThis.indexedDB;
+    else globalThis.indexedDB = originalIndexedDB;
+  }
+});
+
+test('invalid initial cache fails the shared load and never sends an empty fallback', async () => {
+  const invalid = new Error('Invalid persisted identity');
+  let receive;
+  let scans = 0;
+  const sent = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  const service = new IndexedDbService({
+    init: async () => {},
+    getAllTables: async () => { scans += 1; throw invalid; },
+  });
+  service.attachPorts({ ports: {
+    indexedDbOut: { subscribe: (callback) => { receive = callback; } },
+    receiveIndexedDbMessage: { send: (message) => sent.push(message) },
+  } });
+  try {
+    receive({ type: 'requestInitialData' });
+    await expect(service.initialize()).rejects.toBe(invalid);
+    await Bun.sleep(0);
+    await expect(service.initialize()).rejects.toBe(invalid);
+    expect(scans).toBe(1);
+    expect(sent).toEqual([]);
+  } finally {
+    log.mockRestore();
+  }
+});
 
 test('IndexedDbService restores persisted sync cursor with initial data', async () => {
   const persistedCursor: SyncCursor = {
@@ -149,4 +211,142 @@ test('IndexedDbService acknowledges an atomic database epoch reset', async () =>
   expect(sentMessages).toEqual([
     { type: 'databaseEpochResetCompleted', databaseEpoch: 'new-epoch' },
   ]);
+});
+
+test('IndexedDbService reloads initial data after a database epoch reset', async () => {
+  let handleIndexedDbOut;
+  const sent = [];
+  let scans = 0;
+  let snapshot = {
+    tables: { maps: [{ id: 1 }] },
+    cursor: { tables: { maps: { last_seen_updated_at: 4 } } },
+    lastAppliedServerRevision: 4,
+    databaseEpoch: 'old-epoch',
+  };
+  const storage = {
+    init: async () => {},
+    getAllTables: async () => { scans += 1; return snapshot.tables; },
+    getSyncCursor: async () => snapshot.cursor,
+    getServerRevision: async () => snapshot.lastAppliedServerRevision,
+    getDatabaseEpoch: async () => snapshot.databaseEpoch,
+    resetForDatabaseEpoch: async (databaseEpoch) => {
+      snapshot = {
+        tables: {},
+        cursor: { tables: {} },
+        lastAppliedServerRevision: null,
+        databaseEpoch,
+      };
+    },
+  };
+  const service = new IndexedDbService(storage);
+  service.attachPorts({ ports: {
+    indexedDbOut: { subscribe: (callback) => { handleIndexedDbOut = callback; } },
+    receiveIndexedDbMessage: { send: (message) => sent.push(message) },
+  } });
+
+  await service.initialize();
+  handleIndexedDbOut({ type: 'resetForDatabaseEpoch', databaseEpoch: 'new-epoch' });
+  handleIndexedDbOut({ type: 'requestInitialData' });
+  for (let attempt = 0; sent.length < 2 && attempt < 100; attempt += 1) await Bun.sleep(0);
+
+  expect(scans).toBe(2);
+  expect(sent).toEqual([
+    { type: 'databaseEpochResetCompleted', databaseEpoch: 'new-epoch' },
+    {
+      type: 'initialData',
+      data: {
+        tables: {},
+        cursor: { tables: {} },
+        lastAppliedServerRevision: null,
+        databaseEpoch: 'new-epoch',
+      },
+    },
+  ]);
+});
+
+test('IndexedDbService reports invalid writes without publishing catchup entities', async () => {
+  let receive;
+  const notifications = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  const service = new IndexedDbService({
+    init: async () => {},
+    putRows: async () => { throw new Error('Invalid uuid identity for issues.key'); },
+  }, undefined, (...args) => notifications.push(args));
+  service.attachPorts({ ports: { indexedDbOut: { subscribe(callback) { receive = callback; } } } });
+  try {
+    receive({ type: 'writeDelta', entityStreamSource: 'catchup', tableGroups: [
+      { table_name: 'issues', headers: ['key'], rows: [['1']] },
+    ] });
+    await Bun.sleep(0);
+    expect(notifications).toEqual([]);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][1].message).toContain('Invalid uuid identity');
+  } finally {
+    log.mockRestore();
+  }
+});
+
+test('IndexedDbService does not advance queued progress after a delta write fails', async () => {
+  let receive;
+  const cursorWrites = [];
+  const revisionWrites = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  const service = new IndexedDbService({
+    init: async () => {},
+    putRows: async () => { throw new Error('row write failed'); },
+    putSyncCursor: async (cursor) => { cursorWrites.push(cursor); },
+    putServerRevision: async (revision) => { revisionWrites.push(revision); },
+  });
+  service.attachPorts({ ports: { indexedDbOut: { subscribe(callback) { receive = callback; } } } });
+  const cursor = { tables: { issues: { last_seen_updated_at: 10, permission_hash: 'p' } } };
+
+  try {
+    receive({ type: 'writeDelta', entityStreamSource: 'catchup', tableGroups: [
+      { table_name: 'issues', headers: ['id'], rows: [[1]] },
+    ] });
+    receive({ type: 'writeSyncCursor', cursor });
+    receive({ type: 'writeServerRevision', serverRevision: 10 });
+    await Bun.sleep(0);
+
+    expect(cursorWrites).toEqual([]);
+    expect(revisionWrites).toEqual([]);
+  } finally {
+    log.mockRestore();
+  }
+});
+
+test('IndexedDbService resumes progress writes after a successful epoch reset', async () => {
+  let receive;
+  const cursorWrites = [];
+  const revisionWrites = [];
+  const sent = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  const service = new IndexedDbService({
+    init: async () => {},
+    putRows: async () => { throw new Error('row write failed'); },
+    putSyncCursor: async (cursor) => { cursorWrites.push(cursor); },
+    putServerRevision: async (revision) => { revisionWrites.push(revision); },
+    resetForDatabaseEpoch: async () => {},
+  });
+  service.attachPorts({ ports: {
+    indexedDbOut: { subscribe(callback) { receive = callback; } },
+    receiveIndexedDbMessage: { send(message) { sent.push(message); } },
+  } });
+  const cursor = { tables: { issues: { last_seen_updated_at: 11, permission_hash: 'p' } } };
+
+  try {
+    receive({ type: 'writeDelta', tableGroups: [
+      { table_name: 'issues', headers: ['id'], rows: [[1]] },
+    ] });
+    receive({ type: 'resetForDatabaseEpoch', databaseEpoch: 'new-epoch' });
+    receive({ type: 'writeSyncCursor', cursor });
+    receive({ type: 'writeServerRevision', serverRevision: 11 });
+    for (let attempt = 0; revisionWrites.length === 0 && attempt < 100; attempt += 1) await Bun.sleep(0);
+
+    expect(sent).toEqual([{ type: 'databaseEpochResetCompleted', databaseEpoch: 'new-epoch' }]);
+    expect(cursorWrites).toEqual([cursor]);
+    expect(revisionWrites).toEqual([11]);
+  } finally {
+    log.mockRestore();
+  }
 });

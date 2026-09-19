@@ -1,4 +1,4 @@
-update UpdatePost($id: Int, $title: String, $content: String, $published: Bool) {
+update UpdatePost($id: Post.id, $title: String, $content: String, $published: Bool) {
     post {
         @where { id == $id  }
 
@@ -7,5 +7,4 @@ update UpdatePost($id: Int, $title: String, $content: String, $published: Bool) 
         published = $published
     }
 }
-
 

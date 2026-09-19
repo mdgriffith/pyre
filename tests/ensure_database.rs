@@ -1,6 +1,7 @@
 use pyre::server::schema::{ensure_database, EnsureDatabaseError, EnsureDatabaseOutcome};
 
-const SCHEMA: &str = r#"record World {
+const SCHEMA: &str = r#"@syncable(false)
+record World {
     id          Id.Int @id
     assetLayers @link(Campaign.AssetLayer.worldId)
     @public
@@ -119,7 +120,8 @@ async fn ensure_database_rejects_the_wrong_schema_family() -> Result<(), Box<dyn
 {
     let (_temp, conn) = connection().await?;
     ensure_database(&conn, "Campaign", SCHEMA).await?;
-    let clocktower_schema = r#"record Player {
+    let clocktower_schema = r#"@syncable(false)
+record Player {
     id Int @id
     name String
     @public

@@ -3,7 +3,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
-const SCHEMA: &str = "record User {\n    id Int @id\n    name String\n    @public\n}\n";
+const SCHEMA: &str =
+    "@syncable(false)\nrecord User {\n    id Int @id\n    name String\n    @public\n}\n";
 
 fn project(schema: &str, session: &str) -> TempDir {
     let dir = TempDir::new().unwrap();

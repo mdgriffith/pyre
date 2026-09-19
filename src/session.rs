@@ -141,7 +141,11 @@ fn unwrap_nullable(type_: &ast::ColumnType) -> &ast::ColumnType {
 
 fn scalar_session_value(type_: &ast::ColumnType, value: &JsonValue) -> Option<SessionValue> {
     match type_ {
-        ast::ColumnType::String | ast::ColumnType::IdUuid { .. } => value
+        ast::ColumnType::IdUuid { .. } => value
+            .as_str()
+            .filter(|value| crate::server::manifest::is_uuid(value))
+            .map(|value| SessionValue::Text(value.to_string())),
+        ast::ColumnType::String => value
             .as_str()
             .map(|value| SessionValue::Text(value.to_string())),
         ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => {
@@ -194,9 +198,11 @@ fn concrete_session_value(
             value.as_i64().map(SessionValue::Integer)
         }
         ast::ConcreteSerializationType::Real => value.as_f64().map(SessionValue::Real),
-        ast::ConcreteSerializationType::Text
-        | ast::ConcreteSerializationType::Date
-        | ast::ConcreteSerializationType::IdUuid => value
+        ast::ConcreteSerializationType::IdUuid => value
+            .as_str()
+            .filter(|value| crate::server::manifest::is_uuid(value))
+            .map(|value| SessionValue::Text(value.to_string())),
+        ast::ConcreteSerializationType::Text | ast::ConcreteSerializationType::Date => value
             .as_str()
             .map(|value| SessionValue::Text(value.to_string())),
         ast::ConcreteSerializationType::DateTime => {
@@ -316,7 +322,7 @@ mod tests {
         let mut schema = ast::Schema::default();
         crate::parser::run(
             "schema.pyre",
-            "record Item {\n    @public\n    id Int @id\n}",
+            "@syncable(false)\nrecord Item {\n    @public\n    id Int @id\n}",
             &mut schema,
         )
         .unwrap();
@@ -336,7 +342,7 @@ mod tests {
         let mut schema = ast::Schema::default();
         crate::parser::run(
             "schema.pyre",
-            "record Item {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}",
+            "@syncable(false)\nrecord Item {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}",
             &mut schema,
         )
         .unwrap();
@@ -394,7 +400,15 @@ mod tests {
                 &ast::ConcreteSerializationType::IdUuid,
                 &JsonValue::String("uuid".to_string()),
             ),
-            Some(SessionValue::Text("uuid".to_string()))
+            None
+        );
+        let uuid = "ABCDEFAB-CDEF-0123-4567-ABCDEFABCDEF";
+        assert_eq!(
+            concrete_session_value(
+                &ast::ConcreteSerializationType::IdUuid,
+                &serde_json::json!(uuid)
+            ),
+            Some(SessionValue::Text(uuid.to_string()))
         );
     }
 }
