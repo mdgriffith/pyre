@@ -659,7 +659,8 @@ export async function run(
 
     const queryResult: QueryResult = {
         kind: "success",
-        response,
+        // Commit evidence belongs to execution, not best-effort publication.
+        response: committedRevision ? { ...committedRevision, result: response } : response,
         sync,
     };
 

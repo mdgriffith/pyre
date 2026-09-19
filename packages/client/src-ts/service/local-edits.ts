@@ -468,8 +468,10 @@ export class LocalEditsRuntime {
     globalThis.removeEventListener?.('offline', this.offline);
     this.pending.forEach(p => p.listeners.clear());
     this.pending.clear();
-    this.failures.clear();
     this.lifecycle.clear();
+    // Teardown does not wait for storage, but existing observers can still report
+    // failures from cache work already queued by this lifetime.
+    void this.persistence.then(() => this.failures.clear());
     notify(() => this.host.end?.());
     this.resolveEnded();
   }

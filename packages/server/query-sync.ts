@@ -192,7 +192,9 @@ async function sendBestEffort(
   catch { /* Independent recipient delivery. */ }
 }
 
-const namedMutationQueues = new WeakMap<Client, Promise<void>>();
+// Database IDs coordinate pooled handles in this process; legacy callers without
+// an ID retain per-handle ordering. Settled queues are removed below.
+const namedMutationQueues = new Map<DatabaseId | Client, Promise<void>>();
 
 function syncWithWasmForDatabase(
   db: Client,
@@ -224,8 +226,6 @@ function syncWithWasmForDatabase(
       await Promise.all(sends);
       return revision;
     }
-    activateSchemaForDatabase(normalizedDatabaseId);
-
     const broadcastSessions = sessionsWithoutOrigin(legacySessions, originSessionId);
     const originSession = singleOriginSession(legacySessions, originSessionId);
     const syncRequiredMessage = {
@@ -245,6 +245,7 @@ function syncWithWasmForDatabase(
     );
     let result: any;
     try {
+      activateSchemaForDatabase(normalizedDatabaseId);
       const deltasResult = wasm.calculate_sync_deltas(
         affectedRowGroups,
         normalizeSessions(broadcastSessions),
@@ -398,10 +399,11 @@ export async function runWithSync(
   };
 
   if (!namedMutation) return execute();
-  const previous = namedMutationQueues.get(db) ?? Promise.resolve();
+  const queueKey = databaseId ? requireDatabaseId(databaseId) : db;
+  const previous = namedMutationQueues.get(queueKey) ?? Promise.resolve();
   const execution = previous.then(execute);
   const settled = execution.then(() => undefined, () => undefined);
-  namedMutationQueues.set(db, settled);
-  void settled.then(() => { if (namedMutationQueues.get(db) === settled) namedMutationQueues.delete(db); });
+  namedMutationQueues.set(queueKey, settled);
+  void settled.then(() => { if (namedMutationQueues.get(queueKey) === settled) namedMutationQueues.delete(queueKey); });
   return execution;
 }

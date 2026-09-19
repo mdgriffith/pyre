@@ -216,6 +216,14 @@ events, clears overlays, aborts transports, removes hint/online/offline listener
 and detaches worker query subscriptions. Epoch mismatch ends the old lifetime.
 `await db.dispose()` (or `await db.ended`) waits for final delivery and detachment;
 it does not wait for outstanding IndexedDB persistence transactions.
+Existing `onEditFailure` observers remain eligible for persistence failures from
+already-queued work until that work settles, unless explicitly unsubscribed. Those
+events retain the retired lifetime's fence and do not change any write outcome.
+If automatic client recreation fails, `PyreClient` reports it through `onError`
+(or the console when no handler is configured). After resolving the bootstrap
+failure, call `client.syncDatabase(databaseId)` to retry, even if the database is
+already selected for sync. Existing query/entity subscriptions bind to the new
+client; pending writes are never replayed as part of this recovery.
 For auth/epoch changes or explicit unknown-outcome recovery, dispose the old client
 and bind a fresh authenticated configuration with a fresh instance token. This
 does not cancel or establish an ordering barrier against old server transactions.
@@ -313,6 +321,27 @@ are exposed by `Pyre.LocalEdits` (`Confirmed`, `Rejected`, `OutcomeUnknown`,
 or `Pyre.editState` to observe it and quarantine. Consume `Pyre.failures nextModel`
 after each incoming update, even when ignoring receipts: failures are per-update,
 not a durable log. Late settlement can change an unknown Elm outcome.
+
+## Server Boundaries
+
+The host authenticates and authorizes requests, maps each stable database ID to
+the correct physical database and schema family, and partitions live recipients
+by database. A database ID or a matching manifest is not authorization.
+
+Named `runWithSync` calls with the same database ID serialize execution and
+publication across connection handles within one loaded server runtime. Calls
+without an ID only serialize on the exact handle. The delivery callback must
+resolve after handing off the message in order. This is not a distributed queue:
+hosts with multiple writers/processes must coordinate legacy delta delivery or
+use fenced replacement hints, which tolerate reordering. Do not give one physical
+database multiple IDs and expect cross-ID ordering.
+
+Schema caches are process-local evidence, not migration locks. Hosts must quiesce
+schema-dependent traffic during migrations and refresh schema evidence and
+generated manifests in every serving runtime before resuming. An exact-handle
+check alone cannot detect a migration performed through another handle/process.
+Replacement uses the schema captured for the authorized database ID and checks
+its compiled contract; hosts must not route that ID to an unrelated database.
 
 ## Server Seeds
 

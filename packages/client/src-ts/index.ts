@@ -1610,15 +1610,9 @@ export class PyreClient {
       binding: 0,
     };
     this.addPublicRegistration(this.publicQueryRegistrations, registration);
-    return this.getOrCreateClient(targetDatabaseId).then((client) => {
-      try {
-        registration.initializing = false;
-        this.bindPublicQueryRegistration(registration, this.clientGenerations.get(targetDatabaseId)!, client);
-      } catch (error) {
-        registration.active = false;
-        this.deletePublicRegistration(this.publicQueryRegistrations, registration);
-        throw error;
-      }
+    return this.initializePublicRegistration(registration, (generation, client) => {
+      this.bindPublicQueryRegistration(registration, generation, client);
+    }).then(() => {
       return {
         update: (updatedInput: Input) => {
           if (!registration.active) return;
@@ -1636,6 +1630,10 @@ export class PyreClient {
           this.deletePublicRegistration(this.publicQueryRegistrations, registration);
         },
       } satisfies QuerySubscription<Input>;
+    }).catch((error) => {
+      registration.active = false;
+      this.deletePublicRegistration(this.publicQueryRegistrations, registration);
+      throw error;
     });
   }
 
@@ -1695,6 +1693,8 @@ export class PyreClient {
     const targetDatabaseId = requireDatabaseId(databaseId);
     this.markKnownDatabase(targetDatabaseId);
     if (this.syncedDatabaseIds.includes(targetDatabaseId)) {
+      await this.getOrCreateClient(targetDatabaseId);
+      this.startNextSync();
       return;
     }
 
@@ -1766,9 +1766,8 @@ export class PyreClient {
     };
     this.addPublicRegistration(this.publicEntityRegistrations, registration);
     try {
-      const client = await this.getOrCreateClient(targetDatabaseId);
-      registration.initializing = false;
-      await this.bindPublicEntityRegistration(registration, this.clientGenerations.get(targetDatabaseId)!, client);
+      await this.initializePublicRegistration(registration, (generation, client) =>
+        this.bindPublicEntityRegistration(registration, generation, client));
     } catch (error) {
       registration.active = false;
       this.deletePublicRegistration(this.publicEntityRegistrations, registration);
@@ -2294,6 +2293,23 @@ export class PyreClient {
     if (databaseRegistrations?.size === 0) registrations.delete(registration.databaseId);
   }
 
+  private async initializePublicRegistration(
+    registration: { databaseId: DatabaseId; active: boolean; initializing: boolean },
+    bind: (generation: number, client: PyreInternalClient) => void | Promise<void>
+  ): Promise<void> {
+    while (registration.active) {
+      const pending = this.getOrCreateClient(registration.databaseId);
+      const generation = this.clientGenerations.get(registration.databaseId)!;
+      const client = await pending;
+      if (registration.active && this.clientGenerations.get(registration.databaseId) === generation) {
+        registration.initializing = false;
+        // Check and bind in one continuation, without another asynchronous gap.
+        await bind(generation, client);
+        return;
+      }
+    }
+  }
+
   private bindPublicQueryRegistration(
     registration: PublicQueryRegistration,
     generation: number,
@@ -2453,12 +2469,16 @@ export class PyreClient {
         this.internalDevtoolsUnsubscribers.delete(databaseId);
         const retiredGeneration = generation + 1;
         this.clientGenerations.set(databaseId, retiredGeneration);
+        this.unbindPublicRegistrations(databaseId);
         client.disconnect();
         this.emitSyncState();
         if ((this.syncedDatabaseIds.includes(databaseId) || this.hasPublicRegistrations(databaseId))
           && this.clientGenerations.get(databaseId) === retiredGeneration
           && !this.clients.has(databaseId)) {
-          void this.getOrCreateClient(databaseId).catch(() => this.startNextSync());
+          void this.getOrCreateClient(databaseId).catch((error) => {
+            this.reportPublicRebindError(error);
+            this.startNextSync();
+          });
         } else {
           this.startNextSync();
         }
