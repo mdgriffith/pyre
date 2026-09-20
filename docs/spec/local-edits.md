@@ -69,9 +69,21 @@ namespace scope, and requires that bound capability for batch execution. Named
 command results are validated recursively against manifest result metadata before
 revision allocation and commit.
 
+Binding caches are configuration checks, not execution authority. Rust and
+TypeScript compiled execution must compare semantic compiler contracts with the
+latest successful `_pyre_migrations` source in the same read snapshot or locked
+write transaction, before application SQL. Missing/null/invalid authority fails
+closed; comments-only changes are compatible; failed/unfinished migrations are
+ignored. Migrations atomically record source. Empty executor requests still check
+authority and epoch transactionally, without revision allocation or publication
+(unlike locally short-circuited empty builder plans). Legacy row publication needs
+a matching verified execution contract or must use row-free hints. Trusted direct
+SQL/legacy seeds are outside this permission-enforcing boundary. See the
+[runtime coverage matrix](../../packages/server/README.md#authoritative-replacement).
+
 Elm duplicate setters resolve left to right, last setter wins (also for null). Omission
 means unchanged on update, default/nullable omission on create. Empty updates reject
-as `InvalidEdit`; they do not become reads. Empty batches confirm with `[]` in
+as `InvalidEdit`; they do not become reads. Locally short-circuited empty plans confirm with `[]` in
 TypeScript or the applicative `Batch.succeed` value in Elm, with no transport,
 revision, or row-state publication. Invalid members reject the entire batch.
 TypeScript edit and batch builders are pure and capture inputs (including nested

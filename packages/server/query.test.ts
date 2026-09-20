@@ -1,20 +1,66 @@
 import { afterEach, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SchemaMetadata } from "@pyre/core";
 import { createClient } from "@libsql/client";
 import { z } from "zod";
-import { run, runBatch, seed, type BatchManifest, type BatchRequest, type QueryMetadata } from "./query";
+import { executionSchemaContract, run, runBatch, seed, type BatchManifest, type BatchRequest, type QueryMetadata } from "./query";
 import { toRunner } from "./runtime/runner";
 import { buildArgs, toSqlStatements } from "./runtime/sql";
 import { assertSupportedIntegerMode } from "./runtime/libsql";
 import { meta as compiledCreate } from "./fixtures/compiled-batch/generated/queries/metadata/entryCreate";
 import { sql as compiledCreateSql } from "./fixtures/compiled-batch/generated/queries/sql/entryCreate";
 import { CoercedDate, Role, SessionValidator as compiledSession } from "./fixtures/compiled-batch/generated/decode";
-import { manifestVersion as compiledFingerprint } from "./fixtures/compiled-batch/generated/manifest";
+import { manifestVersion as compiledFingerprint, compiledContract, replacementContracts } from "./fixtures/compiled-batch/generated/manifest";
 import { meta as compiledContextQuery } from "./fixtures/compiled-batch/generated/queries/metadata/entriesForContext";
 import { sql as compiledContextSql } from "./fixtures/compiled-batch/generated/queries/sql/entriesForContext";
+import { loadSchemaFromDatabase } from "./schema";
+
+const compiledSource = readFileSync(new URL("./fixtures/compiled-batch/schema.pyre", import.meta.url), "utf8");
+const queryAuthority = { primary_db: "Main", attached_dbs: [], schemaContracts: { Main: "contract-1" } };
+const manifestAuthority = { compiledContract: "contract-1", replacementContracts: { Main: "contract-1" } };
+let activeSchema: any;
+mock.module("./wasm/pyre_wasm.js", () => ({
+  sql_is_initialized: () => "select 1 as is_initialized",
+  sql_introspect: () => "select json_object('schema_source', schema) as result from _pyre_migrations where finished_at is not null and error is null order by id desc limit 1",
+  set_schema: (schema: any) => { activeSchema = schema; },
+  get_schema_compiled_contract: () => activeSchema?.schema_source === compiledSource ? replacementContracts._default
+    : activeSchema?.schema_source === "test schema" ? "contract-1" : "unknown-contract",
+  get_schema_manifest_contract: () => activeSchema?.schema_source === compiledSource ? compiledContract
+    : activeSchema?.schema_source === "test schema" ? "contract-1" : "unknown-contract",
+}));
+
+async function persistAuthority(db: ReturnType<typeof createClient>, source = "test schema") {
+  await db.execute("create table if not exists _pyre_migrations(id integer primary key, finished_at integer, error text, schema text)");
+  await db.execute({ sql: "insert or replace into _pyre_migrations values(1,1,NULL,?)", args: [source] });
+  await loadSchemaFromDatabase(db);
+}
+
+// Validation-only clients still need real bind evidence before request validation.
+async function bindMock<T extends object>(db: T): Promise<T> {
+  const original = (db as any).execute;
+  (db as any).execute = async (sql: string) => ({ rows: sql.includes("is_initialized")
+    ? [{ is_initialized: 1 }] : [{ result: JSON.stringify({ schema_source: "test schema" }) }] });
+  try { await loadSchemaFromDatabase(db as any); }
+  finally { (db as any).execute = original; }
+  return db;
+}
+
+function queryDatabase(results: any[] = []) {
+  const execute = mock(async (statement: any) => {
+    if (typeof statement === "string" && statement.startsWith("SELECT schema")) return { rows: [{ schema: "test schema" }] };
+    return results.shift() ?? { columns: [], rows: [] };
+  });
+  const tx = { execute, commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}) };
+  return {
+    execute: mock(async (sql: string) => {
+      if (sql === "select cast(1 as integer) as _pyre_integer_mode") return { rows: [{ _pyre_integer_mode: 1 }] };
+      throw Error(`Unexpected client SQL: ${sql}`);
+    }),
+    transaction: mock(async () => tx), tx,
+  };
+}
 
 const batchAuthority = { databaseId: "tenant-1", namespace: "Main", manifest: "m1", instance: "tab-1", authGeneration: 2 };
 const createUuidV7 = "01890f2e-7b5c-7cc8-98c4-dc0c0c07398f";
@@ -31,7 +77,7 @@ const batchRequest = (operations: BatchRequest["operations"]): BatchRequest => (
 
 function editManifest(): BatchManifest {
   const common = {
-    primary_db: "Main", session_args: ["userId"], optional_input_args: ["body"], json_input_args: [],
+    ...queryAuthority, session_args: ["userId"], optional_input_args: ["body"], json_input_args: [],
     SessionValidator: z.object({ userId: z.number() }),
   };
   const update: QueryMetadata = {
@@ -43,7 +89,7 @@ function editManifest(): BatchManifest {
       { include: true, params: [], sql: "select '[]' as notes" },
     ],
   };
-  return { version: 1, manifestVersion: "m1", SessionValidator: common.SessionValidator, queries: {
+  return { ...manifestAuthority, version: 1, manifestVersion: "m1", SessionValidator: common.SessionValidator, queries: {
     update,
     create: { ...common, id: "create", operation: "insert", InputValidator: z.object({ id: genericUuid, body: z.string() }),
       generatedEdit: { kind: "create", createUuidInput: "id", writeStatementIndices: [0], writableInputs: ["id", "body"] },
@@ -73,10 +119,11 @@ async function batchDatabase() {
   await db.execute("insert into notes values (1,'first',7), (2,'second',8)");
   await db.execute("create table _pyre_sync(id integer primary key, database_epoch text not null, server_revision integer not null)");
   await db.execute("insert into _pyre_sync values (1,'e1',0)");
+  await persistAuthority(db);
   return db;
 }
 
-test("memory batches reject before detachment, including otherwise-valid writes and stale epochs", async () => {
+test("memory batches reject before detachment, including valid writes, empty batches and stale epochs", async () => {
   for (const url of ["file::memory:", ":memory:", "file::memory:?cache=private", "file::memory:?cache=shared"]) {
     const db = createClient({ url });
     try {
@@ -84,6 +131,7 @@ test("memory batches reject before detachment, including otherwise-valid writes 
       await db.execute("insert into notes values(1,'original',7)");
       await db.execute("create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer)");
       await db.execute("insert into _pyre_sync values(1,'e1',0)");
+      await persistAuthority(db);
       const transaction = mock(db.transaction.bind(db));
       db.transaction = transaction;
       const publish = mock(() => {});
@@ -99,11 +147,11 @@ test("memory batches reject before detachment, including otherwise-valid writes 
       const execute = mock(db.execute.bind(db));
       db.execute = execute;
       expect(await runBatch(db, editManifest(), batchAuthority, batchRequest([]), { userId: 7 }, publish))
-        .toEqual({ kind: "success", response: { ...batchAuthority, databaseEpoch: "e1", requestId: "request-1", status: "confirmed", results: [] } });
-      expect(execute).not.toHaveBeenCalled();
+        .toEqual({ kind: "error", error: { errorType: "TransactionFailed", message: "TransactionFailed" } });
+      expect(execute).toHaveBeenCalledWith("pragma database_list");
       expect(transaction).not.toHaveBeenCalled();
       expect(publish).not.toHaveBeenCalled();
-      // The same public client remains usable for both reads and writes after rejection/success.
+      // The same public client remains usable for both reads and writes after rejection.
       await db.execute("update notes set body = 'still connected' where id = 1");
       expect((await db.execute("select body from notes")).rows[0].body).toBe("still connected");
     } finally { db.close(); }
@@ -113,6 +161,7 @@ test("memory batches reject before detachment, including otherwise-valid writes 
 test("local batch storage guard fails closed when the main filename cannot be established", async () => {
   for (const rows of [[], [{ name: "temp", file: "/tmp/temporary" }], [{ name: "main", file: null }]]) {
     const db = { protocol: "file", execute: mock(async () => ({ rows })), transaction: mock(() => { throw Error("must not detach"); }) };
+    await bindMock(db);
     expect(await runBatch(db as any, editManifest(), batchAuthority, batchRequest([{ operation: "create", input: createInput("new") }]), { userId: 7 }))
       .toEqual({ kind: "error", error: { errorType: "TransactionFailed", message: "TransactionFailed" } });
     expect(db.execute).toHaveBeenCalledWith("pragma database_list");
@@ -130,6 +179,43 @@ test("file-backed databases with memory journals still commit batches", async ()
   } finally { db.close(); }
 });
 
+test("batch and named execution reject missing or changed persisted authority despite cached evidence", async () => {
+  for (const change of ["delete from _pyre_migrations", "update _pyre_migrations set schema = 'revoked permissions'"]) {
+    const db = await batchDatabase();
+    try {
+      const manifest = editManifest();
+      await db.execute(change);
+      const publish = mock(() => {});
+      for (const operations of [[], [{ operation: "create", input: createInput("blocked") }]]) {
+        expect(await runBatch(db, manifest, batchAuthority, batchRequest(operations), { userId: 7 }, publish))
+          .toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest" } });
+      }
+      await expect(run(db, manifest.queries, "update", { id: 1, body: "blocked" }, { userId: 7 }))
+        .rejects.toThrow(change.startsWith("delete") ? "Missing persisted schema authority" : "Schema contract mismatch");
+      expect((await db.execute("select body from notes order by id")).rows).toEqual([{ body: "first" }, { body: "second" }]);
+      expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(0);
+      expect(publish).not.toHaveBeenCalled();
+    } finally { db.close(); }
+  }
+});
+
+test("batch authority is rechecked after transaction acquisition, including empty batches", async () => {
+  for (const operations of [[], [{ operation: "create", input: createInput("blocked") }]]) {
+    const db = await batchDatabase();
+    try {
+      const transaction = db.transaction.bind(db);
+      db.transaction = async mode => {
+        await db.execute("update _pyre_migrations set schema = 'revoked permissions'");
+        return transaction(mode);
+      };
+      expect(await runBatch(db, editManifest(), batchAuthority, batchRequest(operations), { userId: 7 }))
+        .toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest" } });
+      expect((await db.execute("select count(*) as n from notes")).rows[0].n).toBe(2);
+      expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(0);
+    } finally { db.close(); }
+  }
+});
+
 test("libsql string integer mode is rejected before batch execution", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pyre-string-integers-"));
   batchDirectories.push(directory);
@@ -139,6 +225,7 @@ test("libsql string integer mode is rejected before batch execution", async () =
     await db.execute("insert into notes values (1,'first',7)");
     await db.execute("create table _pyre_sync(id integer primary key, database_epoch text not null, server_revision integer not null)");
     await db.execute("insert into _pyre_sync values (1,'e1',0)");
+    await persistAuthority(db);
     await expect(assertSupportedIntegerMode(db)).rejects.toThrow('intMode "string" is unsupported');
 
     expect(await runBatch(db, editManifest(), batchAuthority,
@@ -223,6 +310,7 @@ test("generated missing, forbidden, many-target and SQL failures roll back the e
 
 test("batch validates every member, authority, session, strip-mode protected fields and limits before I/O", async () => {
   const db = { transaction: mock(() => { throw Error("must not execute"); }) };
+  await bindMock(db);
   const manifest = editManifest();
   const valid = batchRequest([{ operation: "update", input: { id: 1, body: "new" } }]);
   const cases: [BatchRequest, Record<string, unknown>][] = [
@@ -273,14 +361,19 @@ test("batch capture is synchronous and queued in invocation order; publication f
   } finally { db.close(); }
 });
 
-test("empty batch has no transaction, revision or publication", async () => {
-  const db = { transaction: mock(() => { throw Error("must not execute"); }) };
+test("empty batch validates persisted authority without revision or publication", async () => {
+  const db = await batchDatabase();
+  const transaction = mock(db.transaction.bind(db));
+  db.transaction = transaction;
   const publish = mock(() => {});
-  const result = await runBatch(db as any, editManifest(), batchAuthority, batchRequest([]), { userId: 7 }, publish);
-  expect(result.kind).toBe("success");
-  if (result.kind === "success") { expect(result.response.results).toEqual([]); expect(result.response.commitRevision).toBeUndefined(); }
-  expect(db.transaction).not.toHaveBeenCalled();
-  expect(publish).not.toHaveBeenCalled();
+  try {
+    const result = await runBatch(db, editManifest(), batchAuthority, batchRequest([]), { userId: 7 }, publish);
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") { expect(result.response.results).toEqual([]); expect(result.response.commitRevision).toBeUndefined(); }
+    expect(transaction).toHaveBeenCalledWith("write");
+    expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(0);
+    expect(publish).not.toHaveBeenCalled();
+  } finally { db.close(); }
 });
 
 test("batch captures nested JSON and rejects nested stripped fields", async () => {
@@ -440,6 +533,7 @@ test("batch codecs preserve explicit null, structured inputs and session discrim
 
 test("batch wire request requires every fence and rejects unknown envelope/member fields and bad types", async () => {
   const db = { transaction: mock(() => { throw Error("must not execute"); }) };
+  await bindMock(db);
   const valid = batchRequest([{ operation: "create", input: createInput("one") }]);
   const malformed: unknown[] = [
     null, [], { ...valid, extra: true }, { ...valid, version: 2 }, { ...valid, version: "1" },
@@ -469,6 +563,7 @@ test("batch wire request requires every fence and rejects unknown envelope/membe
 
 test("generated edits require exactly one nominated included statement", async () => {
   const db = { transaction: mock(() => { throw Error("must not execute"); }) };
+  await bindMock(db);
   for (const indices of [[], [0, 1], [-1], [0.5], [99], [0, 0]]) {
     const manifest = editManifest();
     manifest.queries.create.generatedEdit!.writeStatementIndices = indices;
@@ -512,6 +607,7 @@ test("generated creates accept canonical lowercase UUIDv7 and reject other IDs b
     { body: "missing" },
     { id: 7, body: "non-string" },
   ];
+  await bindMock(db);
   for (const input of invalidInputs) {
     const manifest = editManifest();
     manifest.queries.create.InputValidator = z.object({ id: z.unknown().optional(), body: z.string() });
@@ -548,7 +644,8 @@ test("actual generated metadata executes release identifier and full unused sess
   const db = await batchDatabase();
   try {
     await db.execute("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer)");
-    const manifest: BatchManifest = { version: 1, manifestVersion: compiledFingerprint, SessionValidator: compiledSession, queries: {
+    await persistAuthority(db, compiledSource);
+    const manifest: BatchManifest = { compiledContract, replacementContracts, version: 1, manifestVersion: compiledFingerprint, SessionValidator: compiledSession, queries: {
       [compiledCreate.id]: { ...compiledCreateMetadata, sql: compiledCreateSql },
     } };
     const authority = { ...batchAuthority, manifest: compiledFingerprint, namespace: compiledCreate.primary_db };
@@ -615,7 +712,8 @@ test("compiled recursive JSON preserves nested enums, dates, nulls, lists and di
   const db = await batchDatabase();
   try {
     await db.execute("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer)");
-    const manifest: BatchManifest = { version: 1, manifestVersion: compiledFingerprint, SessionValidator: compiledSession, queries: {
+    await persistAuthority(db, compiledSource);
+    const manifest: BatchManifest = { compiledContract, replacementContracts, version: 1, manifestVersion: compiledFingerprint, SessionValidator: compiledSession, queries: {
       [compiledCreate.id]: { ...compiledCreateMetadata, sql: compiledCreateSql },
     } };
     expect(compiledFingerprint).toMatch(/^sha256:[a-f0-9]{64}$/);
@@ -667,85 +765,27 @@ test("compiled recursive JSON preserves nested enums, dates, nulls, lists and di
   } finally { db.close(); }
 });
 
-test("transaction runner executes every step in exactly one ordered batch", async () => {
-  const db = {
-    batch: mock(async () => [
-      {
-        columns: ["updatedNotes"],
-        rows: [{ updatedNotes: JSON.stringify({ id: 1, body: "updated" }) }],
-      },
-      {
-        columns: ["missingNotes"],
-        rows: [{ missingNotes: JSON.stringify([]) }],
-      },
-      {
-        columns: ["createdNotes"],
-        rows: [{ createdNotes: JSON.stringify({ id: 2, body: "created" }) }],
-      },
-    ]),
-  };
-  const sql = [
-    {
-      include: true,
-      params: ["body", "session_userId"],
-      sql: "update notes returning updatedNotes",
-    },
-    {
-      include: true,
-      params: ["session_userId"],
-      sql: "delete from notes returning missingNotes",
-    },
-    {
-      include: true,
-      params: ["body", "session_userId"],
-      sql: "insert into notes returning createdNotes",
-    },
-  ];
+test("transaction runner rejects manually assembled metadata without compiled schema authority", async () => {
+  const db = { transaction: mock(), batch: mock() };
   const runner = toRunner(
-    {
-      session_args: ["userId"],
-      optional_input_args: [],
-      json_input_args: [],
-      InputValidator: z.object({ body: z.string() }),
-      SessionValidator: z.object({ userId: z.number() }),
-      ReturnData: z.object({
-        updatedNotes: z.array(z.object({ id: z.number(), body: z.string() })),
-        missingNotes: z.array(z.object({ id: z.number(), body: z.string() })),
-        createdNotes: z.array(z.object({ id: z.number(), body: z.string() })),
-      }),
-    },
-    sql,
+    { ...compiledCreate, schemaContracts: undefined } as any,
+    compiledCreateSql,
   );
 
-  const result = await runner(db as any, { userId: 7 }, { body: "updated" });
-
-  expect(db.batch).toHaveBeenCalledTimes(1);
-  expect(db.batch).toHaveBeenCalledWith([
-    {
-      sql: "update notes returning updatedNotes",
-      args: { body: "updated", session_userId: 7 },
-    },
-    {
-      sql: "delete from notes returning missingNotes",
-      args: { session_userId: 7 },
-    },
-    {
-      sql: "insert into notes returning createdNotes",
-      args: { body: "updated", session_userId: 7 },
-    },
-  ]);
-  expect(result).toEqual({
-    updatedNotes: [{ id: 1, body: "updated" }],
-    missingNotes: [],
-    createdNotes: [{ id: 2, body: "created" }],
-  });
+  await expect(runner(db as any, { userId: 7 }, { body: "updated" }))
+    .rejects.toThrow("Missing compiled schema contracts");
+  expect(db.batch).not.toHaveBeenCalled();
+  expect(db.transaction).not.toHaveBeenCalled();
 });
 
 test("failed transaction batch rolls back before sync publication", async () => {
-  const db = createClient({ url: "file::memory:" });
+  const directory = mkdtempSync(join(tmpdir(), "pyre-query-"));
+  batchDirectories.push(directory);
+  const db = createClient({ url: `file:${join(directory, "test.db")}` });
   const syncDeltas = mock(async () => ({ serverRevision: 1 }));
 
   try {
+    await persistAuthority(db);
     await db.execute("create table notes (id integer primary key, body text unique not null)");
     await db.execute({
       sql: "insert into notes (body) values (?)",
@@ -756,6 +796,7 @@ test("failed transaction batch rolls back before sync publication", async () => 
       db,
       {
         createNotes: {
+          ...queryAuthority,
           id: "createNotes",
           sql: [],
           syncSql: [
@@ -784,7 +825,7 @@ test("failed transaction batch rolls back before sync publication", async () => 
       syncDeltas,
       undefined,
       { mode: "sync" },
-    )).rejects.toThrow();
+    )).rejects.toThrow("UNIQUE constraint failed");
 
     const rows = await db.execute("select body from notes order by id");
     expect(rows.rows).toEqual([{ body: "taken" }]);
@@ -795,8 +836,7 @@ test("failed transaction batch rolls back before sync publication", async () => 
 });
 
 test("sync wraps mutation responses with server revision metadata", async () => {
-  const db = {
-    batch: mock(async () => [
+  const db = queryDatabase([
       {
         columns: ["createdNote"],
         rows: [{ createdNote: JSON.stringify({ id: 1, body: "one" }) }],
@@ -811,13 +851,14 @@ test("sync wraps mutation responses with server revision metadata", async () => 
           },
         ],
       },
-    ]),
-  };
+      { rows: [{ database_epoch: "e1", server_revision: 42 }] },
+    ]);
 
   const result = await run(
     db as any,
     {
       createNote: {
+        ...queryAuthority,
         id: "createNote",
         sql: [
           { include: true, params: [], sql: "select createdNote" },
@@ -834,12 +875,20 @@ test("sync wraps mutation responses with server revision metadata", async () => 
     {},
     {},
     new Map(),
-    async () => ({ serverRevision: 42 }),
+    async (_rows, _sessions, _send, _origin, revision) => {
+      expect(db.tx.commit).toHaveBeenCalledTimes(1);
+      expect(executionSchemaContract(revision!)).toBe("contract-1");
+      expect(executionSchemaContract({ ...revision })).toBeUndefined();
+      return revision;
+    },
+    undefined,
+    { commitSyncRevision: true },
   );
 
   await result.sync(() => {});
 
   expect(result.response).toEqual({
+    databaseEpoch: "e1",
     serverRevision: 42,
     result: {
       createdNote: [{ id: 1, body: "one" }],
@@ -848,8 +897,7 @@ test("sync wraps mutation responses with server revision metadata", async () => 
 });
 
 test("sync mode includes the mutation result", async () => {
-  const db = {
-    batch: mock(async () => [
+  const db = queryDatabase([
       {
         columns: ["createdNote"],
         rows: [{ createdNote: JSON.stringify({ id: 1, body: "one" }) }],
@@ -864,13 +912,14 @@ test("sync mode includes the mutation result", async () => {
           },
         ],
       },
-    ]),
-  };
+      { rows: [{ database_epoch: "e1", server_revision: 42 }] },
+    ]);
 
   const result = await run(
     db as any,
     {
       createNote: {
+        ...queryAuthority,
         id: "createNote",
         sql: [{ include: true, params: [], sql: "select createdNote" }],
         syncSql: [
@@ -888,23 +937,29 @@ test("sync mode includes the mutation result", async () => {
     {},
     {},
     new Map(),
-    async () => ({ serverRevision: 42, originMessage: { type: "delta" } }),
+    async (_rows, _sessions, _send, _origin, revision) => {
+      expect(db.tx.commit).toHaveBeenCalledTimes(1);
+      expect(executionSchemaContract(revision!)).toBe("contract-1");
+      return { ...revision, originMessage: { type: "delta" } };
+    },
     undefined,
-    { mode: "sync" },
+    { mode: "sync", commitSyncRevision: true },
   );
 
   await result.sync(() => {});
 
   expect(result.response).toEqual({
+    databaseEpoch: "e1",
     serverRevision: 42,
     sync: { type: "delta" },
     result: {
       createdNote: [{ id: 1, body: "one" }],
     },
   });
-  expect(db.batch).toHaveBeenCalledWith([
+  expect(db.tx.execute.mock.calls.slice(1).map(([statement]) => statement)).toEqual([
     { sql: "select createdNote", args: {} },
     { sql: "select _affectedRows", args: {} },
+    "update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision",
   ]);
 });
 
@@ -982,11 +1037,10 @@ test("SQL statements bind every declared parameter", () => {
 });
 
 test("nullable session args always receive SQL bindings", async () => {
-  const db = {
-    batch: mock(async () => []),
-  };
+  const db = queryDatabase();
   const query = {
     findUsers: {
+      ...queryAuthority,
       id: "findUsers",
       sql: [{
         include: true,
@@ -1020,7 +1074,7 @@ test("nullable session args always receive SQL bindings", async () => {
     );
 
     expect(result.kind).not.toBe("error");
-    const statement = db.batch.mock.calls.at(-1)?.[0][0];
+    const statement = db.tx.execute.mock.calls.at(-1)?.[0];
     expect(statement.args).toEqual({
       session_isAdmin: true,
       session_userId: expectedUserId,
@@ -1028,7 +1082,7 @@ test("nullable session args always receive SQL bindings", async () => {
     expect(Object.keys(statement.args)).toHaveLength(statement.sql.match(/\$session_/g)?.length ?? 0);
   }
 
-  expect(db.batch).toHaveBeenCalledTimes(3);
+  expect(db.transaction).toHaveBeenCalledTimes(3);
 });
 
 test("missing non-nullable session args fail validation before SQL execution", async () => {
@@ -1040,6 +1094,7 @@ test("missing non-nullable session args fail validation before SQL execution", a
     db as any,
     {
       findUsers: {
+        ...queryAuthority,
         id: "findUsers",
         sql: [{ include: true, params: ["session_isAdmin"], sql: "select $session_isAdmin" }],
         session_args: ["isAdmin"],
@@ -1062,20 +1117,19 @@ test("missing non-nullable session args fail validation before SQL execution", a
 });
 
 test("sync does not fan out when no affected rows are returned", async () => {
-  const db = {
-    batch: mock(async () => [
+  const db = queryDatabase([
       {
         columns: ["_affectedRows"],
         rows: [{ _affectedRows: JSON.stringify([]) }],
       },
-    ]),
-  };
+    ]);
   const syncDeltas = mock(async () => ({ serverRevision: 42 }));
 
   const result = await run(
     db as any,
     {
       createNote: {
+        ...queryAuthority,
         id: "createNote",
         sql: [{ include: true, params: [], sql: "select _affectedRows" }],
         session_args: [],

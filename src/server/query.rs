@@ -12,6 +12,101 @@ mod codec_parity_tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn transaction_authority_orders_writes_and_migrations() {
+        use crate::server::schema::{ensure_database, load_schema_from_database};
+        let source = "record Item {\n id Id.Uuid @id\n value String\n @allow(query, insert, update, delete) { True }\n}\n";
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ordering.db");
+        let db = libsql::Builder::new_local(&path).build().await.unwrap();
+        let other = libsql::Builder::new_local(&path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let migrator = other.connect().unwrap();
+        let namespace = crate::ast::DEFAULT_SCHEMANAME;
+        ensure_database(&conn, namespace, source).await.unwrap();
+        conn.execute("INSERT INTO items(id, value) VALUES ('01890f6c-7b80-7000-8000-000000000001', 'original')", ()).await.unwrap();
+        let loaded = load_schema_from_database(&conn).await.unwrap();
+        let context = loaded.context().unwrap();
+        let queries = crate::parser::parse_query(
+            "query.pyre",
+            "update ChangeItems { item { value = \"changed\" } }",
+        )
+        .unwrap();
+        let info = crate::typecheck::check_queries(&queries, context).unwrap();
+        let mut files = Vec::new();
+        crate::generate::manifest::generate_queries(context, &queries, &info, &mut files);
+        let manifest: Manifest = serde_json::from_str(
+            &files
+                .iter()
+                .find(|file| file.path.ends_with("manifest.json"))
+                .unwrap()
+                .contents,
+        )
+        .unwrap();
+        let query = manifest.queries.values().next().unwrap();
+        let changed = source.replace("True", "False");
+
+        // Hold execution's actual immediate transaction across authority checking,
+        // a competing migration attempt, compiled SQL, and revision allocation.
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        manifest
+            .verify_transaction(&tx, namespace, &[])
+            .await
+            .unwrap();
+        let error = ensure_database(&migrator, namespace, &changed)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("locked"), "{error}");
+        execute_generated_sql(&tx, &query.sql, &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::server::sync::next_server_revision(&tx)
+                .await
+                .unwrap()
+                .1,
+            1
+        );
+        tx.commit().await.unwrap();
+
+        // Once the migration wins the write lock and commits, neither this
+        // cached manifest nor a fresh execution transaction can authorize old SQL.
+        ensure_database(&migrator, namespace, &changed)
+            .await
+            .unwrap();
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        assert!(manifest
+            .verify_transaction(&tx, namespace, &[])
+            .await
+            .is_err());
+        tx.rollback().await.unwrap();
+        let bound = BoundManifest::new(manifest.clone(), context).unwrap();
+        let session = PyreSession::new(json!({}), &manifest.session_schema).unwrap();
+        let error = run_with_revision(&conn, &bound, &query.id, json!({}), &session, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "InvalidRequest");
+        let row = conn
+            .query(
+                "SELECT value, (SELECT server_revision FROM _pyre_sync WHERE id = 1) FROM items",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "changed");
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn compiled_recursive_inputs_are_complete_and_preserve_nested_values() {
         let source = format!(
             "{}\n{}",
@@ -57,6 +152,13 @@ mod codec_parity_tests {
             .unwrap();
         let conn = db.connect().unwrap();
         conn.execute_batch("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer); create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer); insert into _pyre_sync values(1,'e1',0);").await.unwrap();
+        conn.execute_batch("create table _pyre_migrations(id integer primary key, schema text, finished_at integer, error text);").await.unwrap();
+        conn.execute(
+            "insert into _pyre_migrations(schema, finished_at) values (?, 1)",
+            libsql::params![source],
+        )
+        .await
+        .unwrap();
         let fingerprint = manifest.fingerprint();
         let bound = BoundManifest::new(manifest.clone(), &context).unwrap();
         let binding = BatchBinding {
@@ -323,17 +425,13 @@ pub async fn run_batch(
         "databaseEpoch": request.database_epoch, "namespace": request.namespace,
         "manifest": request.manifest, "status": "confirmed", "results": []
     });
-    if prepared.is_empty() {
-        return Ok(BatchResult {
-            response,
-            affected_rows: Vec::new(),
-        });
-    }
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
         .map_err(Error::Database)?;
     let execution = async {
+        manifest.verify_transaction(&tx, binding.namespace, &[]).await
+            .map_err(|_| Error::InvalidInput("persisted schema contract mismatch".into()))?;
         let mut databases = tx.query("PRAGMA database_list", ()).await.map_err(Error::Database)?;
         while let Some(database) = databases.next().await.map_err(Error::Database)? {
             let name = database.get::<String>(1).map_err(Error::Database)?;
@@ -346,6 +444,9 @@ pub async fn run_batch(
         let epoch = epoch.next().await.map_err(Error::Database)?.ok_or_else(|| Error::InvalidInput("missing database epoch".into()))?
             .get::<String>(0).map_err(Error::Database)?;
         if epoch != request.database_epoch { return Err(Error::InvalidInput("database epoch mismatch".into())); }
+        if prepared.is_empty() {
+            return Ok(BatchResult { response, affected_rows: Vec::new() });
+        }
         let mut results = Vec::new();
         let mut affected_rows = Vec::new();
         for (index, (query, args)) in prepared.iter().enumerate() {
@@ -384,10 +485,20 @@ pub async fn run_batch(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct QueryResult {
     pub response: JsonValue,
     pub affected_rows: Vec<AffectedRowTableGroup>,
+    // Only execution may mint this after checking persisted transaction authority.
+    // Default/externally assembled results can trigger invalidation, never row deltas.
+    execution_contract: Option<String>,
+}
+
+impl QueryResult {
+    pub(crate) fn matches_context(&self, context: &crate::typecheck::Context) -> bool {
+        self.execution_contract.as_deref()
+            == Some(crate::generate::manifest::compiled_schema_contract(context).as_str())
+    }
 }
 
 #[derive(Debug)]
@@ -416,6 +527,8 @@ struct ResultSet {
 /// This performs the same runtime transformations as the TypeScript server:
 /// JSON input serialization, omittable `__is_set` flags, session SQL args,
 /// response formatting, and `_affectedRows` extraction for live sync deltas.
+/// Attached databases must be attached by the trusted host under the generated
+/// namespace aliases. This API does not accept database paths from query inputs.
 pub async fn run(
     conn: &libsql::Connection,
     manifest: &Manifest,
@@ -471,6 +584,8 @@ pub async fn run_with_revision(
     run_inner(conn, manifest, query_id, input, &session, sync_mode, true).await
 }
 
+/// Diagnostic only: EXPLAIN does not execute the compiled operation or return
+/// application rows. Unlike execution, it may inspect an unmigrated database.
 pub async fn explain(
     conn: &libsql::Connection,
     manifest: &Manifest,
@@ -551,25 +666,52 @@ async fn run_inner(
         .queries
         .get(query_id)
         .ok_or_else(|| Error::UnknownQuery(query_id.to_string()))?;
-    let args = build_args(query, input, session)?;
+    let session = session
+        .revalidate(&manifest.session_schema)
+        .map_err(|error| Error::InvalidSession(error.to_string()))?;
+    let args = build_args(query, input, &session)?;
     let sql = if sync_mode {
         query.sync_sql.as_ref().unwrap_or(&query.sql)
     } else {
         &query.sql
     };
-
-    if query.operation == "query" {
-        return execute_generated_sql(conn, sql, &args, None)
-            .await
-            .map(|result| (result, None));
-    }
+    // Rust has no db_<namespace> path arguments. Use the host's attachments, not
+    // generated TS attachment bindings, and never change aliases after verification.
+    let sql = sql
+        .iter()
+        .filter_map(|statement| {
+            if !statement.include
+                && query.attached_dbs.iter().any(|namespace| {
+                    statement.sql == format!("attach $db_{namespace} as {namespace}")
+                })
+            {
+                return None;
+            }
+            let keyword = statement.sql.split_whitespace().next().unwrap_or("");
+            if keyword.eq_ignore_ascii_case("attach") || keyword.eq_ignore_ascii_case("detach") {
+                return Some(Err(Error::UnsupportedRuntime(
+                    "database attachments must be established by the host".into(),
+                )));
+            }
+            Some(Ok(statement.clone()))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
 
     let tx = conn
-        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .transaction_with_behavior(if query.operation == "query" {
+            libsql::TransactionBehavior::Deferred
+        } else {
+            libsql::TransactionBehavior::Immediate
+        })
         .await
         .map_err(|error| Error::Database(error).execution("begin transaction", None))?;
     let execution = async {
-        let result = execute_generated_sql(&tx, sql, &args, None).await?;
+        manifest
+            .verify_transaction(&tx, &query.primary_db, &query.attached_dbs)
+            .await
+            .map_err(|_| Error::InvalidInput("persisted schema contract mismatch".into()))?;
+        let mut result = execute_generated_sql(&tx, &sql, &args, None).await?;
+        result.execution_contract = Some(manifest.compiled_contract.clone());
         if commit_revision && query.generated_edit.is_none() {
             query
                 .result_schema
@@ -580,7 +722,7 @@ async fn run_inner(
                     Error::InvalidInput("named result does not match its compiled schema".into())
                 })?;
         }
-        let revision = if commit_revision {
+        let revision = if commit_revision && query.operation != "query" {
             let (database_epoch, revision) =
                 crate::server::sync::next_server_revision(&tx)
                     .await
@@ -671,6 +813,7 @@ async fn execute_generated_sql(
             format_response(&included_result_sets)?
         },
         affected_rows: extract_affected_rows(&included_result_sets)?,
+        execution_contract: None,
     })
 }
 

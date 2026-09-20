@@ -9,7 +9,7 @@ const { PyreClient, LocalEditsRuntime } = await import('../packages/client/src-t
 const { runWithSync, runBatchWithSync, LIVE_SYNC_DELIVERY_TIMEOUT_MS } = await import('../packages/server/query-sync.ts');
 const { run } = await import('../packages/server/query.ts');
 const { ensureDatabase, loadSchemaFromDatabase } = await import('../packages/server/schema.ts');
-const { default: initWasm } = await import('../packages/server/wasm/pyre_wasm.js');
+const { default: initWasm, get_schema_compiled_contract, get_schema_manifest_contract } = await import('../packages/server/wasm/pyre_wasm.js');
 await initWasm({ module_or_path: readFileSync(new URL('../packages/server/wasm/pyre_wasm_bg.wasm', import.meta.url)) });
 
 function deferred() {
@@ -149,6 +149,7 @@ test('schema refresh failure after commit preserves revision and requests catchu
   try {
     await ensureDatabase(db, 'Main', 'record Note {\n    @public\n    id Id.Uuid @id\n    body String\n}\n');
     await loadSchemaFromDatabase(directory, db);
+    const schemaContracts = { Main: get_schema_compiled_contract() };
     const transaction = db.transaction.bind(db);
     db.transaction = async mode => {
       const tx = await transaction(mode);
@@ -164,6 +165,7 @@ test('schema refresh failure after commit preserves revision and requests catchu
       return tx;
     };
     const query = { id: 'noop', operation: 'transaction', primary_db: 'Main',
+      attached_dbs: [], schemaContracts,
       InputValidator: z.object({}), SessionValidator: z.object({}), ReturnData: z.object({}),
       session_args: [], optional_input_args: [], json_input_args: [],
       sql: [{ include: false, params: [], sql: 'select 1' }],
@@ -200,6 +202,7 @@ test('named publication is ordered across handles for the same database ID', asy
     await ensureDatabase(first, 'Main', 'record Note {\n    @public\n    id Id.Uuid @id\n    body String\n}\n');
     await loadSchemaFromDatabase(directory, first);
     const query = { id: 'update', operation: 'transaction', primary_db: 'Main',
+      attached_dbs: [], schemaContracts: { Main: get_schema_compiled_contract() },
       InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({}),
       session_args: [], optional_input_args: [], json_input_args: [],
       sql: [
@@ -249,12 +252,14 @@ for (const fenced of [false, true]) for (const rejectRecovery of [false, true]) 
   try {
     await ensureDatabase(first, 'Main', 'record Note {\n    @public\n    id Id.Uuid @id\n    body String\n}\n');
     await loadSchemaFromDatabase(directory, first);
+    const schemaContracts = { Main: get_schema_compiled_contract() };
     const epoch = (await first.execute('select database_epoch from _pyre_sync')).rows[0].database_epoch;
     const registration = id => ({ session: {}, ...(fenced ? { fence: {
       ...fence, databaseId: directory, databaseEpoch: epoch, instance: id,
     } } : {}) });
     const recipients = new Map([['slow', registration('slow')], ['healthy', registration('healthy')]]);
     const query = { id: 'update', operation: 'transaction', primary_db: 'Main',
+      attached_dbs: [], schemaContracts,
       InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({}),
       session_args: [], optional_input_args: [], json_input_args: [],
       sql: [
@@ -330,9 +335,12 @@ for (const retire of [false, true]) test(`batch hints share named delivery (${re
   let pending;
   try {
     await ensureDatabase(db, 'Main', 'record Note {\n    @public\n    id Id.Uuid @id\n    body String\n}\n');
+    const schemaContracts = { Main: get_schema_compiled_contract() };
+    const compiledContract = get_schema_manifest_contract();
     const epoch = (await db.execute('select database_epoch from _pyre_sync')).rows[0].database_epoch;
     const authority = { databaseId: directory, instance: 'tab', authGeneration: 1, namespace: 'Main', manifest: 'm1' };
     const query = { id: 'noop', operation: 'transaction', primary_db: 'Main',
+      attached_dbs: [], schemaContracts,
       InputValidator: z.object({}), SessionValidator: z.object({}), ReturnData: z.object({}),
       session_args: [], optional_input_args: [], json_input_args: [],
       sql: [{ include: false, params: [], sql: 'select 1' }],
@@ -348,7 +356,8 @@ for (const retire of [false, true]) test(`batch hints share named delivery (${re
     t.mock.timers.tick(LIVE_SYNC_DELIVERY_TIMEOUT_MS);
     assert.equal((await pending).response.serverRevision, 1);
     const result = await runBatchWithSync(db,
-      { version: 1, manifestVersion: 'm1', SessionValidator: z.object({}), queries: { noop: query } }, authority,
+      { version: 1, manifestVersion: 'm1', compiledContract, replacementContracts: schemaContracts,
+        SessionValidator: z.object({}), queries: { noop: query } }, authority,
       { version: 1, ...authority, databaseEpoch: epoch, requestId: 'batch', sequence: 1,
         operations: [{ operation: 'noop', input: {} }] }, {}, recipients, send);
     assert.equal(result.response.commitRevision, 2);

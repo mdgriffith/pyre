@@ -267,13 +267,14 @@ test.skipIf(!process.env.PYRE_GENERATED_EDITS)('real generated builders use serv
   const { createClient } = await import('@libsql/client');
   const serverModule = '../../../server/query';
   const { runBatch } = await import(serverModule);
+  const { databases } = await import(process.env.PYRE_GENERATED_EDITS!.replace('edits.ts', 'databases.ts'));
+  const { default: initWasm } = await import('../../../server/wasm/pyre_wasm.js');
+  await initWasm({ module_or_path: readFileSync(new URL('../../../server/wasm/pyre_wasm_bg.wasm', import.meta.url)) });
   const sql = createClient({ url: `file:${temp}/generated.db` });
   try {
-    await sql.executeMultiple(`create table users(key text primary key, name text, note text, reviewer text, status blob, fixed text, updatedAt integer);
-      create table audits(id text primary key, message text, label text default 'audit', updatedAt integer);
-      create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer);
-      insert into users(key,name,note,fixed) values('${key}','base','server','x');
-      insert into _pyre_sync values(1,'e1',0);`);
+    await databases[Main.name].ensureDatabase(sql);
+    await sql.executeMultiple(`insert into users(key,name,note,fixed,updatedAt) values('${key}','base','server','x',0);
+      update _pyre_sync set database_epoch = 'e1', server_revision = 0 where id = 1;`);
     const generatedFence = { ...fence, namespace: Main.name, manifest: manifestVersion };
     const responses = [];
     const h = await ready({ fence: generatedFence, operations, prepare: async request => ({ dispatch: async () => {

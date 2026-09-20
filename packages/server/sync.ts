@@ -2,8 +2,8 @@ import { Client } from "@libsql/client";
 import * as wasm from "./wasm/pyre_wasm.js";
 import { normalizeForWasmJson } from "./wasm-json";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
-import { activateSchemaForDatabase } from "./schema";
-import { internalSafeInteger } from "./runtime/libsql";
+import { activateSchemaForDatabase, assertSchemaContracts, captureReplacementSchema } from "./schema";
+import { assertPersistentTransaction, internalSafeInteger } from "./runtime/libsql";
 
 export type SessionValue =
     | null
@@ -340,154 +340,170 @@ export async function catchup(
     const effectivePageSize = normalizePageSize(pageSize);
     validateSyncCursor(syncCursor);
     const wasmSession = normalizeForWasmJson(session);
+    const compiledContract = wasm.get_schema_compiled_contract();
+    const schema = captureReplacementSchema(databaseId, compiledContract);
 
-    // Step 1: Get sync status SQL
-    const statusStatement = wasm.get_sync_status_sql(syncCursor, wasmSession);
-    if (typeof statusStatement === "string" && statusStatement.startsWith("Error:")) {
-        throw new Error(statusStatement);
-    }
-    const statusSql = typeof statusStatement === "string" ? statusStatement : statusStatement.sql;
-    const statusParams = typeof statusStatement === "string" ? [] : normalizeParams(statusStatement.params);
+    await assertPersistentTransaction(db);
+    const tx = await db.transaction("read");
+    try {
+        // Schema authority, status and rows must all belong to the same snapshot.
+        await assertSchemaContracts(tx, { main: compiledContract }, "main");
+        schema.restore();
+        // Step 1: Get sync status SQL
+        const statusStatement = wasm.get_sync_status_sql(syncCursor, wasmSession);
+        if (typeof statusStatement === "string" && statusStatement.startsWith("Error:")) {
+            throw new Error(statusStatement);
+        }
+        const statusSql = typeof statusStatement === "string" ? statusStatement : statusStatement.sql;
+        const statusParams = typeof statusStatement === "string" ? [] : normalizeParams(statusStatement.params);
 
-    // Step 2: Execute sync status SQL
-    const statusResult = await db.execute(statusParams.length > 0 ? { sql: statusSql, args: statusParams } : statusSql);
-    const rawServerRevision = statusResult.rows[0]?.server_revision;
-    const serverRevision = typeof rawServerRevision === "number" || typeof rawServerRevision === "bigint"
-        ? Number(rawServerRevision)
-        : null;
-    const rawDatabaseEpoch = statusResult.rows[0]?.database_epoch;
-    if (typeof rawDatabaseEpoch !== "string" || rawDatabaseEpoch.length === 0) {
-        throw new Error("Missing database_epoch in _pyre_sync");
-    }
-    const databaseEpoch = rawDatabaseEpoch;
-    if (clientDatabaseEpoch !== undefined && clientDatabaseEpoch !== databaseEpoch) {
-        return {
-            type: "reset",
+        // Step 2: Execute sync status SQL
+        const statusResult = await tx.execute(statusParams.length > 0 ? { sql: statusSql, args: statusParams } : statusSql);
+        const rawServerRevision = statusResult.rows[0]?.server_revision;
+        const serverRevision = typeof rawServerRevision === "number" || typeof rawServerRevision === "bigint"
+            ? Number(rawServerRevision)
+            : null;
+        const rawDatabaseEpoch = statusResult.rows[0]?.database_epoch;
+        if (typeof rawDatabaseEpoch !== "string" || rawDatabaseEpoch.length === 0) {
+            throw new Error("Missing database_epoch in _pyre_sync");
+        }
+        const databaseEpoch = rawDatabaseEpoch;
+        if (clientDatabaseEpoch !== undefined && clientDatabaseEpoch !== databaseEpoch) {
+            return {
+                type: "reset",
+                ...(databaseId ? { databaseId: requireDatabaseId(databaseId) } : {}),
+                databaseEpoch,
+                operation: "replace",
+                scope: "database",
+                reason: "database_epoch_changed",
+            };
+        }
+
+        // Step 3: Get sync SQL for tables that need syncing
+        schema.restore();
+        const syncSqlResult = wasm.get_sync_sql(statusResult.rows, syncCursor, wasmSession, effectivePageSize);
+        if (typeof syncSqlResult === "string" && syncSqlResult.startsWith("Error:")) {
+            throw new Error(syncSqlResult);
+        }
+
+        const sqlResult =
+            typeof syncSqlResult === "string"
+                ? JSON.parse(syncSqlResult)
+                : syncSqlResult;
+
+        const result: SyncPageResult = {
             ...(databaseId ? { databaseId: requireDatabaseId(databaseId) } : {}),
             databaseEpoch,
-            operation: "replace",
-            scope: "database",
-            reason: "database_epoch_changed",
+            tables: {},
+            has_more: false,
         };
-    }
 
-    // Step 3: Get sync SQL for tables that need syncing
-    const syncSqlResult = wasm.get_sync_sql(statusResult.rows, syncCursor, wasmSession, effectivePageSize);
-    if (typeof syncSqlResult === "string" && syncSqlResult.startsWith("Error:")) {
-        throw new Error(syncSqlResult);
-    }
-
-    const sqlResult =
-        typeof syncSqlResult === "string"
-            ? JSON.parse(syncSqlResult)
-            : syncSqlResult;
-
-    const result: SyncPageResult = {
-        ...(databaseId ? { databaseId: requireDatabaseId(databaseId) } : {}),
-        databaseEpoch,
-        tables: {},
-        has_more: false,
-    };
-
-    if (!Array.isArray(sqlResult.tables) || sqlResult.tables.length === 0) {
-        if (serverRevision !== null) {
-            result.serverRevision = serverRevision;
+        if (!Array.isArray(sqlResult.tables) || sqlResult.tables.length === 0) {
+            if (serverRevision !== null) {
+                result.serverRevision = serverRevision;
+            }
+            return result;
         }
-        return result;
-    }
 
-    // Collect all SQL statements for batch execution
-    const allSqlStatements: any[] = [];
-    for (const tableSql of sqlResult.tables) {
-        for (let index = 0; index < tableSql.sql.length; index += 1) {
-            const params = normalizeParams(tableSql.params?.[index]);
-            allSqlStatements.push(params.length > 0
-                ? { sql: tableSql.sql[index], args: params }
-                : tableSql.sql[index]
-            );
+        // Collect all SQL statements for batch execution
+        const allSqlStatements: any[] = [];
+        for (const tableSql of sqlResult.tables) {
+            for (let index = 0; index < tableSql.sql.length; index += 1) {
+                const params = normalizeParams(tableSql.params?.[index]);
+                allSqlStatements.push(params.length > 0
+                    ? { sql: tableSql.sql[index], args: params }
+                    : tableSql.sql[index]
+                );
+            }
         }
-    }
 
-    // Execute all SQL statements in a single batch
-    const allQueryResults = await db.batch(allSqlStatements);
+        // Execute all SQL statements in a single batch
+        const allQueryResults = await tx.batch(allSqlStatements);
 
-    // Process results for each table
-    let resultIndex = 0;
-    for (const tableSql of sqlResult.tables) {
-        const updatedAtIndex = tableSql.headers.indexOf("updatedAt");
-        const jsonColumns = new Set<string>(tableSql.json_columns ?? []);
-        const tableRows: any[] = [];
-        let maxUpdatedAt: number | null = null;
+        // Process results for each table
+        schema.restore();
+        let resultIndex = 0;
+        for (const tableSql of sqlResult.tables) {
+            const updatedAtIndex = tableSql.headers.indexOf("updatedAt");
+            const jsonColumns = new Set<string>(tableSql.json_columns ?? []);
+            const tableRows: any[] = [];
+            let maxUpdatedAt: number | null = null;
 
-        for (let sqlIndex = 0; sqlIndex < tableSql.sql.length; sqlIndex += 1) {
-            const queryResult = allQueryResults[resultIndex++];
-            const columns = queryResult.columns?.[0] === SYNC_ROWS_JSON_COLUMN
-                ? tableSql.headers
-                : queryResult.columns;
-            const rows = rowsFromSyncQueryResult(queryResult, tableSql.headers);
+            for (let sqlIndex = 0; sqlIndex < tableSql.sql.length; sqlIndex += 1) {
+                const queryResult = allQueryResults[resultIndex++];
+                const columns = queryResult.columns?.[0] === SYNC_ROWS_JSON_COLUMN
+                    ? tableSql.headers
+                    : queryResult.columns;
+                const rows = rowsFromSyncQueryResult(queryResult, tableSql.headers);
 
-            for (const row of rows) {
-                const rowObject: Record<string, any> = {};
-                for (const column of columns) {
-                    const value = row[column];
-                    rowObject[column] = jsonColumns.has(column)
-                        ? parseJsonColumnValue(value)
-                        : value;
-                }
-                tableRows.push(rowObject);
+                for (const row of rows) {
+                    const rowObject: Record<string, any> = {};
+                    for (const column of columns) {
+                        const value = row[column];
+                        rowObject[column] = jsonColumns.has(column)
+                            ? parseJsonColumnValue(value)
+                            : value;
+                    }
+                    tableRows.push(rowObject);
 
-                if (updatedAtIndex >= 0 && rowObject.updatedAt !== null && rowObject.updatedAt !== undefined) {
-                    const updatedAt = coerceUnixSeconds(rowObject.updatedAt);
-                    if (maxUpdatedAt === null || updatedAt > maxUpdatedAt) {
-                        maxUpdatedAt = updatedAt;
+                    if (updatedAtIndex >= 0 && rowObject.updatedAt !== null && rowObject.updatedAt !== undefined) {
+                        const updatedAt = coerceUnixSeconds(rowObject.updatedAt);
+                        if (maxUpdatedAt === null || updatedAt > maxUpdatedAt) {
+                            maxUpdatedAt = updatedAt;
+                        }
                     }
                 }
             }
-        }
 
-        const hasMoreForTable = tableRows.length > effectivePageSize;
-        const finalRows = hasMoreForTable ? tableRows.slice(0, effectivePageSize) : tableRows;
-        const lastRow = finalRows[finalRows.length - 1];
-        let lastSeenPrimaryKey: SyncPrimaryKey | null = null;
+            const hasMoreForTable = tableRows.length > effectivePageSize;
+            const finalRows = hasMoreForTable ? tableRows.slice(0, effectivePageSize) : tableRows;
+            const lastRow = finalRows[finalRows.length - 1];
+            let lastSeenPrimaryKey: SyncPrimaryKey | null = null;
 
-        if (lastRow) {
-            maxUpdatedAt = coerceUnixSeconds(lastRow.updatedAt);
-            lastSeenPrimaryKey = coercePrimaryKey(lastRow[tableSql.primary_key]);
-        }
-
-        const reshapedGroup = reshapeSyncTableGroups([
-            {
-                table_name: tableSql.table_name,
-                headers: tableSql.headers,
-                rows: finalRows.map((row) => tableSql.headers.map((header: string) => row[header] ?? null)),
-            },
-        ])[0];
-
-        const reshapedRows = (reshapedGroup?.rows || []).map((row) => {
-            const rowObject: Record<string, unknown> = {};
-
-            for (let index = 0; index < reshapedGroup.headers.length; index += 1) {
-                rowObject[reshapedGroup.headers[index]] = row[index] ?? null;
+            if (lastRow) {
+                maxUpdatedAt = coerceUnixSeconds(lastRow.updatedAt);
+                lastSeenPrimaryKey = coercePrimaryKey(lastRow[tableSql.primary_key]);
             }
 
-            return rowObject;
-        });
+            const reshapedGroup = reshapeSyncTableGroups([
+                {
+                    table_name: tableSql.table_name,
+                    headers: tableSql.headers,
+                    rows: finalRows.map((row) => tableSql.headers.map((header: string) => row[header] ?? null)),
+                },
+            ])[0];
 
-        result.tables[tableSql.table_name] = {
-            rows: reshapedRows,
-            permission_hash: tableSql.permission_hash,
-            last_seen_updated_at: maxUpdatedAt,
-            last_seen_primary_key: lastSeenPrimaryKey,
-        };
+            const reshapedRows = (reshapedGroup?.rows || []).map((row) => {
+                const rowObject: Record<string, unknown> = {};
 
-        if (hasMoreForTable) {
-            result.has_more = true;
+                for (let index = 0; index < reshapedGroup.headers.length; index += 1) {
+                    rowObject[reshapedGroup.headers[index]] = row[index] ?? null;
+                }
+
+                return rowObject;
+            });
+
+            result.tables[tableSql.table_name] = {
+                rows: reshapedRows,
+                permission_hash: tableSql.permission_hash,
+                last_seen_updated_at: maxUpdatedAt,
+                last_seen_primary_key: lastSeenPrimaryKey,
+            };
+
+            if (hasMoreForTable) {
+                result.has_more = true;
+            }
         }
-    }
 
-    if (serverRevision !== null) {
-        result.serverRevision = serverRevision;
-    }
+        if (serverRevision !== null) {
+            result.serverRevision = serverRevision;
+        }
 
-    return result;
+        return result;
+    } finally {
+        try {
+            if (!tx.closed) await tx.rollback();
+        } catch { /* Read-only cleanup must not mask replacement-required errors. */ }
+        try { tx.close(); } catch { /* Read transaction only. */ }
+    }
 }

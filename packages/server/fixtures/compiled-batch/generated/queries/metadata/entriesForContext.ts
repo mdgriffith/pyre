@@ -25,6 +25,7 @@ export type Result = z.infer<typeof ReturnData>;
 
 export const meta = {
   id: "f4bdfe31e86b76b72c4e56c135ad7383af79e1aa9613b9301ac79f2a9f08a115",
+  schemaContracts: {"_default":"c8621ce5b5d01bde643f5a677495ad77b36dce46298214721d6895ab1258c01d"},
   primary_db: "_default",
   attached_dbs: [],
   operation: "query" as const,

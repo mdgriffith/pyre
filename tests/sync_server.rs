@@ -44,11 +44,40 @@ record Job {
 }
 "#;
 
-fn query_result(affected_rows: Vec<AffectedRowTableGroup>) -> QueryResult {
-    QueryResult {
-        response: json!({}),
-        affected_rows,
-    }
+async fn query_result(
+    db: &TestDatabase,
+    affected_rows: Vec<AffectedRowTableGroup>,
+) -> Result<QueryResult, Box<dyn std::error::Error>> {
+    // Exercise shaping with synthetic affected rows, but obtain authority through
+    // real execution instead of manufacturing a publication contract in tests.
+    let table = db.context.tables.keys().next().unwrap();
+    let queries = pyre::parser::parse_query(
+        "test.pyre",
+        &format!("query Authority {{ {table} {{ id }} }}"),
+    )
+    .unwrap();
+    let info = pyre::typecheck::check_queries(&queries, &db.context).unwrap();
+    let mut files = Vec::new();
+    pyre::generate::manifest::generate_queries(&db.context, &queries, &info, &mut files);
+    let manifest: pyre::server::manifest::Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|file| file.path.ends_with("manifest.json"))
+            .unwrap()
+            .contents,
+    )?;
+    let session = PyreSession::new(json!({"userId":1,"gameIds":[]}), &manifest.session_schema)?;
+    let mut result = pyre::server::query::run(
+        &db.db.connect()?,
+        &manifest,
+        manifest.queries.keys().next().unwrap(),
+        json!({}),
+        &session,
+    )
+    .await?;
+    result.response = json!({});
+    result.affected_rows = affected_rows;
+    Ok(result)
 }
 
 #[tokio::test]
@@ -579,10 +608,9 @@ record Workspace {
         revision: 1,
     };
     for groups in [affected.clone(), vec![]] {
-        let mut result = QueryResult {
-            response: json!({"named":[]}),
-            affected_rows: groups,
-        };
+        let mut result = QueryResult::default();
+        result.response = json!({"named":[]});
+        result.affected_rows = groups;
         let messages = server.calculate_committed_deltas(
             &mut result,
             &sessions,
@@ -607,10 +635,9 @@ record Workspace {
             .get::<i64>(0)?,
         1
     );
-    let mut legacy = QueryResult {
-        response: json!({"named":[]}),
-        affected_rows: affected,
-    };
+    let mut legacy = QueryResult::default();
+    legacy.response = json!({"named":[]});
+    legacy.affected_rows = affected;
     let messages = server
         .calculate_deltas(&conn, &mut legacy, &sessions, "main", None)
         .await?;
@@ -1333,7 +1360,7 @@ record Event {
         ("origin".to_string(), SyncSession::new()),
         ("recipient".to_string(), SyncSession::new()),
     ]);
-    let mut result = query_result(affected_rows);
+    let mut result = query_result(&db, affected_rows).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(
             &conn,
@@ -1420,7 +1447,7 @@ record Note {
         ("b".to_string(), SyncSession::new()),
     ]);
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -1468,8 +1495,8 @@ record Note {
     ]);
     let server = SyncServer::new(&db.context);
 
-    let mut first_result = query_result(affected_rows.clone());
-    let mut second_result = query_result(affected_rows);
+    let mut first_result = query_result(&db, affected_rows.clone()).await?;
+    let mut second_result = query_result(&db, affected_rows).await?;
     let first = server
         .calculate_deltas(&conn, &mut first_result, &connected_sessions, "main", None)
         .await?;
@@ -1651,7 +1678,7 @@ record Note {
         ),
     ]);
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -1707,7 +1734,7 @@ record Game {
         ),
     ]);
 
-    let mut result = query_result(affected_rows);
+    let mut result = query_result(&db, affected_rows).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -1765,7 +1792,7 @@ record Map {
     }];
     let connected_sessions = ConnectedSessions::from([("a".to_string(), SyncSession::new())]);
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -1819,8 +1846,8 @@ record Note {
     let connected_sessions = ConnectedSessions::from([("a".to_string(), SyncSession::new())]);
 
     let server = SyncServer::new(&db.context);
-    let mut empty_result = query_result(Vec::new());
-    let mut no_sessions_result = query_result(affected_rows);
+    let mut empty_result = query_result(&db, Vec::new()).await?;
+    let mut no_sessions_result = query_result(&db, affected_rows).await?;
     assert!(server
         .calculate_deltas(&conn, &mut empty_result, &connected_sessions, "main", None)
         .await?
@@ -1879,7 +1906,7 @@ insert CreateNote($id: Note.id, $body: String) {
         ("b".to_string(), SyncSession::new()),
     ]);
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -1930,7 +1957,7 @@ record Note {
     }];
     let connected_sessions = ConnectedSessions::from([("a".to_string(), SyncSession::new())]);
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -1973,7 +2000,7 @@ record Note {
     let server = SyncServer::new(&db.context);
     let connected_sessions = ConnectedSessions::from([("a".to_string(), SyncSession::new())]);
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = server
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -2014,7 +2041,7 @@ record Note {
         .map(|index| (format!("s{}", index), SyncSession::new()))
         .collect::<ConnectedSessions>();
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -2085,7 +2112,7 @@ update UpdateNote($id: Note.id) {
         ),
     ]);
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
@@ -2154,7 +2181,7 @@ delete RemoveNote($id: Note.id) {
         ),
     ]);
 
-    let mut result = query_result(affected_rows.clone());
+    let mut result = query_result(&db, affected_rows.clone()).await?;
     let messages = SyncServer::new(&db.context)
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;

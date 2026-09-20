@@ -5,6 +5,7 @@ Server runtime helpers for executing generated Pyre queries.
 Typical usage:
 
 - import generated `queries` map from `pyre/generated/typescript/server`
+- initialize `@pyre/server/wasm` with `await init()` before execution
 - initialize schema-specific databases through the generated `databases` map
 - execute with `run` from `@pyre/server/query`
 - seed fixture data with the generated `seed` helper from `pyre/generated/typescript/seed`
@@ -52,6 +53,32 @@ that do not already contain Pyre migration metadata.
 
 ## Compiled Batches
 
+### Persisted Schema Authority
+
+All compiled execution paths in Rust and TypeScript (batches, named queries and
+mutations, replacement, and legacy catchup) compare parsed semantic compiler
+contracts against the latest successful migration in `_pyre_migrations`, inside
+the same transaction and before application SQL. Reads use a pinned snapshot;
+writes hold the write lock through execution and commit. Comments-only schema
+changes remain compatible. Missing migration authority, null/invalid schema
+source, or incompatible contracts fail closed; failed and unfinished migrations
+are ignored, not used as authority.
+
+Schema caches and bind-time checks are early configuration checks, never execution
+authority. Migrations must atomically record schema source with their changes.
+Direct SQL and legacy seed helpers are trusted maintenance/setup interfaces,
+outside this compiled permission-enforcing boundary.
+
+TypeScript `run` and `toRunner` (including generated query functions) now require
+initialized `@pyre/server/wasm` and regenerated `schemaContracts` metadata for
+every primary/attached namespace. There is no missing-metadata fallback. Regenerate
+named query artifacts before rollout, alongside the compiler/runtime upgrade.
+Rust named queries require trusted host preattachments; generated `ATTACH`
+directives are skipped rather than choosing database handles. The TypeScript
+attached runtime still has no binding API; this does not add attachment support.
+
+### Execution
+
 `runBatch` from `@pyre/server/query` is the server execution boundary for an
 ordered list of allowlisted compiled operations. It also supports server seed
 submissions with an explicit validated session, without the permission-bypassing
@@ -59,7 +86,8 @@ legacy seed helper. It does not implement client builders or transport routing.
 
 ```ts
 const result = await runBatch(database, {
-  version: 1, manifestVersion, queries, SessionValidator: Decode.SessionValidator,
+  version: 1, manifestVersion, compiledContract, replacementContracts,
+  queries, SessionValidator: Decode.SessionValidator,
 }, {
   databaseId: "tenant-1", namespace: "Main", manifest: manifestVersion,
   instance: "tab-1", authGeneration: 2,
@@ -70,10 +98,11 @@ const result = await runBatch(database, {
 }, effectiveSession);
 ```
 
-The manifest and authority arguments are trusted server configuration. Generated
-manifests carrying compiled contracts additionally require the exact `Client` to
-have completed generated `ensureDatabase` or `loadSchemaFromDatabase`; `runBatch`
-rechecks that schema evidence before execution. Resolve
+The manifest and authority arguments are trusted server configuration. Manifests
+must include generated `compiledContract` and namespace `replacementContracts`.
+The exact `Client` must have completed generated `ensureDatabase` or
+`loadSchemaFromDatabase` for the early configuration check; `runBatch` then checks
+persisted authority inside the transaction, even for empty batches. Resolve
 the actual connection, database ID, namespace, manifest fingerprint, client
 instance and auth generation independently of the request. The manifest's
 `version: 1` is its format version, not the fingerprint in the authority/request
@@ -84,14 +113,14 @@ Database IDs must uniquely identify databases in
 this process; batch execution is queued by that ID. The queue does not serialize
 legacy runners, other processes, or other writers; SQLite provides transaction
 isolation. The database must already have its `_pyre_sync` metadata.
-Use a file-backed or remote libsql database for nonempty batches. The local
+Use a file-backed or remote libsql database for batches, including empty ones. The local
 adapter detaches its connection during `transaction()`, so `runBatch` checks
 the public `Client.protocol` and SQLite's `PRAGMA database_list` before opening
 a local transaction. Local databases without a nonempty `main.file` are rejected
 with sanitized `TransactionFailed`, without detachment, writes, revision allocation,
 or publication. This conservatively includes private/shared in-memory and temporary
-databases; no configuration flag bypasses the check. Empty batches still confirm
-without database I/O. The check is not cached. Remote clients retain their existing
+databases; no configuration flag bypasses the check. Empty batches check persisted
+authority and epoch in a transaction. The check is not cached. Remote clients retain their existing
 transaction path. This guard does not protect calls made directly to the adapter's
 `transaction()` outside this executor.
 
@@ -111,7 +140,8 @@ including rejection of fields removed by strip-mode codecs. Canonical tag-only
 enum objects are allowed to decode to strings, but extra fields still reject.
 A query's `primary_db` must equal the trusted `namespace`; attachments are rejected.
 Only compiled `insert`, `update`, `delete`, or `transaction` operations are allowed.
-An empty batch returns an empty result without I/O or publication.
+An empty batch returns an empty result after transactional validation, without
+revision allocation or publication.
 
 Compiler metadata uses:
 
@@ -160,8 +190,8 @@ postcommit replacement hints without allocating another revision or requiring
 origin registration. Routing must authenticate the trusted instance/auth binding,
 bound the raw body before JSON decoding, wrap errors with the request fence,
 and supply only authorized recipients for
-the bound database. Existing named-single `run`, `toRunner`, and `runWithSync`
-contracts are unchanged.
+the bound database. Named-single `run`, `toRunner`, and `runWithSync` also enforce
+the persisted schema authority requirements above.
 
 Actual compiler fixtures live under `fixtures/compiled-batch`; regenerate them
 with `bun packages/server/fixtures/compiled-batch/regenerate.ts` after building
@@ -204,12 +234,13 @@ configuration or a session rejected by the full compiled `SessionValidator`
 throws synchronously. Unrecognized application claims confer no permissions.
 The same exact `Client` must first be passed to generated `ensureDatabase` or
 `loadSchemaFromDatabase`. Binding checks its captured schema against the selected
-namespace replacement contract and the required generated `compiledContract` once.
+namespace replacement contract and the required generated `compiledContract` once
+as an early configuration check, not as continuing execution authority.
 
 Binding captures session and compiled execution metadata. Submission captures
 inputs, operation IDs, decoders, and result assembly before its first await.
-Nonempty submissions then read the database epoch and call `runBatchWithSync`. The executor checks the
-epoch again inside the write transaction, enforces the compiled namespace and
+Nonempty submissions call `runBatchWithSync`. The executor reads the epoch and
+checks persisted schema authority inside the write transaction, enforces the compiled namespace and
 manifest allowlist, and rejects attachments. A nonempty batch uses exactly one
 atomic write transaction, including its sync revision. Generated CRUD requires
 exactly one authorized direct write per operation; named commands retain their
@@ -236,9 +267,11 @@ an explicit branded UUID, or the generated `seed` helper for setup/import workfl
   failed. This outcome deliberately contains no `result`, partial results, or raw
   executor response. Never replay it as a rejected write.
 
-Empty batches return exactly `{ kind: "confirmed", result: [] }` after local
+The local binding's empty plans return exactly `{ kind: "confirmed", result: [] }` after local
 scope validation, without calling the executor, reading the database epoch, doing
 any database I/O or transport, allocating a revision, or publishing state.
+This is not an authority check: empty requests sent to `runBatch` instead require
+transactional authority and epoch validation.
 
 Server-specific edge limitation: `acceptedUnreconciled` here denotes committed
 writes whose typed result could not be materialized, not browser-cache catchup.
@@ -292,9 +325,9 @@ A successful response has `type: "replacement"`, `scope: "database"`,
 the request's fences, ID, and target. All rows and the revision are read in one
 transaction. Install the whole scope atomically, deleting absent rows; an empty
 scope is not a no-op. Legacy timestamp catchup pages are not replacement evidence.
-The namespace's generated replacement contract must match the captured schema.
-Its schema source must also match the successful migration recorded inside the
-same read snapshot. A migration before snapshot acquisition rejects stale
+The namespace's generated replacement contract must match the captured schema
+and the parsed semantic contract of the latest successful migration inside the
+same read snapshot, not its byte-for-byte source text. A migration before snapshot acquisition rejects stale
 permission evidence; an already-pinned snapshot remains isolated from later
 migrations and cache refreshes. Malformed stored rows reject the entire snapshot.
 Synced linked read permissions require
@@ -313,6 +346,10 @@ When delivery resumes, that hint requests authoritative catchup before normal ro
 deltas resume. A rejected recovery hint is retained for the next publication;
 neither writes nor uncertain row deltas are retried. Batch publication shares this
 ordering without delaying batch acceptance.
+
+Legacy row publication requires the publisher's permission contract to match the
+verified execution contract. A stale cache cannot authorize row deltas; publication
+falls back to row-free hints when that match cannot be established.
 
 Keep registration objects stable for their connection lifetime and replace them
 on reconnect or authentication changes. Deferred delivery checks the current
@@ -351,6 +388,19 @@ npm exec --package=bun -- bun packages/server/fixtures/replacement-wasm.ts
 The focused query-sync suite runs this fixture when the ignored WASM artifact
 is present and explicitly skips it otherwise. Mocked WASM unit tests alone do
 not establish generated-schema conformance.
+
+Focused security coverage (executable references, not a blanket conformance claim):
+
+| Boundary | Fixture or test |
+| --- | --- |
+| Stale handles; revoked/missing/null/invalid authority; comments; failed/unfinished migrations; write ordering; legacy publication | [`fixtures/schema-authority.ts`](fixtures/schema-authority.ts), run by `schema-authority.test.ts`; Rust `persisted_authority_rejects_stale_handles_without_cache_refresh` and `publication_requires_execution_contract_not_cached_permissions` in `tests/query_server.rs` |
+| Generated runner reads/writes and required metadata | [`fixtures/runner-schema.ts`](fixtures/runner-schema.ts), run by `runner.test.ts` |
+| Empty executor batches and pre-acquisition memory guard | `query.test.ts`: `empty batch validates persisted authority without revision or publication`, `memory batches reject before detachment, including valid writes, empty batches and stale epochs` |
+| Replacement snapshot/migration ordering | [`fixtures/replacement-wasm.ts`](fixtures/replacement-wasm.ts): `beforeSnapshot` / `afterSnapshot` scenarios |
+| Trusted Rust attachments | `tests/query_server.rs`: `generated_attachment_directives_use_verified_host_handles` |
+
+The real-WASM test wrappers skip when the WASM artifact is absent. Remote libSQL
+is not established by these local SQLite fixtures.
 
 Write codecs are separate from permissive read-projection codecs. Both runtimes
 require safe integers, canonical boolean inputs, and complete structured variants

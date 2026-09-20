@@ -86,6 +86,7 @@ fn to_entity_stream_module(
     result.push_str(")\n\n\n");
     result.push_str("{-| Register and decode entity stream batches.\n\n    pyreStoreOut\n        (register databaseId\n            \"visible-posts\"\n            [ Posts.stream\n                |> Posts.idIn visiblePostIds\n                |> post\n            ]\n        )\n\n    decodeIncomingBatch value\n\n@docs DatabaseId, StreamId, EntitySubscription, EntityChange, EntityChangeBatch, EntityChangeBatchSource, register, unregister, decodeIncomingBatch\n\n-}\n\n");
     result.push_str("import Db.Database\n");
+    result.push_str("import Db.Id\n");
     result.push_str(&format!(
         "import {} as StreamInternal\n",
         entity_stream_internal_module_name(schema, namespace)

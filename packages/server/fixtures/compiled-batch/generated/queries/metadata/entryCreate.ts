@@ -41,6 +41,7 @@ export type Result = z.infer<typeof ReturnData>;
 
 export const meta = {
   id: "d7fba8953361803f515b8d6eb046b632ed3151ef777dcf1b33bac104b8cc5de5",
+  schemaContracts: {"_default":"c8621ce5b5d01bde643f5a677495ad77b36dce46298214721d6895ab1258c01d"},
   generatedEdit: { kind: "create" as const, createUuidInput: "id", writeStatementIndices: [0], writableInputs: ["id","release","enabled","count","role","details"] },
   primary_db: "_default",
   attached_dbs: [],

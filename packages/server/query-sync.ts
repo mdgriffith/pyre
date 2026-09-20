@@ -4,12 +4,13 @@ import { MAX_REPLACEMENT_PAYLOAD_BYTES, readReplacementTables } from "./sync";
 import * as wasm from "./wasm/pyre_wasm.js";
 import { normalizeForWasmJson } from "./wasm-json";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
-import { assertSupportedIntegerMode, internalSafeInteger } from "./runtime/libsql";
-import { activateSchemaForDatabase, captureReplacementSchema } from "./schema";
+import { assertPersistentTransaction, assertSupportedIntegerMode, internalSafeInteger } from "./runtime/libsql";
+import { assertSchemaContracts, captureReplacementSchema } from "./schema";
 import {
   run,
   runBatch,
   nextLiveSyncRevision,
+  executionSchemaContract,
   type BatchAuthority,
   type BatchManifest,
   type BatchRequest,
@@ -63,6 +64,7 @@ export async function catchupReplacement(
   let captured: ReplacementRequest;
   let session: Session;
   let schema: ReturnType<typeof captureReplacementSchema>;
+  let contracts: Readonly<Record<string, string>>;
   try {
     captured = replacementRequestValidator.parse(structuredClone(request));
     if (manifest.version !== 1 || manifest.manifestVersion !== authority.manifest
@@ -71,16 +73,13 @@ export async function catchupReplacement(
     const decoded = manifest.SessionValidator.safeParse(structuredClone(executingSession));
     if (!decoded.success) return failure("InvalidSession");
     session = decoded.data;
-    schema = captureReplacementSchema(captured.databaseId, manifest.replacementContracts?.[authority.namespace]!);
+    contracts = { [captured.namespace]: manifest.replacementContracts?.[captured.namespace]! };
+    schema = captureReplacementSchema(captured.databaseId, contracts[captured.namespace]);
   } catch { return failure("InvalidRequest"); }
 
   let tx: Awaited<ReturnType<Client["transaction"]>> | undefined;
   try {
-    // The file adapter detaches transaction connections, losing in-memory databases.
-    if (db.protocol === "file") {
-      const databases = await db.execute("pragma database_list");
-      if (!databases.rows.find(row => row.name === "main")?.file) return failure("ReplacementUnavailable");
-    }
+    await assertPersistentTransaction(db);
     await assertSupportedIntegerMode(db);
     tx = await db.transaction("read");
     const databases = await tx.execute("pragma database_list");
@@ -91,8 +90,8 @@ export async function catchupReplacement(
     if (revision < captured.target) return failure("ReplacementUnavailable");
     // Permission evidence and rows must belong to the same snapshot, not just
     // to the same cache entry before asynchronous transaction acquisition.
-    const migration = (await tx.execute("SELECT schema FROM _pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL AND schema IS NOT NULL ORDER BY id DESC LIMIT 1")).rows[0];
-    if (migration?.schema !== schema.schemaSource) return failure("InvalidRequest");
+    try { await assertSchemaContracts(tx, contracts, captured.namespace); }
+    catch { return failure("InvalidRequest"); }
     const tables = await readReplacementTables(tx, session, captured.namespace, schema.restore);
     // Bound wire materialization without ever turning truncation into completeness.
     if (new TextEncoder().encode(JSON.stringify(tables)).byteLength > MAX_REPLACEMENT_PAYLOAD_BYTES)
@@ -324,8 +323,12 @@ function syncWithWasmForDatabase(
       ]),
     );
     let result: any;
+    let schema: ReturnType<typeof captureReplacementSchema>;
     try {
-      activateSchemaForDatabase(normalizedDatabaseId);
+      const contract = committedRevision && executionSchemaContract(committedRevision);
+      if (!contract) throw new Error("Missing execution schema authority");
+      schema = captureReplacementSchema(normalizedDatabaseId, contract);
+      schema.restore();
       const deltasResult = wasm.calculate_sync_deltas(
         affectedRowGroups,
         normalizeSessions(broadcastSessions),
@@ -351,6 +354,7 @@ function syncWithWasmForDatabase(
     for (const group of Array.isArray(result.groups) ? result.groups : []) {
       let data: any;
       try {
+        schema.restore();
         const reshapedTableGroupsResult = wasm.reshape_sync_table_groups(normalizeForWasmJson(group.table_groups));
         if (typeof reshapedTableGroupsResult === "string" && reshapedTableGroupsResult.startsWith("Error:")) {
           throw new Error(reshapedTableGroupsResult);
@@ -389,6 +393,7 @@ function syncWithWasmForDatabase(
     let originMessage: unknown;
     if (originSession) {
       try {
+        schema.restore();
         const originDeltasResult = wasm.calculate_sync_deltas(
           affectedRowGroups,
           normalizeSessions(originSession),

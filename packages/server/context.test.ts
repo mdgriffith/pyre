@@ -1,8 +1,5 @@
 import { expect, mock, test } from "bun:test";
-import { createClient, type Client } from "@libsql/client";
-import { z } from "zod";
 import { createContextManager, type ContextConfig } from "./context";
-import { run, type QueryMap } from "./query";
 
 class Login {
     constructor(readonly id: string) {}
@@ -238,34 +235,11 @@ test("database lookup is per run, no connection ownership, and ordinary callback
 });
 
 test("native libsql ordinary query.run adapter is application-owned", async () => {
-    const db = createClient({ url: "file::memory:" });
-    try {
-        await db.execute("create table notes (body text, role text)");
-        const queries: QueryMap = {
-            insert: {
-                id: "insert", session_args: ["role"], optional_input_args: [], json_input_args: [],
-                InputValidator: z.object({ body: z.string() }), SessionValidator: z.object({ role: z.string() }),
-                sql: [{ include: false, params: ["body", "session_role"], sql: "insert into notes values ($body, $session_role)" }],
-            },
-        };
-        const resolveSession = mock(async (_global: Login, _id: string) => new Session("admin"));
-        // The real adapter uses the actual Client type, not a manager SQL wrapper.
-        const native = createContextManager({
-            getSessionKey: (global: Login) => global.id,
-            resolveSession,
-            getDatabase: async () => db,
-            maxAgeMs: 60_000,
-        });
-        const insert = (database: Client, session: Session, input: { body: string }) => run(database, queries, "insert", input, session);
-        const context = await native.get(login, "a");
-        expect((await context.run(insert, { body: "one" })).kind).toBe("success");
-        expect((await (await native.get(login, "a")).run(insert, { body: "two" })).kind).toBe("success");
-        expect(resolveSession).toHaveBeenCalledTimes(1);
-        native.invalidateDatabase("a");
-        expect((await db.execute("select * from notes")).rows.map(row => ({ body: row.body, role: row.role }))).toEqual([
-            { body: "one", role: "admin" }, { body: "two", role: "admin" },
-        ]);
-    } finally {
-        db.close();
-    }
+    const child = Bun.spawn([process.execPath, new URL("./fixtures/context-native.ts", import.meta.url).pathname], {
+        stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, status] = await Promise.all([
+        new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    expect({ status, stdout, stderr }).toEqual({ status: 0, stdout: "", stderr: "" });
 });

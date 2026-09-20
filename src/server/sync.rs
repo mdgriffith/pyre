@@ -122,6 +122,10 @@ impl<'a> SyncServer<'a> {
             .await
             .map_err(Error::Database)?;
         let execution = async {
+            manifest
+                .verify_transaction(&tx, binding.namespace, &[])
+                .await
+                .map_err(|_| Error::InvalidFence)?;
             let mut databases = tx
                 .query("PRAGMA database_list", ())
                 .await
@@ -392,16 +396,8 @@ impl<'a> SyncServer<'a> {
         origin_session_id: Option<&str>,
     ) -> Result<Vec<SessionDeltaMessage>, Error> {
         let database_id = database_id.as_ref();
-        let broadcast_sessions = sessions_without_origin(connected_sessions, origin_session_id);
-        let messages = build_delta_messages_for_database(
-            self.context,
-            &query_result.affected_rows,
-            &broadcast_sessions,
-            database_id,
-        )?;
-        let origin_message = build_origin_delta_message(
-            self.context,
-            &query_result.affected_rows,
+        let (messages, origin_message) = self.publication_messages(
+            query_result,
             connected_sessions,
             database_id,
             origin_session_id,
@@ -425,15 +421,8 @@ impl<'a> SyncServer<'a> {
         origin_session_id: Option<&str>,
         commit: &crate::server::query::CommittedRevision,
     ) -> Result<Vec<SessionDeltaMessage>, Error> {
-        let messages = build_delta_messages_for_database(
-            self.context,
-            &query_result.affected_rows,
-            &sessions_without_origin(connected_sessions, origin_session_id),
-            database_id,
-        )?;
-        let origin_message = build_origin_delta_message(
-            self.context,
-            &query_result.affected_rows,
+        let (messages, origin_message) = self.publication_messages(
+            query_result,
             connected_sessions,
             database_id,
             origin_session_id,
@@ -445,6 +434,46 @@ impl<'a> SyncServer<'a> {
             &commit.database_epoch,
             commit.revision,
         )
+    }
+
+    fn publication_messages(
+        &self,
+        result: &QueryResult,
+        sessions: &ConnectedSessions,
+        database_id: &str,
+        origin: Option<&str>,
+    ) -> Result<(Vec<SessionDeltaMessage>, Option<DeltaMessage>), Error> {
+        if !result.matches_context(self.context) {
+            let mut hint = DeltaMessage::sync_required_for_database(database_id)?;
+            hint.reconciliation =
+                Some(serde_json::json!({"kind":"replaceRequired", "invalidate":true}));
+            let mut messages = sessions
+                .keys()
+                .filter(|id| Some(id.as_str()) != origin)
+                .map(|id| SessionDeltaMessage {
+                    session_id: id.clone(),
+                    message: hint.clone(),
+                })
+                .collect::<Vec<_>>();
+            messages.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+            // Even an origin absent from the recipient registry must invalidate.
+            return Ok((messages, origin.map(|_| hint)));
+        }
+        Ok((
+            build_delta_messages_for_database(
+                self.context,
+                &result.affected_rows,
+                &sessions_without_origin(sessions, origin),
+                database_id,
+            )?,
+            build_origin_delta_message(
+                self.context,
+                &result.affected_rows,
+                sessions,
+                database_id,
+                origin,
+            )?,
+        ))
     }
 }
 
@@ -590,7 +619,41 @@ pub async fn catchup(
     page_size: usize,
 ) -> Result<SyncPageResult, Error> {
     let page_size = sync::normalize_page_size(page_size).map_err(Error::Sync)?;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
+        .await
+        .map_err(Error::Database)?;
+    let execution = async {
+        let persisted = crate::server::manifest::persisted_context(&tx, "main")
+            .await
+            .map_err(|_| Error::InvalidFence)?;
+        if crate::generate::manifest::compiled_schema_contract(context)
+            != crate::generate::manifest::compiled_schema_contract(&persisted)
+        {
+            return Err(Error::InvalidFence);
+        }
+        catchup_in_transaction(&tx, context, sync_cursor, session, page_size).await
+    }
+    .await;
+    match execution {
+        Ok(result) => {
+            tx.commit().await.map_err(Error::Database)?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error)
+        }
+    }
+}
 
+async fn catchup_in_transaction(
+    conn: &libsql::Connection,
+    context: &typecheck::Context,
+    sync_cursor: &SyncCursor,
+    session: &SyncSession,
+    page_size: usize,
+) -> Result<SyncPageResult, Error> {
     let status_statement =
         sync::get_sync_status_statement(sync_cursor, context, session).map_err(Error::Sync)?;
     let status_rows = query_objects(conn, &status_statement.sql, &status_statement.params).await?;

@@ -1654,7 +1654,10 @@ export class PyreClient {
       this.watchInternalClient(targetDatabaseId, generation, created, client);
       this.startNextSync();
     }, () => {
-      if (this.clients.get(targetDatabaseId) === created) this.clients.delete(targetDatabaseId);
+      if (this.clients.get(targetDatabaseId) !== created) return;
+      this.clients.delete(targetDatabaseId);
+      if (this.syncingDatabaseId === targetDatabaseId) this.syncingDatabaseId = null;
+      this.startNextSync();
     });
     return created;
   }
@@ -2184,12 +2187,14 @@ export class PyreClient {
       queuedDatabaseIds: this.syncedDatabaseIds.filter((databaseId) => databaseId !== this.syncingDatabaseId && !this.completedSyncDatabaseIds.has(databaseId)),
     });
     void clientPromise.then((client) => {
-      if (this.syncingDatabaseId !== nextDatabaseId || !this.syncedDatabaseIds.includes(nextDatabaseId)) {
+      if (this.clients.get(nextDatabaseId) !== clientPromise
+        || this.syncingDatabaseId !== nextDatabaseId
+        || !this.syncedDatabaseIds.includes(nextDatabaseId)) {
         return;
       }
 
       client.startSync();
-    });
+    }, () => {}); // getOrCreateClient releases failed attempts and advances the queue.
   }
 
   private async runPublicMutation<Input>(
@@ -2547,7 +2552,7 @@ export class PyreClient {
 
     void clientPromise.then((client) => {
       client.disconnect();
-    });
+    }, () => {});
   }
 
   private internalClientConfig(databaseId: DatabaseId): SingleDatabasePyreClientCreateConfig & {

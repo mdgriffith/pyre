@@ -146,7 +146,7 @@ export function activateSchemaForDatabase(databaseId?: DatabaseId): void {
 }
 
 /** Capture once, then bind schemaSource to the replacement's database snapshot. */
-export function captureReplacementSchema(databaseId: DatabaseId, compiledContract: string): { restore(): void; schemaSource: string } {
+export function captureReplacementSchema(databaseId: DatabaseId | undefined, compiledContract: string): { restore(): void; schemaSource: string } {
     if (typeof compiledContract !== "string" || !compiledContract) throw new Error("Missing compiled contract");
     const schema = structuredClone(introspectionsByDatabaseId.get(schemaKey(databaseId))?.introspection) as { schema_source?: unknown } | undefined;
     if (typeof schema?.schema_source !== "string" || !schema.schema_source) throw new Error("Missing replacement schema");
@@ -158,7 +158,7 @@ export function captureReplacementSchema(databaseId: DatabaseId, compiledContrac
     return { restore, schemaSource: schema.schema_source };
 }
 
-/** Authenticate a generated manifest against schema evidence captured for this exact client. */
+/** Early configuration check only; cached evidence cannot authorize execution. */
 export function bindSchemaManifest(
     db: Client,
     namespace: string,
@@ -178,6 +178,28 @@ export function bindSchemaManifest(
     if (namespaces.length === 1 && namespaces[0] === namespace
         && compiledContract !== evidence.compiledContract) {
         throw new Error("Schema manifest mismatch");
+    }
+}
+
+/** Permission evidence and application SQL must use the same transaction snapshot.
+ * Never substitute a client cache or the database lifetime epoch for this check. */
+export async function assertSchemaContracts(
+    tx: Pick<Client, "execute">,
+    contracts: Readonly<Record<string, string>>,
+    primaryNamespace: string,
+): Promise<void> {
+    if (!primaryNamespace || !contracts || !Object.hasOwn(contracts, primaryNamespace)
+        || Object.entries(contracts).some(([namespace, contract]) => !namespace || typeof contract !== "string" || !contract)) {
+        throw new Error("Missing compiled schema contracts");
+    }
+    for (const [namespace, expected] of Object.entries(contracts)) {
+        const alias = namespace === primaryNamespace ? "main" : namespace;
+        const result = await tx.execute(`SELECT schema FROM "${alias.replaceAll('"', '""')}"._pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL ORDER BY id DESC LIMIT 1`);
+        const source = result.rows[0]?.schema;
+        if (typeof source !== "string" || !source.trim()) throw new Error("Missing persisted schema authority");
+        // Parse persisted source, not physical tables: introspection alone cannot recover permissions.
+        wasm.set_schema({ tables: [], links: [], migration_state: { MigrationTable: { migrations: [] } }, schema_source: source });
+        if (wasm.get_schema_compiled_contract() !== expected) throw new Error("Schema contract mismatch");
     }
 }
 

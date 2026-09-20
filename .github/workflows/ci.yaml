@@ -63,6 +63,9 @@ jobs:
         working-directory: packages/client
         run: npm exec --yes --package=elm@0.19.1-6 -- bash ./scripts/build.sh --optimize
 
+      - name: Test client TypeScript runtime
+        run: bun test packages/client/src-ts
+
       - name: Test Elm reconciliation
         working-directory: packages/client
         run: |

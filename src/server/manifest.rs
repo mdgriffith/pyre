@@ -11,8 +11,8 @@ pub struct BoundManifest {
 }
 
 impl BoundManifest {
-    /// Authenticate a generated manifest once against schema context loaded from
-    /// the database. A standalone database context binds only its own namespace.
+    /// Bind a generated manifest to a loaded context, not to the current database
+    /// state. Execution must also check persisted authority in its transaction.
     pub fn new(manifest: Manifest, context: &crate::typecheck::Context) -> Result<Self, BindError> {
         if manifest.version != 1
             || manifest.compiled_contract.is_empty()
@@ -83,6 +83,27 @@ impl std::fmt::Display for BindError {
 impl std::error::Error for BindError {}
 
 impl Manifest {
+    /// Check the migration evidence in the same snapshot as the compiled SQL.
+    /// The primary namespace lives in main; attached namespaces use their SQL alias.
+    #[cfg(feature = "database")]
+    pub(crate) async fn verify_transaction(
+        &self,
+        tx: &libsql::Transaction,
+        primary: &str,
+        attached: &[String],
+    ) -> Result<(), BindError> {
+        for (namespace, alias) in std::iter::once((primary, "main"))
+            .chain(attached.iter().map(|name| (name.as_str(), name.as_str())))
+        {
+            let context = persisted_context(tx, alias).await?;
+            let bound = BoundManifest::new(self.clone(), &context)?;
+            if !bound.authorizes_namespace(namespace) {
+                return Err(BindError);
+            }
+        }
+        Ok(())
+    }
+
     /// Authenticate the context used for permission SQL against this compiled manifest.
     pub fn matches_context(&self, context: &crate::typecheck::Context) -> bool {
         self.version == 1
@@ -609,7 +630,9 @@ fn prepare_field(
 
     validate_value(display_name, value, schema)?;
     let sql_value = if schema.type_.starts_with("Json") {
-        JsonValue::String(normalize_json_value_inner(value, schema, false).to_string())
+        JsonValue::String(
+            normalize_json_value_inner(value, schema, tagged_union_types, false).to_string(),
+        )
     } else {
         normalize_sql_value(value, schema)
     };
@@ -824,12 +847,13 @@ fn json_to_session_value(
 
 /// Normalize typed JSON recursively without treating it as a partial read projection.
 pub(crate) fn normalize_json_value(value: &JsonValue, schema: &FieldSchema) -> JsonValue {
-    normalize_json_value_inner(value, schema, true)
+    normalize_json_value_inner(value, schema, &schema.tagged_union_types, true)
 }
 
 fn normalize_json_value_inner(
     value: &JsonValue,
     schema: &FieldSchema,
+    tagged_union_types: &HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
     write_input: bool,
 ) -> JsonValue {
     fn normalize(
@@ -915,7 +939,9 @@ fn normalize_json_value_inner(
             _ => value.clone(),
         }
     }
-    let mut definitions = schema.tagged_union_types.clone();
+    // Nested session fields inherit named types from the enclosing variant schema.
+    let mut definitions = tagged_union_types.clone();
+    definitions.extend(schema.tagged_union_types.clone());
     if !schema.tagged_union_variants.is_empty() {
         definitions.insert(schema.type_.clone(), schema.tagged_union_variants.clone());
     }
@@ -1028,3 +1054,43 @@ impl std::fmt::Display for LoadError {
 }
 
 impl std::error::Error for LoadError {}
+
+/// Missing, unreadable, or invalid evidence is never authority. Do not fall back
+/// to a cached context or physical table introspection (which omits permissions).
+#[cfg(feature = "database")]
+pub(crate) async fn persisted_context(
+    tx: &libsql::Transaction,
+    alias: &str,
+) -> Result<crate::typecheck::Context, BindError> {
+    use crate::db::introspect::{self, IntrospectionRaw, MigrationState, SchemaResult};
+    let sql = format!(
+        "SELECT schema FROM \"{}\"._pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL ORDER BY id DESC LIMIT 1",
+        alias.replace('"', "\"\"")
+    );
+    let mut rows = tx.query(&sql, ()).await.map_err(|_| BindError)?;
+    let source = rows
+        .next()
+        .await
+        .map_err(|_| BindError)?
+        .ok_or(BindError)?
+        .get::<String>(0)
+        .map_err(|_| BindError)?;
+    if source.trim().is_empty() {
+        return Err(BindError);
+    }
+    match introspect::from_raw(IntrospectionRaw {
+        tables: Vec::new(),
+        migration_state: MigrationState::MigrationTable {
+            migrations: Vec::new(),
+        },
+        schema_source: source,
+        links: Vec::new(),
+    })
+    .schema
+    {
+        SchemaResult::Success { context, .. } if !context.valid_namespaces.is_empty() => {
+            Ok(context)
+        }
+        _ => Err(BindError),
+    }
+}

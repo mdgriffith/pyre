@@ -580,6 +580,102 @@ test('setSyncedDatabases starts sync one database at a time in order', async () 
   expect(starts).toEqual(['main', 'campaign:123', 'campaign:456']);
 });
 
+test('failed initialization releases a reserved sync slot, advances the queue, and permits retry', async () => {
+  const starts: string[] = [];
+  const internals = new Map();
+  let rejectB!: (error: Error) => void;
+  const pendingB = new Promise<never>((_, reject) => { rejectB = reject; });
+  let attemptsB = 0;
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'browser-cache',
+    createInternalClient: async ({ databaseId }) => {
+      if (databaseId === 'B' && attemptsB++ === 0) return pendingB;
+      const internal = fakeInternalClient([], databaseId, starts);
+      internals.set(databaseId, internal);
+      return internal;
+    },
+  });
+  try {
+    await client.getOrCreateClient('C');
+    await client.getOrCreateClient('D');
+    const selection = client.setSyncedDatabases(['A', 'B', 'C', 'D']);
+    const rejected = selection.catch(error => error);
+    await Bun.sleep(0);
+    expect(attemptsB).toBe(1);
+    expect(starts).toEqual(['A']);
+    internals.get('A').emitLive();
+    await Bun.sleep(0);
+    expect(client.syncingDatabaseId).toBe('B');
+
+    rejectB(new Error('B initialization failed'));
+    expect((await rejected).message).toBe('B initialization failed');
+    await Bun.sleep(0);
+    expect(client.getInternalDatabaseIds()).not.toContain('B');
+    expect(starts).toEqual(['A', 'C']);
+
+    await client.syncDatabase('B');
+    expect(attemptsB).toBe(2);
+    expect(starts).toEqual(['A', 'C']);
+    internals.get('C').emitLive();
+    await Bun.sleep(0);
+    expect(starts).toEqual(['A', 'C', 'B']);
+    internals.get('B').emitLive();
+    await Bun.sleep(0);
+    expect(starts).toEqual(['A', 'C', 'B', 'D']);
+  } finally {
+    client.disconnect();
+  }
+});
+
+for (const outcome of ['resolve', 'reject']) {
+  test(`stale initialization ${outcome} cannot start an old client or clear its replacement's sync slot`, async () => {
+    const starts: string[] = [];
+    const disconnects: string[] = [];
+    const oldB = fakeInternalClient(disconnects, 'old B', starts);
+    let resolveB!: (client: ReturnType<typeof fakeInternalClient>) => void;
+    let rejectB!: (error: Error) => void;
+    const pendingB = new Promise((resolve, reject) => { resolveB = resolve; rejectB = reject; });
+    const internals = new Map();
+    let attemptsB = 0;
+    const client = await PyreClient.create({
+      schema, server, cacheNamespace: 'browser-cache',
+      createInternalClient: async ({ databaseId }) => {
+        if (databaseId === 'B' && attemptsB++ === 0) return pendingB;
+        const internal = fakeInternalClient(disconnects, databaseId, starts);
+        internals.set(databaseId, internal);
+        return internal;
+      },
+    });
+    try {
+      const selection = client.setSyncedDatabases(['A', 'B']);
+      const settled = selection.catch(error => error);
+      await Bun.sleep(0);
+      internals.get('A').emitLive();
+      await Bun.sleep(0);
+      expect(client.syncingDatabaseId).toBe('B');
+      await client.unsyncDatabase('B');
+      await client.setSyncedDatabases(['A', 'B', 'C']);
+      await Bun.sleep(0);
+      expect(starts).toEqual(['A', 'B']);
+
+      if (outcome === 'resolve') resolveB(oldB);
+      else rejectB(new Error('stale B failure'));
+      const result = await settled;
+      if (outcome === 'reject') expect(result.message).toBe('stale B failure');
+      await Bun.sleep(0);
+      expect(await client.getOrCreateClient('B')).toBe(internals.get('B'));
+      expect(client.syncingDatabaseId).toBe('B');
+      expect(starts).toEqual(['A', 'B']);
+      if (outcome === 'resolve') expect(disconnects).toEqual(['old B']);
+      internals.get('B').emitLive();
+      await Bun.sleep(0);
+      expect(starts).toEqual(['A', 'B', 'C']);
+    } finally {
+      client.disconnect();
+    }
+  });
+}
+
 test('setSyncedDatabases completes an already-live local-edit client before scheduling the next database', async () => {
   const starts: string[] = [];
   const clients = new Map<string, ReturnType<typeof fakeInternalClient>>();

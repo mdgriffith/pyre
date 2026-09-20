@@ -100,7 +100,8 @@ record Workspace {
     assert.deepEqual(before.response.tables.workspaces.rows, [{ id: visibleWorkspaceId, updatedAt: 0 }]);
     assert.deepEqual(before.response.tables.memberships.rows, []);
     await assert.rejects(catchup(linked, { tables: {} }, { userId: 7 }, 1000, "linked"), /ReplacementRequired|replacement/i);
-    const command = { id: "revoke", operation: "delete", primary_db: "_default", session_args: ["userId"],
+    const command = { id: "revoke", operation: "delete", primary_db: "_default", attached_dbs: [],
+      schemaContracts: linkedManifest.replacementContracts, session_args: ["userId"],
       optional_input_args: [], json_input_args: [], InputValidator: z.object({}), SessionValidator: linkedManifest.SessionValidator,
       sql: [{ include: false, params: ["session_userId"], sql: "delete from memberships where userId = $session_userId" }] };
     const fence = { ...linkedAuthority, databaseEpoch: linkedEpoch, instance: "reader", authGeneration: 9 };

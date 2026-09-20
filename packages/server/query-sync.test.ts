@@ -2,13 +2,17 @@
 import { beforeEach, expect, mock, test } from "bun:test";
 import { z } from "zod";
 import { createClient } from "@libsql/client";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { meta as compiledCreate } from "./fixtures/compiled-batch/generated/queries/metadata/entryCreate";
 import { sql as compiledCreateSql, syncSql as compiledCreateSyncSql } from "./fixtures/compiled-batch/generated/queries/sql/entryCreate";
+import { compiledContract } from "./fixtures/compiled-batch/generated/manifest";
 
 const createUuidV7 = "01890f2e-7b5c-7cc8-98c4-dc0c0c07398f";
+const compiledSource = readFileSync(new URL("./fixtures/compiled-batch/schema.pyre", import.meta.url), "utf8");
+const queryAuthority = { primary_db: "Main", attached_dbs: [], schemaContracts: { Main: "contract-1" } };
+const manifestAuthority = { compiledContract: "contract-1", replacementContracts: { Main: "contract-1" } };
 const compiledCreateMetadata = {
   ...compiledCreate,
   generatedEdit: { ...compiledCreate.generatedEdit, createUuidInput: "id" },
@@ -25,10 +29,11 @@ let replacementSession: any;
 let activeSchema: any;
 let replacementRowsValid = true;
 let replacementValidatedSchemas: any[] = [];
+let deltaSchemas: any[] = [];
 
 mock.module("./wasm/pyre_wasm.js", () => ({
   sql_is_initialized: () => "select 1 as is_initialized",
-  sql_introspect: () => "select introspection",
+  sql_introspect: () => "select json_object('schema_source', schema) as result from _pyre_migrations where finished_at is not null and error is null order by id desc limit 1",
   sql_introspect_uninitialized: () => "select uninitialized introspection",
   migrate_with_introspection: (_name: string, _source: string, introspection: any) => ({
     Ok: {
@@ -38,8 +43,8 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   }),
   set_schema: schema => { activeSchema = schema; },
   process_introspection: introspection => introspection,
-  get_schema_compiled_contract: () => activeSchema?.compiledContract ?? "contract-1",
-  get_schema_manifest_contract: () => activeSchema?.manifestContract ?? activeSchema?.compiledContract ?? "contract-1",
+  get_schema_compiled_contract: () => schemaContract(activeSchema?.schema_source),
+  get_schema_manifest_contract: () => activeSchema?.schema_source === compiledSource ? compiledContract : schemaContract(activeSchema?.schema_source),
   validate_replacement_table_groups: () => {
     replacementValidatedSchemas.push(structuredClone(activeSchema));
     return replacementRowsValid ? true : "Error: Invalid union discriminator";
@@ -52,6 +57,7 @@ mock.module("./wasm/pyre_wasm.js", () => ({
     return typeof replacementPlan === "function" ? replacementPlan(session) : replacementPlan;
   },
   calculate_sync_deltas: (_affectedRows: unknown, connectedSessions: Map<string, unknown>) => {
+    deltaSchemas.push(structuredClone(activeSchema));
     if (deltaError) return deltaError;
     const recipientIds = Array.from(connectedSessions.keys()).filter((sessionId) => sessionIds.includes(sessionId));
     return {
@@ -90,6 +96,19 @@ const { readReplacementTables, MAX_REPLACEMENT_PAYLOAD_BYTES, MAX_REPLACEMENT_RO
 const { MAX_LIVE_SYNC_DELTA_ROWS, MAX_LIVE_SYNC_FANOUT_RECIPIENTS, MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES } = await import("./query-sync");
 const { loadSchemaFromDatabase } = await import("./schema");
 
+function schemaContract(source: string) {
+  if (source === compiledSource) return compiledCreate.schemaContracts._default;
+  if (source === "test schema") return "contract-1";
+  if (source === "campaign schema") return "campaign-contract";
+  return `unknown-contract:${source}`;
+}
+
+async function persistAuthority(db, databaseId, source = "test schema") {
+  await db.execute("create table if not exists _pyre_migrations(id integer primary key, finished_at integer, error text, schema text)");
+  await db.execute({ sql: "insert or replace into _pyre_migrations values(1,1,NULL,?)", args: [source] });
+  await loadSchemaFromDatabase(databaseId, db);
+}
+
 test.skipIf(!existsSync(new URL("./wasm/pyre_wasm_bg.wasm", import.meta.url)))("actual WASM compiler contract, replacement codecs and linked legacy fallback", () => {
   const result = spawnSync(process.execPath, [new URL("./fixtures/replacement-wasm.ts", import.meta.url).pathname], { encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr + result.stdout);
@@ -102,8 +121,9 @@ test("batch sync publishes only after atomic commit and needs no registered orig
     await db.execute("create table notes(id integer primary key)");
     await db.execute("create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer)");
     await db.execute("insert into _pyre_sync values(1,'e1',0)");
-    const manifest = { version: 1, manifestVersion: "m1", SessionValidator: z.object({ userId: z.number() }), queries: {
-      create: { id: "create", operation: "insert", primary_db: "Main", InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({ userId: z.number() }),
+    await persistAuthority(db, "tenant-1");
+    const manifest = { ...manifestAuthority, version: 1, manifestVersion: "m1", SessionValidator: z.object({ userId: z.number() }), queries: {
+      create: { ...queryAuthority, id: "create", operation: "insert", InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({ userId: z.number() }),
         generatedEdit: { kind: "create", createUuidInput: "id", writableInputs: ["id"], writeStatementIndices: [0] },
         session_args: [], optional_input_args: [], json_input_args: [],
         sql: [{ include: true, params: [], sql: "insert into notes default values returning id as _pyreEditId" }],
@@ -151,6 +171,7 @@ beforeEach(() => {
   replacementSession = undefined;
   replacementRowsValid = true;
   replacementValidatedSchemas = [];
+  deltaSchemas = [];
 });
 
 async function replacementDatabase(run: (fixture: any) => Promise<void>) {
@@ -169,7 +190,7 @@ async function replacementDatabase(run: (fixture: any) => Promise<void>) {
   };
   const manifest = { version: 1, manifestVersion: "m1", compiledContract: "contract-1", replacementContracts: { Main: "contract-1" }, SessionValidator: z.object({ userId: z.number().int() }), queries:
     Object.fromEntries(Object.entries(commands).map(([id, [InputValidator, sql]]) => [id, {
-      id, operation: "transaction", primary_db: "Main", InputValidator, session_args: ["userId"],
+      ...queryAuthority, id, operation: "transaction", InputValidator, session_args: ["userId"],
       SessionValidator: z.object({ userId: z.number().int() }),
       optional_input_args: [], json_input_args: [], ReturnData: z.object({}),
       sql: [{ include: false, params: ["id", "body", "next", "session_userId"].filter(key => sql.includes(`$${key}`)), sql }],
@@ -194,10 +215,7 @@ async function replacementDatabase(run: (fixture: any) => Promise<void>) {
     await db.execute("insert into notes values(1,'own',7,1,0),(2,'linked',8,2,0),(3,'private',8,3,0)");
     await db.execute("create table memberships(project integer, userId integer)");
     await db.execute("insert into memberships values(2,7)");
-    const execute = db.execute;
-    db.execute = schemaDb.execute as typeof db.execute;
     await loadSchemaFromDatabase(authority.databaseId, db);
-    db.execute = execute;
     const replace = (overrides = {}, session = { userId: 7 }) => catchupReplacement(db, manifest, authority, { ...request, ...overrides }, session);
     const batch = (operations, recipients?, send?) => {
       const { target, ...fence } = request;
@@ -539,6 +557,7 @@ test("queued named mutations capture input and execution session at invocation",
 test("named sync executes actual generated SQL, retains declared rows, and never sends deltas to fenced readers", async () => {
   await replacementDatabase(async ({ db, authority }) => {
     await db.execute("create table entries(id text primary key, release text, enabled integer, count integer, role text, details blob, updatedAt integer)");
+    await persistAuthority(db, authority.databaseId, compiledSource);
     const query = { ...compiledCreateMetadata, sql: compiledCreateSql, syncSql: compiledCreateSyncSql };
     const input = { id: createUuidV7, release: "release", enabled: true, count: 1, role: { _type: "Member" }, details: { _type: "Note", count: 2, enabled: false } };
     const fence = { ...authority, namespace: query.primary_db, databaseEpoch: "e1", instance: "other-tab", authGeneration: 8 };
@@ -591,15 +610,16 @@ test("publication uses current recipient lifetime after commit and failures neve
   });
 });
 
-test("memory batch sync rejects without detaching or publishing, while empty batches confirm", async () => {
+test("memory batch sync rejects without detaching or publishing, including empty batches", async () => {
   const db = createClient({ url: "file::memory:" });
   try {
     await db.execute("create table notes(id integer primary key)");
     await db.execute("insert into notes values(1)");
     await db.execute("create table _pyre_sync(id integer primary key, database_epoch text, server_revision integer)");
     await db.execute("insert into _pyre_sync values(1,'e1',0)");
-    const manifest = { version: 1, manifestVersion: "m1", SessionValidator: z.object({}), queries: {
-      create: { id: "create", operation: "insert", primary_db: "Main", InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({}),
+    await persistAuthority(db, "memory-sync");
+    const manifest = { ...manifestAuthority, version: 1, manifestVersion: "m1", SessionValidator: z.object({}), queries: {
+      create: { ...queryAuthority, id: "create", operation: "insert", InputValidator: z.object({ id: z.string() }), SessionValidator: z.object({}),
         generatedEdit: { kind: "create", createUuidInput: "id", writableInputs: ["id"], writeStatementIndices: [0] },
         session_args: [], optional_input_args: [], json_input_args: [],
         sql: [{ include: true, params: [], sql: "insert into notes default values returning id as _pyreEditId" }],
@@ -612,7 +632,7 @@ test("memory batch sync rejects without detaching or publishing, while empty bat
     expect(await runBatchWithSync(db, manifest, authority, request, {}, recipients, send))
       .toEqual({ kind: "error", error: { errorType: "TransactionFailed", message: "TransactionFailed" } });
     expect(await runBatchWithSync(db, manifest, authority, { ...request, operations: [] }, {}, recipients, send))
-      .toMatchObject({ kind: "success", response: { status: "confirmed", results: [] } });
+      .toEqual({ kind: "error", error: { errorType: "TransactionFailed", message: "TransactionFailed" } });
     expect(send).not.toHaveBeenCalled();
     expect((await db.execute("select * from notes")).rows).toEqual([{ id: 1 }]);
     expect((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision).toBe(0);
@@ -630,9 +650,9 @@ function withoutServerRevision(message: unknown): unknown {
 
 function syncDb() {
   let revision = 0;
+  const source = introspectionResult.schema_source;
   const executedSql: string[] = [];
-  return {
-    batch: mock(async () => [{
+  const affectedRows = {
       columns: ["_affectedRows"],
       rows: [{
         _affectedRows: JSON.stringify([{
@@ -641,22 +661,32 @@ function syncDb() {
           rows: [[1, "World", "Tiling", "tiles/root", 256, "Png"]],
         }]),
       }],
-    }]),
-    execute: mock(async (sql: string) => {
+    };
+  const execute = mock(async (statement: any) => {
+      const sql = typeof statement === "string" ? statement : statement.sql;
       executedSql.push(sql);
+      if (sql === "select cast(1 as integer) as _pyre_integer_mode") return { rows: [{ _pyre_integer_mode: 1 }] };
+      if (sql.startsWith("SELECT schema")) return { rows: [{ schema: source }] };
+      if (sql === "select _affectedRows") return affectedRows;
       if (sql.includes("returning database_epoch, server_revision")) {
         revision += 1;
         return { rows: [{ database_epoch: "test-epoch", server_revision: revision }] };
       }
 
       return { rows: [] };
-    }),
+    });
+  const tx = { execute, commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}) };
+  return {
+    execute,
+    transaction: mock(async () => tx),
     executedSql,
   };
 }
 
 const queryMap = {
   "query-id": {
+    ...queryAuthority,
+    operation: "transaction",
     id: "query-id",
     sql: [{ include: true, params: [], sql: "select _affectedRows" }],
     session_args: [],
@@ -698,6 +728,7 @@ test("runWithSync sends reshaped sync deltas", async () => {
   const syncResult = await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(syncResult.serverRevision).toBe(1);
+  expect(deltaSchemas.map(schema => schema.schema_source)).toEqual(["test schema"]);
   expect(sent.map((entry) => ({ ...entry, message: withoutServerRevision(entry.message) }))).toEqual([
     {
       sessionId: "s1",
@@ -715,6 +746,22 @@ test("runWithSync sends reshaped sync deltas", async () => {
   ]);
 });
 
+test("unverified publication emits only hints for every legacy recipient and the origin", async () => {
+  await loadSchemaFromDatabase(schemaDb as any);
+  const db = syncDb();
+  const sent: any[] = [];
+  // Undeclared legacy operations have no transaction-bound revision proof.
+  const result = await runWithSync(db as any,
+    { "query-id": { ...queryMap["query-id"], operation: undefined } }, "query-id", {}, {},
+    new Map(["origin", "s1", "other"].map(id => [id, { session: {} }])), undefined, "origin");
+  const revision = await result.sync((id, message) => { sent.push([id, message]); });
+  const hint = { type: "syncRequired", serverRevision: 1, databaseEpoch: "test-epoch" };
+  expect(sent).toEqual([["s1", hint], ["other", hint]]);
+  expect(revision.originMessage).toEqual(hint);
+  expect(result.response).toEqual({ serverRevision: 1, databaseEpoch: "test-epoch", sync: hint, result: {} });
+  expect(deltaSchemas).toEqual([]);
+});
+
 test("runWithSync stamps sync deltas with databaseId", async () => {
   introspectionResult = { schema_source: "campaign schema" };
   await loadSchemaFromDatabase("campaign:123", schemaDb as any);
@@ -722,7 +769,7 @@ test("runWithSync stamps sync deltas with databaseId", async () => {
   const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
     syncDb() as any,
-    queryMap,
+    { "query-id": { ...queryMap["query-id"], schemaContracts: { Main: "campaign-contract" } } },
     "query-id",
     {},
     {},
@@ -735,6 +782,7 @@ test("runWithSync stamps sync deltas with databaseId", async () => {
   await result.sync((sessionId, message) => { sent.push({ sessionId, message }); });
 
   expect(sent[0].message.databaseId).toBe("campaign:123");
+  expect(sent[0].message.type).toBe("delta");
   expect(typeof sent[0].message.serverRevision).toBe("number");
 });
 
@@ -757,6 +805,9 @@ test("runWithSync allocates live sync revisions from _pyre_sync", async () => {
   await result.sync(() => {});
 
   expect(db.executedSql).toEqual([
+    "select cast(1 as integer) as _pyre_integer_mode",
+    expect.stringContaining('SELECT schema FROM "main"._pyre_migrations'),
+    "select _affectedRows",
     expect.stringContaining("update _pyre_sync"),
   ]);
 });
@@ -808,7 +859,7 @@ test("runWithSync skips the origin session when provided", async () => {
 
 test("runWithSync includes origin authoritative sync in mutation response envelope", async () => {
   sessionIds = ["s1", "s2"];
-  await loadSchemaFromDatabase(schemaDb as any);
+  await loadSchemaFromDatabase("campaign:123", schemaDb as any);
 
   const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
@@ -829,11 +880,12 @@ test("runWithSync includes origin authoritative sync in mutation response envelo
   expect((result.response as any).serverRevision).toBe(1);
   expect((result.response as any).sync).toEqual(sent[0].message);
   expect((result.response as any).sync.databaseId).toBe("campaign:123");
+  expect((result.response as any).sync.type).toBe("delta");
 });
 
 test("runWithSync builds origin sync from executing session when origin is not live-connected", async () => {
   sessionIds = ["s1"];
-  await loadSchemaFromDatabase(schemaDb as any);
+  await loadSchemaFromDatabase("campaign:123", schemaDb as any);
 
   const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
@@ -889,6 +941,7 @@ test("runWithSync sends syncRequired when delta row count exceeds cap", async ()
   expect(sent).toHaveLength(1);
   expect(sent[0].sessionId).toBe("s1");
   expect(sent[0].message.type).toBe("syncRequired");
+  expect(deltaSchemas).toHaveLength(1);
   expect(typeof sent[0].message.serverRevision).toBe("number");
 });
 
@@ -913,11 +966,12 @@ test("runWithSync sends syncRequired when fanout recipient count exceeds cap", a
 
   expect(sent).toHaveLength(MAX_LIVE_SYNC_FANOUT_RECIPIENTS + 1);
   expect(sent.every((entry) => entry.message.type === "syncRequired")).toBe(true);
+  expect(deltaSchemas).toHaveLength(1);
 });
 
 test("runWithSync sends syncRequired when payload bytes exceed cap", async () => {
   reshapedRows = [[1, "x".repeat(MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES), null]];
-  await loadSchemaFromDatabase(schemaDb as any);
+  await loadSchemaFromDatabase("campaign:123", schemaDb as any);
 
   const sent: Array<{ sessionId: string; message: any }> = [];
   const result = await runWithSync(
@@ -939,6 +993,7 @@ test("runWithSync sends syncRequired when payload bytes exceed cap", async () =>
   expect(sent[0].message.type).toBe("syncRequired");
   expect(sent[0].message.databaseId).toBe("campaign:123");
   expect(typeof sent[0].message.serverRevision).toBe("number");
+  expect(deltaSchemas).toHaveLength(1);
 });
 
 test("runWithSync advances revision and requires catchup when delta calculation fails", async () => {

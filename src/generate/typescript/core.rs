@@ -483,6 +483,17 @@ fn to_query_metadata_file(
     query_info: Option<&typecheck::QueryInfo>,
     formatter: &typealias::TypeFormatter,
 ) -> String {
+    let info = query_info.expect("compiled query metadata requires typechecked query info");
+    let schema_contracts: std::collections::BTreeMap<_, _> = std::iter::once(&info.primary_db)
+        .chain(info.attached_dbs.iter())
+        .map(|namespace| {
+            (
+                namespace,
+                crate::generate::manifest::replacement_contract(context, namespace)
+                    .expect("compiled query namespace requires a schema contract"),
+            )
+        })
+        .collect();
     let mut return_data = String::new();
     typealias::return_data_aliases(context, query, &mut return_data, formatter);
     let uses_coerced_date = return_data.contains("CoercedDate");
@@ -554,6 +565,10 @@ fn to_query_metadata_file(
     let mut meta_block = String::new();
     meta_block.push_str("export const meta = {\n");
     meta_block.push_str(&format!("  id: \"{}\",\n", &query.interface_hash));
+    meta_block.push_str(&format!(
+        "  schemaContracts: {},\n",
+        serde_json::to_string(&schema_contracts).expect("query schema contracts")
+    ));
     if let Some(info) = query_info {
         if let Some(metadata) =
             crate::generate::manifest::generated_edit_metadata(context, query, info)

@@ -555,6 +555,90 @@ record Post {
 }
 
 #[test]
+fn aggregate_entity_streams_with_branded_ids_compile() {
+    let mut schemas = Vec::new();
+    for (namespace, source) in [
+        (
+            "_default",
+            "@syncable(false)\nrecord Counter {\n @public\n id Id.Int @id\n}\n",
+        ),
+        ("Named", "record Document {\n @public\n id Id.Uuid @id\n}\n"),
+        (
+            "Legacy",
+            "@syncable(false)\nrecord LegacyRow {\n @public\n id Int @id\n}\n",
+        ),
+        ("Empty", "// No records in this namespace.\n"),
+    ] {
+        let mut schema = ast::Schema {
+            namespace: namespace.into(),
+            ..ast::Schema::default()
+        };
+        parser::run(&format!("{namespace}/schema.pyre"), source, &mut schema).unwrap();
+        schemas.push(schema);
+    }
+    let mut database = ast::Database { schemas };
+    ast::resolve_id_brands(&mut database);
+    typecheck::check_schema(&database).unwrap();
+    let mut files = Vec::new();
+    elm::generate(Path::new("src"), &database, &mut files);
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir_in(root.join("target")).unwrap();
+    for file in files {
+        let path = temp.path().join(file.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, file.contents).unwrap();
+    }
+    fs::write(
+        temp.path().join("elm.json"),
+        include_str!("fixtures/elm-local-edits/elm.json"),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("src/Streams.elm"),
+        r#"module Streams exposing (all)
+
+import Db.Empty.Stream as Empty
+import Db.Id
+import Db.Legacy.Stream as Legacy
+import Db.Named.Stream as Named
+import Db.Stream as Default
+import Json.Encode as Encode
+
+all =
+    { intRemoved = Default.CounterRemoved (Db.Id.int 1)
+    , uuidRemoved = Named.DocumentRemoved (Db.Id.uuid "00000000-0000-4000-8000-000000000001")
+    , legacyRemoved = Legacy.LegacyRowRemoved 1
+    , intDecoded = Default.decodeIncomingBatch Encode.null
+    , uuidDecoded = Named.decodeIncomingBatch Encode.null
+    , legacyDecoded = Legacy.decodeIncomingBatch Encode.null
+    , emptyDecoded = Empty.decodeIncomingBatch Encode.null
+    }
+"#,
+    )
+    .unwrap();
+    let output = Command::new("npx")
+        .args([
+            "--no-install",
+            "--package",
+            "elm@0.19.1-6",
+            "elm",
+            "make",
+            "src/Streams.elm",
+            "--output=/dev/null",
+        ])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn fixed_namespace_and_entity_stream_name_collisions_compile() {
     let fixed_names = [
         "DatabaseId",

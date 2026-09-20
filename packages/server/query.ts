@@ -2,8 +2,8 @@ import { Client, InStatement, type Transaction } from "@libsql/client";
 import type { LinkInfo, SchemaMetadata, TableMetadata } from "@pyre/core";
 import { z, type ZodType } from "zod";
 import { buildArgs, executeStatements, formatResultData, TargetNotWritable, toSqlStatements, type GeneratedEdit, type JsonSessionValidators, type SqlInfo } from "./runtime/sql";
-import { assertSupportedIntegerMode, internalSafeInteger } from "./runtime/libsql";
-import { bindSchemaManifest } from "./schema";
+import { assertPersistentTransaction, assertSupportedIntegerMode, internalSafeInteger } from "./runtime/libsql";
+import { assertSchemaContracts, bindSchemaManifest } from "./schema";
 
 export type SessionValue =
     | null
@@ -25,6 +25,8 @@ export interface QueryMetadata {
     operation?: "query" | "insert" | "update" | "delete" | string;
     primary_db?: string;
     attached_dbs?: string[];
+    /** Compiler-owned contracts for every database referenced by this query. */
+    schemaContracts?: Readonly<Record<string, string>>;
     sql: SqlInfo[];
     syncSql?: SqlInfo[];
     session_args: string[];
@@ -94,6 +96,12 @@ export interface SyncResult {
     databaseEpoch?: string;
     serverRevision?: number;
     originMessage?: unknown;
+}
+
+// Only successful transaction-bound execution can authorize row publication.
+const executionContracts = new WeakMap<SyncResult, string>();
+export function executionSchemaContract(revision: SyncResult): string | undefined {
+    return executionContracts.get(revision);
 }
 
 export type SyncDeltasFn = (
@@ -213,19 +221,17 @@ export function runBatch(
     captureDatabaseEpoch = false,
 ): Promise<BatchResult> {
     let prepared: { operation: string; query: QueryMetadata; statements: ReturnType<typeof toSqlStatements> }[];
-    let capturedSchemaManifest: Pick<BatchManifest, "compiledContract" | "replacementContracts"> | undefined;
+    let capturedSchemaManifest: Pick<BatchManifest, "compiledContract" | "replacementContracts">;
     let capturedAuthority: BatchAuthority;
     let captured: BatchRequest;
     try {
-        if (manifest.compiledContract !== undefined || manifest.replacementContracts !== undefined) {
-            capturedSchemaManifest = {
-                compiledContract: manifest.compiledContract,
-                replacementContracts: manifest.replacementContracts === undefined
-                    ? undefined
-                    : { ...manifest.replacementContracts },
-            };
-            bindSchemaManifest(db, authority.namespace, capturedSchemaManifest);
-        }
+        capturedSchemaManifest = {
+            compiledContract: manifest.compiledContract,
+            replacementContracts: manifest.replacementContracts === undefined
+                ? undefined
+                : { ...manifest.replacementContracts },
+        };
+        bindSchemaManifest(db, authority.namespace, capturedSchemaManifest);
         // Capture and validate synchronously, before queue/transaction acquisition or any I/O.
         capturedAuthority = structuredClone(authority);
         authority = capturedAuthority;
@@ -295,24 +301,19 @@ export function runBatch(
             requestId: captured.requestId, status: "confirmed", results: [],
         };
         const result: Extract<BatchResult, { kind: "success" }> = { kind: "success", response };
-        if (prepared.length === 0) return result;
         let tx: Transaction | undefined;
         let index: number | undefined;
         let committing = false;
         try {
-            if (db.protocol === "file") {
-                // Local libsql transaction() detaches the client's connection. Check before
-                // detachment: SQLite reports an empty main.file for memory/temporary databases.
-                const databases = await db.execute("pragma database_list");
-                const file = databases.rows.find(row => row.name === "main")?.file;
-                if (typeof file !== "string" || file.length === 0) throw new BatchError("UnsupportedRuntime");
-            }
+            await assertPersistentTransaction(db);
             await assertSupportedIntegerMode(db);
             tx = await db.transaction("write");
-            if (capturedSchemaManifest) {
-                try { bindSchemaManifest(db, capturedAuthority.namespace, capturedSchemaManifest); }
-                catch { throw new BatchError("InvalidInput"); }
+            try {
+                await assertSchemaContracts(tx, {
+                    [capturedAuthority.namespace]: capturedSchemaManifest.replacementContracts?.[capturedAuthority.namespace]!,
+                }, capturedAuthority.namespace);
             }
+            catch { throw new BatchError("InvalidInput"); }
             const databases = await tx.execute("pragma database_list");
             if (databases.rows.some(row => row.name !== "main" && row.name !== "temp")) throw new BatchError("InvalidInput");
             const epoch = await tx.execute("select database_epoch from _pyre_sync where id = 1");
@@ -322,6 +323,10 @@ export function runBatch(
                 captured.databaseEpoch = databaseEpoch;
                 response.databaseEpoch = databaseEpoch;
             } else if (databaseEpoch !== captured.databaseEpoch) throw new BatchError("InvalidInput");
+            if (prepared.length === 0) {
+                await tx.rollback();
+                return result;
+            }
             for (index = 0; index < prepared.length; index++) {
                 const { operation, query, statements } = prepared[index];
                 // Pass only execute, even though libsql Transaction also exposes batch.
@@ -512,7 +517,10 @@ export async function run(
     options: RunOptions = {},
 ): Promise<QueryResult> {
     // Look up query metadata
-    const query = queryMap[queryId];
+    const source = queryMap[queryId];
+    const query = source && { ...source, schemaContracts: { ...source.schemaContracts },
+        attached_dbs: source.attached_dbs && [...source.attached_dbs],
+        sql: structuredClone(source.sql), syncSql: structuredClone(source.syncSql) };
     if (!query) {
         return {
             kind: "error",
@@ -573,22 +581,28 @@ export async function run(
     let committedRevision: SyncResult | undefined;
     let affectedRowGroups: unknown[];
     let response: unknown;
-    if (options.commitSyncRevision) {
-        if (db.protocol === "file") {
-            const databases = await db.execute("pragma database_list");
-            if (!databases.rows.find(row => row.name === "main")?.file) throw new Error("Unsupported in-memory transaction");
+    {
+        if (!query.primary_db || !Array.isArray(query.attached_dbs)
+            || [query.primary_db, ...query.attached_dbs].some(namespace =>
+                !Object.hasOwn(query.schemaContracts, namespace) || !query.schemaContracts[namespace])) {
+            throw new Error("Missing compiled schema contracts");
         }
+        await assertPersistentTransaction(db);
         await assertSupportedIntegerMode(db);
-        const tx = await db.transaction("write");
+        const tx = await db.transaction(query.operation === "query" && !options.commitSyncRevision ? "read" : "write");
         let committing = false;
         try {
+            await assertSchemaContracts(tx, query.schemaContracts, query.primary_db);
             resultSets = await executeStatements({ execute: tx.execute.bind(tx) }, sqlStatements);
             affectedRowGroups = extractAffectedRowGroups(activeSql, resultSets);
             response = formatResultData(activeSql, resultSets);
             if (query.ReturnData && !query.ReturnData.safeParse(response).success) {
                 throw new Error("Failed to decode return data");
             }
-            committedRevision = await nextLiveSyncRevision(tx);
+            if (options.commitSyncRevision) {
+                committedRevision = await nextLiveSyncRevision(tx);
+                executionContracts.set(committedRevision, query.schemaContracts[query.primary_db]);
+            }
             committing = true;
             await tx.commit();
         } catch (error) {
@@ -602,13 +616,6 @@ export async function run(
             }
             throw error;
         } finally { try { tx.close(); } catch { /* Closing cannot erase a committed revision. */ } }
-    } else {
-        resultSets = await executeStatements(db, sqlStatements);
-        affectedRowGroups = extractAffectedRowGroups(activeSql, resultSets);
-        response = formatResultData(activeSql, resultSets);
-        if (query.ReturnData && !query.ReturnData.safeParse(response).success) {
-            throw new Error("Failed to decode return data");
-        }
     }
 
     // Always create sync function - it will be a no-op if there's nothing to send

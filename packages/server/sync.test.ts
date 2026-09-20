@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { afterEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { namespace } from "@pyre/core/local-edits";
 import { z } from "zod";
 
@@ -60,7 +60,8 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   calculate_sync_deltas: () => ({ groups: [] }),
   reshape_sync_table_groups: (groups: any) => reshapeSyncTableGroupsMock(groups),
   set_schema: (introspection: unknown) => { activeSchema = introspection; setSchemaCalls.push(introspection); },
-  get_schema_compiled_contract: () => activeSchema?.compiledContract ?? "contract-1",
+  get_schema_compiled_contract: () => activeSchema?.compiledContract
+    ?? ({ old: "replacement-old", new: "replacement-new" }[activeSchema?.schema_source]) ?? "contract-1",
   get_schema_manifest_contract: () => activeSchema?.manifestContract ?? activeSchema?.compiledContract ?? "contract-1",
   migrate_with_introspection: () => migrationResult,
   sql_introspect_uninitialized: () => "select uninitialized introspection",
@@ -71,6 +72,15 @@ const { catchup, rotateDatabaseEpoch } = await import("./sync");
 const { ensureDatabase, loadSchemaFromDatabase, getIntrospectionJson } = await import("./schema");
 const { localEdits } = await import("./local-edits");
 const { runBatch } = await import("./query");
+
+beforeEach(async () => {
+  const db = { execute: async (sql: string) => sql.includes("is_initialized")
+    ? { rows: [{ is_initialized: 1 }] }
+    : { rows: [{ result: JSON.stringify({ schema_source: "record Note {}" }) }] } };
+  await loadSchemaFromDatabase(db as any);
+  await loadSchemaFromDatabase("main", db as any);
+  setSchemaCalls = [];
+});
 
 afterEach(() => {
   getSyncSqlMock = defaultSyncSql;
@@ -108,6 +118,27 @@ function initializationDatabase(initialized: boolean, introspection: any) {
     },
     tx,
     batches,
+  };
+}
+
+function readDatabase(reads: any, schemaSource: string | null = "record Note {}") {
+  let closed = false;
+  const tx = {
+    execute: mock(async (statement: any) => {
+      const sql = typeof statement === "string" ? statement : statement.sql;
+      if (sql.includes("_pyre_migrations")) return { rows: [{ schema: schemaSource }] };
+      return reads.execute(statement);
+    }),
+    batch: reads.batch,
+    rollback: mock(async () => { closed = true; }),
+    close: mock(() => { closed = true; }),
+    get closed() { return closed; },
+  };
+  return {
+    execute: mock(async () => { throw new Error("Catchup must read inside its transaction"); }),
+    batch: mock(async () => { throw new Error("Catchup must batch inside its transaction"); }),
+    transaction: mock(async () => tx),
+    tx,
   };
 }
 
@@ -289,7 +320,6 @@ test("queued batch revalidates schema evidence after acquiring its write transac
   ], session_args: [], optional_input_args: [], json_input_args: [], InputValidator: z.object({}), SessionValidator: z.object({}) };
   const oldManifest = { version: 1, manifestVersion: authority.manifest, compiledContract: "manifest-old",
     replacementContracts: { Main: "replacement-old" }, queries: { write: query }, SessionValidator: z.object({}) };
-  const unboundManifest = { ...oldManifest, compiledContract: undefined, replacementContracts: undefined };
 
   let releaseFirst: () => void;
   let markFirstStarted: () => void;
@@ -304,13 +334,17 @@ test("queued batch revalidates schema evidence after acquiring its write transac
         return { rows: [{ name: "main", file: "/tmp/schema-race.db" }], columns: ["name", "file"], rowsAffected: 0 };
       }
       if (sql.includes("select database_epoch")) return { rows: [{ database_epoch: "epoch-1" }], columns: ["database_epoch"], rowsAffected: 0 };
+      if (sql.includes("_pyre_migrations")) return { rows: [{ schema: "old" }] };
       if (sql.includes("update _pyre_sync")) return { rows: [{ database_epoch: "epoch-1", server_revision: 1 }], columns: ["database_epoch", "server_revision"], rowsAffected: 1 };
       return { rows: [], columns: [], rowsAffected: 1 };
     }),
     commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}),
   };
   const integerMode = { rows: [{ _pyre_integer_mode: 1 }] };
-  const firstDb = { execute: mock(async () => integerMode), transaction: mock(async () => firstTx) };
+  const firstDb = { execute: mock(async (sql: string) => sql.includes("_pyre_integer_mode")
+    ? integerMode : sql.includes("is_initialized") ? { rows: [{ is_initialized: 1 }] }
+      : { rows: [{ result: JSON.stringify({ schema_source: "old", compiledContract: "replacement-old", manifestContract: "manifest-old" }) }] }),
+    transaction: mock(async () => firstTx) };
 
   let schema = { schema_source: "old", compiledContract: "replacement-old", manifestContract: "manifest-old" };
   const secondExecute = mock(async (sql: string) => sql.includes("_pyre_integer_mode")
@@ -318,22 +352,28 @@ test("queued batch revalidates schema evidence after acquiring its write transac
     : sql.includes("is_initialized")
       ? { rows: [{ is_initialized: 1 }] }
       : { rows: [{ result: JSON.stringify(schema) }] });
-  const secondTx = { execute: mock(async () => { throw new Error("captured SQL must not execute"); }),
+  const secondTx = { execute: mock(async (statement: any) => {
+    const sql = typeof statement === "string" ? statement : statement.sql;
+    if (sql === "pragma database_list") return { rows: [{ name: "main", file: "/tmp/schema-race.db" }] };
+    if (sql.includes("_pyre_migrations")) return { rows: [{ schema: schema.schema_source }] };
+    throw new Error("captured SQL must not execute");
+  }),
     commit: mock(async () => {}), rollback: mock(async () => {}), close: mock(() => {}) };
   const secondDb = { execute: secondExecute, transaction: mock(async () => secondTx) };
 
+  await loadSchemaFromDatabase(firstDb as any);
   await loadSchemaFromDatabase(secondDb as any);
-  const first = runBatch(firstDb as any, unboundManifest as any, authority, request as any, {});
+  const first = runBatch(firstDb as any, oldManifest as any, authority, request as any, {});
   await firstStarted;
   const queued = runBatch(secondDb as any, oldManifest as any, authority, request as any, {});
   schema = { schema_source: "new", compiledContract: "replacement-new", manifestContract: "manifest-new" };
-  await loadSchemaFromDatabase(secondDb as any);
   releaseFirst!();
 
   expect((await first).kind).toBe("success");
   expect(await queued).toEqual({ kind: "error", error: { errorType: "InvalidRequest", message: "InvalidRequest" } });
   expect(secondDb.transaction).toHaveBeenCalledWith("write");
-  expect(secondTx.execute).not.toHaveBeenCalled();
+  expect(secondTx.execute.mock.calls.map(([statement]) => typeof statement === "string" ? statement : statement.sql))
+    .toEqual(['SELECT schema FROM "main"._pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL ORDER BY id DESC LIMIT 1']);
   expect(secondTx.rollback).toHaveBeenCalledTimes(1);
 });
 
@@ -346,7 +386,7 @@ test("ensureDatabase refreshes existing database-id schema registrations", async
   await ensureDatabase(database.db as any, "Main", introspection.schema_source);
   getSyncSqlMock = () => ({ tables: [] });
 
-  await catchup({ execute: mock(async () => ({ rows: [{ database_epoch: "epoch" }] })), batch: mock(async () => []) } as any,
+  await catchup(readDatabase({ execute: mock(async () => ({ rows: [{ database_epoch: "epoch" }] })), batch: mock(async () => []) }) as any,
     { tables: {} }, {}, 1000, "main");
 
   expect(setSchemaCalls.at(-1)).toEqual(introspection);
@@ -375,7 +415,7 @@ test("catchup activates the schema loaded for its databaseId", async () => {
   introspectionResult = campaignIntrospection;
   await loadSchemaFromDatabase("campaign", schemaDb as any);
 
-  await catchup(db as any, { tables: {} }, {}, 1000, "main");
+  await catchup(readDatabase(db, mainIntrospection.schema_source) as any, { tables: {} }, {}, 1000, "main");
 
   expect(setSchemaCalls.at(-1)).toEqual(mainIntrospection);
 });
@@ -409,7 +449,7 @@ test("catchup reshapes flattened custom types before returning sync rows", async
     ])),
   };
 
-  const result = await catchup(db as any, { tables: {} }, {}, 1000);
+  const result = await catchup(readDatabase(db) as any, { tables: {} }, {}, 1000);
 
   expect(result).toEqual({
     databaseEpoch: "test-epoch",
@@ -454,7 +494,7 @@ test("catchup stamps response with databaseId when provided", async () => {
   };
 
   await loadSchemaFromDatabase("campaign:123", schemaDb as any);
-  const result = await catchup(db as any, { tables: {} }, {}, 1000, "campaign:123");
+  const result = await catchup(readDatabase(db, "campaign schema") as any, { tables: {} }, {}, 1000, "campaign:123");
 
   expect(result.databaseId).toBe("campaign:123");
 });
@@ -466,9 +506,15 @@ test("catchup reuses server revision from status query without a second execute"
     batch: mock(async () => ([])),
   };
 
-  const result = await catchup(db as any, { tables: {} }, {}, 1000);
+  const database = readDatabase(db);
+  const result = await catchup(database as any, { tables: {} }, {}, 1000);
 
   expect(result.serverRevision).toBe(7);
+  expect(database.transaction).toHaveBeenCalledWith("read");
+  expect(database.tx.execute).toHaveBeenCalledTimes(2);
+  expect(database.tx.rollback).toHaveBeenCalledTimes(1);
+  expect(database.tx.close).toHaveBeenCalledTimes(1);
+  expect(database.execute).not.toHaveBeenCalled();
   expect(db.execute).toHaveBeenCalledTimes(1);
   expect(db.batch).toHaveBeenCalledTimes(0);
 });
@@ -484,7 +530,7 @@ test("catchup returns an explicit replacement without querying table rows on epo
     batch: mock(async () => ([])),
   };
 
-  const result = await catchup(db as any, { tables: {} }, {}, 1000, "main", "stale-epoch");
+  const result = await catchup(readDatabase(db) as any, { tables: {} }, {}, 1000, "main", "stale-epoch");
 
   expect(result).toEqual({
     type: "reset",
@@ -538,7 +584,7 @@ test("catchup normalizes bigint row values before reshaping", async () => {
     ])),
   };
 
-  const result = await catchup(db as any, { tables: {} }, {}, 1000);
+  const result = await catchup(readDatabase(db) as any, { tables: {} }, {}, 1000);
 
   expect(result.tables.maps.rows[0]).toEqual({
     id: 1,
@@ -585,7 +631,7 @@ test("catchup unwraps double-encoded json objects for json columns", async () =>
     ])),
   };
 
-  const result = await catchup(db as any, { tables: {} }, {}, 1000);
+  const result = await catchup(readDatabase(db) as any, { tables: {} }, {}, 1000);
 
   expect(result.tables.gameEntities.rows[0]).toEqual({
     id: 1,
@@ -630,7 +676,7 @@ test("catchup expands aggregate sync row payloads", async () => {
     ])),
   };
 
-  const result = await catchup(db as any, { tables: {} }, {}, 1000);
+  const result = await catchup(readDatabase(db) as any, { tables: {} }, {}, 1000);
 
   expect(result.tables.gameEntities.rows[0]).toEqual({
     id: 1,
@@ -666,7 +712,7 @@ test("catchup executes status and table sync SQL with bound params", async () =>
     ])),
   };
 
-  await catchup(db as any, { tables: {} }, {}, 1000);
+  await catchup(readDatabase(db) as any, { tables: {} }, {}, 1000);
 
   expect(db.execute).toHaveBeenCalledWith({ sql: "select ? as status", args: ["tenant' OR 1=1 --"] });
   expect(db.batch).toHaveBeenCalledWith([
@@ -700,7 +746,7 @@ test("catchup caps pageSize before requesting sync SQL and slicing rows", async 
     ])),
   };
 
-  const result = await catchup(db as any, { tables: {} }, {}, 999999);
+  const result = await catchup(readDatabase(db) as any, { tables: {} }, {}, 999999);
 
   expect(requestedPageSize).toBe(5000);
   expect(result.tables.maps.rows).toHaveLength(5000);
@@ -772,8 +818,96 @@ test("catchup rejects non-integer database timestamps", async () => {
       ])),
     };
 
-    await expect(catchup(db as any, { tables: {} }, {}, 1000)).rejects.toThrow(
+    await expect(catchup(readDatabase(db) as any, { tables: {} }, {}, 1000)).rejects.toThrow(
       "database updatedAt must be a safe integer number or bigint",
     );
   }
+});
+
+test("catchup rejects missing or changed persisted authority before status or row reads", async () => {
+  for (const source of [null, "", "new"]) {
+    const reads = { execute: mock(async () => { throw new Error("status must not execute"); }), batch: mock(async () => []) };
+    const db = readDatabase(reads, source);
+    getSyncStatusSqlMock = mock(() => "select status");
+
+    await expect(catchup(db as any, { tables: {} }, {})).rejects.toThrow(
+      source === "new" ? "Schema contract mismatch" : "Missing persisted schema authority",
+    );
+
+    expect(db.transaction).toHaveBeenCalledWith("read");
+    expect(db.tx.execute.mock.calls).toEqual([
+      ['SELECT schema FROM "main"._pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL ORDER BY id DESC LIMIT 1'],
+    ]);
+    expect(getSyncStatusSqlMock).not.toHaveBeenCalled();
+    expect(reads.execute).not.toHaveBeenCalled();
+    expect(reads.batch).not.toHaveBeenCalled();
+    expect(db.execute).not.toHaveBeenCalled();
+    expect(db.tx.rollback).toHaveBeenCalledTimes(1);
+    expect(db.tx.close).toHaveBeenCalledTimes(1);
+  }
+});
+
+test("catchup requires cached schema source even when WASM has a compiled contract", async () => {
+  const schemaDb = initializationDatabase(true, { schema_source: "" });
+  await loadSchemaFromDatabase(schemaDb.db as any);
+  const db = readDatabase({ execute: mock(async () => ({})), batch: mock(async () => []) });
+
+  await expect(catchup(db as any, { tables: {} }, {})).rejects.toThrow("Missing replacement schema");
+  expect(db.transaction).not.toHaveBeenCalled();
+});
+
+test("catchup restores its captured schema across transaction, status and batch awaits", async () => {
+  const captured = { schema_source: "old", compiledContract: "replacement-old", tables: [{ name: "maps" }] };
+  const schemaDb = initializationDatabase(true, captured);
+  await loadSchemaFromDatabase("catchup-race", schemaDb.db as any);
+  const other = { schema_source: "new", compiledContract: "replacement-new" };
+  getSyncStatusSqlMock = () => {
+    expect(activeSchema).toEqual(captured);
+    return "select status";
+  };
+  getSyncSqlMock = () => {
+    expect(activeSchema).toEqual(captured);
+    return defaultSyncSql();
+  };
+  reshapeSyncTableGroupsMock = groups => {
+    expect(activeSchema).toEqual(captured);
+    return groups;
+  };
+  const db = readDatabase({
+    execute: mock(async () => {
+      activeSchema = other;
+      return { rows: [{ database_epoch: "epoch", server_revision: 7 }] };
+    }),
+    batch: mock(async () => {
+      activeSchema = other;
+      return [{ columns: ["id", "updatedAt"], rows: [{ id: 1, updatedAt: 42 }] }];
+    }),
+  }, "old");
+  db.transaction.mockImplementation(async () => {
+    await loadSchemaFromDatabase("catchup-race", initializationDatabase(true, other).db as any);
+    return db.tx;
+  });
+
+  const result = await catchup(db as any, { tables: {} }, {}, 1000, "catchup-race");
+  expect(result.serverRevision).toBe(7);
+  expect(result.tables.maps.rows[0]).toMatchObject({ id: 1, updatedAt: 42 });
+  expect(db.transaction).toHaveBeenCalledTimes(1);
+  expect(db.tx.execute).toHaveBeenCalledTimes(2);
+  expect(db.tx.batch).toHaveBeenCalledWith(["select 1"]);
+  expect(db.execute).not.toHaveBeenCalled();
+  expect(db.batch).not.toHaveBeenCalled();
+  expect(db.tx.rollback).toHaveBeenCalledTimes(1);
+  expect(db.tx.close).toHaveBeenCalledTimes(1);
+});
+
+test("catchup preserves replacement-required errors when read transaction cleanup fails", async () => {
+  getSyncSqlMock = () => "Error: replacement required";
+  const db = readDatabase({ execute: mock(async () => ({ rows: [{ database_epoch: "epoch" }] })), batch: mock(async () => []) });
+  db.tx.rollback.mockImplementation(async () => { throw new Error("rollback failed"); });
+  db.tx.close.mockImplementation(() => { throw new Error("close failed"); });
+
+  await expect(catchup(db as any, { tables: {} }, {})).rejects.toThrow("Error: replacement required");
+  expect(db.tx.batch).not.toHaveBeenCalled();
+  expect(db.tx.rollback).toHaveBeenCalledTimes(1);
+  expect(db.tx.close).toHaveBeenCalledTimes(1);
 });

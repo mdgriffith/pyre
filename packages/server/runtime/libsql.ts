@@ -3,6 +3,14 @@ import type { Client } from "@libsql/client";
 const supportedIntegerClients = new WeakSet<object>();
 const INTEGER_MODE_PROBE = "select cast(1 as integer) as _pyre_integer_mode";
 
+/** Local libsql detaches its connection for transactions, losing private memory databases. */
+export async function assertPersistentTransaction(db: Client): Promise<void> {
+  if (db.protocol !== "file") return;
+  const databases = await db.execute("pragma database_list");
+  const file = databases.rows.find(row => row.name === "main")?.file;
+  if (typeof file !== "string" || !file) throw new Error("Unsupported in-memory transaction");
+}
+
 /** Pyre's generated codecs distinguish integer columns from numeric-looking text. */
 export async function assertSupportedIntegerMode(db: Pick<Client, "execute">): Promise<void> {
   if (typeof db === "object" && supportedIntegerClients.has(db)) return;

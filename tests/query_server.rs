@@ -57,6 +57,420 @@ fn bind(manifest: &Manifest, context: &pyre::typecheck::Context) -> BoundManifes
     BoundManifest::new(manifest.clone(), context).unwrap()
 }
 
+#[tokio::test]
+async fn generated_attachment_directives_use_verified_host_handles(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::schema::ensure_database;
+    let mut schemas = Vec::new();
+    for (namespace, record) in [("App", "MainItem"), ("Archive", "ArchiveItem")] {
+        let mut schema = ast::Schema {
+            namespace: namespace.into(),
+            ..Default::default()
+        };
+        parser::run(
+            "schema.pyre",
+            &format!("record {record} {{\n @public\n id Id.Uuid @id\n}}\n"),
+            &mut schema,
+        )
+        .unwrap();
+        schemas.push(schema);
+    }
+    let database = ast::Database { schemas };
+    let context = typecheck::check_schema(&database).unwrap();
+    let manifest = manifest_for(
+        &context,
+        "query Both { mainItem { id } archiveItem { id } }",
+        false,
+    )?;
+    let query = only_query(&manifest);
+    assert_eq!(query.attached_dbs.len(), 1);
+    let attached = &query.attached_dbs[0];
+    let directive = format!("attach $db_{attached} as {attached}");
+    assert!(query.sql.iter().any(|statement| statement.sql == directive));
+    let temp = tempfile::tempdir()?;
+    let mut sources = HashMap::new();
+    let mut paths = HashMap::new();
+    for schema in &database.schemas {
+        let source = pyre::generate::to_string::standalone_schema_to_string(&context, schema);
+        let path = temp.path().join(format!("{}.db", schema.namespace));
+        let db = libsql::Builder::new_local(&path).build().await?;
+        let conn = db.connect()?;
+        ensure_database(&conn, &schema.namespace, &source).await?;
+        let table = if schema.namespace == "App" {
+            "mainItems"
+        } else {
+            "archiveItems"
+        };
+        conn.execute(
+            &format!("INSERT INTO {table}(id) VALUES ('01890f6c-7b80-7000-8000-000000000001')"),
+            (),
+        )
+        .await?;
+        sources.insert(schema.namespace.clone(), source);
+        paths.insert(schema.namespace.clone(), path);
+    }
+    let db = libsql::Builder::new_local(&paths[&query.primary_db])
+        .build()
+        .await?;
+    let conn = db.connect()?;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    // No implicit paths or empty attached databases when the host omits a binding.
+    assert!(query::run(&conn, &manifest, &query.id, json!({}), &session)
+        .await
+        .is_err());
+    conn.execute(
+        &format!("ATTACH DATABASE ? AS {attached}"),
+        libsql::params![paths[attached].to_string_lossy().to_string()],
+    )
+    .await?;
+    let bound = bind(&manifest, &context);
+    for _ in 0..2 {
+        let result = query::run(&conn, &manifest, &query.id, json!({}), &session).await?;
+        let rows = json!([{"id":"01890f6c-7b80-7000-8000-000000000001"}]);
+        assert_eq!(result.response, json!({"mainItem":rows,"archiveItem":rows}));
+        query::run_with_revision(&conn, &bound, &query.id, json!({}), &session, true).await?;
+    }
+    let other = libsql::Builder::new_local(&paths[attached]).build().await?;
+    ensure_database(
+        &other.connect()?,
+        attached,
+        &sources[attached].replace("@public", "@allow(query, insert, update, delete) { False }"),
+    )
+    .await?;
+    assert!(query::run(&conn, &manifest, &query.id, json!({}), &session)
+        .await
+        .is_err());
+    assert!(
+        query::run_with_revision(&conn, &bound, &query.id, json!({}), &session, false)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn publication_requires_execution_contract_not_cached_permissions(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::schema::{ensure_database, load_schema_from_database};
+    let source = "session {\n userId Int\n}\nrecord Note {\n id Id.Uuid @id\n ownerId Int\n body String\n @allow(query) { True }\n @allow(insert, update, delete) { True }\n}\n";
+    let db = TestDatabase::new(source).await?;
+    let conn = db.db.connect()?;
+    let migrator = db.db.connect()?;
+    ensure_database(
+        &migrator,
+        ast::DEFAULT_SCHEMANAME,
+        &source.replace(
+            "@allow(query) { True }",
+            "@allow(query) { ownerId == Session.userId }",
+        ),
+    )
+    .await?;
+    conn.execute("INSERT INTO notes(id, ownerId, body) VALUES ('01890f6c-7b80-7000-8000-000000000001', 1, 'secret')", ()).await?;
+    let loaded = load_schema_from_database(&conn).await?;
+    let context = loaded.context()?;
+    let manifest = manifest_for(
+        context,
+        "update Change { note { body = \"secret\" } }",
+        false,
+    )?;
+    let bound = bind(&manifest, context);
+    let id = &only_query(&manifest).id;
+    let session = PyreSession::new(json!({"userId":1}), &manifest.session_schema)?;
+    let sessions = ConnectedSessions::from([
+        ("origin".into(), session.logical().clone()),
+        ("allowed".into(), session.logical().clone()),
+        (
+            "denied".into(),
+            HashMap::from([("userId".into(), pyre::sync::SessionValue::Integer(2))]),
+        ),
+    ]);
+    for legacy in [false, true] {
+        for matching in [false, true] {
+            let (mut result, commit) = if legacy {
+                (
+                    query::run_sync(&conn, &manifest, id, json!({}), &session).await?,
+                    None,
+                )
+            } else {
+                query::run_with_revision(&conn, &bound, id, json!({}), &session, true).await?
+            };
+            assert!(!result.affected_rows.is_empty());
+            let server = SyncServer::new(if matching { context } else { &db.context });
+            let messages = if let Some(commit) = commit {
+                server.calculate_committed_deltas(
+                    &mut result,
+                    &sessions,
+                    "main",
+                    Some("origin"),
+                    &commit,
+                )?
+            } else {
+                server
+                    .calculate_deltas(&conn, &mut result, &sessions, "main", Some("origin"))
+                    .await?
+            };
+            if matching {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].session_id, "allowed");
+                assert_eq!(messages[0].message.type_, "delta");
+                assert!(!messages[0].message.data.is_empty());
+                assert_eq!(result.response["sync"]["type"], "delta");
+            } else {
+                assert_eq!(messages.len(), 2);
+                for message in messages {
+                    assert_eq!(message.message.type_, "syncRequired");
+                    assert!(message.message.data.is_empty());
+                    assert_eq!(message.message.reconciliation.unwrap()["invalidate"], true);
+                }
+                assert_eq!(result.response["sync"]["type"], "syncRequired");
+                assert!(result.response["sync"].get("data").is_none());
+            }
+        }
+        // An unverified result must not acquire authority from the server's context,
+        // and an origin absent from the registry still gets a row-free hint.
+        let mut unverified = query::QueryResult::default();
+        unverified.response = json!({});
+        let server = SyncServer::new(context);
+        let commit = query::CommittedRevision {
+            database_epoch: "epoch".into(),
+            revision: 99,
+        };
+        let messages = if legacy {
+            server
+                .calculate_deltas(
+                    &conn,
+                    &mut unverified,
+                    &sessions,
+                    "main",
+                    Some("unregistered"),
+                )
+                .await?
+        } else {
+            server.calculate_committed_deltas(
+                &mut unverified,
+                &sessions,
+                "main",
+                Some("unregistered"),
+                &commit,
+            )?
+        };
+        assert_eq!(messages.len(), 3);
+        assert!(messages
+            .iter()
+            .all(|message| message.message.data.is_empty()
+                && message.message.type_ == "syncRequired"));
+        assert_eq!(unverified.response["sync"]["type"], "syncRequired");
+        assert!(unverified.response["sync"].get("data").is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_authority_rejects_stale_handles_without_cache_refresh(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pyre::server::schema::{ensure_database, load_schema_from_database};
+    let source = "record Item {\n id Id.Uuid @id\n value String\n @allow(query, insert, update, delete) { True }\n}\n";
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("authority.db");
+    let db = libsql::Builder::new_local(&path).build().await?;
+    let other_db = libsql::Builder::new_local(&path).build().await?;
+    let conn = db.connect()?;
+    let migrator = other_db.connect()?;
+    let namespace = ast::DEFAULT_SCHEMANAME;
+    ensure_database(&migrator, namespace, source).await?;
+    let loaded = load_schema_from_database(&conn).await?;
+    let context = loaded.context()?;
+    let manifest = manifest_for(context,
+        "query ReadItems { item { id value } }\nupdate ChangeItems { item { value = \"changed\" } }", false)?;
+    let bound = bind(&manifest, context);
+    let read = manifest
+        .queries
+        .values()
+        .find(|q| q.operation == "query")
+        .unwrap();
+    let write = manifest
+        .queries
+        .values()
+        .find(|q| q.operation == "update")
+        .unwrap();
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    conn.execute(
+        "INSERT INTO items(id, value) VALUES ('01890f6c-7b80-7000-8000-000000000001', 'original')",
+        (),
+    )
+    .await?;
+    let epoch: String = conn
+        .query("SELECT database_epoch FROM _pyre_sync WHERE id = 1", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get(0)?;
+    let fingerprint = bound.fingerprint().to_string();
+    let binding = query::BatchBinding {
+        database_id: "test",
+        namespace,
+        manifest: &fingerprint,
+        instance: "tab",
+        auth_generation: 0,
+    };
+    let mut batch = query::BatchRequest {
+        version: 1,
+        database_id: "test".into(),
+        namespace: namespace.into(),
+        manifest: fingerprint.clone(),
+        instance: "tab".into(),
+        auth_generation: 0,
+        database_epoch: epoch.clone(),
+        request_id: "batch".into(),
+        sequence: 1,
+        operations: vec![query::BatchOperation {
+            operation: write.id.clone(),
+            input: json!({}),
+        }],
+    };
+    let replacement = ReplacementRequest {
+        version: 1,
+        request_id: "replacement".into(),
+        target: 0,
+        fence: SyncFence {
+            database_id: "test".into(),
+            namespace: namespace.into(),
+            manifest: fingerprint.clone(),
+            instance: "tab".into(),
+            auth_generation: 0,
+            database_epoch: epoch,
+        },
+    };
+    assert_eq!(
+        query::run(&conn, &manifest, &read.id, json!({}), &session)
+            .await?
+            .response["item"][0]["value"],
+        "original"
+    );
+    SyncServer::new(context)
+        .replacement(&conn, &bound, &binding, &replacement, &session)
+        .await?;
+    pyre::server::sync::catchup(&conn, context, &Default::default(), session.logical(), 100)
+        .await?;
+    // A semantic no-op migration remains compatible; no cache is refreshed.
+    ensure_database(&migrator, namespace, &format!("// comment\n{source}")).await?;
+    query::run_with_revision(&conn, &bound, &read.id, json!({}), &session, false).await?;
+    migrator.execute("INSERT INTO _pyre_migrations(name, sql, schema, finished_at, error) VALUES ('failed', '', 'invalid', 1, 'failed'), ('pending', '', 'invalid', NULL, NULL)", ()).await?;
+    query::run(&conn, &manifest, &read.id, json!({}), &session).await?;
+    // Permission-only changes leave the physical table and sync lifetime intact.
+    ensure_database(&migrator, namespace, &source.replace("True", "False")).await?;
+    for sync_mode in [false, true] {
+        for id in [&read.id, &write.id] {
+            assert!(
+                query::run_with_revision(&conn, &bound, id, json!({}), &session, sync_mode)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    assert!(query::run(&conn, &manifest, &read.id, json!({}), &session)
+        .await
+        .is_err());
+    assert!(
+        query::run_sync(&conn, &manifest, &write.id, json!({}), &session)
+            .await
+            .is_err()
+    );
+    assert!(query::run_batch(&conn, &bound, &binding, &batch, &session)
+        .await
+        .is_err());
+    batch.operations.clear();
+    assert!(query::run_batch(&conn, &bound, &binding, &batch, &session)
+        .await
+        .is_err());
+    assert!(SyncServer::new(context)
+        .replacement(&conn, &bound, &binding, &replacement, &session)
+        .await
+        .is_err());
+    assert!(pyre::server::sync::catchup(
+        &conn,
+        context,
+        &Default::default(),
+        session.logical(),
+        100
+    )
+    .await
+    .is_err());
+    let row = conn
+        .query(
+            "SELECT value, (SELECT server_revision FROM _pyre_sync WHERE id = 1) FROM items",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<String>(0)?, "original");
+    assert_eq!(row.get::<i64>(1)?, 0);
+    drop(row);
+    // No missing/invalid evidence fallback, even though the cached pair still binds.
+    for case in 0..5 {
+        match case {
+            0..=2 => {
+                let evidence = [None, Some(""), Some("not a schema")][case];
+                migrator.execute("UPDATE _pyre_migrations SET schema = ? WHERE id = (SELECT max(id) FROM _pyre_migrations)", libsql::params![evidence]).await?;
+            }
+            3 => {
+                migrator.execute("DELETE FROM _pyre_migrations", ()).await?;
+            }
+            _ => {
+                migrator.execute("DROP TABLE _pyre_migrations", ()).await?;
+            }
+        }
+        for id in [&read.id, &write.id] {
+            assert!(query::run(&conn, &manifest, id, json!({}), &session)
+                .await
+                .is_err());
+            assert!(query::run_sync(&conn, &manifest, id, json!({}), &session)
+                .await
+                .is_err());
+            for sync_mode in [false, true] {
+                assert!(query::run_with_revision(
+                    &conn,
+                    &bound,
+                    id,
+                    json!({}),
+                    &session,
+                    sync_mode
+                )
+                .await
+                .is_err());
+            }
+        }
+        assert!(query::run_batch(&conn, &bound, &binding, &batch, &session)
+            .await
+            .is_err());
+        batch.operations.push(query::BatchOperation {
+            operation: write.id.clone(),
+            input: json!({}),
+        });
+        assert!(query::run_batch(&conn, &bound, &binding, &batch, &session)
+            .await
+            .is_err());
+        batch.operations.clear();
+        assert!(SyncServer::new(context)
+            .replacement(&conn, &bound, &binding, &replacement, &session)
+            .await
+            .is_err());
+        assert!(pyre::server::sync::catchup(
+            &conn,
+            context,
+            &Default::default(),
+            session.logical(),
+            100
+        )
+        .await
+        .is_err());
+    }
+    Ok(())
+}
+
 #[test]
 fn non_unique_relationship_results_are_arrays() -> Result<(), Box<dyn std::error::Error>> {
     let mut schema = ast::Schema::default();
@@ -345,6 +759,144 @@ async fn typed_json_session_enums_match_compiled_bundle_writes(
     let different = PyreSession::new(session_value, &manifest.session_schema)?;
     let found = query::run(&conn, &manifest, &lookup.id, json!({}), &different).await?;
     assert_eq!(found.response, json!({"entry":[]}));
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_typed_json_session_matches_write_normalization(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+@syncable(false)
+type Role = Member | Admin
+type Details = Detail {
+    when DateTime
+    role Role
+    enabled Bool
+}
+type Scope = Scoped { details Json<Details> } | Unscoped
+session {
+    scope Scope
+}
+record Entry {
+    id Id.Int @id
+    details Json<Details>
+    @public
+}
+"#,
+    )
+    .await?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+insert CreateEntry($details: Json<Details>) {
+    entry {
+        details = $details
+        id
+    }
+}
+"#,
+        false,
+    )?;
+    let create = manifest
+        .queries
+        .values()
+        .find(|q| q.operation == "insert")
+        .unwrap();
+    let scope_schema = &manifest.session_schema["scope"];
+    assert!(scope_schema.tagged_union_types.contains_key("Details"));
+    assert!(scope_schema.tagged_union_variants["Scoped"]["details"]
+        .tagged_union_types
+        .is_empty());
+    let details =
+        json!({"_type":"Detail","when":"2026-01-01T00:00:00Z","role":"Member","enabled":true});
+    let session_value = json!({"scope":{"_type":"Scoped","details":details}});
+    let session = PyreSession::new(session_value.clone(), &manifest.session_schema)?;
+    let conn = db.db.connect()?;
+    query::run(
+        &conn,
+        &manifest,
+        &create.id,
+        json!({"details":details}),
+        &session,
+    )
+    .await?;
+    let row = conn
+        .query("select id, json(details) from entries", ())
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    let id = row.get::<i64>(0)?;
+    let stored: serde_json::Value = serde_json::from_str(&row.get::<String>(1)?)?;
+    assert_eq!(
+        stored,
+        json!({"_type":"Detail","when":1767225600,"role":{"_type":"Member"},"enabled":true})
+    );
+
+    for role in [json!("Member"), json!({"_type":"Member","extra":"claim"})] {
+        let mut claims = session_value.clone();
+        claims["extra"] = json!("claim");
+        claims["scope"]["extra"] = json!("claim");
+        claims["scope"]["details"]["extra"] = json!("claim");
+        claims["scope"]["details"]["role"] = role;
+        claims["scope"]["details"]["enabled"] = json!(1);
+        let session = PyreSession::new(claims.clone(), &manifest.session_schema)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                session.sql_args()["session_scope__details"]
+                    .as_str()
+                    .unwrap()
+            )?,
+            stored
+        );
+        assert_eq!(
+            session.logical()["scope__details"],
+            pyre::sync::SessionValue::Text(stored.to_string())
+        );
+        // Nested JSON terminals are not supported in authored predicates; compare
+        // the prepared binding directly against the generated query's stored value.
+        let mut found = conn
+            .query(
+                "select id from entries where details = jsonb(?)",
+                libsql::params![session.sql_args()["session_scope__details"]
+                    .as_str()
+                    .unwrap()],
+            )
+            .await?;
+        assert_eq!(found.next().await?.unwrap().get::<i64>(0)?, id);
+        assert!(found.next().await?.is_none());
+        claims["scope"]["details"]["when"] = json!("2026-01-02T00:00:00Z");
+        let different = PyreSession::new(claims, &manifest.session_schema)?;
+        let mut found = conn
+            .query(
+                "select id from entries where details = jsonb(?)",
+                libsql::params![different.sql_args()["session_scope__details"]
+                    .as_str()
+                    .unwrap()],
+            )
+            .await?;
+        assert!(found.next().await?.is_none());
+    }
+
+    // Session coercions and ignored claims must not loosen write validation.
+    for (field, value) in [
+        ("enabled", json!(1)),
+        ("extra", json!("claim")),
+        ("role", json!({"_type":"Member","extra":"claim"})),
+    ] {
+        let mut invalid = details.clone();
+        invalid[field] = value;
+        assert!(query::run(
+            &conn,
+            &manifest,
+            &create.id,
+            json!({"details":invalid}),
+            &session,
+        )
+        .await
+        .is_err());
+    }
     Ok(())
 }
 

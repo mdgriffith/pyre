@@ -556,6 +556,59 @@ Url.Records.UrlThing.delete(null as unknown as Url.UrlThingId);
     }
 
     #[test]
+    fn namespace_capitalization_rejects_keywords_and_compiles_valid_names() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let temp = tempfile::tempdir_in(root.join("target")).unwrap();
+        let mut schemas = Vec::new();
+        let mut check = String::from("import * as Multi from './multi/edits';\n");
+        for namespace in ["Default", "Class"] {
+            let mut schema = ast::Schema {
+                namespace: namespace.to_lowercase(),
+                ..ast::Schema::default()
+            };
+            crate::parser::run(
+                &format!("{namespace}/schema.pyre"),
+                &format!("record {namespace}Thing {{\n @public\n id Id.Uuid @id\n}}\n"),
+                &mut schema,
+            )
+            .unwrap();
+            let mut database = ast::Database {
+                schemas: vec![schema],
+            };
+            ast::resolve_id_brands(&mut database);
+            let errors = typecheck::check_schema(&database)
+                .err()
+                .expect("lowercase namespace rejected");
+            assert_eq!(errors.len(), 1);
+            assert!(matches!(
+                &errors[0].error_type,
+                crate::error::ErrorType::InvalidSchemaName(name) if name == &namespace.to_lowercase()
+            ));
+            database.schemas[0].namespace = namespace.into();
+            generate_test_root(
+                &database,
+                &temp.path().join(namespace),
+                "// Generated CRUD only.\n",
+            );
+            schemas.extend(database.schemas);
+            check.push_str(&format!(
+                "import * as {namespace} from './{namespace}/edits';\n{namespace}.batch([{namespace}.Records.{namespace}Thing.create({{}})]);\nMulti.{namespace}.batch([Multi.{namespace}.Records.{namespace}Thing.create({{}})]);\nconst marker{namespace}: typeof {namespace}.{namespace} = {namespace}.{namespace};\nconst multiMarker{namespace}: typeof Multi.{namespace}.{namespace} = Multi.{namespace}.{namespace};\n"
+            ));
+        }
+        let database = ast::Database { schemas };
+        generate_test_root(
+            &database,
+            &temp.path().join("multi"),
+            "// Generated CRUD only.\n",
+        );
+        std::fs::write(temp.path().join("check.ts"), check).unwrap();
+        typecheck_generated(
+            temp.path(),
+            r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"node","strict":true,"skipLibCheck":true,"noEmit":true},"files":["check.ts"]}"#,
+        );
+    }
+
+    #[test]
     fn query_only_namespaces_do_not_generate_local_edit_descriptors() {
         let mut query_only = ast::Schema::default();
         crate::parser::run(
@@ -639,7 +692,7 @@ Url.Records.UrlThing.delete(null as unknown as Url.UrlThingId);
         let context = typecheck::check_schema(&database).unwrap();
         let mut queries = crate::parser::parse_query(
             "queries.pyre",
-            "update RenamePost($id: Post.id, $title: String) { post { @where { id == $id } title = $title } user { email } }",
+            "update RenamePost($id: Post.id, $title: String) { post { @where { id == $id } title = $title } user { email } }\nquery Posts { post { id } }\nquery PostsAndUsers { post { id } user { email } }",
         )
         .unwrap();
         crate::generated_queries::append_generated_crud_queries(&mut queries, &context);
@@ -656,9 +709,46 @@ Url.Records.UrlThing.delete(null as unknown as Url.UrlThingId);
             &mut files,
         );
 
-        assert!(files
+        let metadata = &files
             .iter()
-            .any(|file| file.path.ends_with("core/queries/metadata/renamePost.ts")));
+            .find(|file| file.path.ends_with("core/queries/metadata/renamePost.ts"))
+            .unwrap()
+            .contents;
+        assert!(metadata.contains(&format!(
+            "schemaContracts: {},",
+            serde_json::to_string(&crate::generate::manifest::replacement_contracts(&context))
+                .unwrap()
+        )));
+        for name in ["posts", "postsAndUsers", "postCreate"] {
+            let metadata = &files
+                .iter()
+                .find(|file| file.path.ends_with(format!("queries/metadata/{name}.ts")))
+                .unwrap()
+                .contents;
+            let contracts: serde_json::Value = serde_json::from_str(
+                metadata
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("schemaContracts: "))
+                    .unwrap()
+                    .trim_end_matches(','),
+            )
+            .unwrap();
+            assert_eq!(
+                contracts["App"],
+                crate::generate::manifest::replacement_contract(&context, "App").unwrap()
+            );
+            assert_eq!(
+                contracts.get("Auth"),
+                if name == "postsAndUsers" {
+                    Some(serde_json::Value::String(
+                        crate::generate::manifest::replacement_contract(&context, "Auth").unwrap(),
+                    ))
+                } else {
+                    None
+                }
+                .as_ref()
+            );
+        }
         let edits = files
             .iter()
             .find(|file| file.path.ends_with("edits/App.ts"))
@@ -760,20 +850,14 @@ record Records {
             &out.join("core"),
             &mut files,
         );
-        let mut manifest = String::from("import { SessionValidator } from './core/decode';\n");
-        let mut entries = Vec::new();
-        for def in &queries.queries {
-            if let ast::QueryDef::Query(q) = def {
-                let module = crate::ext::string::decapitalize(&q.name);
-                manifest.push_str(&format!("import {{ meta as {} }} from './core/queries/metadata/{module}';\nimport {{ sql as {}Sql }} from './core/queries/sql/{module}';\n", q.name, q.name));
-                entries.push(format!(
-                    "[{}.id]: {{ ...{}, sql: {}Sql }}",
-                    q.name, q.name, q.name
-                ));
-            }
-        }
-        manifest.push_str(&format!("export const manifest = {{ version: 1, manifestVersion: {}, SessionValidator, queries: {{ {} }} }};\n", json(&crate::generate::manifest::fingerprint(&context, &queries, &info)), entries.join(",")));
-        files.push(generate_text_file(out.join("manifest.ts"), manifest));
+        super::super::targets::server::generate_schema(&context, &database, &out, &mut files);
+        super::super::targets::server::generate_queries(
+            &context, &info, &queries, &out, &mut files,
+        );
+        files.push(generate_text_file(
+            out.join("manifest.ts"),
+            "export { manifest } from './server';\n",
+        ));
         let edits = files
             .iter()
             .find(|file| file.path.ends_with("edits/Main.ts"))

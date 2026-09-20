@@ -884,8 +884,10 @@ fn dynamic_manifest(
     }
 
     Ok(Manifest {
-        replacement_contracts: Default::default(),
-        compiled_contract: String::new(),
+        replacement_contracts: generate::manifest::replacement_contracts(context)
+            .into_iter()
+            .collect(),
+        compiled_contract: generate::manifest::compiled_schema_contract(context),
         version: 1,
         session_schema: serde_json::from_value(json!(generate::manifest::session_schema(context)))
             .map_err(|error| error.to_string())?,
@@ -1242,20 +1244,6 @@ record Entry {
         )
         .unwrap();
         fs::write(dir.path().join("session.pyre"), session).unwrap();
-        let options = Options {
-            in_dir: dir.path(),
-            enable_color: false,
-        };
-        let (schema, context, _) = current_schema_context(&options, &json!({})).unwrap();
-        let introspection = pyre::db::introspect::Introspection {
-            tables: vec![],
-            migration_state: pyre::db::introspect::MigrationState::NoMigrationTable,
-            schema: pyre::db::introspect::SchemaResult::Success {
-                schema: ast::Schema::default(),
-                context: typecheck::empty_context(),
-            },
-        };
-        let diff = pyre::db::diff::diff(&context, &schema.schemas[0], &introspection);
         let database = dir
             .path()
             .join("test.db")
@@ -1265,16 +1253,13 @@ record Entry {
             .to_string();
         let db = db::connect(&database, &None).await.unwrap();
         let conn = db.connect().unwrap();
-        for statement in pyre::db::diff::to_sql::to_sql(&diff) {
-            match statement {
-                generate::sql::to_sql::SqlAndParams::Sql(sql) => {
-                    conn.execute_batch(&sql).await.unwrap();
-                }
-                generate::sql::to_sql::SqlAndParams::SqlWithParams { sql, args } => {
-                    conn.execute(&sql, args).await.unwrap();
-                }
-            }
-        }
+        let source = format!(
+            "{}\n{session}",
+            fs::read_to_string(dir.path().join("schema.pyre")).unwrap()
+        );
+        pyre::server::schema::ensure_database(&conn, ast::DEFAULT_SCHEMANAME, &source)
+            .await
+            .unwrap();
         (dir, database)
     }
 
