@@ -1,0 +1,6 @@
+session {
+    userId Int
+    role Role
+    unrelated String
+    context Json<Details>?
+}

@@ -2,6 +2,8 @@ use crate::ast;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+pub const UUID_VALIDATOR: &str = "z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)";
+
 fn collect_tagged_types(
     database: &ast::Database,
 ) -> HashMap<String, (Vec<ast::Variant>, HashSet<String>)> {
@@ -216,11 +218,20 @@ pub fn column_type_to_zod_validator(type_: &ast::ColumnType) -> String {
             format!("{}.nullable()", column_type_to_zod_validator(inner))
         }
         ast::ColumnType::IdInt { .. } => "z.number().int()".to_string(),
-        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::IdUuid { .. } => UUID_VALIDATOR.to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
             ..
+        } => UUID_VALIDATOR.to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type:
+                Some(ast::ConcreteSerializationType::Text | ast::ConcreteSerializationType::Date),
+            ..
         } => "z.string()".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(ast::ConcreteSerializationType::DateTime),
+            ..
+        } => "CoercedDate".to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type:
                 Some(ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt),
@@ -269,7 +280,7 @@ function parseRfc3339(value: string): Date | null {
 
 export const CoercedDate = z.union([z.number(), z.string(), z.date()]).transform((val, ctx) => {
   if (val instanceof Date) {
-    return val;
+    return Number.isNaN(val.getTime()) ? invalidDate(ctx, 'Invalid Date') : val;
   }
 
   if (typeof val === 'number') {
@@ -295,6 +306,204 @@ export const CoercedDate = z.union([z.number(), z.string(), z.date()]).transform
 export const CoercedBool = z.union([z.boolean(), z.literal(0), z.literal(1)]).transform((val) => typeof val === 'number' ? val === 1 : val);
 
 "#
+}
+
+/// Input codecs are separate from permissive partial-projection result decoders.
+pub fn input_column_validator(type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::Json => "z.json().refine(value => value !== null).nonoptional()".into(),
+        ast::ColumnType::Bool => "z.boolean()".into(),
+        ast::ColumnType::Custom(name) => format!("z.lazy(() => {}JsonInput)", name),
+        ast::ColumnType::JsonTyped(inner) => input_column_validator(inner),
+        ast::ColumnType::List(inner) => format!("z.array({})", input_column_validator(inner)),
+        ast::ColumnType::Dict(inner) => {
+            format!("z.record(z.string(), {})", input_column_validator(inner))
+        }
+        ast::ColumnType::Nullable(inner) => format!("{}.nullable()", input_column_validator(inner)),
+        _ => column_type_to_zod_validator(type_),
+    }
+}
+
+pub fn session_column_validator(type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::Json => "z.json().refine(value => value !== null).nonoptional()".into(),
+        ast::ColumnType::Custom(name) => format!("z.lazy(() => {}SessionInput)", name),
+        ast::ColumnType::JsonTyped(inner) => session_json_column_validator(inner, ""),
+        ast::ColumnType::List(inner) => format!("z.array({})", session_column_validator(inner)),
+        ast::ColumnType::Dict(inner) => {
+            format!("z.record(z.string(), {})", session_column_validator(inner))
+        }
+        ast::ColumnType::Nullable(inner) => {
+            format!("{}.nullable()", session_column_validator(inner))
+        }
+        _ => column_type_to_zod_validator(type_),
+    }
+}
+
+pub fn generate_input_tagged_union(name: &str, variants: &[ast::Variant], session: bool) -> String {
+    let mut result = generate_input_tagged_union_mode(name, variants, session, false);
+    if session {
+        result.push_str(&generate_input_tagged_union_mode(
+            name, variants, true, true,
+        ));
+    }
+    result
+}
+
+pub fn session_json_column_validator(type_: &ast::ColumnType, qualifier: &str) -> String {
+    match type_ {
+        ast::ColumnType::Custom(name) => {
+            format!("z.lazy(() => {}{}SessionJsonInput)", qualifier, name)
+        }
+        ast::ColumnType::JsonTyped(inner) => session_json_column_validator(inner, qualifier),
+        ast::ColumnType::List(inner) => format!(
+            "z.array({})",
+            session_json_column_validator(inner, qualifier)
+        ),
+        ast::ColumnType::Dict(inner) => format!(
+            "z.record(z.string(), {})",
+            session_json_column_validator(inner, qualifier)
+        ),
+        ast::ColumnType::Nullable(inner) => format!(
+            "{}.nullable()",
+            session_json_column_validator(inner, qualifier)
+        ),
+        ast::ColumnType::Bool => format!("{}CoercedBool", qualifier),
+        ast::ColumnType::DateTime => format!("{}CoercedDate", qualifier),
+        _ => {
+            let validator = session_column_validator(type_);
+            if validator == "CoercedDate" || validator == "CoercedBool" {
+                format!("{}{}", qualifier, validator)
+            } else {
+                validator
+            }
+        }
+    }
+}
+
+fn generate_input_tagged_union_mode(
+    name: &str,
+    variants: &[ast::Variant],
+    session: bool,
+    json_session: bool,
+) -> String {
+    fn input_type(type_: &ast::ColumnType, session: bool, json_session: bool) -> String {
+        match type_ {
+            ast::ColumnType::Custom(name) => format!(
+                "{}{}",
+                name,
+                if session {
+                    if json_session {
+                        "SessionJsonInput"
+                    } else {
+                        "SessionInput"
+                    }
+                } else {
+                    "JsonInput"
+                }
+            ),
+            ast::ColumnType::JsonTyped(inner) => input_type(inner, session, true),
+            ast::ColumnType::List(inner) => {
+                format!("Array<{}>", input_type(inner, session, json_session))
+            }
+            ast::ColumnType::Dict(inner) => {
+                format!(
+                    "Record<string, {}>",
+                    input_type(inner, session, json_session)
+                )
+            }
+            ast::ColumnType::Nullable(inner) => {
+                format!("{} | null", input_type(inner, session, json_session))
+            }
+            _ => column_type_to_ts_type(type_, false),
+        }
+    }
+    let suffix = if session {
+        if json_session {
+            "SessionJsonInput"
+        } else {
+            "SessionInput"
+        }
+    } else {
+        "Write"
+    };
+    if variants.iter().all(|variant| variant.fields.is_none()) {
+        let tags = variants
+            .iter()
+            .map(|v| format!("\"{}\"", v.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let normalized = if json_session {
+            "({ _type: typeof value === 'string' ? value : value._type })"
+        } else {
+            "typeof value === 'string' ? value : value._type"
+        };
+        let mut result = format!("export const {0}{2} = z.union([z.enum([{1}]), z.{3}({{ _type: z.enum([{1}]) }})]).transform(value => {4});\nexport type {0}{2} = z.infer<typeof {0}{2}>;\n\n", name, tags, suffix, if session { "object" } else { "strictObject" }, normalized);
+        if !session {
+            result.push_str(&format!("export const {0}JsonInput = {0}Write.transform(_type => ({{ _type }}));\nexport type {0}JsonInput = z.infer<typeof {0}JsonInput>;\n\n", name));
+        }
+        return result;
+    }
+    let mut result = format!("export type {}{} =\n", name, suffix);
+    for variant in variants {
+        result.push_str(&format!("  | {{ _type: \"{}\"", variant.name));
+        for field in variant.fields.iter().flatten() {
+            if let ast::Field::Column(col) = field {
+                result.push_str(&format!(
+                    "; {}{}: {}{}",
+                    col.name,
+                    if session && col.nullable { "?" } else { "" },
+                    input_type(&col.type_, session, json_session),
+                    if col.nullable { " | null" } else { "" }
+                ));
+            }
+        }
+        result.push_str(" }\n");
+    }
+    result.push_str(&format!(
+        ";\nexport const {0}{1}: z.ZodType<{0}{1}> = z.discriminatedUnion('_type', [\n",
+        name, suffix
+    ));
+    for variant in variants {
+        result.push_str(&format!(
+            "  z.{}({{ _type: z.literal(\"{}\"),\n",
+            if session { "object" } else { "strictObject" },
+            variant.name
+        ));
+        for field in variant.fields.iter().flatten() {
+            if let ast::Field::Column(col) = field {
+                result.push_str(&format!(
+                    "    {}: {}{},\n",
+                    col.name,
+                    if json_session {
+                        session_json_column_validator(&col.type_, "")
+                    } else if session {
+                        session_column_validator(&col.type_)
+                    } else {
+                        input_column_validator(&col.type_)
+                    },
+                    if col.nullable {
+                        if session {
+                            ".nullish()"
+                        } else {
+                            ".nullable()"
+                        }
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+        result.push_str("  }),\n");
+    }
+    result.push_str("]);\n\n");
+    if !session {
+        result.push_str(&format!(
+            "export const {0}JsonInput = {0}Write;\nexport type {0}JsonInput = {0}Write;\n\n",
+            name
+        ));
+    }
+    result
 }
 
 /// Generate a tagged union decoder using Zod

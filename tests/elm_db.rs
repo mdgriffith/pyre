@@ -50,6 +50,7 @@ type Tiling = Tiling {
 #[test]
 fn db_elm_json_alias_and_json_codecs_are_generated() {
     let schema_source = r#"
+@syncable(false)
 record GameAsset {
     @public
     id    Id.Int @id
@@ -127,6 +128,7 @@ type Lifecycle
         reason String
      }
 
+@syncable(false)
 record Event {
     @public
     id       Id.Int @id
@@ -244,6 +246,7 @@ type Attribute
         value Int
      }
 
+@syncable(false)
 record Entity {
     @public
     id    Id.Int @id

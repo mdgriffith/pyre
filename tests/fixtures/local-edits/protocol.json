@@ -1,0 +1,247 @@
+{
+  "version": 1,
+  "traces": [
+    {
+      "name": "overlapping rejection replays intent rather than inverse rows",
+      "initial": {"Issue:u1": {"title": "old", "assignee": 1}},
+      "steps": [
+        {"action": "submit", "id": "a", "ops": [{"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "first"]]}]},
+        {"action": "dispatch", "id": "a"},
+        {"action": "submit", "id": "b", "ops": [{"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "discard"], ["title", "later"], ["assignee", null]]}]},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "later", "assignee": null}}}},
+        {"action": "reject", "id": "a"},
+        {"action": "expect", "value": {"base": {"Issue:u1": {"title": "old", "assignee": 1}}, "visible": {"Issue:u1": {"title": "later", "assignee": null}}, "states": {"a": "rejected", "b": "queued"}, "failures": [["a", "rejected"]]}},
+        {"action": "reject", "id": "a"},
+        {"action": "expect", "value": {"failures": [["a", "rejected"]]}}
+      ]
+    },
+    {
+      "name": "acceptance waits for complete coverage and preserves later patch",
+      "initial": {"Issue:u1": {"title": "old", "assignee": 1}},
+      "steps": [
+        {"action": "submit", "id": "a", "ops": [{"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "first"]]}]},
+        {"action": "dispatch", "id": "a"},
+        {"action": "submit", "id": "b", "ops": [{"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "later"]]}]},
+        {"action": "accept", "id": "a", "revision": 2},
+        {"action": "expect", "value": {"covered": 0, "required": 2, "states": {"a": "accepted", "b": "queued"}, "visible": {"Issue:u1": {"title": "later", "assignee": 1}}}},
+        {"action": "catchup"},
+        {"action": "replace", "target": 2, "revision": 2, "complete": false, "rows": {}},
+        {"action": "replace", "target": 2, "revision": 1, "complete": true, "rows": {}},
+        {"action": "expect", "value": {"covered": 0, "states": {"a": "accepted", "b": "queued"}}},
+        {"action": "replace", "target": 2, "revision": 2, "complete": true, "rows": {"Issue:u1": {"title": "corrected", "assignee": 9}}},
+        {"action": "expect", "value": {"covered": 2, "base": {"Issue:u1": {"title": "corrected", "assignee": 9}}, "visible": {"Issue:u1": {"title": "later", "assignee": 9}}, "states": {"a": "confirmed", "b": "queued"}}},
+        {"action": "dispatch", "id": "b"},
+        {"action": "reject", "id": "b"},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "corrected", "assignee": 9}}, "failures": [["b", "rejected"]]}}
+      ]
+    },
+    {
+      "name": "lost response never double applies or infers outcome from snapshot",
+      "initial": {"Issue:u1": {"title": "old"}},
+      "steps": [
+        {"action": "submit", "id": "a", "ops": [{"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "mine"]]}]},
+        {"action": "dispatch", "id": "a"},
+        {"action": "unknown", "id": "a"},
+        {"action": "unknown", "id": "a"},
+        {"action": "submit", "id": "b", "ops": [{"kind": "create", "key": "Issue:u2", "safe": true, "row": {"title": "queued"}}]},
+        {"action": "dispatch", "id": "b"},
+        {"action": "catchup"},
+        {"action": "replace", "target": 0, "revision": 4, "complete": true, "rows": {"Issue:u1": {"title": "someone-after-me"}}},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "someone-after-me"}, "Issue:u2": {"title": "queued"}}, "states": {"a": "unknown", "b": "queued"}, "failures": [["a", "unknown"]]}},
+        {"action": "accept", "id": "a", "revision": 3},
+        {"action": "expect", "value": {"states": {"a": "confirmed", "b": "queued"}, "covered": 4}},
+        {"action": "dispatch", "id": "b"},
+        {"action": "expect", "value": {"states": {"a": "confirmed", "b": "sent"}}}
+      ]
+    },
+    {
+      "name": "SSE before HTTP quarantines dispatched intent",
+      "initial": {},
+      "steps": [
+        {"action": "submit", "id": "create", "ops": [{"kind": "create", "key": "Issue:u1", "safe": true, "row": {"title": "mine"}}]},
+        {"action": "dispatch", "id": "create"},
+        {"action": "partial", "revision": 1, "rows": {"Issue:u1": {"title": "server"}}},
+        {"action": "catchup"},
+        {"action": "replace", "target": 1, "revision": 1, "complete": true, "rows": {"Issue:u1": {"title": "server"}}},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "server"}}, "states": {"create": "sent"}, "quarantined": {"create": true}, "failures": []}},
+        {"action": "accept", "id": "create", "revision": 1},
+        {"action": "expect", "value": {"states": {"create": "confirmed"}, "quarantined": {"create": false}, "visible": {"Issue:u1": {"title": "server"}}, "failures": []}}
+      ]
+    },
+    {
+      "name": "quarantine suppresses update without failure until actual timeout",
+      "initial": {"Issue:u1": {"title": "old"}},
+      "steps": [
+        {"action": "submit", "id": "a", "ops": [{"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "mine"]]}]},
+        {"action": "dispatch", "id": "a"},
+        {"action": "catchup"},
+        {"action": "replace", "target": 0, "revision": 1, "complete": true, "rows": {"Issue:u1": {"title": "server"}}},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "server"}}, "states": {"a": "sent"}, "quarantined": {"a": true}, "failures": []}},
+        {"action": "unknown", "id": "a", "reason": "timeout"},
+        {"action": "unknown", "id": "a", "reason": "timeout"},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "server"}}, "states": {"a": "unknown"}, "quarantined": {"a": true}, "failures": [["a", "unknown"]]}},
+        {"action": "reject", "id": "a"},
+        {"action": "expect", "value": {"states": {"a": "rejected"}, "quarantined": {"a": false}, "visible": {"Issue:u1": {"title": "server"}}}}
+      ]
+    },
+    {
+      "name": "newer hint during fetch permits intermediate coverage then later catchup",
+      "initial": {"Issue:u1": {"title": "old"}},
+      "steps": [
+        {"action": "partial", "revision": 10},
+        {"action": "catchup"},
+        {"action": "partial", "revision": 12},
+        {"action": "expect", "value": {"target": 10, "required": 12, "covered": 0}},
+        {"action": "replace", "target": 9, "revision": 10, "complete": true, "rows": {}},
+        {"action": "expect", "value": {"covered": 0}},
+        {"action": "replace", "target": 10, "revision": 10, "complete": true, "rows": {"Issue:u1": {"title": "at10"}}},
+        {"action": "expect", "value": {"covered": 10, "required": 12, "visible": {"Issue:u1": {"title": "at10"}}}},
+        {"action": "catchup"},
+        {"action": "expect", "value": {"target": 12}},
+        {"action": "replace", "target": 12, "revision": 12, "complete": true, "rows": {"Issue:u1": {"title": "at10"}, "Issue:u2": {"title": "at12"}}},
+        {"action": "expect", "value": {"covered": 12, "required": 12, "visible": {"Issue:u1": {"title": "at10"}, "Issue:u2": {"title": "at12"}}}}
+      ]
+    },
+    {
+      "name": "permission minimum overrides captured target and requires current auth fence",
+      "initial": {"Issue:u1": {"title": "private"}},
+      "steps": [
+        {"action": "partial", "revision": 5},
+        {"action": "catchup"},
+        {"action": "invalidate", "minimum": 6},
+        {"action": "invalidate", "minimum": 4},
+        {"action": "replace", "target": 5, "revision": 5, "complete": true, "rows": {"Issue:u1": {"title": "private"}}},
+        {"action": "expect", "value": {"invalid": true, "visible": {}, "covered": 0, "target": 5, "required": 6, "securityMinimum": 6}},
+        {"action": "catchup"},
+        {"action": "replace", "target": 6, "fence": "main/tab1/auth0/e1", "revision": 7, "complete": true, "rows": {"Issue:u1": {"title": "private"}}},
+        {"action": "expect", "value": {"invalid": true, "visible": {}, "covered": 0}},
+        {"action": "partial", "revision": 8},
+        {"action": "replace", "target": 6, "fence": "main/tab1/auth1/e1", "revision": 6, "complete": true, "rows": {}},
+        {"action": "expect", "value": {"invalid": false, "visible": {}, "covered": 6, "required": 8, "securityMinimum": 6}},
+        {"action": "catchup"},
+        {"action": "replace", "target": 8, "revision": 8, "complete": true, "rows": {"Issue:u2": {"title": "public"}}},
+        {"action": "expect", "value": {"visible": {"Issue:u2": {"title": "public"}}, "covered": 8}}
+      ]
+    },
+    {
+      "name": "partial high revision cannot suppress unseen other row and fences isolate",
+      "initial": {"Issue:u1": {"title": "a0"}, "Issue:u2": {"title": "b0"}},
+      "steps": [
+        {"action": "partial", "revision": 12, "rows": {"Issue:u2": {"title": "b12"}}},
+        {"action": "partial", "revision": 11, "rows": {"Issue:u1": {"title": "a11"}}},
+        {"action": "partial", "revision": 12, "rows": {"Issue:u2": {"title": "b12"}}},
+        {"action": "expect", "value": {"covered": 0, "required": 12, "base": {"Issue:u1": {"title": "a0"}, "Issue:u2": {"title": "b0"}}}},
+        {"action": "catchup"},
+        {"action": "replace", "target": 12, "revision": 12, "complete": true, "rows": {"Issue:u1": {"title": "a11"}, "Issue:u2": {"title": "b12"}}},
+        {"action": "replace", "target": 12, "revision": 11, "complete": true, "rows": {}},
+        {"action": "replace", "target": 12, "revision": 12, "complete": true, "rows": {}},
+        {"action": "replace", "target": 12, "fence": "other/tab1/auth1/e1", "revision": 99, "complete": true, "rows": {}},
+        {"action": "expect", "value": {"covered": 12, "visible": {"Issue:u1": {"title": "a11"}, "Issue:u2": {"title": "b12"}}}},
+        {"action": "fence", "fence": "main/tab2/auth2/e2"},
+        {"action": "catchup"},
+        {"action": "replace", "target": 0, "fence": "main/tab1/auth1/e1", "revision": 100, "complete": true, "rows": {"Issue:u1": {"title": "stale"}}},
+        {"action": "expect", "value": {"covered": 0, "visible": {}, "invalid": true}},
+        {"action": "replace", "target": 0, "fence": "main/tab2/auth2/e2", "revision": 0, "complete": true, "rows": {}},
+        {"action": "expect", "value": {"covered": 0, "invalid": false}}
+      ]
+    },
+    {
+      "name": "permission invalidation empty no-SSE replacement and old primary key removal",
+      "initial": {"Issue:old": {"title": "private"}},
+      "steps": [
+        {"action": "submit", "id": "command", "ops": [{"kind": "command", "key": "Issue:old", "safe": false}]},
+        {"action": "dispatch", "id": "command"},
+        {"action": "accept", "id": "command", "revision": 1},
+        {"action": "invalidate", "minimum": 1},
+        {"action": "expect", "value": {"visible": {}, "states": {"command": "accepted"}}},
+        {"action": "catchup"},
+        {"action": "replace", "target": 1, "revision": 1, "complete": true, "rows": {"Issue:new": {"title": "public"}}},
+        {"action": "expect", "value": {"visible": {"Issue:new": {"title": "public"}}, "states": {"command": "confirmed"}}},
+        {"action": "submit", "id": "delete", "ops": [{"kind": "delete", "key": "Issue:new", "safe": true}]},
+        {"action": "expect", "value": {"visible": {}}},
+        {"action": "dispatch", "id": "delete"},
+        {"action": "accept", "id": "delete", "revision": 2},
+        {"action": "catchup"},
+        {"action": "replace", "target": 2, "revision": 2, "complete": true, "rows": {}},
+        {"action": "expect", "value": {"base": {}, "visible": {}, "states": {"command": "confirmed", "delete": "confirmed"}, "covered": 2}}
+      ]
+    },
+    {
+      "name": "mixed batch entirely nonoptimistic and server integer identity only",
+      "initial": {"Issue:u1": {"title": "old"}},
+      "steps": [
+        {"action": "submit", "id": "mixed", "ops": [{"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "new"]]}, {"kind": "create", "key": "Audit:1", "safe": false, "row": {"message": "saved"}}]},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "old"}}}},
+        {"action": "dispatch", "id": "mixed"},
+        {"action": "accept", "id": "mixed", "revision": 1},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "old"}}, "states": {"mixed": "accepted"}}},
+        {"action": "catchup"},
+        {"action": "replace", "target": 1, "revision": 1, "complete": true, "rows": {"Issue:u1": {"title": "new"}, "Audit:1": {"message": "saved"}}},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "new"}, "Audit:1": {"message": "saved"}}, "states": {"mixed": "confirmed"}}}
+      ]
+    },
+    {
+      "name": "empty rules ordered UUID create update and missing replay atomicity",
+      "initial": {},
+      "steps": [
+        {"action": "submit", "id": "empty", "ops": []},
+        {"action": "submit", "id": "invalid", "ops": [{"kind": "update", "key": "Issue:u1", "safe": true, "set": []}]},
+        {"action": "submit", "id": "uuid", "ops": [{"kind": "create", "key": "Issue:u1", "safe": true, "row": {"title": "first"}}, {"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "second"]]}]},
+        {"action": "expect", "value": {"visible": {"Issue:u1": {"title": "second"}}, "covered": 0, "states": {"empty": "confirmed", "invalid": "rejected", "uuid": "queued"}, "failures": [["invalid", "rejected"]]}},
+        {"action": "dispatch", "id": "uuid"},
+        {"action": "submit", "id": "later", "ops": [{"kind": "create", "key": "Issue:u2", "safe": true, "row": {"title": "prefix"}}, {"kind": "update", "key": "Issue:u1", "safe": true, "set": [["title", "later"]]}]},
+        {"action": "reject", "id": "uuid"},
+        {"action": "expect", "value": {"visible": {}, "states": {"empty": "confirmed", "invalid": "rejected", "uuid": "rejected", "later": "queued"}}}
+      ]
+    },
+    {
+      "name": "disposal fences late responses and reports unsent versus dispatched certainty",
+      "initial": {"Issue:u1": {"title": "old"}},
+      "steps": [
+        {"action": "submit", "id": "a", "ops": [{"kind": "delete", "key": "Issue:u1", "safe": true}]},
+        {"action": "dispatch", "id": "a"},
+        {"action": "submit", "id": "b", "ops": [{"kind": "create", "key": "Issue:u2", "safe": true, "row": {"title": "queued"}}]},
+        {"action": "fence", "fence": "main/tab2/auth1/e1"},
+        {"action": "accept", "fence": "main/tab1/auth1/e1", "id": "a", "revision": 1},
+        {"action": "expect", "value": {"visible": {}, "states": {}, "failures": [["a", "unknown"], ["b", "rejected"]], "covered": 0}}
+      ]
+    }
+  ],
+  "transactions": [
+    {
+      "name": "zero actual rows rolls back successful prefix",
+      "initial": {"Issue:u1": {"title": "old"}},
+      "ops": [{"kind": "update", "key": "Issue:u1", "set": [["title", "new"]], "actual": 1, "readable": 1}, {"kind": "delete", "key": "Issue:missing", "actual": 0, "readable": 0}],
+      "expect": {"rows": {"Issue:u1": {"title": "old"}}, "rejectedIndex": 1, "revision": 0}
+    },
+    {
+      "name": "more than one actual row rejects even one readable row",
+      "initial": {"Issue:u1": {"title": "old"}},
+      "ops": [{"kind": "update", "key": "Issue:u1", "set": [["title", "new"]], "actual": 2, "readable": 1}],
+      "expect": {"rows": {"Issue:u1": {"title": "old"}}, "rejectedIndex": 0, "revision": 0}
+    },
+    {
+      "name": "one actual row succeeds with zero readable rows",
+      "initial": {"Issue:u1": {"title": "old"}},
+      "ops": [{"kind": "update", "key": "Issue:u1", "set": [["title", "new"]], "actual": 1, "readable": 0}],
+      "expect": {"rows": {"Issue:u1": {"title": "new"}}, "rejectedIndex": null, "revision": 1}
+    },
+    {
+      "name": "ordered create then update commits one revision",
+      "initial": {},
+      "ops": [{"kind": "create", "key": "Issue:u1", "row": {"title": "first"}, "actual": 1, "readable": 1}, {"kind": "update", "key": "Issue:u1", "set": [["title", "last"]], "actual": 1, "readable": 1}],
+      "expect": {"rows": {"Issue:u1": {"title": "last"}}, "rejectedIndex": null, "revision": 1}
+    },
+    {
+      "name": "named zero cardinality retains declared behavior",
+      "initial": {},
+      "ops": [{"kind": "command", "key": "Issue:u1", "actual": 0, "readable": 0}],
+      "expect": {"rows": {}, "rejectedIndex": null, "revision": 1}
+    },
+    {
+      "name": "empty transaction has no revision",
+      "initial": {}, "ops": [],
+      "expect": {"rows": {}, "rejectedIndex": null, "revision": 0}
+    }
+  ]
+}

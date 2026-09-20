@@ -1,3 +1,5 @@
+@syncable(false)
+
 session {
     userId Id.Int
     role String

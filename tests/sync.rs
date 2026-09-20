@@ -6,6 +6,11 @@ use pyre::sync_shape::{normalize_json_columns, reshape_table_groups};
 use pyre::typecheck;
 use serde_json::json;
 
+const UUID_1: &str = "00000000-0000-4000-8000-000000000001";
+const UUID_2: &str = "00000000-0000-4000-8000-000000000002";
+const UUID_3: &str = "00000000-0000-4000-8000-000000000003";
+const UUID_4: &str = "00000000-0000-4000-8000-000000000004";
+
 fn union_permission_context() -> typecheck::Context {
     let schema_source = r#"
 type ProviderReason
@@ -21,7 +26,7 @@ type JobState
    | Ready
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     state JobState
     updatedAt Int
     @allow(query) { state.Failed.reason.ProviderRejected.code != "blocked" }
@@ -34,6 +39,27 @@ record Job {
         schemas: vec![schema],
     })
     .expect("permission path should typecheck")
+}
+
+#[test]
+fn replacement_sql_is_complete_and_rejects_unknown_namespace() {
+    let context = union_permission_context();
+    let namespace = context.valid_namespaces.iter().next().unwrap();
+    let result = pyre::sync::get_replacement_sql(&context, &Default::default(), namespace).unwrap();
+    assert_eq!(result.tables.len(), 1);
+    let table = &result.tables[0];
+    assert_eq!(table.table_name, "jobs");
+    assert_eq!(table.primary_key, "id");
+    assert_eq!(table.params.len(), table.sql.len());
+    assert!(table.headers.contains(&"state__reason__code".to_string()));
+    assert!(!table.sql[0].contains("LIMIT"));
+    assert!(table.sql[0].contains("\"jobs\".\"state__reason__code\" is not 'blocked'"));
+    let bounds_sql = table.replacement_bounds_sql.as_ref().unwrap();
+    assert!(bounds_sql.contains("count(*) AS \"_pyre_row_count\""));
+    assert!(bounds_sql.contains("sum(length(cast(json_array("));
+    assert!(bounds_sql.contains("AS \"_pyre_byte_count\""));
+    assert!(bounds_sql.contains("\"jobs\".\"state__reason__code\" is not 'blocked'"));
+    assert!(pyre::sync::get_replacement_sql(&context, &Default::default(), "unknown").is_err());
 }
 
 #[test]
@@ -60,21 +86,21 @@ fn live_deltas_require_positive_union_guards_for_not_equal() {
             "state__reason__code".to_string(),
         ],
         rows: vec![
-            vec![json!(1), json!("Ready"), json!(null), json!("allowed")],
+            vec![json!(UUID_1), json!("Ready"), json!(null), json!("allowed")],
             vec![
-                json!(2),
+                json!(UUID_2),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!("allowed"),
             ],
             vec![
-                json!(3),
+                json!(UUID_3),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!("blocked"),
             ],
             vec![
-                json!(4),
+                json!(UUID_4),
                 json!("Failed"),
                 json!("ProviderRejected"),
                 json!(null),
@@ -139,7 +165,7 @@ session {
 }
 
 record Resource {
-    id Int @id
+    id Id.Uuid @id
     first String
     second String
     updatedAt Int
@@ -209,7 +235,7 @@ type State
    | Ready
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     state State
     updatedAt Int
     @allow(query) { state.Failed.code != Session.blockedCode }
@@ -244,7 +270,7 @@ session {{
 }}
 
 record Resource {{
-    id Int @id
+    id Id.Uuid @id
     workspaceId Int
     updatedAt Int
     @allow(query) {{ workspaceId == Session.scope.{variant}.id }}
@@ -287,8 +313,8 @@ fn tagged_union_session_paths_match_catch_up_and_live_delta_semantics() {
             "updatedAt".to_string(),
         ],
         rows: vec![
-            vec![json!(1), json!(7), json!(1)],
-            vec![json!(2), json!(8), json!(1)],
+            vec![json!(UUID_1), json!(7), json!(1)],
+            vec![json!(UUID_2), json!(8), json!(1)],
         ],
     }];
     let sessions = std::collections::HashMap::from([("session".to_string(), session)]);
@@ -348,9 +374,9 @@ fn nullable_session_rhs_matches_catch_up_and_live_delta_semantics() {
             "state__code".to_string(),
         ],
         rows: vec![
-            vec![json!(1), json!("Failed"), json!(null)],
-            vec![json!(2), json!("Failed"), json!("allowed")],
-            vec![json!(3), json!("Ready"), json!("allowed")],
+            vec![json!(UUID_1), json!("Failed"), json!(null)],
+            vec![json!(UUID_2), json!("Failed"), json!("allowed")],
+            vec![json!(UUID_3), json!("Ready"), json!("allowed")],
         ],
     }];
     let sessions = std::collections::HashMap::from([("session".to_string(), session)]);
@@ -374,7 +400,7 @@ type State
    | Ready
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     state State
     updatedAt Int
     @allow(query) { state.Failed.code == Null }
@@ -401,9 +427,9 @@ record Job {
             "state__code".to_string(),
         ],
         rows: vec![
-            vec![json!(1), json!("Failed"), json!(null)],
-            vec![json!(2), json!("Failed"), json!("set")],
-            vec![json!(3), json!("Ready"), json!(null)],
+            vec![json!(UUID_1), json!("Failed"), json!(null)],
+            vec![json!(UUID_2), json!("Failed"), json!("set")],
+            vec![json!(UUID_3), json!("Ready"), json!(null)],
         ],
     }];
     let sessions = std::collections::HashMap::from([(
@@ -421,7 +447,7 @@ record Job {
 fn sync_sql_marks_json_columns_for_runtime_decoding() {
     let schema_source = r#"
 record GameEntity {
-    id Int @id
+    id Id.Uuid @id
     attrs Json
     updatedAt Int
     @public
@@ -484,7 +510,7 @@ session {
 }
 
 record Note {
-    id Int @id
+    id Id.Uuid @id
     workspaceSlug String
     updatedAt Int
     @allow(query) { workspaceSlug == Session.workspaceSlug }
@@ -516,11 +542,11 @@ record Note {
 fn sync_status_sql_expands_session_membership_lists() {
     let schema_source = r#"
 session {
-    activeClocktowerGameIds Json<List<String>>
+    activeClocktowerGameIds Json<List<ClocktowerGame.id>>
 }
 
 record ClocktowerGame {
-    id String @id
+    id Id.Uuid @id
     updatedAt Int
     @allow(query) { id in Session.activeClocktowerGameIds }
     @allow(insert, update, delete) { False }
@@ -536,7 +562,7 @@ record ClocktowerGame {
     let mut session = std::collections::HashMap::new();
     session.insert(
         "activeClocktowerGameIds".to_string(),
-        pyre::sync::SessionValue::Text(r#"["game-1"]"#.to_string()),
+        pyre::sync::SessionValue::Text(format!(r#"["{UUID_1}"]"#)),
     );
 
     let statement = pyre::sync::get_sync_status_statement(&SyncCursor::new(), &context, &session)
@@ -552,7 +578,7 @@ record ClocktowerGame {
 fn sync_sql_caps_page_size() {
     let schema_source = r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -593,7 +619,7 @@ record Note {
 fn sync_cursor_rejects_unknown_tables() {
     let schema_source = r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -610,7 +636,7 @@ record Note {
         "not_a_table".to_string(),
         pyre::sync::TableCursor {
             last_seen_updated_at: Some(1),
-            last_seen_primary_key: Some(serde_json::json!(1)),
+            last_seen_primary_key: Some(serde_json::json!(UUID_1)),
             permission_hash: "perm".to_string(),
         },
     );
@@ -630,7 +656,7 @@ record Note {
 fn sync_cursor_rejects_oversized_permission_hashes() {
     let schema_source = r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -647,7 +673,7 @@ record Note {
         "notes".to_string(),
         pyre::sync::TableCursor {
             last_seen_updated_at: Some(1),
-            last_seen_primary_key: Some(serde_json::json!(1)),
+            last_seen_primary_key: Some(serde_json::json!(UUID_1)),
             permission_hash: "x".repeat(pyre::sync::MAX_SYNC_CURSOR_PERMISSION_HASH_BYTES + 1),
         },
     );
@@ -669,14 +695,14 @@ fn query_only_namespaces_are_excluded_from_sync_sql() {
 @syncable(false)
 
 record Account {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
 "#;
     let campaign_source = r#"
 record Quest {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -751,7 +777,7 @@ fn all_query_only_schemas_have_empty_sync_status() {
 @syncable(false)
 
 record Account {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -789,7 +815,7 @@ type Tiling
      }
 
 record Map {
-    id Int @id
+    id Id.Uuid @id
     tiling Tiling?
     updatedAt Int
     @public
@@ -856,7 +882,7 @@ type Tiling
      }
 
 record Map {
-    id Int @id
+    id Id.Uuid @id
     name String
     tiling Tiling?
     updatedAt Int
@@ -885,7 +911,7 @@ record Map {
                 "updatedAt".to_string(),
             ],
             rows: vec![vec![
-                json!(1),
+                json!(UUID_1),
                 json!("World"),
                 json!("Tiling"),
                 json!("tiles/root"),
@@ -905,7 +931,7 @@ record Map {
     assert_eq!(
         reshaped[0].rows[0],
         vec![
-            json!(1),
+            json!(UUID_1),
             json!("World"),
             json!({
                 "_type": "Tiling",
@@ -934,7 +960,7 @@ type EventPayload
      }
 
 record Event {
-    id Int @id
+    id Id.Uuid @id
     payload EventPayload?
     state Json<SecretEvent>
     note String
@@ -961,7 +987,7 @@ record Event {
             "updatedAt".to_string(),
         ],
         rows: vec![vec![
-            json!(1),
+            json!(UUID_1),
             json!("Secret"),
             json!(r#"{"_type":"SetupRecorded","seats":[]}"#),
             json!("Wrapped"),
@@ -978,7 +1004,7 @@ record Event {
     assert_eq!(
         reshaped[0].rows[0],
         vec![
-            json!(1),
+            json!(UUID_1),
             json!({
                 "_type": "Secret",
                 "secretEvent": { "_type": "SetupRecorded", "seats": [] },
@@ -995,7 +1021,7 @@ record Event {
 fn sync_json_normalization_rejects_malformed_json() {
     let schema_source = r#"
 record Token {
-    id Int @id
+    id Id.Uuid @id
     state Json
     updatedAt Int
     @public
@@ -1014,7 +1040,7 @@ record Token {
             "state".to_string(),
             "updatedAt".to_string(),
         ],
-        rows: vec![vec![json!(1), json!("{malformed"), json!(10)]],
+        rows: vec![vec![json!(UUID_1), json!("{malformed"), json!(10)]],
     }];
     let error =
         match pyre::sync_deltas::calculate_sync_deltas(&affected, &Default::default(), &context) {

@@ -15,6 +15,7 @@ fn both_client_generators_reject_only_authored_session_arguments() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 type Scope
     = Workspace { id Int }
     | Account { id Int }
@@ -113,6 +114,7 @@ record Reply {
 #[test]
 fn generated_typescript_transaction_has_shared_input_and_step_results() {
     let schema_source = r#"
+@syncable(false)
 record Note {
     id Id.Int @id
     body String
@@ -154,7 +156,7 @@ transaction ReplaceNote($id: Note.id, $body: String) {
         .find(|file| path_ends_with(&file.path, "queries/metadata/replaceNote.ts"))
         .expect("generated transaction metadata");
 
-    assert!(generated.contents.contains("id: z.number()"));
+    assert!(generated.contents.contains("id: $Ids.NoteId"));
     assert!(generated.contents.contains("body: z.string()"));
     assert!(generated.contents.contains("removed: Removed.array()"));
     assert!(generated.contents.contains("created: Created.array()"));
@@ -164,8 +166,46 @@ transaction ReplaceNote($id: Note.id, $body: String) {
 }
 
 #[test]
+fn generated_typescript_non_unique_relationship_results_are_arrays() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "@syncable(false)\nrecord Parent {\n @public\n id Id.Int @id\n code String\n matches @link(code, Target.code)\n}\nrecord Target {\n @public\n id Id.Int @id\n code String\n}\n",
+        &mut schema,
+    )
+    .expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let query_list = parser::parse_query(
+        "query.pyre",
+        "query Parents { parent { id matches { id } } }",
+    )
+    .expect("query parses");
+    let query_info = typecheck::check_queries(&query_list, &context).expect("query typechecks");
+    let mut files: Vec<GeneratedFile<String>> = Vec::new();
+    core::generate_queries(
+        &context,
+        &query_info,
+        &query_list,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+    let generated = files
+        .iter()
+        .find(|file| path_ends_with(&file.path, "queries/metadata/parents.ts"))
+        .expect("generated query metadata");
+
+    assert!(generated
+        .contents
+        .contains("matches: Parent_Matches.array()"));
+}
+
+#[test]
 fn generated_typescript_query_shape_rejects_session_filters() {
     let schema_source = r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -230,6 +270,7 @@ query GetRulebookByName($name: String) {
 #[test]
 fn generated_typescript_query_input_validates_typed_json_params_without_stringifying() {
     let schema_source = r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -306,6 +347,7 @@ insert SeedEvent($payload: Json<Lifecycle>) {
 #[test]
 fn generated_typescript_datetime_input_preserves_public_type_and_coerces_at_runtime() {
     let schema_source = r#"
+@syncable(false)
 record Event {
     @public
     id Id.Int @id
@@ -352,6 +394,7 @@ fn generated_typescript_crud_omits_immutable_update_artifacts() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id

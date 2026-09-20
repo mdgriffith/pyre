@@ -18,6 +18,13 @@ use pyre::typecheck;
 use crate::helpers::schema;
 
 fn generate_sql(schema_source: &str, query_source: &str) -> String {
+    let query_only_schema;
+    let schema_source = if schema_source.contains("@syncable(") {
+        schema_source
+    } else {
+        query_only_schema = format!("@syncable(false)\n\n{schema_source}");
+        &query_only_schema
+    };
     let mut parsed_schema = ast::Schema::default();
     parser::run("schema.pyre", schema_source, &mut parsed_schema)
         .unwrap_or_else(|e| panic!("schema failed to parse: {:?}", e));

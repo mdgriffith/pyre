@@ -1,7 +1,9 @@
-import { Client, InStatement } from "@libsql/client";
+import { Client, InStatement, type Transaction } from "@libsql/client";
 import type { LinkInfo, SchemaMetadata, TableMetadata } from "@pyre/core";
-import type { ZodType } from "zod";
-import { buildArgs, formatResultData, toSqlStatements, type SqlInfo } from "./runtime/sql";
+import { z, type ZodType } from "zod";
+import { buildArgs, executeStatements, formatResultData, TargetNotWritable, toSqlStatements, type GeneratedEdit, type JsonSessionValidators, type SqlInfo } from "./runtime/sql";
+import { assertPersistentTransaction, assertSupportedIntegerMode, internalSafeInteger } from "./runtime/libsql";
+import { assertSchemaContracts, bindSchemaManifest } from "./schema";
 
 export type SessionValue =
     | null
@@ -23,13 +25,19 @@ export interface QueryMetadata {
     operation?: "query" | "insert" | "update" | "delete" | string;
     primary_db?: string;
     attached_dbs?: string[];
+    /** Compiler-owned contracts for every database referenced by this query. */
+    schemaContracts?: Readonly<Record<string, string>>;
     sql: SqlInfo[];
     syncSql?: SqlInfo[];
     session_args: string[];
+    json_session_args?: string[];
+    json_session_validators?: JsonSessionValidators;
     optional_input_args: string[];
     json_input_args: string[];
     InputValidator: Validator<any>;
     SessionValidator: Validator<any>;
+    ReturnData?: Validator<any>;
+    generatedEdit?: GeneratedEdit;
 }
 
 /**
@@ -68,7 +76,7 @@ export interface QueryResult {
     };
     /**
      * Broadcast sync deltas to connected clients.
-     * Always present, but will be a no-op if there are no affected rows or no connected sessions.
+     * Always present. Revisioned named mutations also publish catchup hints for zero-row writes.
      * 
      * @param sendToSession - Callback to send a message to a specific session
      * @example
@@ -81,7 +89,7 @@ export interface QueryResult {
      * });
      * ```
      */
-    sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult>;
+    sync(sendToSession: (sessionId: string, message: any) => void | Promise<void>): Promise<SyncResult>;
 }
 
 export interface SyncResult {
@@ -90,15 +98,306 @@ export interface SyncResult {
     originMessage?: unknown;
 }
 
+// Only successful transaction-bound execution can authorize row publication.
+const executionContracts = new WeakMap<SyncResult, string>();
+export function executionSchemaContract(revision: SyncResult): string | undefined {
+    return executionContracts.get(revision);
+}
+
 export type SyncDeltasFn = (
     affectedRowGroups: any[],
     connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
-    sendToSession: (sessionId: string, message: any) => void,
-    originSessionId?: string
+    sendToSession: (sessionId: string, message: any) => void | Promise<void>,
+    originSessionId?: string,
+    committedRevision?: SyncResult,
 ) => Promise<SyncResult | void>;
 
 export interface RunOptions {
     mode?: "normal" | "sync";
+    /** Named mutation sync revisions must commit atomically with their writes. */
+    commitSyncRevision?: boolean;
+}
+
+export const MAX_BATCH_OPERATIONS = 100;
+export const MAX_BATCH_PAYLOAD_BYTES = 1024 * 1024;
+
+/** Trusted server-side allowlist, never supplied by the request. */
+export interface BatchManifest {
+    version: 1;
+    /** Trusted fingerprint emitted alongside the compiled queries. */
+    manifestVersion: string;
+    /** Compiler-owned global schema/session/permission digest. */
+    compiledContract?: string;
+    /** Namespace-scoped permission/schema digests. Missing entries cannot replace. */
+    replacementContracts?: Readonly<Record<string, string>>;
+    queries: QueryMap;
+    SessionValidator: Validator<any>;
+}
+
+/** The route/binding must resolve these authorities independently of the request. */
+export interface BatchAuthority {
+    databaseId: string;
+    namespace: string;
+    manifest: string;
+    instance: string;
+    authGeneration: number;
+}
+
+export interface BatchRequest {
+    version: 1;
+    databaseId: string;
+    namespace: string;
+    manifest: string;
+    databaseEpoch: string;
+    instance: string;
+    authGeneration: number;
+    requestId: string;
+    sequence: number;
+    operations: readonly { operation: string; input: unknown }[];
+}
+
+export interface BatchResponse {
+    databaseId: string;
+    namespace: string;
+    manifest: string;
+    databaseEpoch: string;
+    instance: string;
+    authGeneration: number;
+    requestId: string;
+    status: "accepted" | "confirmed";
+    results: { index: number; operation: string; value: unknown }[];
+    commitRevision?: number;
+    reconciliation?: { kind: "replaceRequired"; atLeast: number; invalidate: true; minimumSafeRevision: number };
+}
+
+export type BatchResult = { kind: "success"; response: BatchResponse } | {
+    kind: "error";
+    error: { errorType: string; message: string; index?: number };
+} | {
+    kind: "unknown";
+    error: { errorType: "OutcomeUnknown"; message: string };
+};
+
+const batchRequestValidator = z.strictObject({
+    version: z.literal(1), databaseId: z.string().min(1), namespace: z.string().min(1),
+    manifest: z.string().min(1), databaseEpoch: z.string(), instance: z.string().min(1),
+    authGeneration: z.number().int().nonnegative(), requestId: z.string().min(1),
+    sequence: z.number().int().positive(),
+    operations: z.array(z.strictObject({ operation: z.string(), input: z.unknown().nonoptional() })).max(MAX_BATCH_OPERATIONS),
+});
+
+class BatchError extends Error {
+    constructor(readonly errorType: string, readonly index?: number) { super(errorType); }
+}
+
+// Reject fields removed by strip-mode object codecs, including nested protected fields.
+function assertNoStrippedFields(input: unknown, decoded: unknown): void {
+    if (input === null || typeof input !== "object" || input instanceof Date || input instanceof Uint8Array) return;
+    // Generated enum codecs accept both a string and the canonical tag-only object.
+    if (typeof decoded === "string" && Object.keys(input).length === 1 && Object.hasOwn(input, "_type") && (input as any)._type === decoded) return;
+    if (decoded === null || typeof decoded !== "object") throw new BatchError("InvalidInput");
+    for (const key of Object.keys(input)) {
+        if (!Object.hasOwn(decoded, key)) throw new BatchError("InvalidInput");
+        assertNoStrippedFields((input as any)[key], (decoded as any)[key]);
+    }
+}
+
+function isCanonicalUuidV7(value: unknown): value is string {
+    return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
+const batchQueues = new Map<string, Promise<unknown>>();
+
+/** Executes captured compiled operations, never public runners with independent commits. */
+export function runBatch(
+    db: Client,
+    manifest: BatchManifest,
+    authority: BatchAuthority,
+    request: BatchRequest,
+    executingSession: Session,
+    publish?: (result: Extract<BatchResult, { kind: "success" }>) => void | Promise<void>,
+    /** Trusted in-process submissions capture their epoch inside the queued transaction.
+     * Never enable this for a client-supplied request. */
+    captureDatabaseEpoch = false,
+): Promise<BatchResult> {
+    let prepared: { operation: string; query: QueryMetadata; statements: ReturnType<typeof toSqlStatements> }[];
+    let capturedSchemaManifest: Pick<BatchManifest, "compiledContract" | "replacementContracts">;
+    let capturedAuthority: BatchAuthority;
+    let captured: BatchRequest;
+    try {
+        capturedSchemaManifest = {
+            compiledContract: manifest.compiledContract,
+            replacementContracts: manifest.replacementContracts === undefined
+                ? undefined
+                : { ...manifest.replacementContracts },
+        };
+        bindSchemaManifest(db, authority.namespace, capturedSchemaManifest);
+        // Capture and validate synchronously, before queue/transaction acquisition or any I/O.
+        capturedAuthority = structuredClone(authority);
+        authority = capturedAuthority;
+        const parsedRequest = batchRequestValidator.safeParse(structuredClone(request));
+        if (!parsedRequest.success) throw new BatchError("InvalidInput");
+        captured = parsedRequest.data;
+        let session: Session;
+        try { session = structuredClone(executingSession); }
+        catch { throw new BatchError("InvalidSession"); }
+        const serialized = JSON.stringify(captured);
+        if (!serialized || new TextEncoder().encode(serialized).byteLength > MAX_BATCH_PAYLOAD_BYTES)
+            throw new BatchError("InvalidInput");
+        if (typeof authority.databaseId !== "string" || !authority.databaseId.trim()
+            || typeof authority.namespace !== "string" || !authority.namespace
+            || typeof authority.manifest !== "string" || !authority.manifest
+            || captured.databaseId !== authority.databaseId || captured.namespace !== authority.namespace
+            || captured.manifest !== authority.manifest || captured.instance !== authority.instance
+            || captured.authGeneration !== authority.authGeneration || manifest.version !== 1
+            || manifest.manifestVersion !== authority.manifest)
+            throw new BatchError("InvalidInput");
+        const effectiveSession = manifest.SessionValidator.safeParse(session);
+        if (!effectiveSession.success) throw new BatchError("InvalidSession");
+        // Only declared, decoded session fields are SQL authority; application claims are ignored.
+        prepared = captured.operations.map((member, index) => {
+            try {
+                if (!member || typeof member.operation !== "string" || !Object.hasOwn(manifest.queries, member.operation))
+                    throw new BatchError("UnknownQuery");
+                const source = manifest.queries[member.operation];
+                const query = { ...source, sql: structuredClone(source.sql), generatedEdit: structuredClone(source.generatedEdit) };
+                if (query.id !== member.operation || query.primary_db !== authority.namespace || (query.attached_dbs?.length ?? 0) > 0
+                    || !["insert", "update", "delete", "transaction"].includes(query.operation ?? ""))
+                    throw new BatchError("InvalidInput");
+                const edit = query.generatedEdit;
+                if (edit) {
+                    if (!["create", "update", "delete"].includes(edit.kind) || edit.writeStatementIndices.length !== 1
+                        || edit.writeStatementIndices.some(i => !Number.isInteger(i) || i < 0 || i >= query.sql.length
+                            || query.sql[i].include !== true)
+                        || (edit.kind === "create") !== (typeof edit.createUuidInput === "string")
+                        || (edit.createUuidInput !== undefined && (!edit.createUuidInput
+                            || !edit.writableInputs.includes(edit.createUuidInput)
+                            || !isCanonicalUuidV7(member.input !== null && typeof member.input === "object"
+                                ? (member.input as any)[edit.createUuidInput] : undefined))))
+                        throw new BatchError("InvalidInput");
+                    if (edit.kind === "update" && !edit.writableInputs.some(key => member.input !== null && typeof member.input === "object" && Object.hasOwn(member.input, key) && (member.input as any)[key] !== undefined))
+                        throw new BatchError("InvalidEdit");
+                }
+                const input = query.InputValidator.safeParse(member.input);
+                if (!input.success) throw new BatchError("InvalidInput");
+                assertNoStrippedFields(member.input, input.data);
+                return { operation: member.operation, query, statements: toSqlStatements(query.sql, buildArgs(
+                    input.data, effectiveSession.data, query.session_args, query.optional_input_args, query.json_input_args, query.json_session_args, query.json_session_validators,
+                )) };
+            } catch (error) {
+                throw new BatchError(error instanceof BatchError ? error.errorType : "InvalidInput", index);
+            }
+        });
+    } catch (error) {
+        return Promise.resolve(batchFailure(error instanceof BatchError ? error : new BatchError("InvalidInput")));
+    }
+
+    const queueKey = capturedAuthority.databaseId;
+    const previous = batchQueues.get(queueKey) ?? Promise.resolve();
+    const execution = previous.then(async (): Promise<BatchResult> => {
+        const response: BatchResponse = {
+            databaseId: captured.databaseId, namespace: captured.namespace, manifest: captured.manifest,
+            databaseEpoch: captured.databaseEpoch, instance: captured.instance, authGeneration: captured.authGeneration,
+            requestId: captured.requestId, status: "confirmed", results: [],
+        };
+        const result: Extract<BatchResult, { kind: "success" }> = { kind: "success", response };
+        let tx: Transaction | undefined;
+        let index: number | undefined;
+        let committing = false;
+        try {
+            await assertPersistentTransaction(db);
+            await assertSupportedIntegerMode(db);
+            tx = await db.transaction("write");
+            try {
+                await assertSchemaContracts(tx, {
+                    [capturedAuthority.namespace]: capturedSchemaManifest.replacementContracts?.[capturedAuthority.namespace]!,
+                }, capturedAuthority.namespace);
+            }
+            catch { throw new BatchError("InvalidInput"); }
+            const databases = await tx.execute("pragma database_list");
+            if (databases.rows.some(row => row.name !== "main" && row.name !== "temp")) throw new BatchError("InvalidInput");
+            const epoch = await tx.execute("select database_epoch from _pyre_sync where id = 1");
+            const databaseEpoch = epoch.rows[0]?.database_epoch;
+            if (typeof databaseEpoch !== "string" || !databaseEpoch) throw new BatchError("InvalidInput");
+            if (captureDatabaseEpoch) {
+                captured.databaseEpoch = databaseEpoch;
+                response.databaseEpoch = databaseEpoch;
+            } else if (databaseEpoch !== captured.databaseEpoch) throw new BatchError("InvalidInput");
+            if (prepared.length === 0) {
+                await tx.rollback();
+                return result;
+            }
+            for (index = 0; index < prepared.length; index++) {
+                const { operation, query, statements } = prepared[index];
+                // Pass only execute, even though libsql Transaction also exposes batch.
+                const sets = await executeStatements({ execute: tx.execute.bind(tx) }, statements, query.generatedEdit);
+                let value: unknown = query.generatedEdit ? undefined : formatResultData(query.sql, sets);
+                if (query.generatedEdit) {
+                    const writes = query.generatedEdit.writeStatementIndices.map(i => sets[i]);
+                    // Identity is authorized by the write, never inferred from read-filtered projections.
+                    const rows = writes.filter(set => set.rowsAffected === 1).flatMap(set => set.rows);
+                    const rawId = rows[0]?._pyreEditId;
+                    const id = typeof rawId === "bigint" ? Number(rawId) : rawId;
+                    if (rows.length !== 1 || (typeof id === "string"
+                        ? id.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+                        : typeof id !== "number" || !Number.isSafeInteger(id)))
+                        throw new BatchError("TargetNotWritable", index);
+                    value = { id };
+                }
+                // Generated batch results have the identity contract, not the legacy named row codec.
+                if (!query.generatedEdit && query.ReturnData) {
+                    const decoded = query.ReturnData.safeParse(value);
+                    if (!decoded.success) throw new BatchError("InvalidResult", index);
+                    // Validate without replacing wire values with TS-only Date/enum transformations.
+                }
+                response.results.push({ index, operation, value });
+            }
+            index = undefined;
+            const revision = await nextLiveSyncRevision(tx);
+            if (revision.databaseEpoch !== captured.databaseEpoch) throw new BatchError("InvalidInput");
+            response.status = "accepted";
+            response.commitRevision = revision.serverRevision;
+            response.reconciliation = { kind: "replaceRequired", atLeast: revision.serverRevision, invalidate: true, minimumSafeRevision: revision.serverRevision };
+            committing = true;
+            await tx.commit();
+        } catch (error) {
+            try { await tx?.rollback(); } catch { /* Preserve the original failure. */ }
+            if (committing) return { kind: "unknown", error: { errorType: "OutcomeUnknown", message: "OutcomeUnknown" } };
+            return batchFailure(error, index);
+        } finally {
+            try { tx?.close(); } catch { /* Closing cannot erase commit evidence. */ }
+        }
+        return result;
+    });
+    const settled = execution.then(() => undefined, () => undefined);
+    batchQueues.set(queueKey, settled);
+    void settled.then(() => { if (batchQueues.get(queueKey) === settled) batchQueues.delete(queueKey); });
+    return execution.then(async result => {
+        // Publication is outside both the transaction and its queue slot.
+        if (result.kind === "success" && result.response.commitRevision !== undefined) {
+            try { await publish?.(structuredClone(result)); } catch { /* Replacement remains possible without publication. */ }
+        }
+        return result;
+    });
+}
+
+function batchFailure(error: unknown, index?: number): BatchResult {
+    const internal = error instanceof BatchError ? error.errorType : error instanceof TargetNotWritable ? "TargetNotWritable"
+        : error instanceof SyntaxError ? "InvalidInput" : "DatabaseError";
+    const errorType = ["InvalidInput", "UnknownQuery", "InvalidResult"].includes(internal) ? "InvalidRequest"
+        : ["InvalidSession", "InvalidEdit", "TargetNotWritable"].includes(internal) ? internal : "TransactionFailed";
+    if (error instanceof BatchError) index = error.index ?? index;
+    return { kind: "error", error: { errorType, message: errorType, ...(index === undefined ? {} : { index }) } };
+}
+
+export async function nextLiveSyncRevision(db: Pick<Client, "execute">): Promise<{ databaseEpoch: string; serverRevision: number }> {
+    const result = await db.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
+    const databaseEpoch = result.rows[0]?.database_epoch;
+    const rawRevision = result.rows[0]?.server_revision;
+    const serverRevision = internalSafeInteger(rawRevision, "Pyre sync server revision");
+    if (typeof databaseEpoch !== "string" || serverRevision < 1)
+        throw new Error("Failed to allocate Pyre sync server revision");
+    return { databaseEpoch, serverRevision };
 }
 
 export type SeedPrimitive = null | boolean | number | string | Uint8Array;
@@ -218,7 +517,10 @@ export async function run(
     options: RunOptions = {},
 ): Promise<QueryResult> {
     // Look up query metadata
-    const query = queryMap[queryId];
+    const source = queryMap[queryId];
+    const query = source && { ...source, schemaContracts: { ...source.schemaContracts },
+        attached_dbs: source.attached_dbs && [...source.attached_dbs],
+        sql: structuredClone(source.sql), syncSql: structuredClone(source.syncSql) };
     if (!query) {
         return {
             kind: "error",
@@ -265,17 +567,56 @@ export async function run(
         query.session_args,
         query.optional_input_args,
         query.json_input_args,
+        query.json_session_args,
+        query.json_session_validators,
     );
 
     // Prepare SQL statements
     const useSyncMode = options.mode === "sync";
     const activeSql = useSyncMode ? query.syncSql ?? query.sql : query.sql;
-    const sqlStatements: InStatement[] = toSqlStatements(activeSql, validArgs);
+    const sqlStatements = toSqlStatements(activeSql, validArgs);
 
     // Execute query
-    const resultSets = await db.batch(sqlStatements);
-    const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
-    const response = formatResultData(activeSql, resultSets);
+    let resultSets;
+    let committedRevision: SyncResult | undefined;
+    let affectedRowGroups: unknown[];
+    let response: unknown;
+    {
+        if (!query.primary_db || !Array.isArray(query.attached_dbs)
+            || [query.primary_db, ...query.attached_dbs].some(namespace =>
+                !Object.hasOwn(query.schemaContracts, namespace) || !query.schemaContracts[namespace])) {
+            throw new Error("Missing compiled schema contracts");
+        }
+        await assertPersistentTransaction(db);
+        await assertSupportedIntegerMode(db);
+        const tx = await db.transaction(query.operation === "query" && !options.commitSyncRevision ? "read" : "write");
+        let committing = false;
+        try {
+            await assertSchemaContracts(tx, query.schemaContracts, query.primary_db);
+            resultSets = await executeStatements({ execute: tx.execute.bind(tx) }, sqlStatements);
+            affectedRowGroups = extractAffectedRowGroups(activeSql, resultSets);
+            response = formatResultData(activeSql, resultSets);
+            if (query.ReturnData && !query.ReturnData.safeParse(response).success) {
+                throw new Error("Failed to decode return data");
+            }
+            if (options.commitSyncRevision) {
+                committedRevision = await nextLiveSyncRevision(tx);
+                executionContracts.set(committedRevision, query.schemaContracts[query.primary_db]);
+            }
+            committing = true;
+            await tx.commit();
+        } catch (error) {
+            try { await tx.rollback(); } catch { /* Preserve the execution/commit failure. */ }
+            if (committing) {
+                return {
+                    kind: "error",
+                    error: { errorType: "OutcomeUnknown", message: "OutcomeUnknown" },
+                    async sync() { return {}; },
+                };
+            }
+            throw error;
+        } finally { try { tx.close(); } catch { /* Closing cannot erase a committed revision. */ } }
+    }
 
     // Always create sync function - it will be a no-op if there's nothing to send
     /**
@@ -300,9 +641,9 @@ export async function run(
      * ]
      * ```
      */
-    async function sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
+    async function sync(sendToSession: (sessionId: string, message: any) => void | Promise<void>): Promise<SyncResult> {
         // Early return if nothing to sync
-        if (affectedRowGroups.length === 0) {
+        if (affectedRowGroups.length === 0 && !committedRevision) {
             return {};
         }
 
@@ -310,13 +651,13 @@ export async function run(
             return {};
         }
 
-        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId) ?? {};
+        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId, committedRevision) ?? {};
         if (typeof syncResult.serverRevision === "number") {
             queryResult.response = {
                 ...(syncResult.databaseEpoch === undefined ? {} : { databaseEpoch: syncResult.databaseEpoch }),
                 serverRevision: syncResult.serverRevision,
                 ...(syncResult.originMessage === undefined ? {} : { sync: syncResult.originMessage }),
-                result: queryResult.response,
+                result: response,
             };
         }
 
@@ -325,7 +666,8 @@ export async function run(
 
     const queryResult: QueryResult = {
         kind: "success",
-        response,
+        // Commit evidence belongs to execution, not best-effort publication.
+        response: committedRevision ? { ...committedRevision, result: response } : response,
         sync,
     };
 

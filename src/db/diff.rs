@@ -307,6 +307,7 @@ mod tests {
         let main_schema = parse_schema(
             "Main",
             r#"
+@syncable(false)
 record MainRecord {
     @public
     @tablename("shared_table")
@@ -318,6 +319,7 @@ record MainRecord {
         let campaign_schema = parse_schema(
             "Campaign",
             r#"
+@syncable(false)
 record CampaignRecord {
     @public
     @tablename("shared_table")
@@ -356,6 +358,7 @@ record CampaignRecord {
         let schema = parse_schema(
             "Main",
             r#"
+@syncable(false)
 record ClocktowerGame {
     @public
     id Id.Uuid @id

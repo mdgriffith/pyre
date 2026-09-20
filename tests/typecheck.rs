@@ -24,8 +24,15 @@ fn check_schema_and_get_layers(schema_source: &str) -> std::collections::HashMap
     layers
 }
 
+fn query_only_schema() -> ast::Schema {
+    ast::Schema {
+        sync_mode: ast::SyncMode::QueryOnly,
+        ..ast::Schema::default()
+    }
+}
+
 fn checked_context(schema_source: &str) -> typecheck::Context {
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -33,6 +40,57 @@ fn checked_context(schema_source: &str) -> typecheck::Context {
     };
 
     typecheck::check_schema(&database).expect("Schema should typecheck")
+}
+
+fn check_schema(schema_source: &str) -> Result<typecheck::Context, Vec<error::Error>> {
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+}
+
+#[test]
+fn synchronized_records_require_uuid_primary_keys() {
+    for primary_key in ["Int", "Id.Int", "String", "Id.Uuid?"] {
+        let errors = check_schema(&format!(
+            "record Note {{\n    @public\n    id {primary_key} @id\n}}"
+        ))
+        .expect_err("default-synchronized schema should reject a non-UUID primary key");
+
+        assert!(errors.iter().any(|error| matches!(
+            &error.error_type,
+            ErrorType::SyncablePrimaryKeyMustBeUuid { record, field, found }
+                if record == "Note" && field == "id" && found == primary_key
+        )));
+    }
+}
+
+#[test]
+fn synchronized_records_accept_uuid_primary_keys() {
+    check_schema(
+        r#"
+record Note {
+    @public
+    id Id.Uuid @id
+}
+"#,
+    )
+    .expect("default-synchronized schema should accept UUID primary keys");
+}
+
+#[test]
+fn query_only_records_may_use_other_primary_keys() {
+    check_schema(
+        r#"
+@syncable(false)
+record Note {
+    @public
+    id Id.Int @id
+}
+"#,
+    )
+    .expect("query-only schema should accept integer primary keys");
 }
 
 #[test]
@@ -557,7 +615,7 @@ record DocumentOwner {
             .iter()
             .map(|arg| arg.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["id", "updatedAt"]
+        vec!["id"]
     );
     typecheck::check_queries(&query_list, &context).expect("generated CRUD should typecheck");
 }
@@ -575,7 +633,7 @@ type Payload
     = Created { ownerId Int @immutable }
 "#,
     ] {
-        let mut schema = ast::Schema::default();
+        let mut schema = query_only_schema();
         parser::run("schema.pyre", schema_source, &mut schema).expect("schema parses");
         let errors = typecheck::check_schema(&ast::Database {
             schemas: vec![schema],
@@ -628,7 +686,7 @@ record User {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("schema should parse");
 
     let database = ast::Database {
@@ -653,7 +711,7 @@ record User {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -677,7 +735,7 @@ record User {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -711,7 +769,7 @@ record Game {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -743,7 +801,7 @@ record Entity {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -779,7 +837,7 @@ record Entity {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -808,7 +866,7 @@ record Document {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -837,7 +895,7 @@ record User {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -861,7 +919,7 @@ record User {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -891,7 +949,7 @@ record User {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -931,7 +989,7 @@ insert SeedEvent {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -974,7 +1032,7 @@ record Event {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -1120,7 +1178,7 @@ type DevSource
    | Browser
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("pyre/schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -1164,7 +1222,7 @@ record Task {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("pyre/schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -1204,7 +1262,7 @@ record Counter {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("pyre/schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -1237,22 +1295,22 @@ fn test_simple_linear_dependency() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    bId Int
+    id Id.Uuid @id
+    bId B.id
     b @link(bId, B.id)
     @public
 }
@@ -1272,22 +1330,22 @@ fn test_multiple_dependencies() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
@@ -1307,16 +1365,16 @@ fn test_circular_dependency() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int?
+    id Id.Uuid @id
+    aId A.id?
     a @link(aId, A.id)
     @public
 }
@@ -1341,19 +1399,19 @@ fn test_independent_tables() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 "#;
@@ -1373,32 +1431,32 @@ fn test_complex_graph() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record D {
     @tablename("d")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
-    cId Int?
+    cId C.id?
     c @link(cId, C.id)
     @public
 }
@@ -1419,24 +1477,24 @@ fn test_three_way_cycle() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    cId Int?
+    id Id.Uuid @id
+    cId C.id?
     c @link(cId, C.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    aId Int?
+    id Id.Uuid @id
+    aId A.id?
     a @link(aId, A.id)
     @public
 }
@@ -1461,30 +1519,30 @@ fn test_cycle_with_external_dependency() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    cId Int?
+    id Id.Uuid @id
+    cId C.id?
     c @link(cId, C.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
     @public
 }
 
 record D {
     @tablename("d")
-    id Int @id
-    bId Int
+    id Id.Uuid @id
+    bId B.id
     b @link(bId, B.id)
     @public
 }
@@ -1516,38 +1574,38 @@ fn test_deep_nested_dependencies() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    bId Int
+    id Id.Uuid @id
+    bId B.id
     b @link(bId, B.id)
     @public
 }
 
 record D {
     @tablename("d")
-    id Int @id
-    cId Int
+    id Id.Uuid @id
+    cId C.id
     c @link(cId, C.id)
     @public
 }
 
 record E {
     @tablename("e")
-    id Int @id
-    dId Int
+    id Id.Uuid @id
+    dId D.id
     d @link(dId, D.id)
     @public
 }
@@ -1570,16 +1628,16 @@ fn test_multiple_links_same_table() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId1 Int
+    id Id.Uuid @id
+    aId1 A.id
     a1 @link(aId1, A.id)
-    aId2 Int
+    aId2 A.id
     a2 @link(aId2, A.id)
     @public
 }
@@ -1598,21 +1656,21 @@ fn test_table_with_no_links() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
+    id Id.Uuid @id
     name String
     @public
 }
@@ -1640,32 +1698,32 @@ fn test_diamond_pattern() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record D {
     @tablename("d")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
-    cId Int?
+    cId C.id?
     c @link(cId, C.id)
     @public
 }
@@ -1686,8 +1744,8 @@ fn test_self_referential_table() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
-    parentId Int?
+    id Id.Uuid @id
+    parentId A.id?
     parent @link(parentId, A.id)
     @public
 }
@@ -1715,7 +1773,7 @@ record User {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -1771,7 +1829,7 @@ record User {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -1811,7 +1869,7 @@ record ClocktowerGame {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     typecheck::check_schema(&ast::Database {
@@ -1834,7 +1892,7 @@ record ClocktowerGame {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
     let errors = typecheck::check_schema(&ast::Database {
         schemas: vec![schema_ast],
@@ -1862,7 +1920,7 @@ record Task {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -1922,7 +1980,7 @@ record Post {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -1978,7 +2036,7 @@ record Post {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -2032,7 +2090,7 @@ record User {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -2085,7 +2143,7 @@ record User {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -2140,7 +2198,7 @@ record User {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -2197,7 +2255,7 @@ record Post {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -2253,7 +2311,7 @@ record Post {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -2312,7 +2370,7 @@ record Post {
 }
 "#;
 
-    let mut schema_ast = ast::Schema::default();
+    let mut schema_ast = query_only_schema();
     parser::run("schema.pyre", schema, &mut schema_ast).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -2423,7 +2481,7 @@ record Post {
 }
     "#;
 
-    let mut schema = ast::Schema::default();
+    let mut schema = query_only_schema();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
 
     let database = ast::Database {
@@ -2517,12 +2575,12 @@ record Account {
 }
     "#;
 
-    let mut app_schema = ast::Schema::default();
+    let mut app_schema = query_only_schema();
     app_schema.namespace = "App".to_string();
     parser::run("pyre/schema/App/schema.pyre", app_source, &mut app_schema)
         .expect("App schema should parse");
 
-    let mut auth_schema = ast::Schema::default();
+    let mut auth_schema = query_only_schema();
     auth_schema.namespace = "Auth".to_string();
     parser::run(
         "pyre/schema/Auth/schema.pyre",
@@ -2572,12 +2630,12 @@ record User {
 }
     "#;
 
-    let mut app_schema = ast::Schema::default();
+    let mut app_schema = query_only_schema();
     app_schema.namespace = "App".to_string();
     parser::run("pyre/schema/App/schema.pyre", app_source, &mut app_schema)
         .expect("App schema should parse");
 
-    let mut auth_schema = ast::Schema::default();
+    let mut auth_schema = query_only_schema();
     auth_schema.namespace = "Auth".to_string();
     parser::run(
         "pyre/schema/Auth/schema.pyre",
@@ -2614,7 +2672,7 @@ query GetPosts {
 
 #[test]
 fn transaction_rejects_writes_to_multiple_namespaces() {
-    let mut app_schema = ast::Schema::default();
+    let mut app_schema = query_only_schema();
     app_schema.namespace = "App".to_string();
     parser::run(
         "pyre/schema/App/schema.pyre",
@@ -2629,7 +2687,7 @@ record Note {
     )
     .expect("App schema should parse");
 
-    let mut auth_schema = ast::Schema::default();
+    let mut auth_schema = query_only_schema();
     auth_schema.namespace = "Auth".to_string();
     parser::run(
         "pyre/schema/Auth/schema.pyre",
@@ -2690,7 +2748,7 @@ transaction CreateNoteAndAccount {
 
 #[test]
 fn foreign_key_requires_namespace_to_reference_external_table() {
-    let mut app_schema = ast::Schema::default();
+    let mut app_schema = query_only_schema();
     app_schema.namespace = "App".to_string();
     parser::run(
         "pyre/schema/App/schema.pyre",
@@ -2705,7 +2763,7 @@ record Post {
     )
     .expect("App schema should parse");
 
-    let mut auth_schema = ast::Schema::default();
+    let mut auth_schema = query_only_schema();
     auth_schema.namespace = "Auth".to_string();
     parser::run(
         "pyre/schema/Auth/schema.pyre",
@@ -2736,7 +2794,7 @@ record User {
 
 #[test]
 fn foreign_key_allows_explicit_external_namespace() {
-    let mut app_schema = ast::Schema::default();
+    let mut app_schema = query_only_schema();
     app_schema.namespace = "App".to_string();
     parser::run(
         "pyre/schema/App/schema.pyre",
@@ -2751,7 +2809,7 @@ record Post {
     )
     .expect("App schema should parse");
 
-    let mut auth_schema = ast::Schema::default();
+    let mut auth_schema = query_only_schema();
     auth_schema.namespace = "Auth".to_string();
     parser::run(
         "pyre/schema/Auth/schema.pyre",
@@ -2806,12 +2864,12 @@ record User {
 }
     "#;
 
-    let mut app_schema = ast::Schema::default();
+    let mut app_schema = query_only_schema();
     app_schema.namespace = "App".to_string();
     parser::run("pyre/schema/App/schema.pyre", app_source, &mut app_schema)
         .expect("App schema should parse");
 
-    let mut auth_schema = ast::Schema::default();
+    let mut auth_schema = query_only_schema();
     auth_schema.namespace = "Auth".to_string();
     parser::run(
         "pyre/schema/Auth/schema.pyre",

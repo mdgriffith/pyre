@@ -1,10 +1,9 @@
-delete DeletePost($id: Int) {
+delete DeletePost($id: Post.id) {
     post {
         @where { id == $id  }
 
         id
     }
 }
-
 
 

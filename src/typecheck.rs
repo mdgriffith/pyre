@@ -1283,6 +1283,34 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                                 }],
                                             });
                                         }
+                                        if schema.sync_mode == ast::SyncMode::Synced
+                                            && (!matches!(
+                                                column.type_,
+                                                ast::ColumnType::IdUuid { .. }
+                                            ) || column.nullable)
+                                        {
+                                            let found = format!(
+                                                "{}{}",
+                                                column.type_.to_string(),
+                                                if column.nullable { "?" } else { "" }
+                                            );
+                                            errors.push(Error {
+                                                filepath: file.path.clone(),
+                                                error_type:
+                                                    ErrorType::SyncablePrimaryKeyMustBeUuid {
+                                                        record: name.clone(),
+                                                        field: column.name.clone(),
+                                                        found,
+                                                    },
+                                                locations: vec![Location {
+                                                    contexts: to_range(&start, &end),
+                                                    primary: to_range(
+                                                        &column.start_typename,
+                                                        &column.end_typename,
+                                                    ),
+                                                }],
+                                            });
+                                        }
                                         has_primary_id = true;
                                     }
 
@@ -3291,47 +3319,8 @@ fn check_record_permissions(
     filepath: &String,
     errors: &mut Vec<Error>,
 ) {
-    let synced = context
-        .tables
-        .values()
-        .find(|table| table.record.name == record.name && table.record == *record)
-        .and_then(|table| context.namespace_sync_modes.get(&table.schema))
-        .copied()
-        .unwrap_or(ast::SyncMode::Synced)
-        == ast::SyncMode::Synced;
-
-    if synced {
-        for field in &record.fields {
-            let expressions: Vec<&ast::WhereArg> = match field {
-                ast::Field::FieldDirective(ast::FieldDirective::Permissions(
-                    ast::PermissionDetails::Star(where_),
-                )) => vec![where_],
-                ast::Field::FieldDirective(ast::FieldDirective::Permissions(
-                    ast::PermissionDetails::OnOperation(operations),
-                )) => operations
-                    .iter()
-                    .filter(|permission| {
-                        permission.operations.contains(&ast::QueryOperation::Query)
-                    })
-                    .map(|permission| &permission.where_)
-                    .collect(),
-                _ => vec![],
-            };
-            for expression in expressions {
-                if let Some(range) = first_exists_range(expression) {
-                    errors.push(Error {
-                        filepath: filepath.clone(),
-                        error_type: ErrorType::SyncedRelationalQueryPermission,
-                        locations: vec![Location {
-                            contexts: vec![],
-                            primary: vec![convert_range(range)],
-                        }],
-                    });
-                }
-            }
-        }
-    }
-
+    // Relational read permissions require complete replacement, not legacy row deltas.
+    // The sync runtime gates legacy entrypoints with requires_replacement().
     for field in &record.fields {
         let expressions: Vec<&ast::WhereArg> = match field {
             ast::Field::FieldDirective(ast::FieldDirective::Permissions(

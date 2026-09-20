@@ -34,6 +34,8 @@ fn permission_predicates_cannot_be_empty() {
 #[test]
 fn permission_constants_allow_explicit_unrestricted_and_denied_operations() {
     let source = r#"
+@syncable(false)
+
 record Post {
     id Int @id
     @allow(query) { True }
@@ -83,7 +85,7 @@ record Post {
     let mut deny_all_schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "record Locked {\n    id Int @id\n    @allow(*) { False }\n}\n",
+        "@syncable(false)\n\nrecord Locked {\n    id Int @id\n    @allow(*) { False }\n}\n",
         &mut deny_all_schema,
     )
     .unwrap();
@@ -189,7 +191,7 @@ record Job {
 fn permission_functions_are_rejected_for_live_sync_consistency() {
     let source = r#"
 record Job {
-    id Int @id
+    id Id.Uuid @id
     code Int
     @allow(query) { code == length("value") }
     @allow(insert, update, delete) { False }
@@ -211,6 +213,8 @@ record Job {
 fn membership_schema(session_type: &str, predicate: &str) -> String {
     format!(
         r#"
+@syncable(false)
+
 session {{
     activeIds {}
 }}
@@ -803,6 +807,8 @@ record Post {
 fn test_single_permission_allowed() {
     // A single @allow directive should be allowed
     let schema_source = r#"
+@syncable(false)
+
 record Post {
     id Int @id
     title String
@@ -867,6 +873,8 @@ record Post {
 #[test]
 fn test_public_directive_parses() {
     let schema_source = r#"
+@syncable(false)
+
 record Post {
     id Int @id
     title String
@@ -1250,6 +1258,8 @@ record Post {
 fn test_public_directive_counts_as_permissions() {
     // Test that @public counts as a permissions directive for validation
     let schema_source = r#"
+@syncable(false)
+
 record Post {
     id Int @id
     title String
@@ -1285,6 +1295,8 @@ record Comment {
 fn test_multiple_fine_grained_permissions_allowed() {
     // Multiple fine-grained permissions should be allowed if they don't overlap
     let schema_source = r#"
+@syncable(false)
+
 record Post {
     id Int @id
     title String

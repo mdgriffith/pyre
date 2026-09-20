@@ -1,11 +1,20 @@
 import type { Client } from "@libsql/client";
 import type { ZodType } from "zod";
-import { buildArgs, formatResultData, toSqlStatements, type SqlInfo } from "./sql";
+import { assertSchemaContracts } from "../schema";
+import { assertPersistentTransaction } from "./libsql";
+import { buildArgs, executeStatements, formatResultData, toSqlStatements, type GeneratedEdit, type JsonSessionValidators, type SqlInfo } from "./sql";
 
 type Validator<T> = ZodType<T>;
 
 type RunnerMeta = {
+  operation: "query" | "insert" | "update" | "delete" | "transaction";
+  primary_db: string;
+  attached_dbs: string[];
+  schemaContracts: Readonly<Record<string, string>>;
+  generatedEdit?: GeneratedEdit;
   session_args: string[];
+  json_session_args?: string[];
+  json_session_validators?: JsonSessionValidators;
   optional_input_args: string[];
   json_input_args: string[];
   InputValidator: Validator<any>;
@@ -27,6 +36,13 @@ export function toRunner<Input, Result>(meta: RunnerMeta, sql: SqlInfo[]) {
     inputOrSession?: Input | Record<string, any>,
     maybeInput?: Input
   ): Promise<Result> => {
+    const primaryNamespace = meta.primary_db;
+    const contracts = { ...meta.schemaContracts };
+    if (!primaryNamespace || !Array.isArray(meta.attached_dbs) ||
+        [primaryNamespace, ...meta.attached_dbs].some(namespace =>
+          !Object.hasOwn(contracts, namespace) || typeof contracts[namespace] !== "string" || !contracts[namespace])) {
+      throw new Error("Missing compiled schema contracts");
+    }
     const input =
       maybeInput === undefined
         ? (inputOrSession as Input | undefined)
@@ -51,9 +67,22 @@ export function toRunner<Input, Result>(meta: RunnerMeta, sql: SqlInfo[]) {
       meta.session_args,
       meta.optional_input_args,
       meta.json_input_args,
+      meta.json_session_args,
+      meta.json_session_validators,
     );
-    const results = await db.batch(toSqlStatements(sql, args));
-    const data = formatResultData(sql, results);
-    return decodeOrThrow(meta.ReturnData, data, "return data");
+    await assertPersistentTransaction(db);
+    const tx = await db.transaction(meta.operation === "query" ? "read" : "write");
+    try {
+      await assertSchemaContracts(tx, contracts, primaryNamespace);
+      const results = await executeStatements({ execute: tx.execute.bind(tx) }, toSqlStatements(sql, args), meta.generatedEdit);
+      const data = decodeOrThrow<Result>(meta.ReturnData, formatResultData(sql, results), "return data");
+      await tx.commit();
+      return data;
+    } catch (error) {
+      if (!tx.closed) await tx.rollback();
+      throw error;
+    } finally {
+      tx.close();
+    }
   };
 }

@@ -3,6 +3,8 @@ export { databaseIdFromUrl, requireDatabaseId, withDatabaseId } from "./database
 export { activateSchemaForDatabase, loadSchemaFromDatabase } from "./schema";
 export { catchup, rotateDatabaseEpoch } from "./sync";
 export { runWithSync as run } from "./query-sync";
+export { runBatchWithSync, catchupReplacement } from "./query-sync";
+export type { SyncFence, BatchSyncRecipient, ReplacementRequest, ReplacementResponse, ReplacementResult } from "./query-sync";
 
 export type {
   DatabaseId,

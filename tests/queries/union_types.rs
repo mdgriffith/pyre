@@ -11,6 +11,8 @@ use crate::helpers::test_database::TestDatabase;
 use crate::helpers::TestError;
 
 const UNION_PREDICATE_SCHEMA: &str = r#"
+@syncable(false)
+
 type ProviderReason
    = ProviderRejected {
         code String?

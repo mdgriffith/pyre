@@ -13,6 +13,7 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 #[test]
 fn typescript_schema_and_decoders_render_typed_json_containers() {
     let schema_source = r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -89,6 +90,7 @@ insert CreateEvent($payload: Json<Lifecycle>, $tags: Json<List<String>>, $counts
 #[test]
 fn typescript_decoders_render_recursive_typed_json_with_lazy_validators() {
     let schema_source = r#"
+@syncable(false)
 type Attribute
    = AttributeInt {
         value    Int
@@ -242,6 +244,7 @@ record Document {
 #[test]
 fn typescript_session_validator_uses_custom_type_decoder() {
     let schema_source = r#"
+@syncable(false)
 type Role
     = Admin
     | Member
@@ -301,6 +304,7 @@ record User {
 #[test]
 fn core_session_validator_composes_named_type_decoders() {
     let schema_source = r#"
+@syncable(false)
 type ParticipantStatus
     = Storyteller
     | Player
@@ -418,7 +422,7 @@ if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "c
 if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "campaign-1", enabled: 2 } }).success) {
   throw new Error("Expected non-canonical nested session boolean to fail");
 }
-SessionValidator.parse({ campaignRole: { _type: "Member", campaignId: "campaign-1", ownerId: "uuid-1" } });
+SessionValidator.parse({ campaignRole: { _type: "Member", campaignId: "campaign-1", ownerId: "00000000-0000-4000-8000-000000000001" } });
 if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "campaign-1", ownerId: 1 } }).success) {
   throw new Error("Expected numeric nested UUID session reference to fail");
 }
@@ -470,6 +474,7 @@ if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "c
 #[test]
 fn typescript_session_references_preserve_id_storage_types() {
     let schema_source = r#"
+@syncable(false)
 session {
     uuidRecordId UuidRecord.id?
     intRecordId  IntRecord.id?
@@ -506,15 +511,19 @@ record IntRecord {
         .expect("generated decode file");
     assert!(decode.contents.contains("uuidRecordId?: string | null;"));
     assert!(decode.contents.contains("intRecordId?: number | null;"));
-    assert!(decode
-        .contents
-        .contains("uuidRecordId: z.string().nullish(),"));
+    assert!(decode.contents.contains(&format!(
+        "uuidRecordId: {}.nullish(),",
+        pyre::generate::typescript::common::UUID_VALIDATOR
+    )));
     assert!(decode
         .contents
         .contains("intRecordId: z.number().int().nullish(),"));
 
     let env = typescript::to_env(&context, &database).expect("env should generate");
-    assert!(env.contains("uuidRecordId: z.string().optional(),"));
+    assert!(env.contains(&format!(
+        "uuidRecordId: {}.optional(),",
+        pyre::generate::typescript::common::UUID_VALIDATOR
+    )));
     assert!(env.contains("intRecordId: z.number().optional(),"));
 
     let temp_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary directory");
@@ -527,6 +536,9 @@ import { SessionValidator } from "./decode.ts";
 
 SessionValidator.parse({ uuidRecordId: "550e8400-e29b-41d4-a716-446655440000" });
 SessionValidator.parse({ intRecordId: 42 });
+for (const uuidRecordId of ["symbolic", "550e8400e29b41d4a716446655440000", "550e8400-e29b-41d4-a716-446655440000\n"]) {
+  if (SessionValidator.safeParse({ uuidRecordId }).success) throw new Error("Expected malformed UUID rejection");
+}
 
 if (SessionValidator.safeParse({ uuidRecordId: 42 }).success) {
   throw new Error("Expected numeric UUID record ID to fail");
@@ -555,6 +567,7 @@ if (SessionValidator.safeParse({ intRecordId: 7.5 }).success) {
 #[test]
 fn typescript_metadata_serializes_payload_union_parameters_but_not_unit_enums() {
     let schema_source = r#"
+@syncable(false)
 type Content
    = Folder
    | Markdown {

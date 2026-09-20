@@ -1,6 +1,7 @@
 module FineGrainedReactivityTest exposing (suite)
 
 import Data.Delta
+import Data.Identity
 import Data.QueryManager
 import Data.Schema
 import Data.Value exposing (Value)
@@ -275,10 +276,10 @@ extractChangedRowIdsTests =
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds identitySchema delta
                 in
                 Expect.equal
-                    (Dict.fromList [ ( "users", Set.fromList [ 1, 2 ] ) ])
+                    (Ok (Dict.fromList [ ( "users", keys [ 1, 2 ] ) ]))
                     result
         , test "extracts row IDs from multiple tables" <|
             \_ ->
@@ -300,13 +301,15 @@ extractChangedRowIdsTests =
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds identitySchema delta
                 in
                 Expect.equal
-                    (Dict.fromList
-                        [ ( "users", Set.fromList [ 1 ] )
-                        , ( "posts", Set.fromList [ 10, 11 ] )
-                        ]
+                    (Ok
+                        (Dict.fromList
+                            [ ( "users", keys [ 1 ] )
+                            , ( "posts", keys [ 10, 11 ] )
+                            ]
+                        )
                     )
                     result
         , test "handles empty delta" <|
@@ -316,10 +319,10 @@ extractChangedRowIdsTests =
                         { tableGroups = [] }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds identitySchema delta
                 in
-                Expect.equal Dict.empty result
-        , test "skips rows without valid ID" <|
+                Expect.equal (Ok Dict.empty) result
+        , test "rejects the whole delta for an invalid ID" <|
             \_ ->
                 let
                     delta =
@@ -336,10 +339,10 @@ extractChangedRowIdsTests =
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds identitySchema delta
                 in
                 Expect.equal
-                    (Dict.fromList [ ( "users", Set.fromList [ 1, 3 ] ) ])
+                    (Err "Primary key has the wrong type")
                     result
         ]
 
@@ -355,7 +358,7 @@ shouldReExecuteQueryTests =
             \_ ->
                 let
                     schema =
-                        { tables = Dict.empty
+                        { tables = identitySchema.tables
                         , queryFieldToTable = Dict.fromList [ ( "users", "users" ) ]
                         }
 
@@ -364,7 +367,8 @@ shouldReExecuteQueryTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ = Nothing
                                     , sort = Nothing
                                     , limit = Nothing
@@ -373,7 +377,7 @@ shouldReExecuteQueryTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2, 3 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", keys [ 1, 2, 3 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -388,7 +392,7 @@ shouldReExecuteQueryTests =
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init schema
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -398,7 +402,7 @@ shouldReExecuteQueryTests =
             \_ ->
                 let
                     schema =
-                        { tables = Dict.empty
+                        { tables = identitySchema.tables
                         , queryFieldToTable = Dict.fromList [ ( "users", "users" ) ]
                         }
 
@@ -407,7 +411,8 @@ shouldReExecuteQueryTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ = Nothing
                                     , sort = Nothing
                                     , limit = Nothing
@@ -416,7 +421,7 @@ shouldReExecuteQueryTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2, 3 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", keys [ 1, 2, 3 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -431,7 +436,7 @@ shouldReExecuteQueryTests =
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init schema
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -446,6 +451,8 @@ shouldReExecuteQueryTests =
                             Dict.fromList
                                 [ ( "games"
                                   , { name = "games"
+                                    , columns = Nothing
+                                    , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                                     , links =
                                         Dict.fromList
                                             [ ( "gameMembers"
@@ -463,6 +470,8 @@ shouldReExecuteQueryTests =
                                   )
                                 , ( "game_members"
                                   , { name = "game_members"
+                                    , columns = Nothing
+                                    , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                                     , links = Dict.empty
                                     , indices = []
                                     }
@@ -472,7 +481,8 @@ shouldReExecuteQueryTests =
                         }
 
                     nestedSelection =
-                        { selections = Dict.fromList [ ( "id", Db.Query.SelectField Nothing ) ]
+                        { source = Nothing
+                        , selections = Dict.fromList [ ( "id", Db.Query.SelectField Nothing ) ]
                         , where_ = Nothing
                         , sort = Nothing
                         , limit = Nothing
@@ -483,7 +493,8 @@ shouldReExecuteQueryTests =
                         , query =
                             Dict.fromList
                                 [ ( "game"
-                                  , { selections =
+                                  , { source = Nothing
+                                    , selections =
                                         Dict.fromList
                                             [ ( "id", Db.Query.SelectField Nothing )
                                             , ( "name", Db.Query.SelectField Nothing )
@@ -497,7 +508,7 @@ shouldReExecuteQueryTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "game", Set.fromList [ 1 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "game", keys [ 1 ] ) ]
                         , revision = 1
                         , lastResult = Nothing
                         }
@@ -512,7 +523,7 @@ shouldReExecuteQueryTests =
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init schema
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -522,7 +533,7 @@ shouldReExecuteQueryTests =
             \_ ->
                 let
                     schema =
-                        { tables = Dict.empty
+                        { tables = identitySchema.tables
                         , queryFieldToTable = Dict.fromList [ ( "users", "users" ) ]
                         }
 
@@ -531,7 +542,8 @@ shouldReExecuteQueryTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ =
                                         Just
                                             (Dict.fromList
@@ -545,7 +557,7 @@ shouldReExecuteQueryTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2, 3 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", keys [ 1, 2, 3 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -562,7 +574,7 @@ shouldReExecuteQueryTests =
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init schema
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -578,12 +590,12 @@ shouldReExecuteQueryTests =
 integrationTests : Test
 integrationTests =
     describe "Integration: Full query reactivity flow"
-        [ test "query with WHERE clause skips re-execution when non-filtered field changes" <|
+        [ test "query with WHERE clause re-executes when selected non-filtered field changes" <|
             \_ ->
                 let
                     -- Schema setup
                     schema =
-                        { tables = Dict.empty
+                        { tables = identitySchema.tables
                         , queryFieldToTable = Dict.fromList [ ( "users", "users" ) ]
                         }
 
@@ -593,7 +605,8 @@ integrationTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ =
                                         Just
                                             (Dict.fromList
@@ -607,7 +620,7 @@ integrationTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", keys [ 1, 2 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -618,14 +631,14 @@ integrationTests =
                             Dict.fromList
                                 [ ( "users"
                                   , Dict.fromList
-                                        [ ( 1
+                                        [ ( Data.Identity.int 1
                                           , Dict.fromList
                                                 [ ( "id", Data.Value.IntValue 1 )
                                                 , ( "role", Data.Value.StringValue "admin" )
                                                 , ( "email", Data.Value.StringValue "admin1@example.com" )
                                                 ]
                                           )
-                                        , ( 2
+                                        , ( Data.Identity.int 2
                                           , Dict.fromList
                                                 [ ( "id", Data.Value.IntValue 2 )
                                                 , ( "role", Data.Value.StringValue "admin" )
@@ -636,6 +649,7 @@ integrationTests =
                                   )
                                 ]
                         , indices = Dict.empty
+                        , schema = schema
                         }
 
                     -- Delta: user 1 changes email (NOT role)
@@ -656,13 +670,12 @@ integrationTests =
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
                 in
-                -- Should NOT re-execute because 'role' didn't change
-                Expect.equal Data.QueryManager.NoReExecute result
+                Expect.equal Data.QueryManager.ReExecuteFull result
         , test "query with WHERE clause triggers re-execution when filtered field changes" <|
             \_ ->
                 let
                     schema =
-                        { tables = Dict.empty
+                        { tables = identitySchema.tables
                         , queryFieldToTable = Dict.fromList [ ( "users", "users" ) ]
                         }
 
@@ -671,7 +684,8 @@ integrationTests =
                         , query =
                             Dict.fromList
                                 [ ( "users"
-                                  , { selections = Dict.empty
+                                  , { source = Nothing
+                                    , selections = Dict.empty
                                     , where_ =
                                         Just
                                             (Dict.fromList
@@ -685,7 +699,7 @@ integrationTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", keys [ 1, 2 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -695,7 +709,7 @@ integrationTests =
                             Dict.fromList
                                 [ ( "users"
                                   , Dict.fromList
-                                        [ ( 1
+                                        [ ( Data.Identity.int 1
                                           , Dict.fromList
                                                 [ ( "id", Data.Value.IntValue 1 )
                                                 , ( "role", Data.Value.StringValue "admin" )
@@ -705,6 +719,7 @@ integrationTests =
                                   )
                                 ]
                         , indices = Dict.empty
+                        , schema = schema
                         }
 
                     -- Delta: user 1 changes role from admin to user
@@ -727,3 +742,18 @@ integrationTests =
                 -- Should re-execute because 'role' changed
                 Expect.equal Data.QueryManager.ReExecuteFull result
         ]
+
+
+keys : List Int -> Set.Set Data.Identity.Key
+keys =
+    List.map Data.Identity.int >> Set.fromList
+
+
+identitySchema : Data.Schema.SchemaMetadata
+identitySchema =
+    { tables =
+        [ "users", "posts" ]
+            |> List.map (\name -> ( name, { name = name, columns = Nothing, primaryKey = { name = "id", kind = Data.Schema.IntKey }, links = Dict.empty, indices = [] } ))
+            |> Dict.fromList
+    , queryFieldToTable = Dict.fromList [ ( "users", "users" ), ( "posts", "posts" ) ]
+    }

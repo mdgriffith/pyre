@@ -1176,6 +1176,8 @@ pub enum QueryDef {
 
 #[derive(Debug, Clone)]
 pub struct Query {
+    /// Set only by the schema CRUD compiler, never inferred from query contents or hashes.
+    pub generated_crud: bool,
     pub interface_hash: String,
     pub full_hash: String,
 

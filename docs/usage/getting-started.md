@@ -201,6 +201,12 @@ High-level purpose:
 - `typescript/server.ts`: query metadata used by `@pyre/server/query` and `@pyre/server/sync`
 - `client/elm/`: generated Elm surfaces for sync-enabled clients
 
+Regenerate named query artifacts before deploying a compiler/runtime upgrade.
+The server requires generated `schemaContracts` for each primary/attached
+namespace; old metadata without these contracts is rejected, not executed through
+a compatibility fallback. Batch manifests also require `compiledContract` and
+`replacementContracts`.
+
 ## Step 5: Choose An Integration Style
 
 After generation, you have a few reasonable ways to use Pyre.
@@ -245,7 +251,10 @@ CLI shortcut: `pyre docs serve`
 
 ```typescript
 import { createClient } from "@libsql/client";
+import { init } from "@pyre/server/wasm";
 import { GetUser } from "./pyre/generated/typescript/run";
+
+await init();
 
 const db = createClient({
     url: "file:./db/playground.db",
@@ -258,6 +267,25 @@ console.log(result.user);
 ```
 
 Generated functions accept an existing libSQL client and return the decoded, typed query result. For session-aware queries, pass the session before the input: `GetUser(db, session, { id: 1 })`.
+
+WASM initialization is required for `run` and `toRunner`, including these generated
+functions. Apply the schema with Pyre migrations first: compiled execution checks
+the parsed semantic contract of the latest successful `_pyre_migrations` source
+inside the same read snapshot or write transaction, before application SQL.
+Comments-only changes are compatible; missing, null, invalid, or incompatible
+authority fails closed. Failed and unfinished migrations are ignored. Cached
+schemas are not authority, and migrations must record source atomically with
+their changes. Direct SQL and legacy seed helpers remain trusted maintenance/setup
+tools, not permission-enforcing execution paths.
+
+Use file-backed SQLite or remote libSQL for TypeScript transactional execution.
+Local in-memory databases are unsupported because the adapter detaches connections;
+the runtime guards before transaction acquisition. Even empty executor batches
+check authority and epoch transactionally, without allocating a revision or
+publishing rows. Rust named attached queries require trusted host preattachments
+and skip generated `ATTACH` directives; the TypeScript attached runtime still has
+no binding API. See the [server runtime guide](../../packages/server/README.md#persisted-schema-authority)
+for the boundary and focused coverage references.
 
 This is the most flexible path when your app already has its own HTTP server and auth model. If the server dispatches generated client requests dynamically, use the `queries` map from `typescript/server.ts` with `@pyre/server/query` or `@pyre/server/sync` instead.
 

@@ -1,11 +1,13 @@
 module RelationshipCardinalityTest exposing (suite)
 
+import Data.Identity
 import Data.Schema
 import Data.Value exposing (Value)
 import Db
 import Db.Query
 import Dict exposing (Dict)
 import Expect
+import Json.Decode as Decode
 import Test exposing (Test, describe, test)
 
 
@@ -43,7 +45,7 @@ suite =
                         }
 
                     dbAfterDelta =
-                        Db.update (Db.DeltaReceived gamesOnlyDelta) Db.init
+                        Db.update (Db.DeltaReceived gamesOnlyDelta) (Db.init schema)
                             |> Tuple.first
 
                     result =
@@ -89,6 +91,41 @@ suite =
                         ]
                     )
                     result
+        , test "top-level alias resolves its source query field" <|
+            \_ ->
+                Decode.decodeString Db.Query.decodeQuery """{"gamesAlias":{"@source":"game","id":true}}"""
+                    |> Result.map (Db.executeQuery schema dbWithRelatedRows)
+                    |> Expect.equal
+                        (Ok
+                            (Dict.fromList
+                                [ ( "gamesAlias"
+                                  , [ Dict.fromList [ ( "id", Data.Value.IntValue 1 ) ] ]
+                                  )
+                                ]
+                            )
+                        )
+        , test "nested where, sort, and limit run before projection" <|
+            \_ ->
+                Decode.decodeString Db.Query.decodeQuery """{"game":{"id":true,"gameMembers":{"userId":true,"@where":{"userId":{"$gt":20}},"@sort":{"field":"id","direction":"desc"},"@limit":1}}}"""
+                    |> Result.map (Db.executeQuery schema dbWithDirectiveRows)
+                    |> Expect.equal
+                        (Ok
+                            (Dict.fromList
+                                [ ( "game"
+                                  , [ Dict.fromList
+                                        [ ( "id", Data.Value.IntValue 1 )
+                                        , ( "gameMembers"
+                                          , Data.Value.ArrayValue
+                                                [ Data.Value.ObjectValue
+                                                    (Dict.fromList [ ( "userId", Data.Value.IntValue 40 ) ])
+                                                ]
+                                          )
+                                        ]
+                                    ]
+                                  )
+                                ]
+                            )
+                        )
         ]
 
 
@@ -98,6 +135,8 @@ schema =
         Dict.fromList
             [ ( "games"
               , { name = "games"
+                , columns = Nothing
+                , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                 , links =
                     Dict.fromList
                         [ ( "gameMembers"
@@ -115,6 +154,8 @@ schema =
               )
             , ( "game_members"
               , { name = "game_members"
+                , columns = Nothing
+                , primaryKey = { name = "id", kind = Data.Schema.IntKey }
                 , links = Dict.empty
                 , indices = []
                 }
@@ -128,7 +169,8 @@ listGamesQuery : Db.Query.Query
 listGamesQuery =
     Dict.fromList
         [ ( "game"
-          , { selections =
+          , { source = Nothing
+            , selections =
                 Dict.fromList
                     [ ( "id", Db.Query.SelectField Nothing )
                     , ( "name", Db.Query.SelectField Nothing )
@@ -144,7 +186,8 @@ listGamesQuery =
 
 gameMembersFieldQuery : Db.Query.FieldQuery
 gameMembersFieldQuery =
-    { selections =
+    { source = Nothing
+    , selections =
         Dict.fromList
             [ ( "id", Db.Query.SelectField Nothing )
             , ( "userId", Db.Query.SelectField Nothing )
@@ -159,7 +202,8 @@ aliasedListGamesQuery : Db.Query.Query
 aliasedListGamesQuery =
     Dict.fromList
         [ ( "game"
-          , { selections =
+          , { source = Nothing
+            , selections =
                 Dict.fromList
                     [ ( "id", Db.Query.SelectField Nothing )
                     , ( "members", Db.Query.SelectNested (Just "gameMembers") gameMembersFieldQuery )
@@ -178,7 +222,7 @@ dbWithEmptyRelatedTable =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Data.Identity.int 1
                       , Dict.fromList
                             [ ( "id", Data.Value.IntValue 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
@@ -189,6 +233,7 @@ dbWithEmptyRelatedTable =
             , ( "game_members", Dict.empty )
             ]
     , indices = Dict.empty
+    , schema = schema
     }
 
 
@@ -198,7 +243,7 @@ dbWithoutRelatedTable =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Data.Identity.int 1
                       , Dict.fromList
                             [ ( "id", Data.Value.IntValue 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
@@ -208,6 +253,7 @@ dbWithoutRelatedTable =
               )
             ]
     , indices = Dict.empty
+    , schema = schema
     }
 
 
@@ -217,7 +263,7 @@ dbWithRelatedRows =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Data.Identity.int 1
                       , Dict.fromList
                             [ ( "id", Data.Value.IntValue 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
@@ -227,7 +273,7 @@ dbWithRelatedRows =
               )
             , ( "game_members"
               , Dict.fromList
-                    [ ( 10
+                    [ ( Data.Identity.int 10
                       , Dict.fromList
                             [ ( "id", Data.Value.IntValue 10 )
                             , ( "gameId", Data.Value.IntValue 1 )
@@ -238,6 +284,40 @@ dbWithRelatedRows =
               )
             ]
     , indices = Dict.empty
+    , schema = schema
+    }
+
+
+dbWithDirectiveRows : Db.Db
+dbWithDirectiveRows =
+    { dbWithRelatedRows
+        | tables =
+            Dict.insert "game_members"
+                (Dict.fromList
+                    [ ( Data.Identity.int 10
+                      , Dict.fromList
+                            [ ( "id", Data.Value.IntValue 10 )
+                            , ( "gameId", Data.Value.IntValue 1 )
+                            , ( "userId", Data.Value.IntValue 20 )
+                            ]
+                      )
+                    , ( Data.Identity.int 11
+                      , Dict.fromList
+                            [ ( "id", Data.Value.IntValue 11 )
+                            , ( "gameId", Data.Value.IntValue 1 )
+                            , ( "userId", Data.Value.IntValue 30 )
+                            ]
+                      )
+                    , ( Data.Identity.int 12
+                      , Dict.fromList
+                            [ ( "id", Data.Value.IntValue 12 )
+                            , ( "gameId", Data.Value.IntValue 1 )
+                            , ( "userId", Data.Value.IntValue 40 )
+                            ]
+                      )
+                    ]
+                )
+                dbWithRelatedRows.tables
     }
 
 

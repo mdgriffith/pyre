@@ -13,6 +13,16 @@ export interface IndexInfo {
   primary: boolean;
 }
 
+export type WireCodec =
+  | { kind: 'string' | 'safeInt' | 'float' | 'bool' | 'date' | 'dateTime' | 'json' | 'uuid' }
+  | { kind: 'list'; item: WireCodec }
+  | { kind: 'dict'; value: WireCodec }
+  | { kind: 'nullable'; value: WireCodec }
+  | { kind: 'enum'; values: string[] }
+  | { kind: 'taggedUnion'; variants: Record<string, Record<string, WireCodec>> }
+  | { kind: 'named'; name: string; value: WireCodec }
+  | { kind: 'reference'; name: string };
+
 export interface ColumnInfo {
   name: string;
   type: string;
@@ -20,11 +30,15 @@ export interface ColumnInfo {
   primary: boolean;
   unique: boolean;
   indexed: boolean;
+  /** Present on generated schemas; optional only for older handwritten metadata. */
+  codec?: WireCodec;
   comment?: string;
 }
 
 export interface TableMetadata {
   name: string;
+  // Unsupported schema keys are explicit so clients fail instead of guessing identity.
+  primaryKey: { name: string; kind: 'int' | 'uuid' | 'unsupported' };
   namespace?: string;
   sync?: 'synced' | 'query-only';
   columns?: ColumnInfo[];
@@ -33,6 +47,8 @@ export interface TableMetadata {
 }
 
 export interface SchemaMetadata {
+  /** Generated per-database scopes, selected before worker/cache initialization. */
+  namespaces?: Record<string, SchemaMetadata>;
   tables: Record<string, TableMetadata>;
   queryFieldToTable: Record<string, string>;
 }

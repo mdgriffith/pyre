@@ -201,6 +201,7 @@ export function parsePath(path: string): PathParseResult {
   if (!path.startsWith('.')) {
     return { ok: false, error: 'Path must start with .' };
   }
+  if (path === '.' || path.endsWith('.')) return { ok: false, error: 'Missing field segment' };
 
   const segments: PathSegment[] = [];
   let index = 1;
@@ -241,6 +242,9 @@ export function parsePath(path: string): PathParseResult {
         if (!/^-?\d+$/.test(indexText)) {
           return { ok: false, error: `Invalid index selector: ${indexText}` };
         }
+        if (!Number.isSafeInteger(Number(indexText)) || Number(indexText) < 0) {
+          return { ok: false, error: 'Invalid index selector' };
+        }
         segments.push({ kind: 'index', index: Number(indexText) });
         index = end + 1;
         continue;
@@ -264,6 +268,24 @@ export function parsePath(path: string): PathParseResult {
 }
 
 function parseIdSelector(path: string, startIndex: number): { ok: boolean; id?: string | number; nextIndex?: number; error?: string } {
+  // Quoted JSON strings disambiguate string "1" from integer 1. Legacy bare
+  // nonnumeric strings remain accepted for existing query delta producers.
+  if (path[startIndex] === '"') {
+    let end = startIndex + 1;
+    while (end < path.length) {
+      if (path[end] === '\\') { end += 2; continue; }
+      if (path[end] === '"') {
+        if (path[end + 1] !== ')') return { ok: false, error: 'Invalid string selector' };
+        try {
+          return { ok: true, id: JSON.parse(path.slice(startIndex, end + 1)), nextIndex: end + 2 };
+        } catch {
+          return { ok: false, error: 'Invalid string selector' };
+        }
+      }
+      end += 1;
+    }
+    return { ok: false, error: 'Unclosed string selector' };
+  }
   let index = startIndex;
   let raw = '';
 
@@ -293,6 +315,9 @@ function parseIdSelector(path: string, startIndex: number): { ok: boolean; id?: 
   }
 
   const id = /^-?\d+$/.test(raw) ? Number(raw) : raw;
+  if (raw.length === 0 || (typeof id === 'number' && !Number.isSafeInteger(id))) {
+    return { ok: false, error: 'Invalid id selector' };
+  }
   return { ok: true, id, nextIndex: index };
 }
 
@@ -360,12 +385,6 @@ function findRowIndexById(list: unknown[], id: string | number): number | null {
     }
     const rowId = (row as Record<string, unknown>).id;
     if (id === rowId) {
-      return i;
-    }
-    if (typeof id === 'number' && typeof rowId === 'string' && rowId === String(id)) {
-      return i;
-    }
-    if (typeof id === 'string' && typeof rowId === 'number' && id === String(rowId)) {
       return i;
     }
   }

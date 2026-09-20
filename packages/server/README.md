@@ -5,6 +5,7 @@ Server runtime helpers for executing generated Pyre queries.
 Typical usage:
 
 - import generated `queries` map from `pyre/generated/typescript/server`
+- initialize `@pyre/server/wasm` with `await init()` before execution
 - initialize schema-specific databases through the generated `databases` map
 - execute with `run` from `@pyre/server/query`
 - seed fixture data with the generated `seed` helper from `pyre/generated/typescript/seed`
@@ -49,6 +50,370 @@ The call returns `"created"`, `"migrated"`, or `"up-to-date"`. It is safe to
 call whenever a database is opened: introspection, planning, DDL, and migration
 recording happen in one write transaction. Pyre rejects non-empty databases
 that do not already contain Pyre migration metadata.
+
+## Compiled Batches
+
+### Persisted Schema Authority
+
+All compiled execution paths in Rust and TypeScript (batches, named queries and
+mutations, replacement, and legacy catchup) compare parsed semantic compiler
+contracts against the latest successful migration in `_pyre_migrations`, inside
+the same transaction and before application SQL. Reads use a pinned snapshot;
+writes hold the write lock through execution and commit. Comments-only schema
+changes remain compatible. Missing migration authority, null/invalid schema
+source, or incompatible contracts fail closed; failed and unfinished migrations
+are ignored, not used as authority.
+
+Schema caches and bind-time checks are early configuration checks, never execution
+authority. Migrations must atomically record schema source with their changes.
+Direct SQL and legacy seed helpers are trusted maintenance/setup interfaces,
+outside this compiled permission-enforcing boundary.
+
+TypeScript `run` and `toRunner` (including generated query functions) now require
+initialized `@pyre/server/wasm` and regenerated `schemaContracts` metadata for
+every primary/attached namespace. There is no missing-metadata fallback. Regenerate
+named query artifacts before rollout, alongside the compiler/runtime upgrade.
+Rust named queries require trusted host preattachments; generated `ATTACH`
+directives are skipped rather than choosing database handles. The TypeScript
+attached runtime still has no binding API; this does not add attachment support.
+
+### Execution
+
+`runBatch` from `@pyre/server/query` is the server execution boundary for an
+ordered list of allowlisted compiled operations. It also supports server seed
+submissions with an explicit validated session, without the permission-bypassing
+legacy seed helper. It does not implement client builders or transport routing.
+
+```ts
+const result = await runBatch(database, {
+  version: 1, manifestVersion, compiledContract, replacementContracts,
+  queries, SessionValidator: Decode.SessionValidator,
+}, {
+  databaseId: "tenant-1", namespace: "Main", manifest: manifestVersion,
+  instance: "tab-1", authGeneration: 2,
+}, {
+  version: 1, instance: "tab-1", authGeneration: 2, requestId: "request-1", sequence: 1,
+  databaseId: "tenant-1", namespace: "Main", manifest: manifestVersion, databaseEpoch: epoch,
+  operations: [{ operation: compiledOperationId, input }],
+}, effectiveSession);
+```
+
+The manifest and authority arguments are trusted server configuration. Manifests
+must include generated `compiledContract` and namespace `replacementContracts`.
+The exact `Client` must have completed generated `ensureDatabase` or
+`loadSchemaFromDatabase` for the early configuration check; `runBatch` then checks
+persisted authority inside the transaction, even for empty batches. Resolve
+the actual connection, database ID, namespace, manifest fingerprint, client
+instance and auth generation independently of the request. The manifest's
+`version: 1` is its format version, not the fingerprint in the authority/request
+`manifest` field. Supply the compiler-emitted `manifestVersion` alongside its
+queries; it must equal the trusted binding's `manifest`. The stored epoch is
+checked inside the transaction.
+Database IDs must uniquely identify databases in
+this process; batch execution is queued by that ID. The queue does not serialize
+legacy runners, other processes, or other writers; SQLite provides transaction
+isolation. The database must already have its `_pyre_sync` metadata.
+Use a file-backed or remote libsql database for batches, including empty ones. The local
+adapter detaches its connection during `transaction()`, so `runBatch` checks
+the public `Client.protocol` and SQLite's `PRAGMA database_list` before opening
+a local transaction. Local databases without a nonempty `main.file` are rejected
+with sanitized `TransactionFailed`, without detachment, writes, revision allocation,
+or publication. This conservatively includes private/shared in-memory and temporary
+databases; no configuration flag bypasses the check. Empty batches check persisted
+authority and epoch in a transaction. The check is not cached. Remote clients retain their existing
+transaction path. This guard does not protect calls made directly to the adapter's
+`transaction()` outside this executor.
+
+Requests are captured before any await and limited to 100 operations and 1 MiB
+of UTF-8 serialized request data. All request fields are required; unknown
+envelope/member fields and invalid types reject. Numeric fences must be safe
+JavaScript integers (`authGeneration >= 0`, `sequence > 0`). The manifest's full
+`SessionValidator` validates the effective session once, including empty batches.
+Generated `Decode.SessionValidator` includes fields unused by a particular query;
+do not substitute a per-query session projection. Application claims outside
+declared session fields are ignored, including extra structured claims; they
+cannot override declared fields via read-projection prefixes. Existing session
+compatibility is retained for `0`/`1` booleans and omitted nullable fields.
+Declared nested session fields are validated recursively before projection decoding.
+Each member validates input,
+including rejection of fields removed by strip-mode codecs. Canonical tag-only
+enum objects are allowed to decode to strings, but extra fields still reject.
+A query's `primary_db` must equal the trusted `namespace`; attachments are rejected.
+Only compiled `insert`, `update`, `delete`, or `transaction` operations are allowed.
+An empty batch returns an empty result after transactional validation, without
+revision allocation or publication.
+
+Compiler metadata uses:
+
+```ts
+generatedEdit?: {
+  kind: "create" | "update" | "delete";
+  writeStatementIndices: number[]; // exactly one zero-based index in sql, include: true
+  writableInputs: string[];       // update setters, excluding identity/managed fields
+}
+json_session_args?: string[];     // session bindings serialized as whole JSON, not union tags
+json_session_validators?: Record<string, ZodType>; // canonical typed-JSON session binding codecs
+```
+
+The nominated compiler statement returns the raw authorized identity as
+`_pyreEditId`. Its direct affected count
+must be exactly one. Generated results are `{ id }`, independent of read
+visibility and the legacy named `ReturnData` codec. Named results retain their
+declared wire shape and validate with `ReturnData` when provided, without
+replacing wire timestamps or enum objects with TypeScript codec transformations.
+The local libsql adapter
+reports zero `rowsAffected` for result-producing statements; the shared executor
+captures SQLite `changes()` immediately after nominated returning writes to
+recover the direct count, excluding triggers/cascades. Other writes use the
+adapter's `rowsAffected` directly. No returned-row count authorizes a write.
+
+Success returns `{ kind: "success", response }`. `response` matches the Rust
+wire payload exactly: `{ requestId, databaseId, instance, authGeneration,
+databaseEpoch, namespace, manifest, status, results: [{ index, operation, value }],
+commitRevision, reconciliation }`. `status` is `accepted` for a nonempty batch;
+an empty batch is `confirmed` with `results: []` and no revision/reconciliation.
+Neither `version` nor `sequence` is echoed in responses.
+Every nonempty committed batch allocates one revision in the
+write transaction, even named no-ops. Reconciliation conservatively requests a
+full replacement with `invalidate: true` and `minimumSafeRevision` equal to the
+commit revision. Errors return `{ kind: "error", error: { errorType, message,
+index? } }`, with zero-based member index when known and both strings set to
+the sanitized Rust `Error::code()` equivalent: `InvalidRequest`, `InvalidSession`,
+`InvalidEdit`, `TargetNotWritable`, or `TransactionFailed`. Session failures are
+batch-level, without a member index. No failure contains successful prefixes.
+A failed commit acknowledgement returns
+`kind: "unknown"`, not a definitive rejection.
+
+An optional final `publish` callback runs after commit and cannot turn commit
+evidence into rejection. `runBatchWithSync` from `@pyre/server/query-sync` sends
+postcommit replacement hints without allocating another revision or requiring
+origin registration. Routing must authenticate the trusted instance/auth binding,
+bound the raw body before JSON decoding, wrap errors with the request fence,
+and supply only authorized recipients for
+the bound database. Named-single `run`, `toRunner`, and `runWithSync` also enforce
+the persisted schema authority requirements above.
+
+Actual compiler fixtures live under `fixtures/compiled-batch`; regenerate them
+with `bun packages/server/fixtures/compiled-batch/regenerate.ts` after building
+the compiler. Regeneration also compiles the generated server module and verifies
+its `manifestVersion` export. Rust and TS tests execute the same fixture schema.
+
+### Typed Server Edits
+
+`localEdits` is available from `@pyre/server` or `@pyre/server/local-edits`.
+It consumes the same namespace-branded core descriptors as the client, without a
+browser, worker, local cache, route, SSE connection, or active subscriber:
+
+```ts
+import { localEdits } from "@pyre/server/local-edits";
+import { Main, Commands, type AuditId } from "./generated/typescript/edits";
+import { manifest } from "./generated/typescript/server";
+
+// Resolve/authorize database and databaseId in trusted application code first.
+const edits = localEdits.bind({
+  database, databaseId, namespace: Main, manifest,
+  session: actualSession,
+  // Optional: your existing live Map<string, BatchSyncRecipient> and sender.
+  connectedSessions, sendToSession,
+});
+const outcome = await edits.submit(Commands.namedAudit({
+  id: crypto.randomUUID() as AuditId,
+  message: "Trusted server command",
+}));
+if (outcome.kind === "confirmed") {
+  console.log(outcome.result);
+}
+```
+
+The binding is a trusted server capability, not an authentication mechanism.
+The host must authorize the actual connection/database ID and session together
+(for example inside `context.run`), and rebind when that authority changes.
+Do not expose `bind` options to request data. No administrator or session is
+synthesized: even sessionless schemas require an explicit `{}`. Invalid binding
+configuration or a session rejected by the full compiled `SessionValidator`
+throws synchronously. Unrecognized application claims confer no permissions.
+The same exact `Client` must first be passed to generated `ensureDatabase` or
+`loadSchemaFromDatabase`. Binding checks its captured schema against the selected
+namespace replacement contract and the required generated `compiledContract` once
+as an early configuration check, not as continuing execution authority.
+
+Binding captures session and compiled execution metadata. Submission captures
+inputs, operation IDs, decoders, and result assembly before its first await.
+Nonempty submissions call `runBatchWithSync`. The executor reads the epoch and
+checks persisted schema authority inside the write transaction, enforces the compiled namespace and
+manifest allowlist, and rejects attachments. A nonempty batch uses exactly one
+atomic write transaction, including its sync revision. Generated CRUD requires
+exactly one authorized direct write per operation; named commands retain their
+compiled semantics. The permission-bypassing legacy `seed` helpers are not used.
+Generated UUID create APIs omit their primary key and rely on the browser local-edit
+runtime to materialize UUIDv7 before transport. The server binding does not invent
+that client input. Trusted server creation should use a compiled named command with
+an explicit branded UUID, or the generated `seed` helper for setup/import workflows.
+
+`submit(Edit<N, R> | Batch<N, R>): Promise<Outcome<R>>` returns:
+
+- `{ kind: "confirmed", result: R, commitRevision?: number }`: committed and
+  authoritative typed results materialized in this execution. Nonempty submissions
+  include `commitRevision`. Results must match the captured manifest operation IDs,
+  count, indices and codecs, including branded UUID/integer IDs and named commands.
+- `{ kind: "rejected", code: string, index?: number }`: definitive noncommit,
+  including validation, permission/cardinality, transaction, or pre-execution epoch
+  read failure. There is no successful prefix; `index` is zero-based when known.
+- `{ kind: "outcomeUnknown", code: "OutcomeUnknown" }`: lost commit acknowledgement,
+  malformed commit evidence, or an unexpected throw/rejection from the executor.
+  Execution may have committed; the submission promise resolves rather than rejects.
+- `{ kind: "acceptedUnreconciled", code: "InvalidResult", commitRevision: number,
+  index?: number }`: valid commit evidence exists, but result decoding or assembly
+  failed. This outcome deliberately contains no `result`, partial results, or raw
+  executor response. Never replay it as a rejected write.
+
+The local binding's empty plans return exactly `{ kind: "confirmed", result: [] }` after local
+scope validation, without calling the executor, reading the database epoch, doing
+any database I/O or transport, allocating a revision, or publishing state.
+This is not an authority check: empty requests sent to `runBatch` instead require
+transactional authority and epoch validation.
+
+Server-specific edge limitation: `acceptedUnreconciled` here denotes committed
+writes whose typed result could not be materialized, not browser-cache catchup.
+Unlike a browser disposal outcome that already has a validated result, this branch
+cannot expose `R`. The binding has no receipt, late-settlement stream, or automatic
+typed-result recovery. Applications must investigate the committed data/codec
+failure explicitly; a snapshot alone cannot settle an `outcomeUnknown` request.
+The internal `runBatchWithSync` success/error/unknown API is unchanged. A throw
+after entering that API is conservatively unknown even if it happened before a
+write: without a returned definitive outcome the binding cannot prove noncommit.
+
+There are no automatic write retries. Publication uses the existing postcommit
+`syncRequired` replacement protocol and the current matching authenticated
+registrations. Delivery failures cannot turn a known commit into rejection or
+suppress other recipients. A subscriber is never required for execution.
+
+The runnable [fixture example](fixtures/local-edits/seed.ts) mirrors browser UUIDv7
+materialization before submitting generated creates. It creates a project first,
+then creates its linked task in a later batch because references to rows created
+in the same batch are unsupported. The named command retains an explicit UUID input.
+The example's fresh file-backed SQLite database is removed afterward.
+From the repository root:
+
+```sh
+cargo build --bin pyre
+bun run --cwd packages/server seed:local-edits
+bun run --cwd packages/server test:local-edits
+TMPDIR="$PWD/target/tmp" bun test packages/server/query.test.ts packages/server/query-sync.test.ts
+bun run --cwd packages/server typecheck
+bun run --cwd packages/server typecheck:local-edits
+```
+
+Fixture generation uses the current compiler, with all output under `target/`.
+The typed binding supports the executor's existing file-backed SQLite/libSQL
+contract; remote libSQL is not covered by these tests. In-memory local databases
+are unsupported because that adapter detaches transaction connections.
+Configure `@libsql/client` with its default `intMode: "number"` or with
+`intMode: "bigint"`. Pyre does not support `intMode: "string"`: generated codecs
+must distinguish integer columns from numeric-looking text without guessing.
+
+### Authoritative Replacement
+
+`catchupReplacement` from `@pyre/server/query-sync` takes a database connection,
+generated `manifest`, trusted `BatchAuthority`, replacement request, and effective
+session. The request contains `version: 1`, `requestId`, `target`, and the same
+flat database/instance/auth/namespace/manifest/epoch fences as a batch. The host
+must authenticate the authority independently of the request.
+
+A successful response has `type: "replacement"`, `scope: "database"`,
+`complete: true`, `serverRevision`, `tables: { [name]: { rows: [...] } }`, and
+the request's fences, ID, and target. All rows and the revision are read in one
+transaction. Install the whole scope atomically, deleting absent rows; an empty
+scope is not a no-op. Legacy timestamp catchup pages are not replacement evidence.
+The namespace's generated replacement contract must match the captured schema
+and the parsed semantic contract of the latest successful migration inside the
+same read snapshot, not its byte-for-byte source text. A migration before snapshot acquisition rejects stale
+permission evidence; an already-pinned snapshot remains isolated from later
+migrations and cache refreshes. Malformed stored rows reject the entire snapshot.
+Synced linked read permissions require
+this replacement path; legacy catchup rejects them with `ReplacementRequired`.
+
+`runBatchWithSync` recipients contain `{ session, fence }` from authenticated
+registration. Hints contain each recipient's fence, `type: "syncRequired"`,
+`serverRevision`, and conservative `reconciliation` invalidation metadata, never
+private rows or origin request IDs. Hints only raise required/security revision;
+they cannot advance covered revision. Named `runWithSync` mutations also commit
+their revision with the write and require `sendToSession`. Delivery is ordered per
+registration, but a named request waits at most five seconds for publication before
+releasing the database's mutation queue. While a send remains unresolved, subsequent
+publications to that registration coalesce into one metadata-only invalidation.
+When delivery resumes, that hint requests authoritative catchup before normal row
+deltas resume. A rejected recovery hint is retained for the next publication;
+neither writes nor uncertain row deltas are retried. Batch publication shares this
+ordering without delaying batch acceptance.
+
+Legacy row publication requires the publisher's permission contract to match the
+verified execution contract. A stale cache cannot authorize row deltas; publication
+falls back to row-free hints when that match cannot be established.
+
+Keep registration objects stable for their connection lifetime and replace them
+on reconnect or authentication changes. Deferred delivery checks the current
+registration map before starting another send, so retired registrations cannot
+send queued hints to a replacement connection. Transport adapters remain responsible
+for terminating their own stalled I/O; Pyre cannot cancel a callback's pending promise.
+
+Pass the trusted current manifest
+fingerprint as the final optional argument to enable fenced hints; absent or stale
+manifest evidence suppresses fenced hints without changing legacy recipients. The
+returned `sync()` method is idempotent and returns the already-published revision metadata.
+Failed or delayed SSE delivery does not change known batch acceptance.
+
+The libraries register no routes. The built-in server exposes POST
+`/sync/replacement` and POST `/sync/replacement/events` for replacement and fenced
+SSE registration, separately from its legacy sync routes. Registration reads its
+initial revision after enrolling the connection, covering commits that occurred
+during authentication even when a reconnecting client already covers the earlier
+validation snapshot. Signed sessions bind
+the instance and auth generation as they do for POST `/db`.
+
+Replacement currently materializes a complete scope in memory, not pinned pages.
+Both runtimes preflight the complete scope and reject more than 10,000 rows or
+64 MiB of projected row/object data rather than returning partial coverage;
+remote libSQL remains unverified. The opt-in [browser local-edit runtime](../../docs/usage/local-edits.md)
+implements client installation, pending-intent replay and receipt settlement through
+configured transport adapters. Typed server seeding is described above.
+
+Build WASM before running the production-boundary fixture:
+
+```sh
+npm exec --package=wasm-pack -- wasm-pack build wasm --target web --out-dir ../packages/server/wasm
+npm exec --package=bun -- bun packages/server/fixtures/replacement-wasm.ts
+```
+
+The focused query-sync suite runs this fixture when the ignored WASM artifact
+is present and explicitly skips it otherwise. Mocked WASM unit tests alone do
+not establish generated-schema conformance.
+
+Focused security coverage (executable references, not a blanket conformance claim):
+
+| Boundary | Fixture or test |
+| --- | --- |
+| Stale handles; revoked/missing/null/invalid authority; comments; failed/unfinished migrations; write ordering; legacy publication | [`fixtures/schema-authority.ts`](fixtures/schema-authority.ts), run by `schema-authority.test.ts`; Rust `persisted_authority_rejects_stale_handles_without_cache_refresh` and `publication_requires_execution_contract_not_cached_permissions` in `tests/query_server.rs` |
+| Generated runner reads/writes and required metadata | [`fixtures/runner-schema.ts`](fixtures/runner-schema.ts), run by `runner.test.ts` |
+| Empty executor batches and pre-acquisition memory guard | `query.test.ts`: `empty batch validates persisted authority without revision or publication`, `memory batches reject before detachment, including valid writes, empty batches and stale epochs` |
+| Replacement snapshot/migration ordering | [`fixtures/replacement-wasm.ts`](fixtures/replacement-wasm.ts): `beforeSnapshot` / `afterSnapshot` scenarios |
+| Trusted Rust attachments | `tests/query_server.rs`: `generated_attachment_directives_use_verified_host_handles` |
+
+The real-WASM test wrappers skip when the WASM artifact is absent. Remote libSQL
+is not established by these local SQLite fixtures.
+
+Write codecs are separate from permissive read-projection codecs. Both runtimes
+require safe integers, canonical boolean inputs, and complete structured variants
+with explicit nullable fields. Unknown structured write fields reject rather than
+being silently discarded. Typed JSON is normalized recursively: nested dates
+become Unix seconds, nested enums retain their tagged-object representation, and
+list/dictionary members and nulls are preserved. UUID codecs intentionally accept
+strings without UUID syntax validation in both runtimes.
+
+Regenerated query metadata includes `json_session_validators` for typed-JSON
+session arguments. These codecs run when binding SQL, after ordinary session
+decoding, so nested enum tags have the same object representation as stored
+writes. Scalar enum session arguments outside JSON still bind as strings.
 
 ## Seed Data
 

@@ -1,0 +1,7 @@
+insert NamedAudit($id: Audit.id, $message: String) {
+    audit {
+        id = $id
+        message = $message
+        updatedAt
+    }
+}

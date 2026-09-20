@@ -88,7 +88,7 @@ Pyre treats mutation request order, response order, and live-sync arrival order 
 
 The protocol authority is the server-assigned monotonic revision on sync events. The server stores that counter in Pyre internal metadata (`_pyre_sync`) so revisions survive process restarts. Mutation responses should also include this revision when authoritative mutation results are added to the response envelope.
 
-Server integrations must await the `result.sync(...)` returned from `runWithSync` after successful mutations. That call allocates the `_pyre_sync` revision, sends live messages with `serverRevision`, and returns `{ serverRevision }` for integrations that want to include protocol metadata in their mutation response envelope.
+Server integrations pass their delivery callback and, when using fenced recipients, the trusted current manifest fingerprint as the final `runWithSync` arguments for mutations. The call commits the `_pyre_sync` revision and publishes live messages in commit order before resolving. Fenced hints are suppressed when current manifest evidence is absent or does not match the recipient. The returned `result.sync()` is idempotent and returns the already-published revision metadata.
 
 ## Public sync state
 

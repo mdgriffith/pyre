@@ -10,11 +10,30 @@ pub fn response_expression(
 ) -> String {
     let mut values = Vec::new();
     let table_name = ast::get_tablename(&table.record.name, &table.record.fields);
+    let query_fields = ast::collect_query_fields(&query_field.fields);
+    let explicit_columns = query_fields
+        .iter()
+        .filter(|field| field.name != "*")
+        .map(|field| field.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut selections = Vec::new();
+    let mut wildcard_rendered = false;
 
-    for field in &query_field.fields {
-        let ast::ArgField::Field(query_field) = field else {
+    for query_field in &query_fields {
+        if query_field.name == "*" {
+            if !wildcard_rendered {
+                wildcard_rendered = true;
+                // Explicit selections replace wildcard columns, including when aliased.
+                for field in &table.record.fields {
+                    if let ast::Field::Column(column) = field {
+                        if !explicit_columns.contains(column.name.as_str()) {
+                            selections.push((column, column.name.clone()));
+                        }
+                    }
+                }
+            }
             continue;
-        };
+        }
         let Some(ast::Field::Column(column)) = table
             .record
             .fields
@@ -23,8 +42,11 @@ pub fn response_expression(
         else {
             continue;
         };
+        selections.push((column, ast::get_aliased_name(query_field)));
+    }
 
-        let column_name = string::quote(&query_field.name);
+    for (column, response_name) in selections {
+        let column_name = string::quote(&column.name);
         let value = if column.type_.is_bool() {
             format!("json(case when {column_name} = 1 then 'true' else 'false' end)")
         } else if column.type_.is_json_like() {
@@ -38,7 +60,7 @@ pub fn response_expression(
                 context,
                 column,
                 &table_name,
-                &query_field.name,
+                &column.name,
                 false,
             )
         } else {
@@ -47,12 +69,7 @@ pub fn response_expression(
         .trim_end()
         .to_string();
         let separator = if value.starts_with('\n') { "," } else { ", " };
-        values.push(format!(
-            "'{}'{}{}",
-            ast::get_aliased_name(query_field),
-            separator,
-            value
-        ));
+        values.push(format!("'{}'{}{}", response_name, separator, value));
     }
 
     format!("json_object({})", values.join(", "))

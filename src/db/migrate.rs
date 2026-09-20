@@ -96,7 +96,11 @@ pub fn migrate_dynamic(
         introspection,
         new_schema_source,
         schema_filepath,
-        ast::DEFAULT_SCHEMANAME,
+        new_schema_source
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("// @pyre.namespace "))
+            .unwrap_or(ast::DEFAULT_SCHEMANAME),
     )
 }
 
@@ -408,7 +412,7 @@ record Member {
         };
         parser::run(
             "pyre/schema/App/schema.pyre",
-            "record Post {\n    @public\n    id Id.Int @id\n    userId Auth.User.id\n}\n",
+            "@syncable(false)\nrecord Post {\n    @public\n    id Id.Int @id\n    userId Auth.User.id\n}\n",
             &mut app,
         )
         .expect("App schema should parse");

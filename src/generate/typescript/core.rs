@@ -6,7 +6,7 @@ use crate::generate::sql;
 use crate::generate::typealias;
 use crate::generate::typescript::common;
 use crate::typecheck;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 pub fn generate_schema(
@@ -15,6 +15,10 @@ pub fn generate_schema(
     base_out_dir: &Path,
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
+    files.push(generate_text_file(
+        base_out_dir.join("ids.ts"),
+        generate_id_file(context),
+    ));
     files.push(generate_text_file(
         base_out_dir.join("decode.ts"),
         generate_decode_file(context, database),
@@ -29,6 +33,63 @@ pub fn generate_schema(
     ));
 }
 
+fn generate_id_file(context: &typecheck::Context) -> String {
+    let ids = collect_ids(context);
+    if ids.is_empty() {
+        return "export {};\n".to_string();
+    }
+
+    let mut result = String::from("import { z } from 'zod';\n\n");
+    for (brand, primitive) in ids {
+        let validator = if primitive == "number" {
+            "z.number().int()"
+        } else {
+            common::UUID_VALIDATOR
+        };
+        result.push_str(&format!(
+            "declare const {brand}IdBrand: unique symbol;\nexport type {brand}Id = {primitive} & {{ readonly [{brand}IdBrand]: true }};\nexport const {brand}Id = {validator}.transform((value): {brand}Id => value as {brand}Id);\n\n"
+        ));
+    }
+    result
+}
+
+pub(super) fn collect_ids(
+    context: &typecheck::Context,
+) -> std::collections::BTreeMap<String, &'static str> {
+    let mut ids = std::collections::BTreeMap::new();
+    for table in context.tables.values() {
+        for column in ast::collect_columns(&table.record.fields) {
+            match &column.type_ {
+                ast::ColumnType::Int if ast::is_primary_key(&column) => {
+                    ids.insert(table.record.name.clone(), "number");
+                }
+                ast::ColumnType::IdInt { table: brand } => {
+                    ids.insert(
+                        if brand.is_empty() {
+                            table.record.name.clone()
+                        } else {
+                            brand.clone()
+                        },
+                        "number",
+                    );
+                }
+                ast::ColumnType::IdUuid { table: brand } => {
+                    ids.insert(
+                        if brand.is_empty() {
+                            table.record.name.clone()
+                        } else {
+                            brand.clone()
+                        },
+                        "string",
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    ids
+}
+
 pub fn generate_queries(
     context: &typecheck::Context,
     all_query_info: &HashMap<String, typecheck::QueryInfo>,
@@ -37,6 +98,7 @@ pub fn generate_queries(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let formatter = to_metadata_formatter();
+    super::local_edits::generate(context, all_query_info, query_list, base_out_dir, files);
 
     for operation in &query_list.queries {
         match operation {
@@ -106,6 +168,8 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
             variants,
             recursive_types.contains(&name),
         ));
+        result.push_str(&common::generate_input_tagged_union(&name, variants, false));
+        result.push_str(&common::generate_input_tagged_union(&name, variants, true));
     }
 
     // Get session definition
@@ -141,7 +205,7 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 ast::ColumnType::ForeignKey { .. } => "number".to_string(),
                 ast::ColumnType::Bool => "boolean".to_string(),
                 ast::ColumnType::DateTime => "Date | string | number".to_string(),
-                other => other.to_string(),
+                other => common::column_type_to_ts_type(other, false),
             };
             let (optional, nullable) = if col.nullable {
                 ("?", " | null")
@@ -157,7 +221,21 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
     result.push_str("}\n\n");
     result.push_str(&session_validation_helpers(context, &session));
 
-    result.push_str("export const SessionValidator = z.object({\n");
+    // Validate before legacy projection decoding so unrelated prefixed claims cannot override fields.
+    result.push_str("const EffectiveSessionValidator = z.object({\n");
+    for field in &session.fields {
+        if let ast::Field::Column(col) = field {
+            result.push_str(&format!(
+                "  {}: {}{},\n",
+                col.name,
+                common::session_column_validator(&col.type_),
+                if col.nullable { ".nullish()" } else { "" }
+            ));
+        }
+    }
+    result.push_str(
+        "});\n\nexport const SessionValidator = z.preprocess((value, ctx) => {\n  const parsed = EffectiveSessionValidator.safeParse(value);\n  if (!parsed.success) {\n    for (const issue of parsed.error.issues) ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message });\n    return z.NEVER;\n  }\n  return parsed.data;\n}, z.object({\n",
+    );
     for field in &session.fields {
         if let ast::Field::Column(col) = field {
             let validator = match &col.type_ {
@@ -169,11 +247,14 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 ast::ColumnType::Float => "z.number()".to_string(),
                 ast::ColumnType::IdUuid { .. }
                 | ast::ColumnType::ForeignKey {
+                    serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
+                    ..
+                } => common::UUID_VALIDATOR.to_string(),
+                ast::ColumnType::ForeignKey {
                     serialization_type:
                         Some(
                             ast::ConcreteSerializationType::Text
-                            | ast::ConcreteSerializationType::Date
-                            | ast::ConcreteSerializationType::IdUuid,
+                            | ast::ConcreteSerializationType::Date,
                         ),
                     ..
                 } => "z.string()".to_string(),
@@ -192,7 +273,7 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
                 ast::ColumnType::ForeignKey { .. } => "z.number()".to_string(),
                 ast::ColumnType::Bool => "CoercedBool".to_string(),
                 ast::ColumnType::DateTime => "CoercedDate".to_string(),
-                other => format!("z.any() /* {} */", other),
+                other => common::column_type_to_zod_validator(other),
             };
             let validator = if col.nullable {
                 format!("{}.nullish()", validator)
@@ -202,7 +283,7 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
             result.push_str(&format!("  {}: {},\n", col.name, validator));
         }
     }
-    result.push_str("});\n\n");
+    result.push_str("}));\n\n");
 
     result
 }
@@ -314,7 +395,19 @@ fn to_metadata_formatter() -> typealias::TypeFormatter {
                  is_link,
                  is_optional,
                  is_array_relationship,
+                 identity_brand,
              }| {
+                if let Some(brand) = identity_brand {
+                    let validator = format!("$Ids.{}Id", brand);
+                    let validator = match (is_link, is_array_relationship, is_optional) {
+                        (true, true, _) => format!("{}.array()", validator),
+                        (true, false, true) | (false, _, true) => {
+                            format!("{}.nullable()", validator)
+                        }
+                        _ => validator,
+                    };
+                    return format!("  {}: {}", name, validator);
+                }
                 let parsed_type = ast::ColumnType::from_str(type_);
                 let (base_type, is_primitive, needs_coercion) = if is_link {
                     (type_.to_string(), false, false)
@@ -327,7 +420,9 @@ fn to_metadata_formatter() -> typealias::TypeFormatter {
                         ast::ColumnType::Bool => ("z.boolean()".to_string(), true, true),
                         ast::ColumnType::DateTime => ("z.date()".to_string(), true, true),
                         ast::ColumnType::IdInt { .. } => ("z.number()".to_string(), true, false),
-                        ast::ColumnType::IdUuid { .. } => ("z.string()".to_string(), true, false),
+                        ast::ColumnType::IdUuid { .. } => {
+                            (common::UUID_VALIDATOR.to_string(), true, false)
+                        }
                         ast::ColumnType::ForeignKey { .. } => {
                             ("z.number()".to_string(), true, false)
                         }
@@ -388,6 +483,17 @@ fn to_query_metadata_file(
     query_info: Option<&typecheck::QueryInfo>,
     formatter: &typealias::TypeFormatter,
 ) -> String {
+    let info = query_info.expect("compiled query metadata requires typechecked query info");
+    let schema_contracts: std::collections::BTreeMap<_, _> = std::iter::once(&info.primary_db)
+        .chain(info.attached_dbs.iter())
+        .map(|namespace| {
+            (
+                namespace,
+                crate::generate::manifest::replacement_contract(context, namespace)
+                    .expect("compiled query namespace requires a schema contract"),
+            )
+        })
+        .collect();
     let mut return_data = String::new();
     typealias::return_data_aliases(context, query, &mut return_data, formatter);
     let uses_coerced_date = return_data.contains("CoercedDate");
@@ -395,6 +501,7 @@ fn to_query_metadata_file(
 
     let mut imports = String::new();
     imports.push_str("import { z } from 'zod';\n");
+    imports.push_str("import * as $Ids from '../../ids';\n");
     if query.operation == ast::QueryOperation::Query {
         imports.push_str("import type { GeneratedQueryShape } from '@pyre/core';\n");
     }
@@ -424,7 +531,7 @@ fn to_query_metadata_file(
     };
 
     let session_args = match query_info {
-        Some(info) => get_session_args(&info.variables),
+        Some(info) => get_session_args(&info.variables, false),
         None => "[]".to_string(),
     };
     let omittable_args = format!(
@@ -458,7 +565,22 @@ fn to_query_metadata_file(
     let mut meta_block = String::new();
     meta_block.push_str("export const meta = {\n");
     meta_block.push_str(&format!("  id: \"{}\",\n", &query.interface_hash));
+    meta_block.push_str(&format!(
+        "  schemaContracts: {},\n",
+        serde_json::to_string(&schema_contracts).expect("query schema contracts")
+    ));
     if let Some(info) = query_info {
+        if let Some(metadata) =
+            crate::generate::manifest::generated_edit_metadata(context, query, info)
+        {
+            meta_block.push_str(&format!(
+                "  generatedEdit: {{ kind: {} as const, {}writeStatementIndices: {}, writableInputs: {} }},\n",
+                serde_json::to_string(&metadata.kind).expect("generated edit kind"),
+                metadata.create_uuid_input.as_ref().map(|input| format!("createUuidInput: {}, ", serde_json::to_string(input).expect("create UUID input"))).unwrap_or_default(),
+                serde_json::to_string(&metadata.write_statement_indices).expect("generated write indices"),
+                serde_json::to_string(&metadata.writable_inputs).expect("generated writable inputs")
+            ));
+        }
         meta_block.push_str(&format!(
             "  primary_db: {},\n",
             string::quote(&info.primary_db)
@@ -485,6 +607,39 @@ fn to_query_metadata_file(
         }
     ));
     meta_block.push_str(&format!("  session_args: {},\n", session_args));
+    meta_block.push_str(&format!(
+        "  json_session_args: {},\n",
+        query_info
+            .map(|info| get_session_args(&info.variables, true))
+            .unwrap_or_else(|| "[]".into())
+    ));
+    let mut json_session_validators = Vec::new();
+    if let Some(info) = query_info {
+        for param in info.variables.values() {
+            if let typecheck::ParamInfo::Defined {
+                from_session: true,
+                used: true,
+                session_name: Some(name),
+                type_: Some(type_),
+                ..
+            } = param
+            {
+                let type_ = ast::ColumnType::from_str(type_);
+                if matches!(type_, ast::ColumnType::Json | ast::ColumnType::JsonTyped(_)) {
+                    json_session_validators.push((
+                        name,
+                        common::session_json_column_validator(&type_, "Decode."),
+                    ));
+                }
+            }
+        }
+    }
+    json_session_validators.sort_by_key(|(name, _)| *name);
+    meta_block.push_str("  json_session_validators: {\n");
+    for (name, validator) in json_session_validators {
+        meta_block.push_str(&format!("    {}: {},\n", string::quote(name), validator));
+    }
+    meta_block.push_str("  },\n");
     meta_block.push_str(&format!("  optional_input_args: {},\n", omittable_args));
     meta_block.push_str(&format!("  json_input_args: {},\n", json_input_args));
     meta_block.push_str("  InputValidator,\n");
@@ -516,6 +671,19 @@ fn to_query_metadata_file(
     blocks.push(meta_block.trim_end().to_string());
 
     format!("{}\n", blocks.join("\n\n"))
+}
+
+pub(crate) fn compiled_codec_contract(
+    context: &typecheck::Context,
+    query: Option<&ast::Query>,
+    database: &ast::Database,
+) -> String {
+    let mut result = generate_decode_file(context, database);
+    if let Some(query) = query {
+        result.push_str(&to_param_type_alias(context, &query.args));
+        typealias::return_data_aliases(context, query, &mut result, &to_metadata_formatter());
+    }
+    result
 }
 
 fn to_query_sql_file(
@@ -655,7 +823,7 @@ fn bool_to_ts_bool(bool: bool) -> String {
     "false".to_string()
 }
 
-fn get_session_args(params: &HashMap<String, typecheck::ParamInfo>) -> String {
+fn get_session_args(params: &HashMap<String, typecheck::ParamInfo>, json_only: bool) -> String {
     let mut session_args: Vec<String> = Vec::new();
 
     for (_name, info) in params {
@@ -664,9 +832,19 @@ fn get_session_args(params: &HashMap<String, typecheck::ParamInfo>) -> String {
                 from_session,
                 used,
                 session_name,
+                type_,
                 ..
             } => {
-                if *from_session && *used {
+                if *from_session
+                    && *used
+                    && (!json_only
+                        || type_.as_ref().is_some_and(|name| {
+                            matches!(
+                                ast::ColumnType::from_str(name),
+                                ast::ColumnType::Json | ast::ColumnType::JsonTyped(_)
+                            )
+                        }))
+                {
                     match session_name {
                         None => continue,
                         Some(session_name_string) => {
@@ -1091,13 +1269,33 @@ fn to_filter_operator_key(operator: &ast::Operator) -> &'static str {
 }
 
 fn to_schema_metadata(context: &typecheck::Context) -> String {
-    let mut result = String::new();
-    result.push_str("import type { SchemaMetadata } from '@pyre/core';\n\n");
+    let scopes = context
+        .valid_namespaces
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|namespace| {
+            format!(
+                "  {}: {}",
+                string::quote(namespace),
+                schema_metadata_value(context, Some(namespace))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("import type {{ SchemaMetadata }} from '@pyre/core';\n\nexport const schemaMetadataByNamespace: Record<string, SchemaMetadata> = {{\n{}\n}};\n\nexport const schemaMetadata: SchemaMetadata = {{ ...{}, namespaces: schemaMetadataByNamespace }};\n", scopes, schema_metadata_value(context, None))
+}
 
-    result.push_str("export const schemaMetadata: SchemaMetadata = {\n");
+fn schema_metadata_value(context: &typecheck::Context, namespace: Option<&str>) -> String {
+    let mut result = String::new();
+    result.push_str("{\n");
     result.push_str("  tables: {\n");
 
-    let mut tables: Vec<&typecheck::Table> = context.tables.values().collect();
+    let mut tables: Vec<&typecheck::Table> = context
+        .tables
+        .values()
+        .filter(|table| namespace.is_none_or(|ns| table.schema == ns))
+        .collect();
     tables.sort_by(|a, b| {
         let a_table_name = ast::get_tablename(&a.record.name, &a.record.fields);
         let b_table_name = ast::get_tablename(&b.record.name, &b.record.fields);
@@ -1115,6 +1313,35 @@ fn to_schema_metadata(context: &typecheck::Context) -> String {
 
         result.push_str(&format!("    {}: {{\n", string::quote(&table_name)));
         result.push_str(&format!("      name: {},\n", string::quote(&table_name)));
+        let primary_key = table
+            .record
+            .fields
+            .iter()
+            .find_map(|field| match field {
+                ast::Field::Column(column) if ast::is_primary_key(column) => Some(column),
+                _ => None,
+            })
+            .expect("checked records require a primary key");
+        let primary_key_kind = match &primary_key.type_ {
+            ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => "int",
+            ast::ColumnType::IdUuid { .. } => "uuid",
+            ast::ColumnType::ForeignKey {
+                serialization_type: Some(kind),
+                ..
+            } => match kind {
+                ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt => {
+                    "int"
+                }
+                ast::ConcreteSerializationType::IdUuid => "uuid",
+                _ => "unsupported",
+            },
+            _ => "unsupported",
+        };
+        result.push_str(&format!(
+            "      primaryKey: {{ name: {}, kind: {} }},\n",
+            string::quote(&primary_key.name),
+            string::quote(primary_key_kind)
+        ));
         result.push_str(&format!(
             "      namespace: {},\n",
             string::quote(&table.schema)
@@ -1160,6 +1387,10 @@ fn to_schema_metadata(context: &typecheck::Context) -> String {
                 result.push_str(&format!(
                     "          nullable: {},\n",
                     if column.nullable { "true" } else { "false" }
+                ));
+                result.push_str(&format!(
+                    "          codec: {},\n",
+                    wire_codec(context, &column.type_, column.nullable, &mut HashSet::new())
                 ));
                 result.push_str(&format!(
                     "          primary: {},\n",
@@ -1337,8 +1568,122 @@ fn to_schema_metadata(context: &typecheck::Context) -> String {
     }
 
     result.push_str("\n  }\n");
-    result.push_str("};\n");
+    result.push_str("}");
     result
+}
+
+fn wire_codec(
+    context: &typecheck::Context,
+    type_: &ast::ColumnType,
+    nullable: bool,
+    expanding: &mut HashSet<String>,
+) -> String {
+    let codec = match type_ {
+        ast::ColumnType::String => "{ kind: \"string\" }".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => "{ kind: \"safeInt\" }".to_string(),
+        ast::ColumnType::Float => "{ kind: \"float\" }".to_string(),
+        ast::ColumnType::Bool => "{ kind: \"bool\" }".to_string(),
+        ast::ColumnType::Date => "{ kind: \"date\" }".to_string(),
+        ast::ColumnType::DateTime => "{ kind: \"dateTime\" }".to_string(),
+        ast::ColumnType::Json => "{ kind: \"json\" }".to_string(),
+        ast::ColumnType::JsonTyped(inner) => wire_codec(context, inner, false, expanding),
+        ast::ColumnType::List(inner) => format!(
+            "{{ kind: \"list\", item: {} }}",
+            wire_codec(context, inner, false, expanding)
+        ),
+        ast::ColumnType::Dict(inner) => format!(
+            "{{ kind: \"dict\", value: {} }}",
+            wire_codec(context, inner, false, expanding)
+        ),
+        ast::ColumnType::Nullable(inner) => return wire_codec(context, inner, true, expanding),
+        ast::ColumnType::IdUuid { .. } => "{ kind: \"uuid\" }".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type: Some(serialization),
+            ..
+        } => wire_codec_for_serialization(serialization),
+        ast::ColumnType::ForeignKey { .. } => {
+            panic!("checked foreign key requires a concrete wire codec")
+        }
+        ast::ColumnType::Custom(name) => {
+            if !expanding.insert(name.clone()) {
+                format!("{{ kind: \"reference\", name: {} }}", string::quote(name))
+            } else {
+                let value = match context.types.get(name) {
+                    Some((_, typecheck::Type::OneOf { variants }))
+                        if variants.iter().all(|variant| variant.fields.is_none()) =>
+                    {
+                        let values = variants
+                            .iter()
+                            .map(|variant| string::quote(&variant.name))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{{ kind: \"enum\", values: [{values}] }}")
+                    }
+                    Some((_, typecheck::Type::OneOf { variants })) => {
+                        let variants = variants
+                            .iter()
+                            .map(|variant| {
+                                let fields = variant
+                                    .fields
+                                    .iter()
+                                    .flatten()
+                                    .filter_map(|field| match field {
+                                        ast::Field::Column(column) => Some(format!(
+                                            "{}: {}",
+                                            string::quote(&column.name),
+                                            wire_codec(
+                                                context,
+                                                &column.type_,
+                                                column.nullable,
+                                                expanding,
+                                            )
+                                        )),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("{}: {{ {fields} }}", string::quote(&variant.name))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{{ kind: \"taggedUnion\", variants: {{ {variants} }} }}")
+                    }
+                    Some((_, typecheck::Type::Integer)) => "{ kind: \"safeInt\" }".to_string(),
+                    Some((_, typecheck::Type::Float)) => "{ kind: \"float\" }".to_string(),
+                    Some((_, typecheck::Type::String)) => "{ kind: \"string\" }".to_string(),
+                    _ => panic!("checked custom column type requires a wire codec: {name}"),
+                };
+                expanding.remove(name);
+                format!(
+                    "{{ kind: \"named\", name: {}, value: {value} }}",
+                    string::quote(name)
+                )
+            }
+        }
+    };
+
+    if nullable {
+        format!("{{ kind: \"nullable\", value: {codec} }}")
+    } else {
+        codec
+    }
+}
+
+fn wire_codec_for_serialization(type_: &ast::ConcreteSerializationType) -> String {
+    let kind = match type_ {
+        ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt => {
+            "safeInt"
+        }
+        ast::ConcreteSerializationType::Real => "float",
+        ast::ConcreteSerializationType::Text => "string",
+        ast::ConcreteSerializationType::Date => "date",
+        ast::ConcreteSerializationType::DateTime => "dateTime",
+        ast::ConcreteSerializationType::IdUuid => "uuid",
+        ast::ConcreteSerializationType::Blob
+        | ast::ConcreteSerializationType::VectorBlob { .. }
+        | ast::ConcreteSerializationType::JsonB => "json",
+    };
+    format!("{{ kind: \"{kind}\" }}")
 }
 
 fn get_linked_table<'a>(
@@ -1361,12 +1706,15 @@ fn to_input_decoder_zod_type(type_: &str) -> String {
 fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float => "z.number()".to_string(),
+        ast::ColumnType::Int => "z.number().int()".to_string(),
+        ast::ColumnType::Float => "z.number()".to_string(),
         ast::ColumnType::Bool => "z.boolean()".to_string(),
         ast::ColumnType::DateTime => "z.union([z.date(), z.string(), z.number()])".to_string(),
         ast::ColumnType::Date => "z.string()".to_string(),
-        ast::ColumnType::Json => "z.unknown()".to_string(),
-        ast::ColumnType::JsonTyped(inner) => output_zod_type_for_column_type(inner),
+        ast::ColumnType::Json => {
+            "z.json().refine(value => value !== null).nonoptional()".to_string()
+        }
+        ast::ColumnType::JsonTyped(inner) => json_input_decoder_zod_type(inner),
         ast::ColumnType::List(inner) => {
             format!("z.array({})", input_zod_type_for_column_type(inner))
         }
@@ -1379,11 +1727,28 @@ fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", input_zod_type_for_column_type(inner))
         }
-        ast::ColumnType::IdInt { .. } | ast::ColumnType::ForeignKey { .. } => {
-            "z.number()".to_string()
+        ast::ColumnType::IdInt { table } if !table.is_empty() => format!("$Ids.{table}Id"),
+        ast::ColumnType::IdInt { .. } => "z.number().int()".to_string(),
+        ast::ColumnType::ForeignKey { .. } => common::input_column_validator(type_),
+        ast::ColumnType::IdUuid { table } if !table.is_empty() => format!("$Ids.{table}Id"),
+        ast::ColumnType::IdUuid { .. } => common::UUID_VALIDATOR.to_string(),
+        ast::ColumnType::Custom(name) => format!("Decode.{}Write", name),
+    }
+}
+
+fn json_input_decoder_zod_type(type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::Custom(name) => format!("Decode.{}JsonInput", name),
+        ast::ColumnType::JsonTyped(inner) => json_input_decoder_zod_type(inner),
+        ast::ColumnType::List(inner) => format!("z.array({})", json_input_decoder_zod_type(inner)),
+        ast::ColumnType::Dict(inner) => format!(
+            "z.record(z.string(), {})",
+            json_input_decoder_zod_type(inner)
+        ),
+        ast::ColumnType::Nullable(inner) => {
+            format!("{}.nullable()", json_input_decoder_zod_type(inner))
         }
-        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
-        ast::ColumnType::Custom(name) => format!("Decode.{}", name),
+        _ => input_decoder_zod_type_for_column_type(type_),
     }
 }
 
@@ -1428,10 +1793,12 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", output_zod_type_for_column_type(inner))
         }
+        ast::ColumnType::IdInt { table } if !table.is_empty() => format!("$Ids.{table}Id"),
         ast::ColumnType::IdInt { .. } | ast::ColumnType::ForeignKey { .. } => {
             "z.number()".to_string()
         }
-        ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
+        ast::ColumnType::IdUuid { table } if !table.is_empty() => format!("$Ids.{table}Id"),
+        ast::ColumnType::IdUuid { .. } => common::UUID_VALIDATOR.to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}", name),
     }
 }
@@ -1440,15 +1807,18 @@ fn to_param_type_alias(
     context: &typecheck::Context,
     args: &Vec<ast::QueryParamDefinition>,
 ) -> String {
-    let mut result = "const RawInputValidator = z.object({".to_string();
+    let mut result = "export const RawInputValidator = z.object({".to_string();
     let mut is_first = true;
     for arg in args {
-        let type_name = arg
-            .type_
-            .as_deref()
-            .map(|type_| typecheck::resolve_query_param_type(context, type_))
-            .unwrap_or("unknown".to_string());
-        let mut type_string = to_zod_type(&type_name);
+        let mut type_string =
+            query_id_validator(context, arg.type_.as_deref()).unwrap_or_else(|| {
+                let type_name = arg
+                    .type_
+                    .as_deref()
+                    .map(|type_| typecheck::resolve_query_param_type(context, type_))
+                    .unwrap_or("unknown".to_string());
+                to_zod_type(&type_name)
+            });
         if arg.nullable {
             type_string = format!("{}.nullable()", type_string);
         }
@@ -1467,12 +1837,15 @@ fn to_param_type_alias(
     result.push_str("const InputValidator = z.object({");
     let mut is_first = true;
     for arg in args {
-        let type_name = arg
-            .type_
-            .as_deref()
-            .map(|type_| typecheck::resolve_query_param_type(context, type_))
-            .unwrap_or("unknown".to_string());
-        let mut type_string = to_input_decoder_zod_type(&type_name);
+        let mut type_string =
+            query_id_validator(context, arg.type_.as_deref()).unwrap_or_else(|| {
+                let type_name = arg
+                    .type_
+                    .as_deref()
+                    .map(|type_| typecheck::resolve_query_param_type(context, type_))
+                    .unwrap_or("unknown".to_string());
+                to_input_decoder_zod_type(&type_name)
+            });
         if arg.nullable {
             type_string = format!("{}.nullable()", type_string);
         }
@@ -1490,4 +1863,49 @@ fn to_param_type_alias(
 
     result.push_str("export type Input = z.infer<typeof RawInputValidator>;");
     result
+}
+
+fn query_id_validator(context: &typecheck::Context, type_: Option<&str>) -> Option<String> {
+    let type_ = ast::ColumnType::from_str(type_?);
+    match type_ {
+        ast::ColumnType::IdInt { table } | ast::ColumnType::IdUuid { table }
+            if !table.is_empty() =>
+        {
+            Some(format!("$Ids.{table}Id"))
+        }
+        ast::ColumnType::ForeignKey {
+            schema,
+            table,
+            field,
+            ..
+        } => context
+            .tables
+            .values()
+            .find(|candidate| {
+                candidate.record.name == table
+                    && schema
+                        .as_ref()
+                        .is_none_or(|schema| candidate.schema == *schema)
+            })
+            .and_then(|candidate| {
+                ast::collect_columns(&candidate.record.fields)
+                    .into_iter()
+                    .find(|column| column.name == field)
+                    .and_then(|column| match &column.type_ {
+                        ast::ColumnType::Int if ast::is_primary_key(&column) => {
+                            Some(candidate.record.name.clone())
+                        }
+                        ast::ColumnType::IdInt { table } | ast::ColumnType::IdUuid { table } => {
+                            Some(if table.is_empty() {
+                                candidate.record.name.clone()
+                            } else {
+                                table.clone()
+                            })
+                        }
+                        _ => None,
+                    })
+            })
+            .map(|brand| format!("$Ids.{brand}Id")),
+        _ => None,
+    }
 }

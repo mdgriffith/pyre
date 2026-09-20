@@ -46,6 +46,7 @@ record Account {
 pub fn schema_v1_complete() -> String {
     format!(
         r#"
+@syncable(false)
 {}
 
 {}
@@ -59,6 +60,7 @@ pub fn schema_v1_complete() -> String {
 pub fn schema_v2_complete() -> String {
     format!(
         r#"
+@syncable(false)
 record User {{
     id   Int    @id
     name String
@@ -85,6 +87,7 @@ pub fn schema_v3_complete() -> String {
 pub fn full_schema() -> String {
     format!(
         r#"
+@syncable(false)
 record User {{
     id   Int    @id
     name String
@@ -124,6 +127,7 @@ type Result
 pub fn union_column_reuse_schema() -> String {
     format!(
         r#"
+@syncable(false)
 record TestRecord {{
     id Int @id
     result Result
@@ -154,6 +158,7 @@ type MixedResult
 pub fn union_separate_columns_schema() -> String {
     format!(
         r#"
+@syncable(false)
 record TestRecord {{
     id Int @id
     result MixedResult
@@ -188,6 +193,7 @@ type Action
 pub fn union_required_fields_schema() -> String {
     format!(
         r#"
+@syncable(false)
 record TestRecord {{
     id Int @id
     action Action

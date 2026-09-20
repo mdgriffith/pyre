@@ -18,6 +18,7 @@ fn create_record_with_directive(
     let mut schema = ast::Schema::default();
     let schema_source = format!(
         r#"
+@syncable(false)
 record TestRecord {{
     {} Int @id
     {} Int {}
@@ -92,7 +93,8 @@ fn column_default_id(schema: &ast::Schema, column_name: &str) -> String {
 #[test]
 fn default_id_contains_only_the_parsed_value() {
     let schema = parse_schema(
-        r#"record Example {
+        r#"@syncable(false)
+record Example {
     published Bool @default(False)
 
     label String
@@ -180,13 +182,15 @@ fn adding_or_removing_a_default_produces_a_modified_column_error() {
 #[test]
 fn adding_or_removing_immutable_produces_no_migration_error() {
     let mutable = parse_schema(
-        r#"record Document {
+        r#"@syncable(false)
+record Document {
     id      Int @id
     ownerId Int
 }"#,
     );
     let immutable = parse_schema(
-        r#"record Document {
+        r#"@syncable(false)
+record Document {
     id      Int @id
     ownerId Int @immutable
 }"#,
@@ -303,6 +307,7 @@ fn test_linked_to_unique_field_fallback_to_id() {
     // Test that the fallback behavior still works (checking for "id" field name)
     let mut schema = ast::Schema::default();
     let schema_source = r#"
+@syncable(false)
 record TestRecord {
     id Int @id
     name String
@@ -470,6 +475,7 @@ fn test_select_type_columns_unknown_type() {
     // This test is mainly to ensure the code doesn't panic
     let mut schema = ast::Schema::default();
     let schema_source = r#"
+@syncable(false)
 record User {
     id Int @id
     name String
@@ -580,6 +586,7 @@ fn test_select_type_columns_qualified_table_name() {
 fn test_resolve_id_brands_sets_brand_on_id_columns() {
     // Test that ID columns (Id.Int or Id.Uuid) get their brand set to the record name
     let schema_source = r#"
+@syncable(false)
 record User {
     id Id.Int @id
     name String
@@ -657,6 +664,7 @@ record Post {
 fn test_resolve_id_brands_resolves_foreign_key_references() {
     // Test that foreign key references resolve the brand from the referenced table
     let schema_source = r#"
+@syncable(false)
 record User {
     id Id.Int @id
     name String
