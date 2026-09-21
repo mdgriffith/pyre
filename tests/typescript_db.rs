@@ -51,10 +51,12 @@ record Document {
             .contents
     };
     let builders = file("edits.ts");
-    assert!(builders.contains("documentCreate(input: Omit<DocumentCreate.Input, \"id\">)"));
+    assert!(builders.contains(
+        "documentCreate(input: Omit<BindIds<DocumentCreate.Input, DocumentIds>, \"id\">)"
+    ));
     assert!(builders.contains("[\"id\"]: createId()"));
-    assert!(builders.contains("patch: Omit<DocumentUpdate.Input, \"id\">"));
-    assert!(builders.contains("documentDelete(id: DocumentDelete.Input[\"id\"])"));
+    assert!(builders.contains("patch: Omit<BindIds<DocumentUpdate.Input, DocumentIds>, \"id\">"));
+    assert!(builders.contains("documentDelete(id: DocumentId)"));
     assert!(file("metadata/documentCreate.ts")
         .contains("generatedEdit: { writeStatement: 0, createId: \"id\" }"));
     let update = file("metadata/documentUpdate.ts");

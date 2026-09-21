@@ -14,6 +14,12 @@ record Document {
     owner String @immutable
     summary String?
     tags Json<List<String>>
+    assignee Account.id?
+}
+record Account {
+    @public
+    id Id.Uuid @id
+    name String
 }
 "#,
         &mut schema,
@@ -43,19 +49,46 @@ record Document {
     std::fs::write(dir.path().join("Main.elm"), r#"port module Main exposing (main)
 import Db.Edit
 import Db.Edit.Document as Document
+import Db.Edit.Account as Account
 import Db.Edit.Internal as Internal
 import Db.Id
+import Db.Database
 import Json.Encode as Encode
 import Platform
+import Query.DocumentDelete
 port output : Encode.Value -> Cmd msg
 main =
     Platform.worker
-        { init = \() -> ( (), output (Encode.list Internal.encode [ create, Document.update (Db.Id.uuid "01900000-0000-7000-8000-000000000000") patch ]) )
+        { init = \() -> ( (), output (Encode.list identity [ Internal.encode create, Internal.encode (Document.update (Db.Id.uuid "01900000-0000-7000-8000-000000000000") patch), receiptCheck ]) )
         , update = \() model -> ( model, Cmd.none )
         , subscriptions = \_ -> Sub.none
         }
 create = Document.create { title = "Title", owner = "Owner", tags = [] } [ Document.withSummary Nothing ]
 patch = [ Document.title "New title", Document.summary Nothing, Document.tags [ "tag" ] ]
+receiptCheck =
+    let
+        database = Db.Database.fromString "tenant:1"
+        wire = Encode.object
+            [ ( "databaseId", Encode.string "tenant:1" )
+            , ( "requestId", Encode.string "request:1" )
+            , ( "result", Encode.object
+                [ ( "ok", Encode.bool True )
+                , ( "value", Encode.list identity
+                    [ Encode.object
+                        [ ( "index", Encode.int 0 )
+                        , ( "queryId", Encode.string Query.DocumentDelete.id )
+                        , ( "result", Encode.object [ ( "document", Encode.list identity [ Encode.object [ ( "id", Encode.string "01900000-0000-7000-8000-000000000000" ) ] ] ) ] )
+                        ]
+                    ] )
+                ] )
+            ]
+    in
+    case Db.Edit.receive database "request:1" wire of
+        Err _ -> Encode.bool False
+        Ok receipt ->
+            case ( Document.deleteResult 0 receipt, Document.createResult 0 receipt, Db.Edit.receive (Db.Database.fromString "tenant:2") "request:1" wire ) of
+                ( Ok deleted, Err _, Err _ ) -> Encode.bool (List.length deleted.document == 1)
+                _ -> Encode.bool False
 "#).unwrap();
     let output = Command::new("elm")
         .args(["make", "Main.elm", "--output=elm.js"])
@@ -73,6 +106,7 @@ patch = [ Document.title "New title", Document.summary Nothing, Document.tags [ 
         "Document.title Nothing",
         "Document.owner \"forbidden\"",
         "Document.create { title = \"missing\" } []",
+        "Document.update (Db.Id.uuid \"01900000-0000-7000-8000-000000000000\") [ Account.name \"wrong record\" ]",
     ] {
         std::fs::write(
             dir.path().join("Main.elm"),
@@ -90,12 +124,20 @@ patch = [ Document.title "New title", Document.summary Nothing, Document.tags [ 
         );
     }
     std::fs::write(dir.path().join("verify.ts"), r#"
-import { documentCreate, documentUpdate, batch } from './typescript/core/edits';
+import { documentCreate, documentUpdate, documentId, accountId, batch, database } from './typescript/core/edits';
 import { captureOperations } from '@pyre/client/operations';
+import type { PyreClient } from '@pyre/client';
 import { meta as createMeta } from './typescript/core/queries/metadata/documentCreate';
 import { meta as updateMeta } from './typescript/core/queries/metadata/documentUpdate';
 const created = documentCreate({ title: 'Title', owner: 'Owner', tags: [], summary: null });
-const edits = batch([created, documentUpdate('01900000-0000-7000-8000-000000000000', { summary: null })]);
+const id = documentId('01900000-0000-7000-8000-000000000000');
+const account = accountId('01900000-0000-7000-8000-000000000001');
+documentUpdate(id, { assignee: account });
+// @ts-expect-error Another record's ID cannot target this record
+documentUpdate(account, {});
+// @ts-expect-error Foreign keys retain their target record identity
+documentUpdate(id, { assignee: id });
+const edits = batch([created, documentUpdate(id, { summary: null })]);
 const captured = captureOperations(edits);
 if (captured.length !== 2) throw new Error('Missing operations');
 if (!createMeta.InputValidator.safeParse(captured[0].input).success) throw new Error('Create input rejected');
@@ -103,11 +145,21 @@ if (updateMeta.InputValidator.safeParse({ id: '01900000-0000-7000-8000-000000000
 // @ts-expect-error ID is allocated by the runtime
 documentCreate({ id: 'forged', title: 'Title', owner: 'Owner', tags: [] });
 // @ts-expect-error Immutable fields are not patchable
-documentUpdate('id', { owner: 'Other' });
+documentUpdate(id, { owner: 'Other' });
 // @ts-expect-error Non-nullable values cannot be cleared
-documentUpdate('id', { title: null });
+documentUpdate(id, { title: null });
 // @ts-expect-error Required create fields cannot be omitted
 documentCreate({ title: 'Title' });
+// @ts-expect-error Unbranded strings are not record identities
+documentUpdate('01900000-0000-7000-8000-000000000000', {});
+async function typedSubmission(client: PyreClient) {
+  const result = await client.submit(database('_default', 'tenant:1'), edits);
+  if (result.ok) documentUpdate(result.value[0].result.document[0].id, { title: 'Typed result' });
+  // @ts-expect-error Namespace is checked at the submission boundary
+  client.submit(database('Other', 'tenant:1'), edits);
+  // @ts-expect-error Generated operations require namespace evidence
+  client.submit('tenant:1', edits);
+}
 "#).unwrap();
     let tsc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/tsc");
     let output = Command::new(tsc)
@@ -141,6 +193,7 @@ assert.deepEqual(edits[0].input, { title: 'Title', owner: 'Owner', tags: [], sum
 assert.equal(edits[0].createId, 'id');
 assert.deepEqual(edits[1].input, { id: '01900000-0000-7000-8000-000000000000', title: 'New title', summary: null, tags: ['tag'] });
 assert(!('owner' in edits[1].input));
+assert.equal(edits[2], true, 'typed receipt must reject another database and wrong operation accessor');
 "#).unwrap();
     for script in ["verify.ts", "verify-elm.ts"] {
         let output = Command::new("bun")

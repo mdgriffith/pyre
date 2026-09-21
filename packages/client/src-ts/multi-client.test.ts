@@ -139,6 +139,10 @@ test('explicit submission snapshots pure operations and forwards one ordered bat
   expect(runs[0].module.optimistic.map(op => op.optimistic.set[0].field)).toEqual(['title', 'title']);
   expect(result.value.map(op => op.index)).toEqual([0, 1]);
   expect(() => client.submit('main', [{}])).toThrow('Expected an operation');
+  const scoped = operation({ operation: 'update', id: 'edit', primary_db: 'Main' }, {});
+  expect(() => client.submit('main', [scoped])).toThrow('require a database target');
+  expect(() => client.submit({ namespace: 'Other', databaseId: 'main' }, [scoped])).toThrow('one database namespace');
+  expect(runs).toHaveLength(1);
   expect(() => operation({ id: 'read', operation: 'query' }, {})).toThrow('compiled mutation');
   client.disconnect();
 });

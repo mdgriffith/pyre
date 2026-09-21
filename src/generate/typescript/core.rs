@@ -37,7 +37,52 @@ pub fn generate_queries(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let formatter = to_metadata_formatter();
-    let mut edits = String::from("// Generated browser-independent CRUD builders.\nimport { operation, createId, type Operation } from '@pyre/client/operations';\nexport { batch } from '@pyre/client/operations';\n\n");
+    let mut edits = String::from("// Generated browser-independent CRUD builders.\nimport { operation, createId, type Operation } from '@pyre/client/operations';\nexport { batch, database } from '@pyre/client/operations';\n\ndeclare const identity: unique symbol;\ntype Id<Namespace, Record, Value> = Value & { readonly [identity]: readonly [Namespace, Record] };\ntype BindIds<Value, Ids> = { [Key in keyof Value]: Key extends keyof Ids ? Ids[Key] | Extract<Value[Key], null | undefined> : Value[Key] };\ntype BindRows<Value, Ids> = { [Key in keyof Value]: Value[Key] extends (infer Row)[] ? BindIds<Row, Ids>[] : Value[Key] };\n\n");
+    let mut identity_tables: Vec<_> = context.tables.values().collect();
+    identity_tables.sort_by(|a, b| a.record.name.cmp(&b.record.name));
+    for table in identity_tables {
+        let name = &table.record.name;
+        let columns = ast::collect_columns(&table.record.fields);
+        let key = columns
+            .iter()
+            .find(|column| ast::is_primary_key(column))
+            .unwrap();
+        let uuid = matches!(key.type_, ast::ColumnType::IdUuid { .. });
+        let base = if uuid { "string" } else { "number" };
+        edits.push_str(&format!(
+            "export type {name}Id = Id<{}, {}, {base}>;\n",
+            string::quote(&table.schema),
+            string::quote(name)
+        ));
+        let validation = if uuid {
+            "typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)"
+        } else {
+            "!Number.isSafeInteger(value)"
+        };
+        edits.push_str(&format!("export function {}Id(value: {base}): {name}Id {{ if ({validation}) throw new Error('Invalid {name} identity'); return value as {name}Id; }}\n", string::decapitalize(name)));
+        let mut ids = Vec::new();
+        for column in columns {
+            let target = match &column.type_ {
+                ast::ColumnType::IdInt { .. } | ast::ColumnType::IdUuid { .. } => {
+                    Some(name.as_str())
+                }
+                ast::ColumnType::ForeignKey { table, field, .. } => context
+                    .tables
+                    .get(&string::decapitalize(table))
+                    .filter(|target| {
+                        ast::collect_columns(&target.record.fields)
+                            .iter()
+                            .any(|key| key.name == *field && ast::is_primary_key(key))
+                    })
+                    .map(|_| table.as_str()),
+                _ => None,
+            };
+            if let Some(target) = target {
+                ids.push(format!("{}: {target}Id", string::quote(&column.name)));
+            }
+        }
+        edits.push_str(&format!("type {name}Ids = {{ {} }};\n\n", ids.join("; ")));
+    }
 
     for operation in &query_list.queries {
         match operation {
@@ -57,32 +102,33 @@ pub fn generate_queries(
                         string::decapitalize(module)
                     ));
                     let namespace = string::quote(&info.primary_db);
+                    let record = &table.record.name;
                     let key = string::quote(&primary_key.name);
                     let (input_type, input) = match q.operation {
                         ast::QueryOperation::Insert
                             if matches!(primary_key.type_, ast::ColumnType::IdUuid { .. }) =>
                         {
                             (
-                                format!("input: Omit<{module}.Input, {key}>"),
+                                format!("input: Omit<BindIds<{module}.Input, {record}Ids>, {key}>"),
                                 format!("{{ ...input, [{}]: createId() }}", key),
                             )
                         }
                         ast::QueryOperation::Insert => {
-                            (format!("input: {module}.Input"), "input".into())
+                            (format!("input: BindIds<{module}.Input, {record}Ids>"), "input".into())
                         }
                         ast::QueryOperation::Update => (
                             format!(
-                                "id: {module}.Input[{key}], patch: Omit<{module}.Input, {key}>"
+                                "id: {record}Id, patch: Omit<BindIds<{module}.Input, {record}Ids>, {key}>"
                             ),
                             format!("{{ ...patch, [{key}]: id }}"),
                         ),
                         _ => (
-                            format!("id: {module}.Input[{key}]"),
+                            format!("id: {record}Id"),
                             format!("{{ [{key}]: id }}"),
                         ),
                     };
                     edits.push_str(&format!(
-                        "export function {}({input_type}): Operation<{namespace}, {module}.Result> {{\n  return operation({module}.meta, {input}) as Operation<{namespace}, {module}.Result>;\n}}\n\n",
+                        "export function {}({input_type}): Operation<{namespace}, BindRows<{module}.Result, {record}Ids>> {{\n  return operation({module}.meta, {input}) as Operation<{namespace}, BindRows<{module}.Result, {record}Ids>>;\n}}\n\n",
                         string::decapitalize(module)
                     ));
                 }

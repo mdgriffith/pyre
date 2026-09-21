@@ -344,7 +344,7 @@ insert CreatePost($title: String) {
     let content = &generated.contents;
 
     assert!(
-        content.contains("module Query.CreatePost exposing (encode, DatabaseId, Default, RequestId, id, name, mutationRequest, decodeMutationResult, MutationResult, Input, Post, ReturnData)"),
+        content.contains("module Query.CreatePost exposing (encode, DatabaseId, Default, RequestId, id, name, mutationRequest, decodeMutationResult, decodeReturnData, MutationResult, Input, Post, ReturnData)"),
         "Mutation modules should expose bridge metadata helpers. Generated:\n{}",
         content
     );

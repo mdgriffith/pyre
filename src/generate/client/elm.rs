@@ -1715,10 +1715,18 @@ fn to_edit_module(
 ) -> String {
     let lookup = ElmLookup::from_context(context);
     let mut exposing = vec!["Patch".to_string(), "CreateOption".to_string()];
-    let mut used_names: HashSet<String> = ["create", "update", "delete", "optimistic"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let mut used_names: HashSet<String> = [
+        "create",
+        "update",
+        "delete",
+        "optimistic",
+        "createResult",
+        "updateResult",
+        "deleteResult",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
     let mut builder_names = HashMap::new();
     // Reserve patch names first, then disambiguate optional-create builders.
     for operation in [ast::QueryOperation::Update, ast::QueryOperation::Insert] {
@@ -1741,7 +1749,11 @@ fn to_edit_module(
             }
         }
     }
-    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit.Internal as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict\nimport Json.Encode as Encode\nimport Time\n\n\ntype Patch\n    = Patch ( String, Encode.Value )\n\n\ntype CreateOption\n    = CreateOption ( String, Encode.Value )\n\n\n");
+    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Edit.Internal as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict\nimport Json.Encode as Encode\nimport Time\n");
+    for query in queries {
+        body.push_str(&format!("import Query.{}\n", query.name));
+    }
+    body.push_str("\n\ntype Patch\n    = Patch ( String, Encode.Value )\n\n\ntype CreateOption\n    = CreateOption ( String, Encode.Value )\n\n\n");
     for query in queries {
         let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
         let key = ast::collect_columns(&table.record.fields)
@@ -1750,6 +1762,13 @@ fn to_edit_module(
             .unwrap();
         let namespace = elm_database_namespace(&info[&query.name].primary_db);
         let edit_type = format!("Internal.Edit Db.Database.{namespace}");
+        let result_name = match query.operation {
+            ast::QueryOperation::Insert => "createResult",
+            ast::QueryOperation::Update => "updateResult",
+            _ => "deleteResult",
+        };
+        exposing.push(result_name.into());
+        body.push_str(&format!("{result_name} : Int -> Db.Edit.Receipt Db.Database.{namespace} -> Result String Query.{0}.ReturnData\n{result_name} =\n    Db.Edit.result Query.{0}.id Query.{0}.decodeReturnData\n\n\n", query.name));
         let construct = |input: &str, optimistic: &str, create_id: &str| {
             format!(
                 "Internal.Edit {{ queryId = {}, input = {}, optimistic = {}, createId = {} }}",
@@ -2078,6 +2097,7 @@ fn to_query_file(
             exposing_items.push("optimistic".to_string());
         }
         exposing_items.push("decodeMutationResult".to_string());
+        exposing_items.push("decodeReturnData".to_string());
         exposing_items.push("MutationResult".to_string());
     }
 

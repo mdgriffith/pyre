@@ -210,7 +210,7 @@ fn to_query_type_alias(
                     }
                     rendered_fields.push((
                         column.name.clone(),
-                        column.type_.query_type_string(),
+                        return_column_type(table, column),
                         FieldMetadata {
                             is_link: false,
                             is_optional: column.nullable,
@@ -232,7 +232,7 @@ fn to_query_type_alias(
                 ast::Field::Column(col) => {
                     rendered_fields.push((
                         aliased_name,
-                        col.type_.query_type_string(),
+                        return_column_type(table, col),
                         FieldMetadata {
                             is_link: false,
                             is_optional: col.nullable,
@@ -284,6 +284,20 @@ fn to_query_type_alias(
 
     result.push_str(&(formatter.to_type_def_end)());
     result.push_str("\n\n");
+}
+
+fn return_column_type(table: &ast::RecordDetails, column: &ast::Column) -> String {
+    match &column.type_ {
+        ast::ColumnType::IdUuid { table: brand } if brand.is_empty() => ast::ColumnType::IdUuid {
+            table: table.name.clone(),
+        }
+        .query_type_string(),
+        ast::ColumnType::IdInt { table: brand } if brand.is_empty() => ast::ColumnType::IdInt {
+            table: table.name.clone(),
+        }
+        .query_type_string(),
+        _ => column.type_.query_type_string(),
+    }
 }
 
 pub fn push_alias_stack(field: &ast::QueryField, alias_stack: &str) -> String {

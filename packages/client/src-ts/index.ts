@@ -1,5 +1,13 @@
 import loadElm from '../dist/engine.mjs';
-import { captureOperations, createId, type Operation } from './operations';
+import {
+  captureOperations,
+  createId,
+  decodeOperationResults,
+  type Operation,
+  type OperationResults,
+  type SubmissionResult,
+  type SubmissionTarget,
+} from './operations';
 import { IndexedDBStorage, IndexedDbService } from './service/indexeddb';
 import {
   EntityStreamService,
@@ -1293,16 +1301,35 @@ export class PyreClient {
   }
 
   /** Execute one ordered, atomic batch through the existing mutation engine. */
-  submit(databaseId: DatabaseId, operations: readonly Operation[]): Promise<MutationResult> {
-    const captured = captureOperations(operations);
+  submit<const Items extends readonly Operation[]>(
+    target: SubmissionTarget<Items>,
+    operations: Items,
+  ): Promise<SubmissionResult<OperationResults<Items>>> {
+    const items = Object.freeze([...operations]) as unknown as Items;
+    const captured = captureOperations(items, typeof target === 'string' ? undefined : target);
+    if (typeof target === 'string' && captured.some(item => item.namespace !== undefined)) {
+      throw new Error('Namespace-scoped operations require a database target');
+    }
+    const databaseId = typeof target === 'string' ? target : target.databaseId;
     requireDatabaseId(databaseId);
-    if (captured.length === 0) return Promise.resolve({ ok: true, value: [] });
+    if (captured.length === 0) return Promise.resolve({ ok: true, value: [] as unknown as OperationResults<Items> });
     const input = captured.map(({ queryId, input }) => ({ queryId, input }));
     const optimistic = captured.filter((item) => item.optimistic != null)
       .map(({ input, optimistic }) => ({ input, optimistic }));
     return new Promise((resolve, reject) => {
       void this.run(databaseId, { operation: 'transaction', id: '$batch', optimistic }, input,
-        (result) => resolve(result as MutationResult)).catch(reject);
+        (result) => {
+          const receipt = result as MutationResult;
+          if (!receipt.ok) {
+            resolve({ ok: false, error: receipt.error ?? 'Mutation failed' });
+            return;
+          }
+          try {
+            resolve({ ok: true, value: decodeOperationResults(items, receipt.value) });
+          } catch (error) {
+            reject(error);
+          }
+        }).catch(reject);
     });
   }
 
