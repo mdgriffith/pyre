@@ -94,11 +94,13 @@ export type SyncDeltasFn = (
     affectedRowGroups: any[],
     connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
     sendToSession: (sessionId: string, message: any) => void,
-    originSessionId?: string
+    originSessionId?: string,
+    committedRevision?: { databaseEpoch: string; serverRevision: number }
 ) => Promise<SyncResult | void>;
 
 export interface RunOptions {
     mode?: "normal" | "sync";
+    allocateSyncRevision?: boolean;
 }
 
 export type SeedPrimitive = null | boolean | number | string | Uint8Array;
@@ -271,9 +273,23 @@ export async function run(
     const useSyncMode = options.mode === "sync";
     const activeSql = useSyncMode ? query.syncSql ?? query.sql : query.sql;
     const sqlStatements: InStatement[] = toSqlStatements(activeSql, validArgs);
+    const allocateRevision = options.allocateSyncRevision && activeSql.some((statement) => statement.sql.includes("_affectedRows"));
 
     // Execute query
-    const resultSets = await db.batch(sqlStatements);
+    // Allocate in the mutation's transaction, never in the later fanout callback.
+    // Otherwise delayed publication could give older row values a newer revision.
+    if (allocateRevision) {
+        sqlStatements.push("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
+    }
+    const resultSets = allocateRevision ? await db.batch(sqlStatements, "write") : await db.batch(sqlStatements);
+    let committedRevision: { databaseEpoch: string; serverRevision: number } | undefined;
+    if (allocateRevision) {
+        const stamp = resultSets.pop()?.rows[0];
+        if (typeof stamp?.database_epoch !== "string" || (typeof stamp?.server_revision !== "number" && typeof stamp?.server_revision !== "bigint")) {
+            throw new Error("Failed to allocate Pyre sync server revision");
+        }
+        committedRevision = { databaseEpoch: stamp.database_epoch, serverRevision: Number(stamp.server_revision) };
+    }
     const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
     const response = formatResultData(activeSql, resultSets);
 
@@ -300,7 +316,13 @@ export async function run(
      * ]
      * ```
      */
-    async function sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
+    let syncPromise: Promise<SyncResult> | undefined;
+    function sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
+        syncPromise ??= publish(sendToSession);
+        return syncPromise;
+    }
+
+    async function publish(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
         // Early return if nothing to sync
         if (affectedRowGroups.length === 0) {
             return {};
@@ -310,7 +332,7 @@ export async function run(
             return {};
         }
 
-        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId) ?? {};
+        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId, committedRevision) ?? {};
         if (typeof syncResult.serverRevision === "number") {
             queryResult.response = {
                 ...(syncResult.databaseEpoch === undefined ? {} : { databaseEpoch: syncResult.databaseEpoch }),

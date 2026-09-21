@@ -218,7 +218,7 @@ test('Elm live syncRequired starts catchup from the current cursor', async () =>
   }
 });
 
-test('Elm live syncRequired ignores stale server revisions', async () => {
+test('Elm recovery hints are not suppressed by a revision applied to only one row', async () => {
   const { app, requests, restore } = await startSyncedElmApp();
 
   try {
@@ -238,7 +238,7 @@ test('Elm live syncRequired ignores stale server revisions', async () => {
     await nextElmTurn();
     await nextElmTurn();
 
-    expect(requests).toHaveLength(requestCountAfterInitialCatchup);
+    expect(requests).toHaveLength(requestCountAfterInitialCatchup + 1);
   } finally {
     restore();
   }
@@ -322,9 +322,9 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
         });
       }
 
-      if (message?.type === 'writeDelta' && message?.entityStreamSource === 'catchup') {
-        notifications.push(message);
-      }
+    });
+    app.ports.visibleStateOut.subscribe((message) => {
+      if (message.source === 'catchup' && message.data.length > 0) notifications.push(message);
     });
 
     await nextElmTurn();
@@ -332,15 +332,15 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
 
     expect(notifications).toEqual([
       {
-        type: 'writeDelta',
-        entityStreamSource: 'catchup',
-        tableGroups: [
+        source: 'catchup',
+        data: [
           {
             table_name: 'maps',
             headers: ['id', 'name', 'updatedAt'],
             rows: [[1, 'Catchup Map', 1]],
           },
         ],
+        snapshot: [{ table_name: 'maps', headers: ['id', 'name', 'updatedAt'], rows: [[1, 'Catchup Map', 1]] }],
       },
     ]);
   } finally {

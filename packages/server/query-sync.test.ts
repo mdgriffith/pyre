@@ -78,7 +78,10 @@ function syncDb() {
   let revision = 0;
   const executedSql: string[] = [];
   return {
-    batch: mock(async () => [{
+    batch: mock(async (statements: any[]) => {
+      executedSql.push(statements.at(-1));
+      revision += 1;
+      return [{
       columns: ["_affectedRows"],
       rows: [{
         _affectedRows: JSON.stringify([{
@@ -87,7 +90,8 @@ function syncDb() {
           rows: [[1, "World", "Tiling", "tiles/root", 256, "Png"]],
         }]),
       }],
-    }]),
+    }, { rows: [{ database_epoch: "test-epoch", server_revision: revision }] }];
+    }),
     execute: mock(async (sql: string) => {
       executedSql.push(sql);
       if (sql.includes("returning database_epoch, server_revision")) {
@@ -122,6 +126,31 @@ const schemaDb = {
     return { rows: [{ result: JSON.stringify(introspectionResult) }] };
   }),
 };
+
+test('commit order determines revisions even when fanout is reversed or repeated', async () => {
+  await loadSchemaFromDatabase(schemaDb as any);
+  const db = syncDb();
+  const first = await runWithSync(db as any, queryMap, 'query-id', {}, {}, new Map([['s1', { session: {} }]]));
+  const second = await runWithSync(db as any, queryMap, 'query-id', {}, {}, new Map([['s1', { session: {} }]]));
+  const sent: any[] = [];
+  const newer = await second.sync((_id, message) => sent.push(message));
+  const older = await first.sync((_id, message) => sent.push(message));
+  expect([newer.serverRevision, older.serverRevision]).toEqual([2, 1]);
+  await first.sync((_id, message) => sent.push(message));
+  expect(sent).toHaveLength(2);
+  expect(first.response.result).not.toHaveProperty('serverRevision');
+});
+
+test('permission-filtered recipients get identity-free invalidation while visible edits remain incremental', async () => {
+  await loadSchemaFromDatabase(schemaDb as any);
+  const result = await runWithSync(syncDb() as any, queryMap, 'query-id', {}, {}, new Map([
+    ['s1', { session: {} }], ['denied', { session: {} }],
+  ]));
+  const sent: any[] = [];
+  await result.sync((id, message) => sent.push({ id, message }));
+  expect(sent.find((entry) => entry.id === 's1').message.type).toBe('delta');
+  expect(withoutServerRevision(sent.find((entry) => entry.id === 'denied').message)).toEqual({ type: 'invalidate' });
+});
 
 test("runWithSync sends reshaped sync deltas", async () => {
   await loadSchemaFromDatabase(schemaDb as any);
@@ -404,12 +433,12 @@ test("runWithSync advances revision and requires catchup when delta calculation 
   const syncResult = await result.sync((sessionId, message) => sent.push({ sessionId, message }));
 
   expect(syncResult.serverRevision).toBe(1);
-  expect(syncResult.originMessage.type).toBe("syncRequired");
+  expect(syncResult.originMessage.type).toBe("invalidate");
   expect(sent).toEqual([
     {
       sessionId: "recipient",
       message: {
-        type: "syncRequired",
+        type: "invalidate",
         serverRevision: 1,
         databaseEpoch: "test-epoch",
       },

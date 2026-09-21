@@ -77,13 +77,15 @@ type alias Model =
     , initialDataLoaded : Bool
     , inProgress : Bool
     , tablesSynced : Int
+    , generation : Int
     }
 
 
 type Msg
     = InitialDataLoaded Data.IndexedDb.SyncCursor (Maybe String)
     | CatchupRequired
-    | CatchupResponseReceived (Result Http.Error CatchupResponse)
+    | CatchupResponseReceived Int (Result Http.Error CatchupResponse)
+    | Invalidate String Int
     | DatabaseEpochResetCompleted String
     | DatabaseEpochResetFailed String String
 
@@ -111,6 +113,7 @@ init server =
     , initialDataLoaded = False
     , inProgress = False
     , tablesSynced = 0
+    , generation = 0
     }
 
 
@@ -175,8 +178,19 @@ update msg model db =
             , destructiveReset = False
             }
 
-        CatchupResponseReceived result ->
-            handleCatchupResponse result model db
+        CatchupResponseReceived generation result ->
+            if generation == model.generation then
+                handleCatchupResponse result model db
+
+            else
+                emptyUpdate model db
+
+        Invalidate epoch revision ->
+            let
+                result =
+                    handleCatchupResponse (Ok (DatabaseResetReceived { databaseId = model.server.databaseId, databaseEpoch = epoch })) model db
+            in
+            { result | dbCmds = [ Data.IndexedDb.resetForDatabaseEpochAtRevision epoch revision ] }
 
         DatabaseEpochResetCompleted completedEpoch ->
             if model.pendingResetEpoch == Just completedEpoch then
@@ -191,7 +205,7 @@ update msg model db =
                 in
                 { model = nextModel
                 , db = db
-                , cmd = requestCatchup Dict.empty nextModel.server (Just completedEpoch)
+                , cmd = requestCatchup nextModel.generation Dict.empty nextModel.server (Just completedEpoch)
                 , dbCmds = []
                 , delta = Nothing
                 , serverRevision = Nothing
@@ -234,7 +248,7 @@ startCatchupIfReady model =
                     }
             in
             ( { model | inProgress = True, status = Syncing progress }
-            , requestCatchup model.cursor model.server model.databaseEpoch
+            , requestCatchup model.generation model.cursor model.server model.databaseEpoch
             )
 
         _ ->
@@ -262,6 +276,7 @@ handleCatchupResponse result model db =
                                     }
                             , cursor = Dict.empty
                             , pendingResetEpoch = Just reset.databaseEpoch
+                            , generation = model.generation + 1
                             , inProgress = True
                             , tablesSynced = 0
                         }
@@ -326,7 +341,7 @@ handleCatchupResponse result model db =
 
                         ( nextModel, cmd ) =
                             if response.hasMore then
-                                ( baseModel, requestCatchup updatedCursor model.server (Just response.databaseEpoch) )
+                                ( baseModel, requestCatchup baseModel.generation updatedCursor model.server (Just response.databaseEpoch) )
 
                             else
                                 ( { baseModel | inProgress = False }, Cmd.none )
@@ -385,8 +400,8 @@ failedUpdate message model db =
     { result | error = Just message }
 
 
-requestCatchup : SyncCursor -> ServerConfig -> Maybe String -> Cmd Msg
-requestCatchup cursor server maybeEpoch =
+requestCatchup : Int -> SyncCursor -> ServerConfig -> Maybe String -> Cmd Msg
+requestCatchup generation cursor server maybeEpoch =
     let
         url =
             server.baseUrl ++ server.catchupPath
@@ -400,7 +415,7 @@ requestCatchup cursor server maybeEpoch =
             , headers = httpHeaders server.headers
             , url = url
             , body = body
-            , expect = Http.expectJson CatchupResponseReceived decodeCatchupResponse
+            , expect = Http.expectJson (CatchupResponseReceived generation) decodeCatchupResponse
             , timeout = Nothing
             , tracker = Nothing
             }
@@ -411,7 +426,7 @@ requestCatchup cursor server maybeEpoch =
             , headers = httpHeaders server.headers
             , url = url
             , body = body
-            , expect = Http.expectJson CatchupResponseReceived decodeCatchupResponse
+            , expect = Http.expectJson (CatchupResponseReceived generation) decodeCatchupResponse
             , timeout = Nothing
             , tracker = Nothing
             }
@@ -472,7 +487,9 @@ applyCatchupDelta response db =
             ( updatedDb, _ ) =
                 Db.update (Db.LocalDeltaReceived delta) dbWithKnownTables
         in
-        ( Just delta, updatedDb, [ Data.IndexedDb.writeDeltaWithEntityNotification "catchup" delta.tableGroups ] )
+        -- Main applies and persists this delta through the same revision filter
+        -- as live messages and mutation responses.
+        ( Just delta, updatedDb, [] )
 
 
 ensureTablesExist : List String -> Db.Db -> Db.Db
@@ -572,22 +589,28 @@ computeSyncCursor db cursor =
 
                 updatedEntry =
                     { lastSeenUpdatedAt =
-                        case maxCursor of
-                            Just ( updatedAt, _ ) ->
-                                Just updatedAt
-
-                            Nothing ->
-                                Dict.get tableName cursor
-                                    |> Maybe.map .lastSeenUpdatedAt
-                                    |> Maybe.withDefault Nothing
+                        Dict.get tableName cursor
+                            |> Maybe.andThen .lastSeenUpdatedAt
                     , lastSeenPrimaryKey =
-                        case maxCursor of
-                            Just ( _, primaryKey ) ->
-                                Just primaryKey
+                        Dict.get tableName cursor
+                            |> Maybe.andThen
+                                (\entry ->
+                                    case entry.lastSeenPrimaryKey of
+                                        Just key ->
+                                            Just key
 
-                            Nothing ->
-                                Dict.get tableName cursor
-                                    |> Maybe.andThen .lastSeenPrimaryKey
+                                        Nothing ->
+                                            case maxCursor of
+                                                Just ( timestamp, key ) ->
+                                                    if entry.lastSeenUpdatedAt == Just timestamp then
+                                                        Just key
+
+                                                    else
+                                                        Nothing
+
+                                                Nothing ->
+                                                    Nothing
+                                )
                     , permissionHash = existingPermission
                     }
             in

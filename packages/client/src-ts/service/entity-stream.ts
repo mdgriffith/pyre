@@ -28,7 +28,7 @@ export interface EntitySubscription {
 export interface EntityChange {
   tableName: string;
   id: string | number;
-  op: 'row';
+  op: 'row' | 'remove';
   row: Record<string, unknown>;
 }
 
@@ -52,6 +52,29 @@ interface EntityStreamRegistration {
 export class EntityStreamService {
   private registrations: Set<EntityStreamRegistration> = new Set();
   private sequence = 0;
+  private visibleRows = new Map<string, Array<Record<string, unknown>>>();
+
+  snapshot(): Map<string, Array<Record<string, unknown>>> {
+    return structuredClone(this.visibleRows);
+  }
+
+  handleVisibleState(tableGroups: ServerTableGroup[], source: EntityChangeBatchSource, databaseId?: string): void {
+    const next = expandTableGroups(tableGroups);
+    const previous = this.visibleRows;
+    this.visibleRows = next;
+    this.registrations.forEach(({ subscription, callback }) => {
+      const before = collectChanges(subscription, previous);
+      const after = collectChanges(subscription, next);
+      const key = (change: EntityChange) => JSON.stringify([change.tableName, change.id]);
+      const oldRows = new Map(before.map((change) => [key(change), change]));
+      const newRows = new Map(after.map((change) => [key(change), change]));
+      const changes: EntityChange[] = [
+        ...before.filter((change) => !newRows.has(key(change))).map((change): EntityChange => ({ ...change, op: 'remove', row: { id: change.id } })),
+        ...after.filter((change) => JSON.stringify(oldRows.get(key(change))?.row) !== JSON.stringify(change.row)),
+      ];
+      if (changes.length > 0) callback({ type: 'entity-change-batch', databaseId, sequence: this.reserveSequence(), source, changes: structuredClone(changes) });
+    });
+  }
 
   subscribe(subscription: EntitySubscription, callback: EntityChangeCallback): () => void {
     validateEntitySubscription(subscription);

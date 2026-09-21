@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { expect, test } from 'bun:test';
 import loadElm from '../dist/engine.mjs';
+import { EntityStreamService } from './service/entity-stream';
 
 const turn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const schema = {
@@ -44,7 +45,7 @@ async function harness(run) {
     }
   }
   globalThis.XMLHttpRequest = Xhr;
-  async function client() {
+  async function client(restored = {}) {
     const Elm = loadElm(Object.create(globalThis));
     const app = Elm.Main.init({ flags: {
       schema, server: { baseUrl: 'http://test', catchupPath: '/sync', databaseId: 'test' },
@@ -54,17 +55,22 @@ async function harness(run) {
     const writes = [];
     const results = [];
     const queryResults = [];
-    app.ports.visibleStateOut.subscribe((message) => visible.push(message));
+    const entities = new EntityStreamService();
+    app.ports.visibleStateOut.subscribe((message) => {
+      visible.push(message);
+      entities.handleVisibleState(message.snapshot, message.source, 'test');
+    });
     app.ports.indexedDbOut.subscribe((message) => writes.push(message));
     app.ports.queryManagerOut.subscribe((message) => results.push(message));
     app.ports.queryClientOut.subscribe((message) => queryResults.push(message));
     app.ports.receiveIndexedDbMessage.send({ type: 'initialData', data: {
       tables: { notes: initial }, cursor: { tables: {} }, databaseEpoch: 'epoch-1', lastAppliedServerRevision: null,
+      ...restored,
     } });
     await turn();
     await turn();
     return {
-      app, visible, writes, results,
+      app, visible, writes, results, entities,
       async edit(requestId, title, id = 1) {
         app.ports.receiveQueryManagerMessage.send({
           type: 'sendMutation', requestId, mutationId: 'update', baseUrl: 'http://test/db',
@@ -104,6 +110,56 @@ test('two clients share incremental authority; origin confirms without live deli
     expect((await a.rows())[0]).toEqual({ id: 1, title: 'Normalized', other: 'Server' });
     expect(a.visible.at(-1).data).toEqual(groups([[1, 'Server', 'Normalized']]).map((g) => ({ ...g, headers: ['id', 'other', 'title'] })));
     expect(requests).toHaveLength(1);
+  });
+});
+
+test('reload restores per-row revisions independently and keeps the invalidation floor', async () => {
+  await harness(async ({ client }) => {
+    const a = await client({ lastAppliedServerRevision: 3, rowRevisions: [['notes', 1, 1], ['notes', 2, 3]] });
+    await a.live(2, [[1, 'Delayed valid', 'Server'], [2, 'Stale', 'Server']]);
+    expect((await a.rows()).map((row) => row.title)).toEqual(['Delayed valid', 'Second']);
+    const reset = await client({ tables: { notes: [initial[1]] }, lastAppliedServerRevision: 3, revisionFloor: 3, rowRevisions: [['notes', 2, 3]] });
+    reset.app.ports.receiveSSEMessage.send({ type: 'invalidate', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 1 });
+    await turn();
+    await reset.live(2, [[1, 'Must not return', 'Secret']]);
+    expect((await reset.rows()).map((row) => row.id)).toEqual([2]);
+  });
+});
+
+test('engine snapshots include initial and late optimistic readers, rollback and reset removals', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client();
+    const subscription = { tables: [{ tableName: 'notes' }] };
+    expect(a.entities.createBatchFromRows(subscription, a.entities.snapshot(), 'indexeddb-initial').changes).toHaveLength(2);
+    await a.edit('pending', 'Pending');
+    expect(a.entities.createBatchFromRows(subscription, a.entities.snapshot(), 'indexeddb-initial').changes[0].row.title).toBe('Pending');
+    const batches = [];
+    a.entities.subscribe(subscription, (batch) => batches.push(batch));
+    requests[0].complete({}, 403);
+    await turn();
+    expect(batches.at(-1).changes[0].row.title).toBe('Initial');
+    a.app.ports.receiveSSEMessage.send({ type: 'invalidate', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 3 });
+    await turn();
+    expect(batches.at(-1).changes.map((change) => change.op)).toEqual(['remove', 'remove']);
+    expect(a.entities.snapshot().size).toBe(0);
+    await a.live(4, [[1, 'During reset', 'Secret']]);
+    expect(await a.rows()).toEqual([]);
+  });
+});
+
+test('catchup cannot replace a newer live row or persist a stale version', async () => {
+  await harness(async ({ client, setCatchupResponse }) => {
+    const a = await client();
+    await a.live(5, [[1, 'New', 'New']]);
+    setCatchupResponse({ databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 4, has_more: false,
+      tables: { notes: { rows: [{ id: 1, title: 'Old', other: 'Old' }], permission_hash: '', last_seen_updated_at: null } } });
+    const before = a.writes.length;
+    a.app.ports.receiveSSEMessage.send({ type: 'syncRequired', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 6 });
+    await turn();
+    await turn();
+    expect((await a.rows())[0].title).toBe('New');
+    expect(a.writes.slice(before).filter((m) => m.type === 'writeDelta').flatMap((m) => m.tableGroups).flatMap((g) => g.rows)).toEqual([]);
+    expect(a.writes.filter((m) => m.type === 'writeServerRevision').at(-1).serverRevision).toBe(5);
   });
 });
 

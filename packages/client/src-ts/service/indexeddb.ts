@@ -257,6 +257,55 @@ export class IndexedDBStorage {
     });
   }
 
+  async getRowRevisions(): Promise<Array<[string, number, number]>> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const request = db.transaction(['meta'], 'readonly').objectStore('meta').get('rowRevisions');
+      request.onsuccess = () => resolve(Object.entries(request.result ?? {}).map(([key, revision]) => [...JSON.parse(key), revision] as [string, number, number]));
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async getRevisionFloor(): Promise<number | null> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const request = db.transaction(['meta'], 'readonly').objectStore('meta').get('revisionFloor');
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  // Engine-approved authority and its per-row stamps commit together. A global
+  // revision cannot stand in for these stamps: responses can arrive out of order
+  // for different rows, including across a reload.
+  async putAuthoritativeDelta(groups: TableGroup[], revision: number): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['tables', 'meta'], 'readwrite');
+      const rows = tx.objectStore('tables');
+      const meta = tx.objectStore('meta');
+      const request = meta.get('rowRevisions');
+      request.onsuccess = () => {
+        const stamps: Record<string, number> = request.result ?? {};
+        for (const group of groups) {
+          for (const values of group.rows) {
+            const row = Object.fromEntries(group.headers.map((header, index) => [header, values[index]]));
+            const key = JSON.stringify([group.table_name, row.id]);
+            if (stamps[key] !== undefined && stamps[key] >= revision) continue;
+            rows.put({ ...row, tableName: group.table_name });
+            stamps[key] = revision;
+          }
+        }
+        meta.put(stamps, 'rowRevisions');
+      };
+      const current = meta.get('lastAppliedServerRevision');
+      current.onsuccess = () => meta.put(Math.max(current.result ?? 0, revision), 'lastAppliedServerRevision');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('Authoritative write aborted'));
+    });
+  }
+
   async putServerRevision(serverRevision: number): Promise<void> {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
@@ -292,7 +341,7 @@ export class IndexedDBStorage {
     });
   }
 
-  async resetForDatabaseEpoch(databaseEpoch: string): Promise<void> {
+  async resetForDatabaseEpoch(databaseEpoch: string, revisionFloor?: number): Promise<void> {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(['tables', 'syncCursor', 'meta'], 'readwrite');
@@ -300,6 +349,13 @@ export class IndexedDBStorage {
       tx.objectStore('syncCursor').clear();
       const meta = tx.objectStore('meta');
       meta.delete('lastAppliedServerRevision');
+      meta.delete('rowRevisions');
+      if (revisionFloor === undefined) {
+        meta.delete('revisionFloor');
+      } else {
+        meta.put(revisionFloor, 'revisionFloor');
+        meta.put(revisionFloor, 'lastAppliedServerRevision');
+      }
       meta.put(databaseEpoch, 'databaseEpoch');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(new Error(`Failed to reset database epoch: ${tx.error}`));
@@ -445,14 +501,18 @@ export class IndexedDbService {
     }
   }
 
-  private async handleMessage(message: { type?: string; tableGroups?: TableGroup[]; cursor?: SyncCursor; serverRevision?: number; databaseEpoch?: string; entityStreamSource?: string }): Promise<void> {
+  private async handleMessage(message: { type?: string; tableGroups?: TableGroup[]; cursor?: SyncCursor; serverRevision?: number; revisionFloor?: number; databaseEpoch?: string; entityStreamSource?: string }): Promise<void> {
     if (message.type === 'requestInitialData') {
       await this.sendInitialData();
       return;
     }
 
     if (message.type === 'writeDelta') {
-      await this.writeDelta(message.tableGroups || [], message.entityStreamSource);
+      if (typeof message.serverRevision === 'number') {
+        await this.storage.putAuthoritativeDelta(message.tableGroups || [], message.serverRevision);
+      } else {
+        await this.writeDelta(message.tableGroups || [], message.entityStreamSource);
+      }
       return;
     }
 
@@ -473,7 +533,7 @@ export class IndexedDbService {
     }
 
     if (message.type === 'resetForDatabaseEpoch' && typeof message.databaseEpoch === 'string') {
-      await this.resetForDatabaseEpoch(message.databaseEpoch);
+      await this.resetForDatabaseEpoch(message.databaseEpoch, message.revisionFloor);
     }
   }
 
@@ -490,6 +550,8 @@ export class IndexedDbService {
       const cursor = await this.storage.getSyncCursor();
       const lastAppliedServerRevision = await this.storage.getServerRevision();
       const databaseEpoch = await this.storage.getDatabaseEpoch();
+      const rowRevisions = await this.storage.getRowRevisions();
+      const revisionFloor = await this.storage.getRevisionFloor();
 
       const tableCounts = Object.fromEntries(
         Object.entries(tables).map(([tableName, rows]) => [tableName, rows.length])
@@ -498,7 +560,7 @@ export class IndexedDbService {
 
       this.elmApp.ports.receiveIndexedDbMessage.send({
         type: 'initialData',
-        data: { tables, cursor, lastAppliedServerRevision, databaseEpoch },
+        data: { tables, cursor, lastAppliedServerRevision, databaseEpoch, rowRevisions, revisionFloor },
       });
       this.debugLog('[PyreClient] IndexedDB initial data loaded', {
         tableCounts,
@@ -514,12 +576,12 @@ export class IndexedDbService {
     }
   }
 
-  private async resetForDatabaseEpoch(databaseEpoch: string): Promise<void> {
+  private async resetForDatabaseEpoch(databaseEpoch: string, revisionFloor?: number): Promise<void> {
     if (!this.elmApp?.ports.receiveIndexedDbMessage) {
       return;
     }
     try {
-      await this.storage.resetForDatabaseEpoch(databaseEpoch);
+      await this.storage.resetForDatabaseEpoch(databaseEpoch, revisionFloor);
       this.onDatabaseEpochReset?.();
       this.onDatabaseEpochStored?.(databaseEpoch);
       this.elmApp.ports.receiveIndexedDbMessage.send({

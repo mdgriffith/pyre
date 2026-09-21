@@ -121,7 +121,7 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
 
     result.push_str("type EntityChange\n");
     if records.is_empty() {
-        result.push_str("    = EntityDecodeFailed String Decode.Value\n\n\n");
+        result.push_str("    = EntityDecodeFailed String Decode.Value\n    | EntityRemoved String Decode.Value\n\n\n");
     } else {
         for (index, record) in records.iter().enumerate() {
             let prefix = if index == 0 { "    = " } else { "    | " };
@@ -130,7 +130,7 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
                 prefix, record.record_name, record.table_module_segment
             ));
         }
-        result.push_str("    | EntityDecodeFailed String Decode.Value\n\n\n");
+        result.push_str("    | EntityDecodeFailed String Decode.Value\n    | EntityRemoved String Decode.Value\n\n\n");
     }
 
     result.push_str("type EntityChangeBatchSource\n    = IndexedDbInitial\n    | Catchup\n    | Live\n    | UnknownSource String\n\n\n");
@@ -193,6 +193,10 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
 
     result.push_str("entityChangeDecoder : Decode.Decoder EntityChange\n");
     result.push_str("entityChangeDecoder =\n");
+    result.push_str("    Decode.field \"op\" Decode.string\n        |> Decode.andThen\n            (\\op ->\n                case op of\n                    \"remove\" ->\n                        Decode.map2 EntityRemoved\n                            (Decode.field \"tableName\" Decode.string)\n                            (Decode.field \"id\" Decode.value)\n\n                    \"row\" ->\n                        rowEntityChangeDecoder\n\n                    _ ->\n                        Decode.fail (\"Unknown entity operation: \" ++ op)\n            )\n\n\n");
+    result.push_str(
+        "rowEntityChangeDecoder : Decode.Decoder EntityChange\nrowEntityChangeDecoder =\n",
+    );
     result.push_str("    Decode.map2 Tuple.pair\n");
     result.push_str("        (Decode.field \"tableName\" Decode.string)\n");
     result.push_str("        (Decode.field \"row\" Decode.value)\n");

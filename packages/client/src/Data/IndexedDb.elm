@@ -5,6 +5,8 @@ port module Data.IndexedDb exposing
     , receiveIncoming
     , requestInitialData
     , resetForDatabaseEpoch
+    , resetForDatabaseEpochAtRevision
+    , writeAuthoritativeDelta
     , writeDatabaseEpoch
     , writeDelta
     , writeDeltaWithEntityNotification
@@ -28,6 +30,8 @@ type alias InitialData =
     , cursor : SyncCursor
     , lastAppliedServerRevision : Maybe Int
     , databaseEpoch : Maybe String
+    , rowRevisions : Dict ( String, Int ) Int
+    , revisionFloor : Maybe Int
     }
 
 
@@ -153,11 +157,47 @@ decodeIncoming =
 
 decodeInitialData : Decode.Decoder InitialData
 decodeInitialData =
-    Decode.map4 InitialData
+    Decode.map6 InitialData
         (Decode.field "tables" (Decode.dict (Decode.list (Decode.dict Data.Value.decodeValue))))
         (Decode.field "cursor" decodeSyncCursor)
         (Decode.maybe (Decode.field "lastAppliedServerRevision" Decode.int))
         (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
+        (Decode.oneOf
+            [ Decode.field "rowRevisions"
+                (Decode.list
+                    (Decode.map3 (\table id revision -> ( ( table, id ), revision ))
+                        (Decode.index 0 Decode.string)
+                        (Decode.index 1 Decode.int)
+                        (Decode.index 2 Decode.int)
+                    )
+                )
+                |> Decode.map Dict.fromList
+            , Decode.succeed Dict.empty
+            ]
+        )
+        (Decode.maybe (Decode.field "revisionFloor" Decode.int))
+
+
+resetForDatabaseEpochAtRevision : String -> Int -> Cmd msg
+resetForDatabaseEpochAtRevision epoch revision =
+    indexedDbOut
+        (Encode.object
+            [ ( "type", Encode.string "resetForDatabaseEpoch" )
+            , ( "databaseEpoch", Encode.string epoch )
+            , ( "revisionFloor", Encode.int revision )
+            ]
+        )
+
+
+writeAuthoritativeDelta : Maybe Int -> List TableGroup -> Cmd msg
+writeAuthoritativeDelta revision groups =
+    indexedDbOut
+        (Encode.object
+            [ ( "type", Encode.string "writeDelta" )
+            , ( "tableGroups", Encode.list Data.Delta.encodeTableGroup groups )
+            , ( "serverRevision", Maybe.map Encode.int revision |> Maybe.withDefault Encode.null )
+            ]
+        )
 
 
 decodeSyncCursor : Decode.Decoder SyncCursor

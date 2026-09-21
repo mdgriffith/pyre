@@ -16,18 +16,6 @@ export const MAX_LIVE_SYNC_DELTA_ROWS = 5000;
 export const MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES = 1024 * 1024;
 export const MAX_LIVE_SYNC_FANOUT_RECIPIENTS = 1000;
 
-async function nextLiveSyncRevision(db: Client): Promise<{ databaseEpoch: string; serverRevision: number }> {
-  const result = await db.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
-  const databaseEpoch = result.rows[0]?.database_epoch;
-  const value = result.rows[0]?.server_revision;
-
-  if (typeof databaseEpoch !== "string" || (typeof value !== "number" && typeof value !== "bigint")) {
-    throw new Error("Failed to allocate Pyre sync server revision");
-  }
-
-  return { databaseEpoch, serverRevision: Number(value) };
-}
-
 function countRows(tableGroups: unknown): number {
   if (!Array.isArray(tableGroups)) {
     return 0;
@@ -79,10 +67,10 @@ function singleOriginSession(
   return origin ? new Map([[originSessionId, origin]]) : undefined;
 }
 
-function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDeltasFn {
+function syncWithWasmForDatabase(databaseId?: DatabaseId): SyncDeltasFn {
   const normalizedDatabaseId = databaseId ? requireDatabaseId(databaseId) : undefined;
 
-  return async (affectedRowGroups, connectedSessions, sendToSession, originSessionId) => {
+  return async (affectedRowGroups, connectedSessions, sendToSession, originSessionId, committedRevision) => {
     activateSchemaForDatabase(normalizedDatabaseId);
 
     const broadcastSessions = sessionsWithoutOrigin(connectedSessions, originSessionId);
@@ -93,7 +81,18 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
         { ...data, session: normalizeForWasmJson(data.session) },
       ]),
     );
-    const { databaseEpoch, serverRevision } = await nextLiveSyncRevision(db);
+    if (!committedRevision) throw new Error("Missing committed sync revision");
+    const { databaseEpoch, serverRevision } = committedRevision;
+    // The affected-row format contains only post-update rows. If a session
+    // cannot see all of them, it may have lost access to a cached row. Do not
+    // disclose that row's identity: invalidate the cache and catch up instead.
+    const invalidation = {
+      type: "invalidate",
+      serverRevision,
+      databaseEpoch,
+      ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
+    };
+    const affectedCount = countRows(affectedRowGroups);
     const deltasResult = wasm.calculate_sync_deltas(
       affectedRowGroups,
       normalizeSessions(broadcastSessions),
@@ -101,12 +100,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
 
     if (typeof deltasResult === "string" && deltasResult.startsWith("Error:")) {
       console.error("[SyncDeltas] Failed to calculate sync deltas:", deltasResult);
-      const message = {
-        type: "syncRequired",
-        serverRevision,
-        databaseEpoch,
-        ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-      };
+      const message = invalidation;
       for (const sessionId of broadcastSessions.keys()) {
         sendToSession(sessionId, message);
       }
@@ -119,9 +113,7 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
 
     const result = typeof deltasResult === "string" ? JSON.parse(deltasResult) : deltasResult;
 
-    if ((!Array.isArray(result.groups) || result.groups.length === 0) && !originSession) {
-      return { databaseEpoch, serverRevision };
-    }
+    const delivered = new Set<string>();
 
     for (const group of Array.isArray(result.groups) ? result.groups : []) {
       const reshapedTableGroupsResult = wasm.reshape_sync_table_groups(normalizeForWasmJson(group.table_groups));
@@ -143,7 +135,9 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
         data,
       };
 
-      const message = liveSyncRequiresCatchup(deltaMessage, countRows(data), group.session_ids.length)
+      const message = countRows(group.table_groups) < affectedCount
+        ? invalidation
+        : liveSyncRequiresCatchup(deltaMessage, countRows(data), group.session_ids.length)
         ? {
           type: "syncRequired",
           serverRevision,
@@ -154,10 +148,15 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
 
       for (const sessionId of group.session_ids) {
         sendToSession(sessionId, message);
+        delivered.add(sessionId);
       }
     }
 
-    let originMessage: unknown;
+    for (const sessionId of broadcastSessions.keys()) {
+      if (!delivered.has(sessionId)) sendToSession(sessionId, invalidation);
+    }
+
+    let originMessage: unknown = originSession ? invalidation : undefined;
     if (originSession) {
       const originDeltasResult = wasm.calculate_sync_deltas(
         affectedRowGroups,
@@ -186,7 +185,9 @@ function syncWithWasmForDatabase(db: Client, databaseId?: DatabaseId): SyncDelta
               ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
               data,
             };
-            originMessage = liveSyncRequiresCatchup(deltaMessage, countRows(data), originGroup.session_ids.length)
+            originMessage = countRows(originGroup.table_groups) < affectedCount
+              ? invalidation
+              : liveSyncRequiresCatchup(deltaMessage, countRows(data), originGroup.session_ids.length)
               ? {
                 type: "syncRequired",
                 serverRevision,
@@ -214,9 +215,8 @@ export async function runWithSync(
   originSessionId?: string,
 ): Promise<QueryResult> {
   const syncSessions = connectedSessions ? new Map(connectedSessions) : new Map();
-  if (originSessionId && !syncSessions.has(originSessionId)) {
-    syncSessions.set(originSessionId, { session: executingSession as Record<string, SessionValue> });
-  }
+  const responseSessionId = originSessionId ?? `__pyre_response_${crypto.randomUUID()}`;
+  syncSessions.set(responseSessionId, { session: executingSession as Record<string, SessionValue> });
 
-  return run(db, queryMap, queryId, args, executingSession, syncSessions, syncWithWasmForDatabase(db, databaseId), originSessionId, { mode: "sync" });
+  return run(db, queryMap, queryId, args, executingSession, syncSessions, syncWithWasmForDatabase(databaseId), responseSessionId, { mode: "sync", allocateSyncRevision: true });
 }

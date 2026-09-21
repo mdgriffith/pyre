@@ -24,6 +24,8 @@ test('IndexedDbService restores persisted sync cursor with initial data', async 
     getSyncCursor: async () => persistedCursor,
     getServerRevision: async () => serverRevision,
     getDatabaseEpoch: async () => 'persisted-epoch',
+    getRowRevisions: async () => [['maps', 1, 7]],
+    getRevisionFloor: async () => null,
     putSyncCursor: async (cursor: SyncCursor) => {
       Object.assign(persistedCursor, cursor);
     },
@@ -72,6 +74,8 @@ test('IndexedDbService restores persisted sync cursor with initial data', async 
         cursor: persistedCursor,
         lastAppliedServerRevision: 7,
         databaseEpoch: 'persisted-epoch',
+        rowRevisions: [['maps', 1, 7]],
+        revisionFloor: null,
       },
     },
   ]);

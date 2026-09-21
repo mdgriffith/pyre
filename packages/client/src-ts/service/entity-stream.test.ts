@@ -22,6 +22,20 @@ const delta = [
   },
 ];
 
+test('engine-visible projection emits removals on filter exit and reset without retaining secret rows', () => {
+  const service = new EntityStreamService();
+  service.handleVisibleState(delta, 'catchup');
+  const batches: any[] = [];
+  service.subscribe({ tables: [{ tableName: 'posts', where: { published: true } }] }, (batch) => batches.push(batch));
+  service.handleVisibleState([{ ...delta[0], rows: [[1, 10, 'Private now', false], [2, 20, 'Draft', false]] }], 'optimistic');
+  expect(batches[0].changes).toEqual([{ tableName: 'posts', id: 1, op: 'remove', row: { id: 1 } }]);
+  service.handleVisibleState(delta, 'mutation-response');
+  expect(batches[1].changes[0].row.title).toBe('Hello');
+  service.handleVisibleState([], 'catchup');
+  expect(batches[2].changes[0].op).toBe('remove');
+  expect(service.snapshot().size).toBe(0);
+});
+
 test('entity stream emits matching table rows as batches', () => {
   const service = new EntityStreamService();
   const batches: unknown[] = [];

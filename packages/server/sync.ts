@@ -254,6 +254,29 @@ export async function catchup(
     databaseId?: DatabaseId,
     clientDatabaseEpoch?: string,
 ): Promise<CatchupResult> {
+    validateSyncCursor(syncCursor);
+    normalizePageSize(pageSize);
+    const tx = await db.transaction("read");
+    try {
+        const result = await catchupSnapshot(tx, syncCursor, session, pageSize, databaseId, clientDatabaseEpoch);
+        await tx.commit();
+        return result;
+    } catch (error) {
+        if (!tx.closed) await tx.rollback();
+        throw error;
+    } finally {
+        tx.close();
+    }
+}
+
+async function catchupSnapshot(
+    db: Pick<Client, "execute" | "batch">,
+    syncCursor: SyncCursor,
+    session: SyncSession,
+    pageSize: number,
+    databaseId?: DatabaseId,
+    clientDatabaseEpoch?: string,
+): Promise<CatchupResult> {
     activateSchemaForDatabase(databaseId);
     const effectivePageSize = normalizePageSize(pageSize);
     validateSyncCursor(syncCursor);
@@ -290,6 +313,7 @@ export async function catchup(
     }
 
     // Step 3: Get sync SQL for tables that need syncing
+    activateSchemaForDatabase(databaseId);
     const syncSqlResult = wasm.get_sync_sql(statusResult.rows, syncCursor, wasmSession, effectivePageSize);
     if (typeof syncSqlResult === "string" && syncSqlResult.startsWith("Error:")) {
         throw new Error(syncSqlResult);
@@ -328,6 +352,7 @@ export async function catchup(
 
     // Execute all SQL statements in a single batch
     const allQueryResults = await db.batch(allSqlStatements);
+    activateSchemaForDatabase(databaseId);
 
     // Process results for each table
     let resultIndex = 0;

@@ -61,7 +61,11 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   sql_introspect_uninitialized: () => "select uninitialized introspection",
 }));
 
-const { catchup, rotateDatabaseEpoch } = await import("./sync");
+const { catchup: catchupImplementation, rotateDatabaseEpoch } = await import("./sync");
+const catchup = (db: any, ...args: any[]) => catchupImplementation({
+  ...db,
+  transaction: mock(async () => ({ ...db, commit: async () => {}, rollback: async () => {}, close() {}, closed: false })),
+}, ...args);
 const { ensureDatabase, loadSchemaFromDatabase } = await import("./schema");
 
 afterEach(() => {
