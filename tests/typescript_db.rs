@@ -11,6 +11,70 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 }
 
 #[test]
+fn generated_crud_builders_reuse_typed_modules_and_checked_execution() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+record Document {
+    @public
+    id Id.Uuid @id
+    title String
+    owner String @immutable
+    summary String?
+    tags Json<List<String>>
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap();
+    let mut queries = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = vec![];
+    core::generate_queries(
+        &context,
+        &info,
+        &queries,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+    let file = |suffix: &str| {
+        &files
+            .iter()
+            .find(|file| path_ends_with(&file.path, suffix))
+            .unwrap()
+            .contents
+    };
+    let builders = file("edits.ts");
+    assert!(builders.contains("documentCreate(input: Omit<DocumentCreate.Input, \"id\">)"));
+    assert!(builders.contains("[\"id\"]: createId()"));
+    assert!(builders.contains("patch: Omit<DocumentUpdate.Input, \"id\">"));
+    assert!(builders.contains("documentDelete(id: DocumentDelete.Input[\"id\"])"));
+    assert!(file("metadata/documentCreate.ts")
+        .contains("generatedEdit: { writeStatement: 0, createId: \"id\" }"));
+    let update = file("metadata/documentUpdate.ts");
+    assert!(update.contains("generatedEdit: { writeStatement: 0 }"));
+    assert!(update.contains("summary: z.string().nullable().optional()"));
+    assert!(!update
+        .split("export type Input")
+        .next()
+        .unwrap()
+        .contains("owner:"));
+
+    // A command that merely claims a reserved name is not compiler-owned.
+    let ast::QueryDef::Query(mut impostor) = queries.queries[0].clone() else {
+        panic!()
+    };
+    impostor.args.clear();
+    assert!(pyre::generated_queries::generated_crud_table(&context, &impostor).is_none());
+}
+
+#[test]
 fn typescript_schema_and_decoders_render_typed_json_containers() {
     let schema_source = r#"
 type Lifecycle

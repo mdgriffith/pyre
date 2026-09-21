@@ -106,6 +106,20 @@ test("composed execution rejects mismatched namespaces before opening a transact
   expect(db.transaction).not.toHaveBeenCalled();
 });
 
+test("generated UUID creates reject noncanonical identity before execution", async () => {
+  const db = { transaction: mock(() => { throw new Error('must not execute'); }) };
+  const query = {
+    id: 'create', sql: [], session_args: [], optional_input_args: [], json_input_args: [],
+    generatedEdit: { writeStatement: 0, createId: 'id' },
+    InputValidator: z.object({ id: z.string() }).strict(), SessionValidator: z.object({}),
+  };
+  for (const id of [undefined, '01900000-0000-4000-8000-000000000000', '019ABCDE-0000-7000-8000-000000000000', '01900000-0000-7000-0000-000000000000']) {
+    const result = await run(db as any, { create: query }, 'create', { id }, {});
+    expect(result.error?.errorType).toBe('InvalidInput');
+  }
+  expect(db.transaction).not.toHaveBeenCalled();
+});
+
 test("failed commit reports unknown outcome rather than a safe-to-retry rejection", async () => {
   const tx = {
     batch: async () => [],

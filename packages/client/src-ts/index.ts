@@ -1,5 +1,5 @@
 import loadElm from '../dist/engine.mjs';
-import { captureOperations, type Operation } from './operations';
+import { captureOperations, createId, type Operation } from './operations';
 import { IndexedDBStorage, IndexedDbService } from './service/indexeddb';
 import {
   EntityStreamService,
@@ -2294,6 +2294,26 @@ function entityValuesEqual(left: unknown, right: unknown): boolean {
 function parseElmBridgeIncomingMessage(message: unknown): ElmBridgeIncomingMessage {
   const raw = asObject(message, 'Pyre bridge message');
   const type = raw.type;
+
+  if (type === 'submit') {
+    if (!Array.isArray(raw.operations)) throw new Error('Expected an operation batch');
+    const captured = raw.operations.map((value) => {
+      const descriptor = asObject(value, 'operation');
+      const input = { ...asObject(descriptor.input, 'operation input') };
+      if (descriptor.createId != null) {
+        input[asNonEmptyString(descriptor.createId, 'create identity field')] = createId();
+      }
+      return { queryId: asNonEmptyString(descriptor.queryId, 'operation queryId'), input, optimistic: descriptor.optimistic };
+    });
+    return {
+      type: 'mutate',
+      databaseId: requireDatabaseId(raw.databaseId, 'submit message databaseId'),
+      requestId: asNonEmptyString(raw.requestId, 'submit message requestId'),
+      mutationId: '$batch',
+      mutationInput: captured.map(({ queryId, input }) => ({ queryId, input })),
+      optimistic: captured.filter(item => item.optimistic != null).map(({ input, optimistic }) => ({ input, optimistic })),
+    };
+  }
 
   if (type === 'mutate') {
     return {

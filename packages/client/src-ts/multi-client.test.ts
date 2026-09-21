@@ -661,6 +661,35 @@ test('Elm bridge routes mutation messages by databaseId', async () => {
   ]);
 });
 
+test('Elm edit submission allocates UUIDv7 once and shares captured input with prediction', async () => {
+  const received: any[] = [];
+  const outbound = fakePort();
+  await PyreClient.create({
+    schema, server, cacheNamespace: 'edit-bridge',
+    createInternalClient: async config => ({
+      ...fakeInternalClient([], config.databaseId),
+      run(databaseId: string, queryModule: any, input: any, callback: any) {
+        received.push({ databaseId, queryModule, input });
+        callback({ ok: true, value: [] });
+      },
+    }),
+    elm: { app: { ports: { pyreStoreOut: outbound.port } } },
+  });
+  const prediction = { queryField: 'notes', where: { field: 'id', input: 'id' }, set: [] };
+  outbound.emit({ type: 'submit', databaseId: 'campaign:123', requestId: 'create-batch', operations: [
+    { queryId: 'create', input: { title: 'Title' }, createId: 'id', optimistic: prediction },
+    { queryId: 'update', input: { id: 'existing', title: 'Updated' }, optimistic: prediction },
+  ] });
+  await Bun.sleep(0);
+  expect(received).toHaveLength(1);
+  const sent = received[0];
+  expect(sent.queryModule.id).toBe('$batch');
+  expect(sent.input[0].input.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  expect(sent.queryModule.optimistic[0].input).toEqual(sent.input[0].input);
+  expect(sent.input[0]).not.toHaveProperty('createId');
+  expect(sent.input[1].input).toEqual({ id: 'existing', title: 'Updated' });
+});
+
 test('Elm bridge routes entity stream registrations and batches by streamId', async () => {
   const receivedSubscriptions: any[] = [];
   const unsubscribed: string[] = [];

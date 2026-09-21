@@ -921,15 +921,27 @@ fn collect_id_brands(database: &ast::Database) -> Vec<(String, IdKind)> {
     for schema in &database.schemas {
         for file in &schema.files {
             for definition in &file.definitions {
-                if let ast::Definition::Record { fields, .. } = definition {
+                if let ast::Definition::Record { name, fields, .. } = definition {
                     for field in fields {
                         if let ast::Field::Column(column) = field {
                             match &column.type_ {
-                                ast::ColumnType::IdInt { table } if !table.is_empty() => {
-                                    brands.entry(table.clone()).or_insert(IdKind::Int);
+                                ast::ColumnType::IdInt { table } => {
+                                    brands
+                                        .entry(if table.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            table.clone()
+                                        })
+                                        .or_insert(IdKind::Int);
                                 }
-                                ast::ColumnType::IdUuid { table } if !table.is_empty() => {
-                                    brands.entry(table.clone()).or_insert(IdKind::Uuid);
+                                ast::ColumnType::IdUuid { table } => {
+                                    brands
+                                        .entry(if table.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            table.clone()
+                                        })
+                                        .or_insert(IdKind::Uuid);
                                 }
                                 _ => {}
                             }
@@ -1639,6 +1651,34 @@ pub fn generate_queries(
     files: &mut Vec<GeneratedFile<String>>,
 ) {
     let mut query_names: Vec<String> = Vec::new();
+    files.push(generate_text_file(
+        base_out_dir.join("Db/Edit.elm"),
+        include_str!("./static/elm/src/Db/Edit.elm"),
+    ));
+    files.push(generate_text_file(
+        base_out_dir.join("Db/Edit/Internal.elm"),
+        include_str!("./static/elm/src/Db/Edit/Internal.elm"),
+    ));
+
+    let mut edit_modules: HashMap<String, Vec<&ast::Query>> = HashMap::new();
+    for definition in &query_list.queries {
+        if let ast::QueryDef::Query(query) = definition {
+            if let Some(table) = crate::generated_queries::generated_crud_table(context, query) {
+                edit_modules
+                    .entry(table.record.name.clone())
+                    .or_default()
+                    .push(query);
+            }
+        }
+    }
+    let mut records: Vec<_> = edit_modules.into_iter().collect();
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+    for (record, queries) in records {
+        files.push(generate_text_file(
+            base_out_dir.join(format!("Db/Edit/{record}.elm")),
+            to_edit_module(context, all_query_info, &record, &queries),
+        ));
+    }
 
     for operation in &query_list.queries {
         match operation {
@@ -1665,6 +1705,169 @@ pub fn generate_queries(
             generate_pyre_module(context, all_query_info, query_list, &query_names),
         ));
     }
+}
+
+fn to_edit_module(
+    context: &typecheck::Context,
+    info: &HashMap<String, typecheck::QueryInfo>,
+    record: &str,
+    queries: &[&ast::Query],
+) -> String {
+    let lookup = ElmLookup::from_context(context);
+    let mut exposing = vec!["Patch".to_string(), "CreateOption".to_string()];
+    let mut used_names: HashSet<String> = ["create", "update", "delete", "optimistic"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut builder_names = HashMap::new();
+    // Reserve patch names first, then disambiguate optional-create builders.
+    for operation in [ast::QueryOperation::Update, ast::QueryOperation::Insert] {
+        for query in queries.iter().filter(|query| query.operation == operation) {
+            for arg in query.args.iter().filter(|arg| arg.omittable) {
+                let prefix = if operation == ast::QueryOperation::Update {
+                    "patch"
+                } else {
+                    "create"
+                };
+                let mut name = if operation == ast::QueryOperation::Update {
+                    arg.name.clone()
+                } else {
+                    format!("with{}", string::capitalize(&arg.name))
+                };
+                while !used_names.insert(name.clone()) {
+                    name.push('_');
+                }
+                builder_names.insert((prefix, arg.name.clone()), name);
+            }
+        }
+    }
+    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit.Internal as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict\nimport Json.Encode as Encode\nimport Time\n\n\ntype Patch\n    = Patch ( String, Encode.Value )\n\n\ntype CreateOption\n    = CreateOption ( String, Encode.Value )\n\n\n");
+    for query in queries {
+        let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
+        let key = ast::collect_columns(&table.record.fields)
+            .into_iter()
+            .find(|c| ast::is_primary_key(c))
+            .unwrap();
+        let namespace = elm_database_namespace(&info[&query.name].primary_db);
+        let edit_type = format!("Internal.Edit Db.Database.{namespace}");
+        let construct = |input: &str, optimistic: &str, create_id: &str| {
+            format!(
+                "Internal.Edit {{ queryId = {}, input = {}, optimistic = {}, createId = {} }}",
+                string::quote(&query.interface_hash),
+                input,
+                optimistic,
+                create_id
+            )
+        };
+        match query.operation {
+            ast::QueryOperation::Update | ast::QueryOperation::Delete => {
+                let key_arg = query.args.iter().find(|arg| arg.name == key.name).unwrap();
+                let key_type = to_elm_typename(&lookup, key_arg.type_.as_deref().unwrap(), false);
+                let key_encoder =
+                    to_param_encoder_str(&lookup, key_arg.type_.as_deref().unwrap(), false);
+                let key_pair = format!("( {}, {} id )", string::quote(&key.name), key_encoder);
+                if query.operation == ast::QueryOperation::Update {
+                    exposing.push("update".into());
+                    let optimistic = to_optimistic_update_elm(query).unwrap_or_else(|| "optimistic : Input -> Encode.Value\noptimistic _ =\n    Encode.null\n\n\n".into());
+                    // Prediction is compiler-owned and independent of argument values.
+                    body.push_str(&optimistic.replace(
+                        "optimistic : Input -> Encode.Value",
+                        "optimistic : () -> Encode.Value",
+                    ));
+                    body.push_str(&format!("update : ({key_type}) -> List Patch -> {edit_type}\nupdate id patches =\n    {}\n\n\n", construct(&format!("(Encode.object ({key_pair} :: List.map (\\(Patch pair) -> pair) patches))"), "(optimistic ())", "Nothing")));
+                    for arg in query.args.iter().filter(|arg| arg.omittable) {
+                        let name = builder_names[&("patch", arg.name.clone())].clone();
+                        exposing.push(name.clone());
+                        let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                        let type_ = if arg.nullable {
+                            format!("Maybe ({base})")
+                        } else {
+                            base
+                        };
+                        let encoder = to_param_encoder_str(
+                            &lookup,
+                            arg.type_.as_deref().unwrap(),
+                            arg.nullable,
+                        );
+                        body.push_str(&format!("{name} : ({type_}) -> Patch\n{name} value =\n    Patch ( {}, {} value )\n\n\n", string::quote(&arg.name), encoder));
+                    }
+                } else {
+                    exposing.push("delete".into());
+                    body.push_str(&format!(
+                        "delete : ({key_type}) -> {edit_type}\ndelete id =\n    {}\n\n\n",
+                        construct(
+                            &format!("(Encode.object [ {key_pair} ])"),
+                            "Encode.null",
+                            "Nothing"
+                        )
+                    ));
+                }
+            }
+            ast::QueryOperation::Insert => {
+                exposing.extend(["create".into(), "Required".into()]);
+                let allocated_id = matches!(key.type_, ast::ColumnType::IdUuid { .. });
+                let args: Vec<_> = query
+                    .args
+                    .iter()
+                    .filter(|arg| !(allocated_id && arg.name == key.name))
+                    .collect();
+                let required: Vec<_> = args.iter().filter(|arg| !arg.omittable).collect();
+                let fields: Vec<_> = required
+                    .iter()
+                    .map(|arg| {
+                        let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                        format!(
+                            "{} : {}",
+                            arg.name,
+                            if arg.nullable {
+                                format!("Maybe ({base})")
+                            } else {
+                                base
+                            }
+                        )
+                    })
+                    .collect();
+                body.push_str(&format!(
+                    "type alias Required =\n    {{ {} }}\n\n\n",
+                    fields.join("\n    , ")
+                ));
+                let pairs: Vec<_> = required
+                    .iter()
+                    .map(|arg| {
+                        format!(
+                            "( {}, {} input.{} )",
+                            string::quote(&arg.name),
+                            to_param_encoder_str(
+                                &lookup,
+                                arg.type_.as_deref().unwrap(),
+                                arg.nullable
+                            ),
+                            arg.name
+                        )
+                    })
+                    .collect();
+                body.push_str(&format!("create : Required -> List CreateOption -> {edit_type}\ncreate input options =\n    {}\n\n\n", construct(&format!("(Encode.object ([ {} ] ++ List.map (\\(CreateOption pair) -> pair) options))", pairs.join(", ")), "Encode.null", &if allocated_id { format!("(Just {})", string::quote(&key.name)) } else { "Nothing".into() })));
+                for arg in args.iter().filter(|arg| arg.omittable) {
+                    let name = builder_names[&("create", arg.name.clone())].clone();
+                    exposing.push(name.clone());
+                    let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                    let type_ = if arg.nullable {
+                        format!("Maybe ({base})")
+                    } else {
+                        base
+                    };
+                    let encoder =
+                        to_param_encoder_str(&lookup, arg.type_.as_deref().unwrap(), arg.nullable);
+                    body.push_str(&format!("{name} : ({type_}) -> CreateOption\n{name} value =\n    CreateOption ( {}, {} value )\n\n\n", string::quote(&arg.name), encoder));
+                }
+            }
+            _ => {}
+        }
+    }
+    format!(
+        "module Db.Edit.{record} exposing ({})\n\n{body}",
+        exposing.join(", ")
+    )
 }
 
 fn to_query_file(

@@ -37,11 +37,55 @@ pub fn generate_queries(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let formatter = to_metadata_formatter();
+    let mut edits = String::from("// Generated browser-independent CRUD builders.\nimport { operation, createId, type Operation } from '@pyre/client/operations';\nexport { batch } from '@pyre/client/operations';\n\n");
 
     for operation in &query_list.queries {
         match operation {
             ast::QueryDef::Query(q) => {
                 let query_info = all_query_info.get(&q.name);
+                if let (Some(table), Some(info)) = (
+                    crate::generated_queries::generated_crud_table(context, q),
+                    query_info,
+                ) {
+                    let primary_key = ast::collect_columns(&table.record.fields)
+                        .into_iter()
+                        .find(|column| ast::is_primary_key(column))
+                        .expect("CRUD primary key");
+                    let module = &q.name;
+                    edits.push_str(&format!(
+                        "import * as {module} from './queries/metadata/{}';\n",
+                        string::decapitalize(module)
+                    ));
+                    let namespace = string::quote(&info.primary_db);
+                    let key = string::quote(&primary_key.name);
+                    let (input_type, input) = match q.operation {
+                        ast::QueryOperation::Insert
+                            if matches!(primary_key.type_, ast::ColumnType::IdUuid { .. }) =>
+                        {
+                            (
+                                format!("input: Omit<{module}.Input, {key}>"),
+                                format!("{{ ...input, [{}]: createId() }}", key),
+                            )
+                        }
+                        ast::QueryOperation::Insert => {
+                            (format!("input: {module}.Input"), "input".into())
+                        }
+                        ast::QueryOperation::Update => (
+                            format!(
+                                "id: {module}.Input[{key}], patch: Omit<{module}.Input, {key}>"
+                            ),
+                            format!("{{ ...patch, [{key}]: id }}"),
+                        ),
+                        _ => (
+                            format!("id: {module}.Input[{key}]"),
+                            format!("{{ [{key}]: id }}"),
+                        ),
+                    };
+                    edits.push_str(&format!(
+                        "export function {}({input_type}): Operation<{namespace}, {module}.Result> {{\n  return operation({module}.meta, {input}) as Operation<{namespace}, {module}.Result>;\n}}\n\n",
+                        string::decapitalize(module)
+                    ));
+                }
                 files.push(generate_text_file(
                     base_out_dir
                         .join("queries/metadata")
@@ -63,6 +107,16 @@ pub fn generate_queries(
             _ => continue,
         }
     }
+    let mut records: Vec<_> = context.tables.values().collect();
+    records.sort_by(|a, b| a.record.name.cmp(&b.record.name));
+    for table in records {
+        let name = &table.record.name;
+        let has_all = ["Create", "Update", "Delete"].iter().all(|suffix| query_list.queries.iter().any(|definition| matches!(definition, ast::QueryDef::Query(query) if query.name == format!("{name}{suffix}") && crate::generated_queries::generated_crud_table(context, query).is_some())));
+        if has_all {
+            edits.push_str(&format!("export const {name} = {{ create: {}Create, update: {}Update, delete: {}Delete }} as const;\n", string::decapitalize(name), string::decapitalize(name), string::decapitalize(name)));
+        }
+    }
+    files.push(generate_text_file(base_out_dir.join("edits.ts"), edits));
 }
 
 fn sql_types_file() -> String {
@@ -413,9 +467,12 @@ fn to_query_metadata_file(
     }
     imports.push_str("import * as Decode from '../../decode';\n");
 
-    let input_block = to_param_type_alias(context, &query.args)
+    let mut input_block = to_param_type_alias(context, &query.args)
         .trim_end()
         .to_string();
+    if crate::generated_queries::generated_crud_table(context, query).is_some() {
+        input_block = input_block.replace("\n});", "\n}).strict();");
+    }
 
     let query_shape_block = if query.operation == ast::QueryOperation::Query {
         Some(to_query_shape(context, query).trim_end().to_string())
@@ -490,6 +547,25 @@ fn to_query_metadata_file(
     meta_block.push_str("  InputValidator,\n");
     meta_block.push_str("  SessionValidator: Decode.SessionValidator,\n");
     meta_block.push_str("  ReturnData,\n");
+    if let Some(table) = crate::generated_queries::generated_crud_table(context, query) {
+        if let Some(info) = query_info {
+            // Generated CRUD is one scalar write after any ATTACH statements.
+            let create_id = ast::collect_columns(&table.record.fields)
+                .into_iter()
+                .find(|column| ast::is_primary_key(column))
+                .filter(|column| {
+                    query.operation == ast::QueryOperation::Insert
+                        && matches!(column.type_, ast::ColumnType::IdUuid { .. })
+                })
+                .map(|column| format!(", createId: {}", string::quote(&column.name)))
+                .unwrap_or_default();
+            meta_block.push_str(&format!(
+                "  generatedEdit: {{ writeStatement: {}{} }},\n",
+                sql::to_sql::format_attach(info).len(),
+                create_id
+            ));
+        }
+    }
     if query.operation == ast::QueryOperation::Query {
         meta_block.push_str("  queryShape,\n");
         meta_block.push_str("  toQueryShape: (_input: Input) => queryShape,\n");

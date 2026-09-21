@@ -31,7 +31,7 @@ export interface QueryMetadata {
     InputValidator: Validator<any>;
     SessionValidator: Validator<any>;
     /** Compiler-owned index of the direct write whose cardinality must be one. */
-    generatedEdit?: { writeStatement: number };
+    generatedEdit?: { writeStatement: number; createId?: string };
 }
 
 /**
@@ -448,6 +448,13 @@ async function runOperations(
         }
         const query = Object.hasOwn(queryMap, operation.queryId) ? queryMap[operation.queryId] : undefined;
         if (!query) return fail("UnknownQuery", "Unknown operation", index);
+        if (query.generatedEdit?.createId) {
+            const input = operation.input as Record<string, unknown> | null;
+            const id = input?.[query.generatedEdit.createId];
+            if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) {
+                return fail("InvalidInput", "Generated creates require a canonical UUIDv7", index);
+            }
+        }
         const currentNamespace = query.primary_db ?? "";
         namespace ??= currentNamespace;
         if (namespace !== currentNamespace || query.attached_dbs?.length) return fail("InvalidInput", "Operations must target one database namespace", index);
