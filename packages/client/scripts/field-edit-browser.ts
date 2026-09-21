@@ -1,4 +1,4 @@
-import { PyreClient } from '../src-ts/index';
+import { operation, PyreClient } from '../src-ts/index';
 import { IndexedDBStorage } from '../src-ts/service/indexeddb';
 
 const who = location.pathname.slice(1) || 'a';
@@ -18,6 +18,14 @@ Object.assign(window, {
     batches, results,
     get rows() { return rows; },
     get connected() { return connected; },
+    async batch(inputs: Array<{ id: number; title: string }>) {
+      const edits = inputs.map(input => operation({ operation: 'update', id: 'edit', optimistic: {
+        queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }],
+      } }, input));
+      const result = await client.submit('proof', edits);
+      results.push(result);
+      return result;
+    },
     edit(title: string) {
       return client.run('proof', { operation: 'update', id: 'edit', optimistic: {
         queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }],

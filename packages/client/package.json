@@ -15,6 +15,10 @@
     "./devtools": {
       "types": "./src-ts/devtools.ts",
       "default": "./src-ts/devtools.ts"
+    },
+    "./operations": {
+      "types": "./src-ts/operations.ts",
+      "default": "./src-ts/operations.ts"
     }
   },
   "scripts": {

@@ -65,9 +65,9 @@ remove that identity. Regenerate Elm streams and handle `EntityRemoved table id`
 Deploy the client support for `invalidate` with the server change; older clients
 cannot perform this permission-loss recovery.
 
-This milestone proves existing one-field updates with integer IDs. General
-client composition, atomic batches, insert/delete prediction, and a general
-incremental deletion protocol remain subsequent work.
+The initial milestone proves existing field updates with integer IDs. Ordered
+field batches now use the same engine. Insert/delete prediction and a general
+incremental deletion protocol remain subsequent work in this feature PR.
 
 ## Composed server execution (MEC-108)
 
@@ -98,8 +98,40 @@ which must not be automatically replayed. Empty batches return an empty result
 without database I/O. Local interactive execution requires a file-backed libsql
 database because its adapter detaches the connection for a transaction.
 
-Client builders, batch prediction, and CRUD removal delivery are the next parts
-of the same feature PR.
+## Explicit client composition (MEC-111)
+
+```ts
+import { operation } from '@pyre/client/operations';
+
+const edits = [
+  operation(UpdateTitle, { id: firstId, title: 'First' }),
+  operation(UpdateTitle, { id: secondId, title: 'Second' }),
+  operation(UpdateTitle, { id: firstId, title: 'Final' }),
+];
+const result = await client.submit(databaseId, edits);
+```
+
+Construction captures JSON values and prediction metadata without starting a
+worker or executing a request. The browser-independent operations entrypoint can
+also supply descriptors to request/response adapters. Submission returns the
+existing `MutationResult`, with ordered indexed results on success. Empty batches
+return immediately without opening a database client.
+
+The existing mutation transport sends one POST to the query endpoint's `$batch`
+identifier. Its JSON body is the ordered `{ queryId, input }` array. The application
+adapter passes that array to `run` or `runWithSync` instead of a named query ID;
+it returns execution errors as non-success HTTP statuses, as for named mutations.
+Prediction metadata never goes to the server. Existing named calls and the Elm
+`mutate` bridge remain supported, including `$batch` with a descriptor-array input.
+
+The worker captures every field intent in order against the preceding operation's
+visible result, then publishes once. The entire list belongs to one request and
+settles or rejects together. Later requests survive rejection, and out-of-order
+acknowledged batches shield their fields with authoritative normalized values.
+Predictions remain memory-only; only accepted authoritative rows are persisted.
+
+Generated record-specific builders/compiler metadata and CRUD removal delivery
+remain the next parts of the same feature PR.
 
 ## Reproduce the native proof
 

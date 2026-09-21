@@ -39,6 +39,23 @@ try {
   assert(await a.evaluate("proof.results.at(-1).ok === false"));
   assert(await a.evaluate("proof.batches.at(-1).changes[0].row.title === 'NORMALIZED'"));
 
+  const beforeBatch = await (await a.request.get(`${url}/stats`)).json();
+  const optimisticBefore = await a.evaluate("proof.batches.filter(b => b.source === 'optimistic').length");
+  const batch = await a.evaluate("proof.batch([{ id: 1, title: 'intermediate' }, { id: 2, title: 'second' }, { id: 1, title: 'final' }])");
+  assert.equal(batch.ok, true);
+  assert.deepEqual(batch.value.map((entry: any) => entry.index), [0, 1, 2]);
+  await b.waitForFunction("proof.rows[0].title === 'FINAL' && proof.rows[1].title === 'SECOND'");
+  assert.deepEqual(await a.evaluate('proof.rows'), await b.evaluate('proof.rows'));
+  assert.equal(await a.evaluate("proof.batches.filter(b => b.source === 'optimistic').length"), optimisticBefore + 1);
+  const afterBatch = await (await a.request.get(`${url}/stats`)).json();
+  assert.equal(afterBatch.mutations, beforeBatch.mutations + 1);
+  assert.equal(afterBatch.delta, beforeBatch.delta + 1);
+  assert.equal(afterBatch.catchup, beforeBatch.catchup);
+  const rejected = await a.evaluate("proof.batch([{ id: 1, title: 'rollback' }, { id: 999, title: 'missing' }])");
+  assert.equal(rejected.ok, false);
+  assert.deepEqual(await a.evaluate('proof.rows'), await b.evaluate('proof.rows'));
+  await a.waitForFunction("async () => (await proof.persisted())[0].title === 'FINAL'");
+
   // Keep the committed HTTP response held across a permission-loss reset.
   await b.evaluate("proof.edit('hold')");
   await b.waitForFunction("proof.rows[0].title === 'hold'");
@@ -59,5 +76,5 @@ try {
   await b.waitForFunction('window.proof?.connected && proof.rows?.length === 1');
   assert.equal(await b.evaluate('proof.rows[0].id'), 2);
   assert.deepEqual(await b.evaluate('(async () => (await proof.late())[0].changes.map(c => c.id))()'), [2]);
-  console.log('PASS: two native clients, incremental HTTP/SSE, normalization, rejection, late readers, permission removal, held-response IndexedDB safety and reload');
+  console.log('PASS: two native clients, atomic repeated/multi-row submission and rollback, incremental HTTP/SSE, normalization, rejection, late readers, permission removal, held-response IndexedDB safety and reload');
 } finally { await browser.close(); }

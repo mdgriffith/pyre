@@ -1,4 +1,5 @@
 import loadElm from '../dist/engine.mjs';
+import { captureOperations, type Operation } from './operations';
 import { IndexedDBStorage, IndexedDbService } from './service/indexeddb';
 import {
   EntityStreamService,
@@ -61,6 +62,7 @@ export type {
   EntityWhereValue,
 } from './service/entity-stream';
 export type { CacheNamespace, DatabaseId } from './routing';
+export { operation, type Operation } from './operations';
 
 interface PyreBridgeClient {
   run<Input = unknown>(
@@ -1154,7 +1156,7 @@ class SingleDatabasePyreClient {
         getServerCredentials(this.server),
         this.server.withCredentials === true
       );
-    })();
+    })().catch((error) => callback({ ok: false, error: String(error) }));
   }
 
   private runBridgeMutation(
@@ -1201,7 +1203,12 @@ class SingleDatabasePyreClient {
         getServerCredentials(this.server),
         this.server.withCredentials === true
       );
-    })();
+    })().catch((error) => {
+      mutationResultPort?.send?.({
+        type: 'mutation-result', requestId: message.requestId, mutationId: message.mutationId,
+        mutationName: message.mutationName ?? null, result: { ok: false, error: String(error) },
+      } satisfies ElmBridgeMutationResultMessage);
+    });
   }
 
   private emitDevtoolsEvent(type: string, payload?: unknown): void {
@@ -1283,6 +1290,20 @@ export class PyreClient {
     return this.getOrCreateClient(databaseId).then((client) => (
       client.run(databaseId, queryModule, input, callback)
     ));
+  }
+
+  /** Execute one ordered, atomic batch through the existing mutation engine. */
+  submit(databaseId: DatabaseId, operations: readonly Operation[]): Promise<MutationResult> {
+    const captured = captureOperations(operations);
+    requireDatabaseId(databaseId);
+    if (captured.length === 0) return Promise.resolve({ ok: true, value: [] });
+    const input = captured.map(({ queryId, input }) => ({ queryId, input }));
+    const optimistic = captured.filter((item) => item.optimistic != null)
+      .map(({ input, optimistic }) => ({ input, optimistic }));
+    return new Promise((resolve, reject) => {
+      void this.run(databaseId, { operation: 'transaction', id: '$batch', optimistic }, input,
+        (result) => resolve(result as MutationResult)).catch(reject);
+    });
   }
 
   async getOrCreateClient(databaseId: DatabaseId): Promise<PyreInternalClient> {

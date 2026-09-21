@@ -40,7 +40,7 @@ type Msg
 
 
 type Incoming
-    = SendMutation String String String (List ( String, String )) String Bool Encode.Value (Maybe OptimisticMutation) -- requestId, mutationId, baseUrl, headers, credentials, withCredentials, input, optimistic metadata
+    = SendMutation String String String (List ( String, String )) String Bool Encode.Value (List ( OptimisticMutation, Encode.Value )) -- requestId, mutationId, baseUrl, headers, credentials, withCredentials, input, captured optimistic operations
 
 
 type alias OptimisticMutation =
@@ -1159,7 +1159,20 @@ decodeIncoming =
                                 ]
                             )
                             (Decode.field "input" Decode.value)
-                            (Decode.maybe (Decode.field "optimistic" decodeOptimisticMutation))
+                            (Decode.oneOf
+                                [ Decode.field "optimistic"
+                                    (Decode.list
+                                        (Decode.map2 Tuple.pair
+                                            (Decode.field "optimistic" decodeOptimisticMutation)
+                                            (Decode.field "input" Decode.value)
+                                        )
+                                    )
+                                , Decode.map2 (\metadata input -> [ ( metadata, input ) ])
+                                    (Decode.field "optimistic" decodeOptimisticMutation)
+                                    (Decode.field "input" Decode.value)
+                                , Decode.succeed []
+                                ]
+                            )
 
                     _ ->
                         Decode.fail ("Unknown QueryManager incoming type: " ++ type_)

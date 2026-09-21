@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { expect, test } from 'bun:test';
 
-import { PyreClient } from './index';
+import { operation, PyreClient } from './index';
 import { QueryClientService } from './service/query-client';
 import {
   __resetPyreDevtoolsRegistryForTests,
@@ -98,6 +98,49 @@ test('PyreClient requires cacheNamespace', async () => {
     schema,
     server,
   })).rejects.toThrow('PyreClient.create requires cacheNamespace');
+});
+
+test('explicit submission snapshots pure operations and forwards one ordered batch through run', async () => {
+  const runs = [];
+  let created = 0;
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'batch',
+    createInternalClient: async (config) => {
+      created++;
+      return { ...fakeInternalClient([], config.databaseId),
+        run(databaseId, module, input, callback) {
+          runs.push({ databaseId, module, input });
+          callback({ ok: true, value: input.map((op, index) => ({ index, queryId: op.queryId, result: op.input })) });
+        },
+      };
+    },
+  });
+  const module = { operation: 'update', id: 'edit', optimistic: {
+    queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }],
+  } };
+  const input = { id: 1, title: 'Captured', nested: { value: 1 } };
+  const first = operation(module, input);
+  input.title = 'Changed';
+  input.nested.value = 2;
+  const second = operation(module, input);
+  module.optimistic.set[0].field = 'wrong';
+  expect(created).toBe(0);
+  expect(await client.submit('main', [])).toEqual({ ok: true, value: [] });
+  expect(created).toBe(0);
+  const submitted = [first, second];
+  const completion = client.submit('main', submitted);
+  submitted.reverse();
+  const result = await completion;
+  expect(runs).toHaveLength(1);
+  expect(runs[0]).toMatchObject({ databaseId: 'main', module: { id: '$batch', operation: 'transaction' }, input: [
+    { queryId: 'edit', input: { id: 1, title: 'Captured', nested: { value: 1 } } },
+    { queryId: 'edit', input: { id: 1, title: 'Changed', nested: { value: 2 } } },
+  ] });
+  expect(runs[0].module.optimistic.map(op => op.optimistic.set[0].field)).toEqual(['title', 'title']);
+  expect(result.value.map(op => op.index)).toEqual([0, 1]);
+  expect(() => client.submit('main', [{}])).toThrow('Expected an operation');
+  expect(() => operation({ id: 'read', operation: 'query' }, {})).toThrow('compiled mutation');
+  client.disconnect();
 });
 
 test('connect and sync selection create session-free internal clients', async () => {

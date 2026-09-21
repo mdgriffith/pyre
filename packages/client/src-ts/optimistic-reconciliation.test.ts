@@ -71,6 +71,16 @@ async function harness(run) {
     await turn();
     return {
       app, visible, writes, results, entities,
+      async batch(requestId, operations) {
+        app.ports.receiveQueryManagerMessage.send({
+          type: 'sendMutation', requestId, mutationId: '$batch', baseUrl: 'http://test/db',
+          input: operations.map(({ input }) => ({ queryId: 'update', input })),
+          optimistic: operations.map(({ input, where = 'id' }) => ({ input, optimistic: {
+            queryField: 'notes', where: { field: where, input: where }, set: [{ field: 'title', input: 'title' }],
+          } })),
+        });
+        await turn();
+      },
       async edit(requestId, title, id = 1) {
         app.ports.receiveQueryManagerMessage.send({
           type: 'sendMutation', requestId, mutationId: 'update', baseUrl: 'http://test/db',
@@ -110,6 +120,82 @@ test('two clients share incremental authority; origin confirms without live deli
     expect((await a.rows())[0]).toEqual({ id: 1, title: 'Normalized', other: 'Server' });
     expect(a.visible.at(-1).data).toEqual(groups([[1, 'Server', 'Normalized']]).map((g) => ({ ...g, headers: ['id', 'other', 'title'] })));
     expect(requests).toHaveLength(1);
+  });
+});
+
+test('batch captures repeated and multiple rows in order and publishes once; rejection preserves later intent', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client();
+    const before = a.visible.length;
+    await a.batch('batch', [
+      { input: { id: 1, title: 'Intermediate' } },
+      { input: { id: 2, title: 'Other' } },
+      { input: { id: 1, title: 'Final' } },
+    ]);
+    expect(a.visible.length - before).toBe(1);
+    expect((await a.rows()).map(row => row.title)).toEqual(['Final', 'Other']);
+    expect(requests).toHaveLength(1);
+    expect(requests[0].input.map(op => op.input.title)).toEqual(['Intermediate', 'Other', 'Final']);
+    await a.edit('later', 'Later', 2);
+    const rejecting = a.visible.length;
+    requests[0].complete({}, 403);
+    await turn();
+    expect(a.visible.length - rejecting).toBe(1);
+    expect((await a.rows()).map(row => row.title)).toEqual(['Initial', 'Later']);
+    requests[1].complete(envelope(2, [[2, 'Normalized later', 'Server']]));
+    await turn();
+    expect((await a.rows()).map(row => row.title)).toEqual(['Initial', 'Normalized later']);
+  });
+});
+
+test('later batch confirmation shields every affected field until an earlier batch settles', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client();
+    await a.batch('earlier', [{ input: { id: 1, title: 'A' } }, { input: { id: 2, title: 'B' } }]);
+    await a.batch('later', [{ input: { id: 1, title: 'C' } }, { input: { id: 2, title: 'D' } }]);
+    const before = a.visible.length;
+    requests[1].complete(envelope(2, [[1, 'Normalized C', 'Server'], [2, 'Normalized D', 'Server']]));
+    await turn();
+    expect(a.visible.length - before).toBe(1);
+    expect((await a.rows()).map(row => row.title)).toEqual(['Normalized C', 'Normalized D']);
+    requests[0].complete(envelope(1, [[1, 'Old A', 'Old'], [2, 'Old B', 'Old']]));
+    await turn();
+    expect((await a.rows()).map(row => row.title)).toEqual(['Normalized C', 'Normalized D']);
+  });
+});
+
+test('batch selection sees preceding operations before publication', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client();
+    // The second operation selects the value written by the first operation.
+    a.app.ports.receiveQueryManagerMessage.send({
+      type: 'sendMutation', requestId: 'dependent', mutationId: '$batch', baseUrl: 'http://test/db', input: [],
+      optimistic: [
+        { input: { id: 1, title: 'Selected' }, optimistic: { queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }] } },
+        { input: { match: 'Selected', title: 'Final' }, optimistic: { queryField: 'notes', where: { field: 'title', input: 'match' }, set: [{ field: 'title', input: 'title' }] } },
+      ],
+    });
+    await turn();
+    expect((await a.rows())[0].title).toBe('Final');
+    requests[0].complete({}, 403);
+    await turn();
+    expect((await a.rows())[0].title).toBe('Initial');
+  });
+});
+
+test('invalidation fences a whole held batch from readers and persistence', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client();
+    await a.batch('held-batch', [{ input: { id: 1, title: 'A' } }, { input: { id: 2, title: 'B' } }]);
+    a.app.ports.receiveSSEMessage.send({ type: 'invalidate', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 3 });
+    await turn();
+    const writes = a.writes.length;
+    requests[0].complete(envelope(2, [[1, 'Old A', 'Secret'], [2, 'Old B', 'Secret']]));
+    await turn();
+    expect(await a.rows()).toEqual([]);
+    expect(a.writes.length).toBe(writes);
+    expect(a.results.at(-1).result).toMatchObject({ ok: false });
+    expect(a.entities.snapshot().size).toBe(0);
   });
 });
 

@@ -32,6 +32,7 @@ await loadSchemaFromDatabase('proof', db);
 // Precompiled one-field operation fixture, including its existing affected-row
 // output. No client-authored SQL or runtime query compilation is accepted.
 const queries = { edit: {
+  generatedEdit: { writeStatement: 0 },
   id: 'edit', session_args: [], optional_input_args: [], json_input_args: [],
   InputValidator: z.object({ id: z.number().int(), title: z.string() }), SessionValidator: z.object({ admin: z.boolean() }),
   sql: [
@@ -75,7 +76,8 @@ const server = Bun.serve({ port: 0, idleTimeout: 0, async fetch(request) {
     counts.mutations++;
     const input = await request.json();
     if (input.title === 'reject') return Response.json({ error: 'Rejected' }, { status: 403 });
-    const result = await runWithSync(db, queries, 'edit', input, session, sessions, 'proof', who);
+    const result = await runWithSync(db, queries, Array.isArray(input) ? input : 'edit', input, session, sessions, 'proof', who);
+    if (result.kind === 'error') return Response.json(result.error, { status: 400 });
     await result.sync(send);
     if (input.title === 'hold') { held = true; await new Promise<void>((resolve) => { release = resolve; }); held = false; }
     return Response.json(result.response);

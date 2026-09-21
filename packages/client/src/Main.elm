@@ -62,10 +62,15 @@ type alias Model =
 
 
 type alias OptimisticInFlight =
+    { intents : List FieldIntent
+    , acknowledgedServerRevision : Maybe Int
+    }
+
+
+type alias FieldIntent =
     { tableName : String
     , rowIds : List Int
     , setValues : List ( String, Data.Value.Value )
-    , acknowledgedServerRevision : Maybe Int
     }
 
 
@@ -433,7 +438,7 @@ handleQueryManagerIncoming incoming model =
             -- Mutations are handled via HTTP request
             let
                 ( optimisticModel, optimisticCmds ) =
-                    applyOptimisticMutation requestId optimistic input model
+                    applyOptimisticMutation requestId optimistic model
 
                 url =
                     buildMutationUrl baseUrl mutationId
@@ -620,21 +625,18 @@ buildMutationUrl baseUrl id =
             baseUrl ++ "/" ++ id
 
 
-applyOptimisticMutation : String -> Maybe QueryManager.OptimisticMutation -> Encode.Value -> Model -> ( Model, List (Cmd Msg) )
-applyOptimisticMutation requestId maybeOptimistic input model =
-    case maybeOptimistic of
-        Nothing ->
-            ( model, [] )
-
-        Just optimistic ->
+applyOptimisticMutation : String -> List ( QueryManager.OptimisticMutation, Encode.Value ) -> Model -> ( Model, List (Cmd Msg) )
+applyOptimisticMutation requestId operations model =
+    let
+        capture ( optimistic, input ) ( visible, intents ) =
             case Decode.decodeValue (Decode.dict Data.Value.decodeValue) input of
                 Err _ ->
-                    ( model, [] )
+                    ( visible, intents )
 
                 Ok inputValues ->
                     case Dict.get optimistic.where_.input inputValues of
                         Nothing ->
-                            ( model, [] )
+                            ( visible, intents )
 
                         Just whereValue ->
                             let
@@ -651,14 +653,14 @@ applyOptimisticMutation requestId maybeOptimistic input model =
                                             )
 
                                 matchingRows =
-                                    Dict.get tableName model.db.tables
+                                    Dict.get tableName visible.tables
                                         |> Maybe.withDefault Dict.empty
                                         |> Dict.toList
                                         |> List.filter
                                             (\( _, row ) -> Dict.get optimistic.where_.field row == Just whereValue)
                             in
                             if List.isEmpty setValues || List.isEmpty matchingRows then
-                                ( model, [] )
+                                ( visible, intents )
 
                             else
                                 let
@@ -666,14 +668,25 @@ applyOptimisticMutation requestId maybeOptimistic input model =
                                         { tableName = tableName
                                         , rowIds = List.map Tuple.first matchingRows
                                         , setValues = setValues
-                                        , acknowledgedServerRevision = Nothing
                                         }
+
+                                    ( nextVisible, _ ) =
+                                        Db.update (Db.LocalDeltaReceived (intentDelta model.authoritativeDb Nothing pending visible)) visible
                                 in
-                                publishVisible "optimistic"
-                                    { model
-                                        | inFlightOptimistic = Dict.insert requestId pending model.inFlightOptimistic
-                                        , optimisticOrder = appendUnique requestId model.optimisticOrder
-                                    }
+                                ( nextVisible, pending :: intents )
+
+        ( _, captured ) =
+            List.foldl capture ( model.db, [] ) operations
+    in
+    if List.isEmpty captured then
+        ( model, [] )
+
+    else
+        publishVisible "optimistic"
+            { model
+                | inFlightOptimistic = Dict.insert requestId { intents = List.reverse captured, acknowledgedServerRevision = Nothing } model.inFlightOptimistic
+                , optimisticOrder = appendUnique requestId model.optimisticOrder
+            }
 
 
 rollbackOptimisticMutation : String -> String -> String -> Model -> ( Model, Cmd Msg )
@@ -851,11 +864,16 @@ replayOptimisticMutations model db =
                         ( currentDb, cmds )
 
                     Just optimistic ->
-                        let
-                            ( nextDb, cmd ) =
-                                Db.update (Db.LocalDeltaReceived (intentDelta model.authoritativeDb optimistic currentDb)) currentDb
-                        in
-                        ( nextDb, cmd :: cmds )
+                        List.foldl
+                            (\intent ( visible, commands ) ->
+                                let
+                                    ( nextDb, cmd ) =
+                                        Db.update (Db.LocalDeltaReceived (intentDelta model.authoritativeDb optimistic.acknowledgedServerRevision intent visible)) visible
+                                in
+                                ( nextDb, cmd :: commands )
+                            )
+                            ( currentDb, cmds )
+                            optimistic.intents
             )
             ( db, [] )
         |> Tuple.mapSecond List.reverse
@@ -869,8 +887,8 @@ removeOptimisticMutation requestId model =
     }
 
 
-intentDelta : Db.Db -> OptimisticInFlight -> Db.Db -> Data.Delta.Delta
-intentDelta authoritative pending visible =
+intentDelta : Db.Db -> Maybe Int -> FieldIntent -> Db.Db -> Data.Delta.Delta
+intentDelta authoritative acknowledgedServerRevision pending visible =
     let
         table db =
             Dict.get pending.tableName db.tables |> Maybe.withDefault Dict.empty
@@ -879,7 +897,7 @@ intentDelta authoritative pending visible =
             Dict.get id (table visible)
                 |> Maybe.map
                     (\row ->
-                        case pending.acknowledgedServerRevision of
+                        case acknowledgedServerRevision of
                             Nothing ->
                                 applySetValues pending.setValues row
 
