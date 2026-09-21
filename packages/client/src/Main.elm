@@ -43,6 +43,7 @@ type alias SyncConfig =
 type alias Model =
     { schema : Data.Schema.SchemaMetadata
     , db : Db.Db
+    , authoritativeDb : Db.Db
     , queryManager : QueryManager.Model
     , catchup : Catchup.Model
     , syncStatus : SyncState.SyncStatus
@@ -54,18 +55,23 @@ type alias Model =
     , inFlightOptimistic : Dict String OptimisticInFlight
     , optimisticOrder : List String
     , lastAppliedServerRevision : Maybe Int
+    , generation : Int
+    , rowRevisions : Dict ( String, Int ) Int
     }
 
 
 type alias OptimisticInFlight =
-    { forward : Data.Delta.Delta
-    , inverse : Data.Delta.Delta
+    { tableName : String
+    , rowIds : List Int
+    , setValues : List ( String, Data.Value.Value )
     , acknowledgedServerRevision : Maybe Int
     }
 
 
 type alias MutationSyncMessage =
     { serverRevision : Maybe Int
+    , databaseId : Maybe String
+    , databaseEpoch : Maybe String
     , delta : Maybe Data.Delta.Delta
     , requiresCatchup : Bool
     }
@@ -80,7 +86,7 @@ type Msg
     | LiveSyncReceived LiveSync.Incoming
     | QueryManagerReceived QueryManager.Incoming
     | QueryClientReceived QueryManager.QueryClientIncoming
-    | MutationRequest String String String Encode.Value (Result Http.Error Encode.Value)
+    | MutationRequest Int String String (Result Http.Error Encode.Value)
     | DbMsg Db.Msg
     | Error String
     | CatchupMsg Catchup.Msg
@@ -99,6 +105,7 @@ init : Flags -> ( Model, Cmd Msg )
 init flags =
     ( { schema = flags.schema
       , db = Db.init
+      , authoritativeDb = Db.init
       , queryManager = QueryManager.init
       , catchup = Catchup.init flags.server
       , syncStatus = SyncState.NotStarted
@@ -110,6 +117,8 @@ init flags =
       , inFlightOptimistic = Dict.empty
       , optimisticOrder = []
       , lastAppliedServerRevision = Nothing
+      , generation = 0
+      , rowRevisions = Dict.empty
       }
     , Cmd.batch
         [ if flags.sync.autoStart then
@@ -144,7 +153,7 @@ update msg model =
                             Db.update (Db.FromIndexedDb model.schema incoming) model.db
 
                         baseModel =
-                            { model | db = updatedDb }
+                            { model | db = updatedDb, authoritativeDb = updatedDb }
 
                         ( updatedModel, indexedDbCmd ) =
                             handleIndexedDbIncoming incoming baseModel
@@ -155,12 +164,12 @@ update msg model =
 
                 IndexedDb.DatabaseEpochResetCompleted databaseEpoch ->
                     applyCatchupUpdate
-                        (Catchup.update (Catchup.DatabaseEpochResetCompleted databaseEpoch) model.catchup model.db)
+                        (Catchup.update (Catchup.DatabaseEpochResetCompleted databaseEpoch) model.catchup model.authoritativeDb)
                         model
 
                 IndexedDb.DatabaseEpochResetFailed databaseEpoch message ->
                     applyCatchupUpdate
-                        (Catchup.update (Catchup.DatabaseEpochResetFailed databaseEpoch message) model.catchup model.db)
+                        (Catchup.update (Catchup.DatabaseEpochResetFailed databaseEpoch message) model.catchup model.authoritativeDb)
                         model
 
         LiveSyncReceived incoming ->
@@ -197,13 +206,17 @@ update msg model =
             , Cmd.batch queryCmds
             )
 
-        MutationRequest requestId mutationId _ _ result ->
-            case result of
-                Ok response ->
-                    settleSuccessfulMutation requestId mutationId response model
+        MutationRequest generation requestId mutationId result ->
+            if generation /= model.generation then
+                ( model, QueryManager.mutationResult requestId mutationId (Err "Mutation response invalidated by sync reset; outcome unknown") )
 
-                Err error ->
-                    rollbackOptimisticMutation requestId mutationId (httpErrorToString error) model
+            else
+                case result of
+                    Ok response ->
+                        settleSuccessfulMutation requestId mutationId response model
+
+                    Err error ->
+                        rollbackOptimisticMutation requestId mutationId (httpErrorToString error) model
 
         Error errorMessage ->
             ( model
@@ -211,7 +224,7 @@ update msg model =
             )
 
         CatchupMsg catchupMsg ->
-            applyCatchupUpdate (Catchup.update catchupMsg model.catchup model.db) model
+            applyCatchupUpdate (Catchup.update catchupMsg model.catchup model.authoritativeDb) model
 
         SyncControlReceived StartSync ->
             if model.syncRequested then
@@ -250,7 +263,7 @@ handleIndexedDbIncoming incoming model =
                     }
 
                 ( catchupModel, catchupCmd ) =
-                    applyCatchupUpdate (Catchup.update (Catchup.InitialDataLoaded initialData.cursor initialData.databaseEpoch) model.catchup model.db) baseModel
+                    applyCatchupUpdate (Catchup.update (Catchup.InitialDataLoaded initialData.cursor initialData.databaseEpoch) model.catchup model.authoritativeDb) baseModel
             in
             ( catchupModel
             , Cmd.batch [ Cmd.batch cmds, catchupCmd ]
@@ -278,28 +291,21 @@ handleLiveSyncIncoming incoming model =
 
                 Nothing ->
                     if liveEpochMismatch model messageEpoch then
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
-
-                    else if isStaleServerRevision serverRevision model.lastAppliedServerRevision then
-                        ( model, Cmd.none )
+                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.authoritativeDb) model
 
                     else
                         let
-                            ( updatedDb, dbCmds ) =
-                                applyAuthoritativeDelta delta model
+                            ( authoritativeModel, dbCmds ) =
+                                applyAuthoritativeDelta serverRevision delta model
 
-                            ( updatedQueryManager, triggerCmds ) =
-                                QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager delta
+                            ( updatedModel, visibleCmds ) =
+                                publishVisible "live" authoritativeModel
                         in
-                        ( { model
-                            | db = updatedDb
-                            , queryManager = updatedQueryManager
-                            , lastAppliedServerRevision = updateLastAppliedServerRevision serverRevision model.lastAppliedServerRevision
-                          }
+                        ( updatedModel
                         , Cmd.batch
-                            [ Cmd.batch (List.map (Cmd.map DbMsg) dbCmds)
-                            , Cmd.batch triggerCmds
-                            , writeServerRevisionCmd serverRevision
+                            [ Cmd.batch dbCmds
+                            , Cmd.batch visibleCmds
+                            , writeServerRevisionCmd updatedModel.lastAppliedServerRevision
                             ]
                         )
 
@@ -312,7 +318,7 @@ handleLiveSyncIncoming incoming model =
 
                 Nothing ->
                     if liveEpochMismatch model messageEpoch then
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
+                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.authoritativeDb) model
 
                     else
                         ( model, Cmd.none )
@@ -374,10 +380,10 @@ handleLiveSyncIncoming incoming model =
                             ( model, Cmd.none )
 
                         else
-                            applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
+                            applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.authoritativeDb) model
 
                     else
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.db) model
+                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.authoritativeDb) model
 
 
 liveEpochMismatch : Model -> Maybe String -> Bool
@@ -428,7 +434,7 @@ handleQueryManagerIncoming incoming model =
                     , body = Http.jsonBody input
                     , expect =
                         Http.expectStringResponse
-                            (MutationRequest requestId mutationId baseUrl input)
+                            (MutationRequest model.generation requestId mutationId)
                             (\response ->
                                 case response of
                                     Http.BadUrl_ badUrl ->
@@ -636,69 +642,40 @@ applyOptimisticMutation requestId maybeOptimistic input model =
                                 matchingRows =
                                     Dict.get tableName model.db.tables
                                         |> Maybe.withDefault Dict.empty
-                                        |> Dict.values
+                                        |> Dict.toList
                                         |> List.filter
-                                            (\row -> Dict.get optimistic.where_.field row == Just whereValue)
+                                            (\( _, row ) -> Dict.get optimistic.where_.field row == Just whereValue)
                             in
                             if List.isEmpty setValues || List.isEmpty matchingRows then
                                 ( model, [] )
 
                             else
                                 let
-                                    updatedRows =
-                                        List.map (applySetValues setValues) matchingRows
-
-                                    forward =
-                                        deltaFromRows tableName updatedRows
-
-                                    inverse =
-                                        deltaFromRows tableName matchingRows
-
-                                    ( updatedDb, dbCmd ) =
-                                        Db.update (Db.LocalDeltaReceived forward) model.db
-
-                                    ( updatedQueryManager, triggerCmds ) =
-                                        QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager forward
+                                    pending =
+                                        { tableName = tableName
+                                        , rowIds = List.map Tuple.first matchingRows
+                                        , setValues = setValues
+                                        , acknowledgedServerRevision = Nothing
+                                        }
                                 in
-                                ( { model
-                                    | db = updatedDb
-                                    , queryManager = updatedQueryManager
-                                    , inFlightOptimistic = Dict.insert requestId { forward = forward, inverse = inverse, acknowledgedServerRevision = Nothing } model.inFlightOptimistic
-                                    , optimisticOrder = appendUnique requestId model.optimisticOrder
-                                  }
-                                , Cmd.map DbMsg dbCmd :: triggerCmds
-                                )
+                                publishVisible "optimistic"
+                                    { model
+                                        | inFlightOptimistic = Dict.insert requestId pending model.inFlightOptimistic
+                                        , optimisticOrder = appendUnique requestId model.optimisticOrder
+                                    }
 
 
 rollbackOptimisticMutation : String -> String -> String -> Model -> ( Model, Cmd Msg )
 rollbackOptimisticMutation requestId mutationId error model =
-    case Dict.get requestId model.inFlightOptimistic of
-        Nothing ->
-            ( removeOptimisticMutation requestId model
-            , QueryManager.mutationResult requestId mutationId (Err error)
-            )
-
-        Just optimistic ->
-            let
-                ( updatedDb, dbCmd ) =
-                    Db.update (Db.LocalDeltaReceived optimistic.inverse) model.db
-
-                ( updatedQueryManager, triggerCmds ) =
-                    QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager optimistic.inverse
-
-                cleanedModel =
-                    removeOptimisticMutation requestId model
-            in
-            ( { cleanedModel
-                | db = updatedDb
-                , queryManager = updatedQueryManager
-              }
-            , Cmd.batch
-                (QueryManager.mutationResult requestId mutationId (Err error)
-                    :: Cmd.map DbMsg dbCmd
-                    :: triggerCmds
-                )
-            )
+    let
+        ( updatedModel, cmds ) =
+            removeOptimisticMutation requestId model
+                |> pruneAcknowledgedOptimisticPrefix
+                |> publishVisible "mutation-response"
+    in
+    ( updatedModel
+    , Cmd.batch (QueryManager.mutationResult requestId mutationId (Err error) :: cmds)
+    )
 
 
 settleSuccessfulMutation : String -> String -> Encode.Value -> Model -> ( Model, Cmd Msg )
@@ -710,7 +687,13 @@ settleSuccessfulMutation requestId mutationId response model =
         maybeSyncMessage =
             extractMutationSyncMessage response
     in
-    if Dict.member requestId model.inFlightOptimistic && missingAuthoritativeMutationEnvelope serverRevision maybeSyncMessage then
+    if Maybe.map (\sync -> validateLiveSyncDatabaseId model sync.databaseId "mutation response" /= Nothing || liveEpochMismatch model sync.databaseEpoch) maybeSyncMessage == Just True then
+        rollbackOptimisticMutation requestId mutationId "Mutation response has invalid database identity or epoch" model
+
+    else if Catchup.pendingDatabaseEpoch model.catchup /= Nothing then
+        rollbackOptimisticMutation requestId mutationId "Mutation response invalidated by sync reset; outcome unknown" model
+
+    else if Dict.member requestId model.inFlightOptimistic && missingAuthoritativeMutationEnvelope serverRevision maybeSyncMessage then
         rollbackOptimisticMutation requestId mutationId "Optimistic mutation response missing authoritative sync envelope" model
 
     else
@@ -733,29 +716,18 @@ settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevisio
         shouldApplyAuthoritative =
             not (isStaleServerRevision serverRevision model.lastAppliedServerRevision)
 
-        ( authoritativeModel, authoritativeDbCmds, authoritativeQueryCmds ) =
+        ( authoritativeModel, authoritativeCmds ) =
             case maybeSyncMessage of
                 Just syncMessage ->
                     case syncMessage.delta of
                         Just delta ->
-                            if shouldApplyAuthoritative then
-                                let
-                                    ( updatedDb, dbCmds ) =
-                                        applyAuthoritativeDelta delta model
-
-                                    ( updatedQueryManager, triggerCmds ) =
-                                        QueryManager.notifyTablesChanged model.schema updatedDb model.queryManager delta
-                                in
-                                ( { model | db = updatedDb, queryManager = updatedQueryManager }, dbCmds, triggerCmds )
-
-                            else
-                                ( model, [], [] )
+                            applyAuthoritativeDelta serverRevision delta model
 
                         Nothing ->
-                            ( model, [], [] )
+                            ( model, [] )
 
                 Nothing ->
-                    ( model, [], [] )
+                    ( model, [] )
 
         updatedModel =
             case serverRevision of
@@ -768,24 +740,27 @@ settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevisio
                         |> updateModelLastAppliedServerRevision serverRevision
                         |> pruneAcknowledgedOptimisticPrefix
 
+        ( visibleModel, visibleCmds ) =
+            publishVisible "mutation-response" updatedModel
+
         ( finalModel, catchupCmd ) =
             case maybeSyncMessage of
                 Just syncMessage ->
                     if syncMessage.requiresCatchup && shouldApplyAuthoritative then
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired updatedModel.catchup updatedModel.db) updatedModel
+                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired visibleModel.catchup visibleModel.authoritativeDb) visibleModel
 
                     else
-                        ( updatedModel, Cmd.none )
+                        ( visibleModel, Cmd.none )
 
                 Nothing ->
-                    ( updatedModel, Cmd.none )
+                    ( visibleModel, Cmd.none )
     in
     ( finalModel
     , Cmd.batch
         [ QueryManager.mutationResult requestId mutationId (Ok response)
-        , writeServerRevisionCmd serverRevision
-        , Cmd.batch (List.map (Cmd.map DbMsg) authoritativeDbCmds)
-        , Cmd.batch authoritativeQueryCmds
+        , writeServerRevisionCmd finalModel.lastAppliedServerRevision
+        , Cmd.batch authoritativeCmds
+        , Cmd.batch visibleCmds
         , catchupCmd
         ]
     )
@@ -830,16 +805,22 @@ pruneAcknowledgedOptimisticPrefix model =
                     pruneAcknowledgedOptimisticPrefix { model | optimisticOrder = rest }
 
 
-applyAuthoritativeDelta : Data.Delta.Delta -> Model -> ( Db.Db, List (Cmd Db.Msg) )
-applyAuthoritativeDelta delta model =
+applyAuthoritativeDelta : Maybe Int -> Data.Delta.Delta -> Model -> ( Model, List (Cmd Msg) )
+applyAuthoritativeDelta revision delta model =
     let
-        ( authoritativeDb, authoritativeCmd ) =
-            Db.update (Db.DeltaReceived delta) model.db
+        ( accepted, rowRevisions ) =
+            filterAuthoritativeRows revision delta model.rowRevisions
 
-        ( replayedDb, replayCmds ) =
-            replayOptimisticMutations model authoritativeDb
+        ( authoritativeDb, authoritativeCmd ) =
+            Db.update (Db.DeltaReceived accepted) model.authoritativeDb
     in
-    ( replayedDb, authoritativeCmd :: replayCmds )
+    ( { model
+        | authoritativeDb = authoritativeDb
+        , rowRevisions = rowRevisions
+        , lastAppliedServerRevision = updateLastAppliedServerRevision revision model.lastAppliedServerRevision
+      }
+    , [ Cmd.map DbMsg authoritativeCmd ]
+    )
 
 
 replayOptimisticMutations : Model -> Db.Db -> ( Db.Db, List (Cmd Db.Msg) )
@@ -854,7 +835,7 @@ replayOptimisticMutations model db =
                     Just optimistic ->
                         let
                             ( nextDb, cmd ) =
-                                Db.update (Db.LocalDeltaReceived optimistic.forward) currentDb
+                                Db.update (Db.LocalDeltaReceived (intentDelta model.authoritativeDb optimistic currentDb)) currentDb
                         in
                         ( nextDb, cmd :: cmds )
             )
@@ -868,6 +849,119 @@ removeOptimisticMutation requestId model =
         | inFlightOptimistic = Dict.remove requestId model.inFlightOptimistic
         , optimisticOrder = List.filter ((/=) requestId) model.optimisticOrder
     }
+
+
+intentDelta : Db.Db -> OptimisticInFlight -> Db.Db -> Data.Delta.Delta
+intentDelta authoritative pending visible =
+    let
+        table db =
+            Dict.get pending.tableName db.tables |> Maybe.withDefault Dict.empty
+
+        updateRow id =
+            Dict.get id (table visible)
+                |> Maybe.map
+                    (\row ->
+                        case pending.acknowledgedServerRevision of
+                            Nothing ->
+                                applySetValues pending.setValues row
+
+                            Just _ ->
+                                -- A later acknowledged edit shields its fields from earlier
+                                -- pending intent, but uses the server's normalized values.
+                                let
+                                    authoritativeRow =
+                                        Dict.get id (table authoritative) |> Maybe.withDefault Dict.empty
+
+                                    confirmedValues =
+                                        List.filterMap
+                                            (\( field, _ ) -> Dict.get field authoritativeRow |> Maybe.map (Tuple.pair field))
+                                            pending.setValues
+                                in
+                                applySetValues confirmedValues row
+                    )
+    in
+    deltaFromRows pending.tableName (List.filterMap updateRow pending.rowIds)
+
+
+filterAuthoritativeRows : Maybe Int -> Data.Delta.Delta -> Dict ( String, Int ) Int -> ( Data.Delta.Delta, Dict ( String, Int ) Int )
+filterAuthoritativeRows revision delta revisions =
+    let
+        filterGroup group ( accGroups, stamps ) =
+            let
+                filterRow values ( accRows, currentStamps ) =
+                    case Dict.get "id" (Dict.fromList (List.map2 Tuple.pair group.headers values)) of
+                        Just (Data.Value.IntValue id) ->
+                            let
+                                key =
+                                    ( group.tableName, id )
+                            in
+                            if isStaleServerRevision revision (Dict.get key currentStamps) then
+                                ( accRows, currentStamps )
+
+                            else
+                                ( values :: accRows
+                                , case revision of
+                                    Just value ->
+                                        Dict.insert key value currentStamps
+
+                                    Nothing ->
+                                        currentStamps
+                                )
+
+                        _ ->
+                            ( values :: accRows, currentStamps )
+
+                ( rows, nextStamps ) =
+                    List.foldl filterRow ( [], stamps ) group.rows
+            in
+            ( { group | rows = List.reverse rows } :: accGroups, nextStamps )
+
+        ( groups, nextRevisions ) =
+            List.foldl filterGroup ( [], revisions ) delta.tableGroups
+    in
+    ( { tableGroups = List.reverse groups }, nextRevisions )
+
+
+publishVisible : String -> Model -> ( Model, List (Cmd Msg) )
+publishVisible source model =
+    let
+        ( visibleDb, _ ) =
+            replayOptimisticMutations model model.authoritativeDb
+
+        changed =
+            Dict.toList visibleDb.tables
+                |> List.concatMap
+                    (\( tableName, rows ) ->
+                        let
+                            previous =
+                                Dict.get tableName model.db.tables |> Maybe.withDefault Dict.empty
+                        in
+                        rows
+                            |> Dict.toList
+                            |> List.filter (\( id, row ) -> Dict.get id previous /= Just row)
+                            |> List.map Tuple.second
+                            |> deltaFromRows tableName
+                            |> .tableGroups
+                    )
+
+        delta =
+            { tableGroups = List.filter (\group -> not (List.isEmpty group.rows)) changed }
+
+        ( queryManager, queryCmds ) =
+            QueryManager.notifyTablesChanged model.schema visibleDb model.queryManager delta
+    in
+    ( { model | db = visibleDb, queryManager = queryManager }
+    , visibleStateOut
+        (Encode.object
+            [ ( "source", Encode.string source )
+            , ( "data", Data.Delta.encodeDelta delta )
+            ]
+        )
+        :: queryCmds
+    )
+
+
+port visibleStateOut : Encode.Value -> Cmd msg
 
 
 isStaleServerRevision : Maybe Int -> Maybe Int -> Bool
@@ -922,35 +1016,47 @@ decodeMutationSyncMessage =
             (\type_ ->
                 case type_ of
                     "delta" ->
-                        Decode.map2
-                            (\serverRevision delta ->
+                        Decode.map4
+                            (\serverRevision delta databaseId databaseEpoch ->
                                 { serverRevision = serverRevision
+                                , databaseId = databaseId
+                                , databaseEpoch = databaseEpoch
                                 , delta = Just delta
                                 , requiresCatchup = False
                                 }
                             )
                             (Decode.maybe (Decode.field "serverRevision" Decode.int))
                             (Decode.field "data" Data.Delta.decodeDelta)
+                            (Decode.maybe (Decode.field "databaseId" Decode.string))
+                            (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
 
                     "syncRequired" ->
-                        Decode.map
-                            (\serverRevision ->
+                        Decode.map3
+                            (\serverRevision databaseId databaseEpoch ->
                                 { serverRevision = serverRevision
+                                , databaseId = databaseId
+                                , databaseEpoch = databaseEpoch
                                 , delta = Nothing
                                 , requiresCatchup = True
                                 }
                             )
                             (Decode.maybe (Decode.field "serverRevision" Decode.int))
+                            (Decode.maybe (Decode.field "databaseId" Decode.string))
+                            (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
 
                     "catchupRequired" ->
-                        Decode.map
-                            (\serverRevision ->
+                        Decode.map3
+                            (\serverRevision databaseId databaseEpoch ->
                                 { serverRevision = serverRevision
+                                , databaseId = databaseId
+                                , databaseEpoch = databaseEpoch
                                 , delta = Nothing
                                 , requiresCatchup = True
                                 }
                             )
                             (Decode.maybe (Decode.field "serverRevision" Decode.int))
+                            (Decode.maybe (Decode.field "databaseId" Decode.string))
+                            (Decode.maybe (Decode.field "databaseEpoch" Decode.string))
 
                     _ ->
                         Decode.fail ("Unknown mutation sync message type: " ++ type_)
@@ -1041,17 +1147,25 @@ applyCatchupUpdate result model =
                 ( result.db, [] )
 
             else
-                case result.delta of
-                    Just _ ->
-                        replayOptimisticMutations model result.db
-
-                    Nothing ->
-                        ( result.db, [] )
+                replayOptimisticMutations { model | authoritativeDb = result.db } result.db
 
         updatedModel =
             { model
                 | catchup = result.model
                 , db = replayedDb
+                , authoritativeDb = result.db
+                , generation =
+                    if result.destructiveReset then
+                        model.generation + 1
+
+                    else
+                        model.generation
+                , rowRevisions =
+                    if result.destructiveReset then
+                        Dict.empty
+
+                    else
+                        model.rowRevisions
                 , syncStatus = nextSyncStatus
                 , tableSyncStatuses = nextTableSyncStatuses
                 , lastAppliedServerRevision =
