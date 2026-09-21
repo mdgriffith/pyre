@@ -101,21 +101,22 @@ database because its adapter detaches the connection for a transaction.
 ## Explicit client composition (MEC-111)
 
 ```ts
-import { operation } from '@pyre/client/operations';
+import { database, operation } from '@pyre/client/operations';
 
 const edits = [
   operation(UpdateTitle, { id: firstId, title: 'First' }),
   operation(UpdateTitle, { id: secondId, title: 'Second' }),
   operation(UpdateTitle, { id: firstId, title: 'Final' }),
 ];
-const result = await client.submit(databaseId, edits);
+const result = await client.submit(database(UpdateTitle.primary_db, databaseId), edits);
 ```
 
 Construction captures JSON values and prediction metadata without starting a
 worker or executing a request. The browser-independent operations entrypoint can
-also supply descriptors to request/response adapters. Submission returns the
-existing `MutationResult`, with ordered indexed results on success. Empty batches
-return immediately without opening a database client.
+also supply descriptors to request/response adapters. Submission returns a
+discriminated result with ordered indexed results on success. Generated builders
+retain tuple result types and decode through the compiled validators. Empty
+batches return immediately without opening a database client.
 
 The existing mutation transport sends one POST to the query endpoint's `$batch`
 identifier. Its JSON body is the ordered `{ queryId, input }` array. The application
@@ -130,8 +131,9 @@ settles or rejects together. Later requests survive rejection, and out-of-order
 acknowledged batches shield their fields with authoritative normalized values.
 Predictions remain memory-only; only accepted authoritative rows are persisted.
 
-Generated record-specific builders/compiler metadata and CRUD removal delivery
-remain the next parts of the same feature PR.
+Generated record-specific builders, typed results, and compiler metadata are
+documented in `composed-operation-builders.md`. UUID worker identity and CRUD
+removal delivery remain the next parts of the same feature PR.
 
 ## Reproduce the native proof
 
