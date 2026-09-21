@@ -69,6 +69,38 @@ This milestone proves existing one-field updates with integer IDs. General
 client composition, atomic batches, insert/delete prediction, and a general
 incremental deletion protocol remain subsequent work.
 
+## Composed server execution (MEC-108)
+
+`run` and `runWithSync` also accept an ordered array in place of the query ID:
+
+```ts
+const operations = [
+  { queryId: UpdateTitle.id, input: { id: firstId, title: "First" } },
+  { queryId: UpdateTitle.id, input: { id: secondId, title: "Second" } },
+];
+const result = await runWithSync(db, queries, operations, undefined, session,
+  connectedSessions, databaseId, originConnectionId);
+await result.sync(sendToSession);
+```
+
+The server manifest supplies validators, session bindings, database namespace,
+and precompiled SQL. All operations execute in order in one write transaction.
+Results retain `{ index, queryId, result }` for each entry, including repeated
+operations. Named commands retain their own cardinality semantics. Compiler-owned
+`generatedEdit.writeStatement` metadata requires exactly one direct affected row;
+zero/multiple writes or any operation failure rolls back the whole batch.
+
+One revision is allocated and validated before commit. Only final affected row
+versions are permission-filtered and published through the existing sync path;
+publication remains an explicit, memoized post-commit action. A publication error
+does not imply rollback. A lost commit acknowledgement returns `OutcomeUnknown`,
+which must not be automatically replayed. Empty batches return an empty result
+without database I/O. Local interactive execution requires a file-backed libsql
+database because its adapter detaches the connection for a transaction.
+
+Client builders, batch prediction, and CRUD removal delivery are the next parts
+of the same feature PR.
+
 ## Reproduce the native proof
 
 Requires Rust's `wasm32-unknown-unknown` target, installed workspace dependencies,

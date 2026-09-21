@@ -1,6 +1,10 @@
 // @ts-nocheck
 import { beforeEach, expect, mock, test } from "bun:test";
 import { z } from "zod";
+import { createClient } from "@libsql/client";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let introspectionResult = { schema_source: "test schema" };
 let sessionIds = ["s1"];
@@ -139,6 +143,47 @@ test('commit order determines revisions even when fanout is reversed or repeated
   await first.sync((_id, message) => sent.push(message));
   expect(sent).toHaveLength(2);
   expect(first.response.result).not.toHaveProperty('serverRevision');
+});
+
+test("runWithSync publishes an atomic repeated-operation batch once to origin and peer", async () => {
+  await loadSchemaFromDatabase(schemaDb as any);
+  sessionIds = ["origin", "peer"];
+  const directory = mkdtempSync(join(tmpdir(), "pyre-sync-batch-"));
+  const db = createClient({ url: `file:${join(directory, "test.db")}` });
+  try {
+    await db.batch([
+      "create table maps (id integer primary key, name text)",
+      "insert into maps values (1, 'Initial')",
+      "create table _pyre_sync (id integer primary key, database_epoch text, server_revision integer)",
+      "insert into _pyre_sync values (1, 'test-epoch', 0)",
+    ]);
+    const queries = { edit: {
+      ...queryMap["query-id"], id: "edit", generatedEdit: { writeStatement: 0 },
+      InputValidator: z.object({ name: z.string() }),
+      sql: [
+        { include: false, params: ["name"], sql: "update maps set name = $name where id = 1" },
+        { include: true, params: [], sql: "select json_array(json_object('table_name', 'maps', 'headers', json_array('id', 'name'), 'rows', json_array(json_array(id, name)))) as _affectedRows from maps" },
+      ],
+    } };
+    const result = await runWithSync(db, queries, [
+      { queryId: "edit", input: { name: "Intermediate" } },
+      { queryId: "edit", input: { name: "World" } },
+    ], undefined, {}, new Map([["origin", { session: {} }], ["peer", { session: {} }]]), undefined, "origin");
+    expect(result.kind).toBe("success");
+    expect((await db.execute("select * from maps")).rows).toEqual([{ id: 1, name: "World" }]);
+    const sent = [];
+    const sync = await result.sync((id, message) => sent.push({ id, message }));
+    expect(sync.serverRevision).toBe(1);
+    expect(sync.originMessage.type).toBe("delta");
+    expect(sent).toHaveLength(1);
+    expect(sent[0].id).toBe("peer");
+    expect(sent[0].message).toEqual(sync.originMessage);
+    expect(result.response.result.map(operation => operation.index)).toEqual([0, 1]);
+    await result.sync(() => { throw new Error("must not republish"); });
+  } finally {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('permission-filtered recipients get identity-free invalidation while visible edits remain incremental', async () => {

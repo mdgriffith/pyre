@@ -6,6 +6,7 @@ import { activateSchemaForDatabase } from "./schema";
 import {
   run,
   type QueryMap,
+  type OperationDescriptor,
   type QueryResult,
   type Session,
   type SessionValue,
@@ -207,7 +208,7 @@ function syncWithWasmForDatabase(databaseId?: DatabaseId): SyncDeltasFn {
 export async function runWithSync(
   db: Client,
   queryMap: QueryMap,
-  queryId: string,
+  queryId: string | readonly OperationDescriptor[],
   args: any,
   executingSession: Session,
   connectedSessions?: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,

@@ -1,4 +1,4 @@
-import { Client, InStatement } from "@libsql/client";
+import { Client, InStatement, type Transaction } from "@libsql/client";
 import type { LinkInfo, SchemaMetadata, TableMetadata } from "@pyre/core";
 import type { ZodType } from "zod";
 import { buildArgs, formatResultData, toSqlStatements, type SqlInfo } from "./runtime/sql";
@@ -30,6 +30,8 @@ export interface QueryMetadata {
     json_input_args: string[];
     InputValidator: Validator<any>;
     SessionValidator: Validator<any>;
+    /** Compiler-owned index of the direct write whose cardinality must be one. */
+    generatedEdit?: { writeStatement: number };
 }
 
 /**
@@ -37,6 +39,12 @@ export interface QueryMetadata {
  */
 export interface QueryMap {
     [queryId: string]: QueryMetadata;
+}
+
+/** Transport contains identifiers and values only; SQL and authority stay on the server. */
+export interface OperationDescriptor {
+    queryId: string;
+    input: unknown;
 }
 
 /**
@@ -65,6 +73,7 @@ export interface QueryResult {
     error?: {
         errorType: string;
         message: string;
+        operationIndex?: number;
     };
     /**
      * Broadcast sync deltas to connected clients.
@@ -211,7 +220,7 @@ function decodeOrError<T>(validator: Validator<T>, data: unknown, context: strin
 export async function run(
     db: Client,
     queryMap: QueryMap,
-    queryId: string,
+    queryId: string | readonly OperationDescriptor[],
     args: any,
     executingSession: Session,
     connectedSessions?: Map<string, { session: Record<string, SessionValue>;[key: string]: any }>,
@@ -219,8 +228,12 @@ export async function run(
     originSessionId?: string,
     options: RunOptions = {},
 ): Promise<QueryResult> {
+    if (Array.isArray(queryId)) {
+        return runOperations(db, queryMap, queryId, executingSession, connectedSessions, syncDeltas, originSessionId, options);
+    }
     // Look up query metadata
-    const query = queryMap[queryId];
+    const id = queryId as string;
+    const query = Object.hasOwn(queryMap, id) ? queryMap[id] : undefined;
     if (!query) {
         return {
             kind: "error",
@@ -230,6 +243,9 @@ export async function run(
             },
             async sync() { return {}; },
         };
+    }
+    if (query.generatedEdit) {
+        return runOperations(db, queryMap, [{ queryId: id, input: args }], executingSession, connectedSessions, syncDeltas, originSessionId, options, true);
     }
 
     // Validate input
@@ -293,6 +309,18 @@ export async function run(
     const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
     const response = formatResultData(activeSql, resultSets);
 
+    return executionResult(response, affectedRowGroups, connectedSessions, syncDeltas, originSessionId, committedRevision);
+}
+
+function executionResult(
+    response: unknown,
+    affectedRowGroups: any[],
+    connectedSessions?: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
+    syncDeltas?: SyncDeltasFn,
+    originSessionId?: string,
+    committedRevision?: { databaseEpoch: string; serverRevision: number },
+): QueryResult {
+
     // Always create sync function - it will be a no-op if there's nothing to send
     /**
      * Broadcast sync deltas to connected clients.
@@ -352,6 +380,145 @@ export async function run(
     };
 
     return queryResult;
+}
+
+async function executeCheckedStatements(db: Pick<Client, "execute">, statements: InStatement[], writeStatement: number) {
+    if (!Number.isInteger(writeStatement) || writeStatement < 0 || writeStatement >= statements.length) {
+        throw new Error("Invalid generated edit metadata");
+    }
+    const results = [];
+    for (const [index, statement] of statements.entries()) {
+        results.push(await db.execute(statement));
+        if (index === writeStatement) {
+            // libsql RETURNING may report rowsAffected=0. changes() is the direct
+            // write count, excluding triggers, on this transaction connection.
+            const count = await db.execute("select changes() as count");
+            if (Number(count.rows[0]?.count) !== 1) throw new Error("Generated edit must affect exactly one row");
+        }
+    }
+    return results;
+}
+
+async function writeTransaction<T>(db: Client, execute: (tx: Transaction) => Promise<T>): Promise<T> {
+    // The local adapter detaches the client's connection for an interactive
+    // transaction. Private in-memory databases would silently lose their state.
+    if (db.protocol === "file") {
+        const databases = await db.execute("pragma database_list");
+        if (!databases.rows.some(row => row.name === "main" && typeof row.file === "string" && row.file.length > 0)) {
+            throw new Error("Composed/generated operations require a file-backed local database");
+        }
+    }
+    const tx = await db.transaction("write");
+    let committing = false;
+    try {
+        const result = await execute(tx);
+        committing = true;
+        await tx.commit();
+        return result;
+    } catch (error) {
+        try { if (!tx.closed) await tx.rollback(); } catch (_) { /* Preserve the execution outcome. */ }
+        if (committing) throw new CommitOutcomeUnknown();
+        throw error;
+    } finally {
+        tx.close();
+    }
+}
+
+class CommitOutcomeUnknown extends Error {}
+
+async function runOperations(
+    db: Client,
+    queryMap: QueryMap,
+    operations: readonly OperationDescriptor[],
+    executingSession: Session,
+    connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }> | undefined,
+    syncDeltas: SyncDeltasFn | undefined,
+    originSessionId: string | undefined,
+    options: RunOptions,
+    single = false,
+): Promise<QueryResult> {
+    const fail = (errorType: string, message: string, operationIndex?: number): QueryResult => ({
+        kind: "error", error: { errorType, message, ...(operationIndex === undefined ? {} : { operationIndex }) },
+        async sync() { return {}; },
+    });
+    let namespace: string | undefined;
+    for (const [index, operation] of operations.entries()) {
+        if (!operation || typeof operation.queryId !== "string" || !Object.hasOwn(operation, "input") || Object.keys(operation).some(key => key !== "queryId" && key !== "input")) {
+            return fail("InvalidInput", "Expected an operation descriptor", index);
+        }
+        const query = Object.hasOwn(queryMap, operation.queryId) ? queryMap[operation.queryId] : undefined;
+        if (!query) return fail("UnknownQuery", "Unknown operation", index);
+        const currentNamespace = query.primary_db ?? "";
+        namespace ??= currentNamespace;
+        if (namespace !== currentNamespace || query.attached_dbs?.length) return fail("InvalidInput", "Operations must target one database namespace", index);
+        for (const [validator, value, type] of [
+            [query.InputValidator, operation.input, "InvalidInput"],
+            [query.SessionValidator, executingSession, "InvalidSession"],
+        ] as const) {
+            if (!validator.safeParse(value).success) return fail(type, "Operation validation failed", index);
+        }
+    }
+    if (operations.length === 0) return executionResult([], [], connectedSessions, syncDeltas, originSessionId);
+    const responses: Array<{ index: number; queryId: string; result: unknown }> = [];
+    const affected: any[] = [];
+    let finalGroups: any[] = [];
+    let operationIndex = 0;
+    let revision: { databaseEpoch: string; serverRevision: number } | undefined;
+    try {
+        await writeTransaction(db, async tx => {
+            for (const operation of operations) {
+                const metadata = queryMap[operation.queryId];
+                // Reuse validation, binding, SQL selection and result formatting.
+                // This facade executes within the outer transaction; it never commits.
+                const executor = {
+                    batch: (statements: InStatement[]) => metadata.generatedEdit
+                        ? executeCheckedStatements(tx, statements, metadata.generatedEdit.writeStatement)
+                        : tx.batch(statements),
+                } as Client;
+                const result = await run(executor, { [operation.queryId]: { ...metadata, generatedEdit: undefined } }, operation.queryId, operation.input, executingSession,
+                    undefined, async groups => { affected.push(...groups); }, undefined, { mode: options.mode });
+                if (result.kind === "error") throw new Error("Operation validation failed");
+                responses.push({ index: operationIndex, queryId: operation.queryId, result: result.response });
+                await result.sync(() => {});
+                operationIndex += 1;
+            }
+            finalGroups = combineAffectedRows(affected);
+            if (options.allocateSyncRevision && operations.some(op => {
+                const query = queryMap[op.queryId];
+                return (query.syncSql ?? query.sql).some(statement => statement.sql.includes("_affectedRows"));
+            })) {
+                const stamp = (await tx.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision")).rows[0];
+                const serverRevision = Number(stamp?.server_revision);
+                if (typeof stamp?.database_epoch !== "string" || !Number.isSafeInteger(serverRevision)) throw new Error("Invalid sync revision");
+                revision = { databaseEpoch: stamp.database_epoch, serverRevision };
+            }
+        });
+    } catch (error) {
+        if (error instanceof CommitOutcomeUnknown) return fail("OutcomeUnknown", "Commit outcome unknown; do not automatically replay");
+        return fail("TransactionFailed", "Operation batch failed", operationIndex);
+    }
+    return executionResult(single ? responses[0].result : responses, finalGroups, connectedSessions, syncDeltas, originSessionId, revision);
+}
+
+function combineAffectedRows(affected: any[]): any[] {
+    // Only final row versions may be authorized/published: intermediate versions
+    // could leak data after a later operation revokes access to the same row.
+    const finalGroups = new Map<string, any>();
+    for (const group of affected) {
+        const idIndex = group.headers.indexOf("id");
+        if (idIndex < 0) throw new Error("Affected rows require identity");
+        for (const row of group.rows) {
+            finalGroups.set(JSON.stringify([group.table_name, row[idIndex]]), { ...group, rows: [row] });
+        }
+    }
+    const tables = new Map<string, any>();
+    for (const group of finalGroups.values()) {
+        const key = JSON.stringify([group.table_name, group.headers]);
+        const table = tables.get(key);
+        if (table) table.rows.push(...group.rows);
+        else tables.set(key, group);
+    }
+    return [...tables.values()];
 }
 
 /**

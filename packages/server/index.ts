@@ -17,6 +17,7 @@ export type {
     QueryResult,
     QueryMap,
     QueryMetadata,
+    OperationDescriptor,
     SeedInput,
     SeedOptions,
     SeedResult,
