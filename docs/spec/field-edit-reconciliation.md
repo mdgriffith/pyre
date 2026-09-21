@@ -65,9 +65,10 @@ remove that identity. Regenerate Elm streams and handle `EntityRemoved table id`
 Deploy the client support for `invalidate` with the server change; older clients
 cannot perform this permission-loss recovery.
 
-The initial milestone proves existing field updates with integer IDs. Ordered
-field batches now use the same engine. Insert/delete prediction and a general
-incremental deletion protocol remain subsequent work in this feature PR.
+The proof now uses UUID identities throughout the existing worker and its
+persistence path. Ordered field batches use the same engine. Insert/delete
+prediction and a general incremental deletion protocol remain subsequent work
+in this feature PR.
 
 ## Composed server execution (MEC-108)
 
@@ -132,8 +133,8 @@ acknowledged batches shield their fields with authoritative normalized values.
 Predictions remain memory-only; only accepted authoritative rows are persisted.
 
 Generated record-specific builders, typed results, and compiler metadata are
-documented in `composed-operation-builders.md`. UUID worker identity and CRUD
-removal delivery remain the next parts of the same feature PR.
+documented in `composed-operation-builders.md`. Schema-level UUID enforcement,
+fixture migration and CRUD removal delivery remain work in the same feature PR.
 
 ## Reproduce the native proof
 

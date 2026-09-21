@@ -22,7 +22,7 @@ record Note {
   @watch
   @allow(query) { title != "HIDDEN" || Session.admin == True }
   @allow(update, insert, delete) { True }
-   id Id.Uuid @id
+  id Id.Uuid @id
   title String
   updatedAt Int
 }
