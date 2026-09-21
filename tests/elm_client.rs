@@ -15,7 +15,7 @@ fn generated_elm_update_groups_list_input_types() {
 record MapEntityTrail {
     @public
 
-    id    Id.Int @id
+    id    Id.Uuid @id
     trail Json<List<Int>>
 }
 "#;
@@ -65,7 +65,7 @@ type ChoiceStorage
 record LegacyChoice {
     @public
 
-    id              Id.Int @id
+    id              Id.Uuid @id
     expectedChoices Json<ChoiceStorage>?
 }
 "#;
@@ -127,7 +127,7 @@ fn generated_elm_crud_omits_immutable_update_encoder_but_returns_field() {
         r#"
 record Document {
     @public
-    id      Int @id
+    id      Id.Uuid @id
     ownerId Int @immutable
     title   String
 }
@@ -183,14 +183,14 @@ fn generated_pyre_elm_uses_query_upserts() {
 record Rulebook {
     @public
 
-    id   Id.Int @id
+    id   Id.Uuid @id
     name String
 }
 
 record GameWorld {
     @public
 
-    id   Id.Int @id
+    id   Id.Uuid @id
     slug String
 }
 "#;
@@ -299,6 +299,7 @@ query GetGameWorld($slug: String) {
 #[test]
 fn generated_elm_mutation_modules_include_bridge_metadata() {
     let schema_source = r#"
+@syncable(false)
 record Post {
     @public
 
@@ -368,7 +369,7 @@ fn generated_schema_scoped_entity_stream_modules_encode_id_filtered_streams() {
 record Post {
     @public
 
-    id    Id.Int @id
+    id    Id.Uuid @id
     title String
 }
 
@@ -384,7 +385,7 @@ record Comment {
 record Post {
     @public
 
-    id    Id.Int @id
+    id    Id.Uuid @id
     title String
 }
 "#;
@@ -482,18 +483,18 @@ record Post {
             .contains("module Db.Table.Posts exposing (Row, Stream, decodeRow, stream, idIn)")
             && post_table
                 .contents
-                .contains("type alias Row =\n    { id : Int\n    , title : String\n    }")
+                .contains("type alias Row =\n    { id : String\n    , title : String\n    }")
             && post_table
                 .contents
                 .contains("stream : StreamInternal.TableSubscription Stream\nstream =\n    StreamInternal.table \"posts\"")
-            && post_table.contents.contains("idIn : List Int -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream")
-            && post_table.contents.contains("StreamInternal.addCondition \"id\" (Encode.object [ ( \"$in\", Encode.list Encode.int values ) ]) subscription")
+            && post_table.contents.contains("idIn : List String -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream")
+            && post_table.contents.contains("StreamInternal.addCondition \"id\" (Encode.object [ ( \"$in\", Encode.list Encode.string values ) ]) subscription")
             && post_table
                 .contents
                 .contains("decodeRow : Decode.Decoder Row\ndecodeRow =\n    Decode.succeed Row")
             && post_table
                 .contents
-                .contains("|> Db.Decode.andField \"id\" Decode.int"),
+                .contains("|> Db.Decode.andField \"id\" Decode.string"),
         "Db.Table.Posts should expose the row type and decoder. Generated:\n{}",
         post_table.contents
     );
@@ -507,11 +508,11 @@ record Post {
             .contents
             .contains("module Db.Table.Comments exposing (Row, Stream, decodeRow, stream, idIn, postIdIn)")
             && comment_table.contents.contains(
-            "type alias Row =\n    { id : String\n    , postId : Int\n    , body : String\n    }"
+            "type alias Row =\n    { id : String\n    , postId : String\n    , body : String\n    }"
         ) && comment_table
             .contents
-            .contains("|> Db.Decode.andField \"postId\" Decode.int")
-            && comment_table.contents.contains("postIdIn : List Int -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream"),
+            .contains("|> Db.Decode.andField \"postId\" Decode.string")
+            && comment_table.contents.contains("postIdIn : List String -> StreamInternal.TableSubscription Stream -> StreamInternal.TableSubscription Stream"),
         "Db.Table.Comments should expose the row type and decoder. Generated:\n{}",
         comment_table.contents
     );

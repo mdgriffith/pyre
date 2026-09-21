@@ -702,13 +702,13 @@ mod tests {
             schema_source: r#"
 record Parent {
     @public
-    id       Id.Int @id
+    id       Id.Uuid @id
     children @link(Campaign.Child.parentId)
 }
 
 record Child {
     @public
-    id       Id.Int @id
+    id       Id.Uuid @id
     parentId Parent.id
     parent   @link(parentId, Campaign.Parent.id)
 }

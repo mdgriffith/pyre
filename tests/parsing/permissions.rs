@@ -35,7 +35,7 @@ fn permission_predicates_cannot_be_empty() {
 fn permission_constants_allow_explicit_unrestricted_and_denied_operations() {
     let source = r#"
 record Post {
-    id Int @id
+    id Id.Uuid @id
     @allow(query) { True }
     @allow(insert, update, delete) { False }
 }
@@ -83,7 +83,7 @@ record Post {
     let mut deny_all_schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        "record Locked {\n    id Int @id\n    @allow(*) { False }\n}\n",
+        "record Locked {\n    id Id.Uuid @id\n    @allow(*) { False }\n}\n",
         &mut deny_all_schema,
     )
     .unwrap();
@@ -108,7 +108,7 @@ type State
    | Ready
 
 record Job {{
-    id Int @id
+    id Id.Uuid @id
     state State
     @allow(query) {{ {} }}
 }}
@@ -172,7 +172,7 @@ type State
    | Ready
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     state State
     @allow(query) { state.Failed.code == Session.code }
 }
@@ -189,7 +189,7 @@ record Job {
 fn permission_functions_are_rejected_for_live_sync_consistency() {
     let source = r#"
 record Job {
-    id Int @id
+    id Id.Uuid @id
     code Int
     @allow(query) { code == length("value") }
     @allow(insert, update, delete) { False }
@@ -211,6 +211,7 @@ record Job {
 fn membership_schema(session_type: &str, predicate: &str) -> String {
     format!(
         r#"
+@syncable(false)
 session {{
     activeIds {}
 }}
@@ -804,7 +805,7 @@ fn test_single_permission_allowed() {
     // A single @allow directive should be allowed
     let schema_source = r#"
 record Post {
-    id Int @id
+    id Id.Uuid @id
     title String
     authorId Int
     @allow(*) { authorId == Session.userId }
@@ -868,7 +869,7 @@ record Post {
 fn test_public_directive_parses() {
     let schema_source = r#"
 record Post {
-    id Int @id
+    id Id.Uuid @id
     title String
     @public
 }
@@ -1251,13 +1252,13 @@ fn test_public_directive_counts_as_permissions() {
     // Test that @public counts as a permissions directive for validation
     let schema_source = r#"
 record Post {
-    id Int @id
+    id Id.Uuid @id
     title String
     @public
 }
 
 record Comment {
-    id Int @id
+    id Id.Uuid @id
     content String
     authorId Int
     @allow(*) { authorId == Session.userId }
@@ -1286,7 +1287,7 @@ fn test_multiple_fine_grained_permissions_allowed() {
     // Multiple fine-grained permissions should be allowed if they don't overlap
     let schema_source = r#"
 record Post {
-    id Int @id
+    id Id.Uuid @id
     title String
     authorId Int
     @allow(query) { authorId == Session.userId }

@@ -18,7 +18,7 @@ record Rulebook {
 
     versions @link(RulebookVersion.rulebookId)
 
-    id   Id.Int @id
+    id   Id.Uuid @id
     name String
 }
 
@@ -28,7 +28,7 @@ record RulebookVersion {
     documents @link(RulebookVersionDocument.rulebookVersionId)
     rules     @link(RulebookVersionRules.rulebookVersionId)
 
-    id         Id.Int @id
+    id         Id.Uuid @id
     rulebookId Rulebook.id
     versionTag String
 }
@@ -36,7 +36,7 @@ record RulebookVersion {
 record RulebookDocument {
     @public
 
-    id          Id.Int @id
+    id          Id.Uuid @id
     contentHash String
     content     String
 }
@@ -44,7 +44,7 @@ record RulebookDocument {
 record RulebookRules {
     @public
 
-    id          Id.Int @id
+    id          Id.Uuid @id
     contentHash String
     content     String
 }
@@ -54,7 +54,7 @@ record RulebookVersionDocument {
 
     rulebookDocument @link(rulebookDocumentId, RulebookDocument.id)
 
-    id                 Id.Int @id
+    id                 Id.Uuid @id
     rulebookVersionId  RulebookVersion.id
     rulebookDocumentId RulebookDocument.id
     path               String
@@ -66,7 +66,7 @@ record RulebookVersionRules {
 
     rulebookRules @link(rulebookRulesId, RulebookRules.id)
 
-    id               Id.Int @id
+    id               Id.Uuid @id
     rulebookVersionId RulebookVersion.id
     rulebookRulesId   RulebookRules.id
     path              String

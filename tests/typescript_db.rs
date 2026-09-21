@@ -79,6 +79,7 @@ record Document {
 #[test]
 fn typescript_schema_and_decoders_render_typed_json_containers() {
     let schema_source = r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -308,6 +309,7 @@ record Document {
 #[test]
 fn typescript_session_validator_uses_custom_type_decoder() {
     let schema_source = r#"
+@syncable(false)
 type Role
     = Admin
     | Member
@@ -367,6 +369,7 @@ record User {
 #[test]
 fn core_session_validator_composes_named_type_decoders() {
     let schema_source = r#"
+@syncable(false)
 type ParticipantStatus
     = Storyteller
     | Player
@@ -536,6 +539,7 @@ if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "c
 #[test]
 fn typescript_session_references_preserve_id_storage_types() {
     let schema_source = r#"
+@syncable(false)
 session {
     uuidRecordId UuidRecord.id?
     intRecordId  IntRecord.id?
@@ -621,6 +625,7 @@ if (SessionValidator.safeParse({ intRecordId: 7.5 }).success) {
 #[test]
 fn typescript_metadata_serializes_payload_union_parameters_but_not_unit_enums() {
     let schema_source = r#"
+@syncable(false)
 type Content
    = Folder
    | Markdown {

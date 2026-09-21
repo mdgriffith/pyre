@@ -112,7 +112,7 @@ fn test_sync_status_sql_after_roundtrip_with_branded_ids() {
     let schema_source = r#"
 record User {
     @public
-    id Id.Int @id
+    id Id.Uuid @id
     updatedAt DateTime
 }
 "#;
@@ -137,13 +137,13 @@ record User {
         })
         .expect("Should find id field");
 
-    id_field.type_ = ast::ColumnType::IdInt {
+    id_field.type_ = ast::ColumnType::IdUuid {
         table: "User".to_string(),
     };
 
     let roundtripped_schema_source = schema_to_string("", &schema);
-    assert!(!roundtripped_schema_source.contains("Id.Int<"));
-    assert!(roundtripped_schema_source.contains("Id.Int"));
+    assert!(!roundtripped_schema_source.contains("Id.Uuid<"));
+    assert!(roundtripped_schema_source.contains("Id.Uuid"));
 
     let introspection = introspect::from_raw(introspect::IntrospectionRaw {
         tables: vec![],
@@ -437,6 +437,7 @@ record Post {
 #[test]
 fn test_valid_foreign_key_passes_validation() {
     let schema_source = r#"
+@syncable(false)
 record User {
     @public
     id Id.Int @id
@@ -478,7 +479,7 @@ record User {
 
 record Post {
     @public
-    id Id.Int @id
+    id Id.Uuid @id
     authorId User.id
     title String
 }
@@ -501,8 +502,9 @@ record Post {
 }
 
 #[test]
-fn test_sync_schema_roundtrip_with_plain_int_fk_field_succeeds() {
+fn test_query_only_schema_roundtrip_with_plain_int_fk_field_succeeds() {
     let schema_source = r#"
+@syncable(false)
 session {
     userId Int
     role   String
@@ -562,13 +564,15 @@ record Post {
     let result = sync::get_sync_status_statement(&sync_cursor, context, &session);
     assert!(
         result.is_ok(),
-        "Sync status SQL statement should be generated"
+        "Query-only status SQL statement should be generated"
     );
+    assert!(!result.unwrap().sql.contains("FROM \"users\""));
 }
 
 #[test]
-fn test_sync_schema_roundtrip_with_user_id_field_reference_fails_typecheck() {
+fn test_query_only_schema_roundtrip_with_user_id_field_reference_fails_typecheck() {
     let schema_source = r#"
+@syncable(false)
 session {
     userId Int
     role   String
@@ -688,7 +692,7 @@ session {
 record GameDocument {
     @allow(*) { Session.isAdmin == True }
 
-    id        Id.Int   @id
+    id        Id.Uuid  @id
     updatedAt DateTime @default(now)
 }
 "#;
@@ -723,7 +727,7 @@ record GameDocument {
     let conn = db.connect().expect("Failed to connect to sqlite db");
 
     conn.execute(
-        "create table gameDocuments (id integer not null primary key, updatedAt integer not null)",
+        "create table gameDocuments (id text not null primary key, updatedAt integer not null)",
         (),
     )
     .await

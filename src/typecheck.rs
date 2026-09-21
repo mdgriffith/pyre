@@ -1284,6 +1284,25 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                             });
                                         }
                                         has_primary_id = true;
+                                        if schema.sync_mode == ast::SyncMode::Synced
+                                            && (column.nullable
+                                                || !matches!(
+                                                    column.type_,
+                                                    ast::ColumnType::IdUuid { .. }
+                                                ))
+                                        {
+                                            errors.push(Error {
+                                                filepath: file.path.clone(),
+                                                error_type: ErrorType::InvalidSyncedPrimaryKey {
+                                                    record: name.clone(),
+                                                    field: column.name.clone(),
+                                                },
+                                                locations: vec![Location {
+                                                    contexts: to_range(start, end),
+                                                    primary: to_range(&column.start, &column.end),
+                                                }],
+                                            });
+                                        }
                                     }
 
                                     // Validate foreign key references

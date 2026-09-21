@@ -121,6 +121,7 @@ type MembershipRole
 #[test]
 fn elm_generates_rich_types_for_typed_json_fields_and_inputs() {
     let schema_source = r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -239,6 +240,7 @@ query GetEvents {
 #[test]
 fn elm_wraps_dict_decoders_for_typed_json_fields() {
     let schema_source = r#"
+@syncable(false)
 type Attribute
    = AttributeInt {
         value Int

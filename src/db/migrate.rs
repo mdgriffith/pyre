@@ -408,7 +408,7 @@ record Member {
         };
         parser::run(
             "pyre/schema/App/schema.pyre",
-            "record Post {\n    @public\n    id Id.Int @id\n    userId Auth.User.id\n}\n",
+            "record Post {\n    @public\n    id Id.Uuid @id\n    userId Auth.User.id\n}\n",
             &mut app,
         )
         .expect("App schema should parse");

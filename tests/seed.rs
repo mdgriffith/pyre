@@ -420,6 +420,7 @@ use pyre::seed;
 #[tokio::test]
 async fn test_seed_populates_immutable_fields() -> Result<(), TestError> {
     let schema_source = r#"
+@syncable(false)
 record Document {
     id      Int @id
     ownerId Int @immutable

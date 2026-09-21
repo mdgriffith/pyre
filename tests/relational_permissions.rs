@@ -146,7 +146,11 @@ fn validates_paths_body_and_sync_gate() {
         )));
     }
 
-    let synced = QUERY_ONLY_SCHEMA.replace("@syncable(false)\n", "");
+    let synced = QUERY_ONLY_SCHEMA
+        .replace("@syncable(false)\n", "")
+        .replace("id Int @id", "id Id.Uuid @id")
+        .replace("workspaceId Int", "workspaceId Workspace.id")
+        .replace("userId Int", "userId User.id");
     let errors = check_schema(&synced).unwrap_err();
     assert!(errors.iter().any(|error| matches!(
         &error.error_type,

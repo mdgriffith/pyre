@@ -8,6 +8,7 @@ type Status
 "#;
 
 pub const SCHEMA_V1: &str = r#"
+@syncable(false)
 record User {
     id   Int    @id
     name String

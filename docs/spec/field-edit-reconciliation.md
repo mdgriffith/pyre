@@ -133,8 +133,9 @@ acknowledged batches shield their fields with authoritative normalized values.
 Predictions remain memory-only; only accepted authoritative rows are persisted.
 
 Generated record-specific builders, typed results, and compiler metadata are
-documented in `composed-operation-builders.md`. Schema-level UUID enforcement,
-fixture migration and CRUD removal delivery remain work in the same feature PR.
+documented in `composed-operation-builders.md`, including the enforced synced
+UUID identity rule and migration guidance. CRUD removal delivery remains work in
+the same feature PR.
 
 ## Reproduce the native proof
 

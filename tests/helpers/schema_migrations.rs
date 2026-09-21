@@ -41,6 +41,7 @@ record Account {
 pub fn schema_v1_complete() -> String {
     format!(
         r#"
+@syncable(false)
 {}
 
 {}
@@ -53,6 +54,7 @@ pub fn schema_v1_complete() -> String {
 pub fn schema_v2_complete() -> String {
     format!(
         r#"
+@syncable(false)
 record User {{
     id   Int    @id
     name String
@@ -73,6 +75,7 @@ record User {{
 pub fn schema_v3_complete() -> String {
     format!(
         r#"
+@syncable(false)
 record User {{
     id   Int    @id
     name String

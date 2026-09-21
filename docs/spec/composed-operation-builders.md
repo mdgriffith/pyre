@@ -87,10 +87,35 @@ IndexedDB version 3 clears older authoritative caches and their cursors/revision
 atomically, then reloads authority from the server. Deploy the UUID server/schema
 migration with this client upgrade; integer-keyed synced caches are unsupported.
 
-This is a checkpoint in the full MEC-106 feature PR. Schema-level enforcement and
-the broader UUID fixture migration, create/delete prediction and incremental
+This is a checkpoint in the full MEC-106 feature PR. Create/delete prediction and incremental
 removals, broader submission/bridge conformance, and complete feature examples
 remain release work in this same PR.
+
+## Schema identity migration
+
+Syncability defaults to true. Every record in a synced namespace must have exactly
+one non-null `Id.Uuid @id` column; its field name need not be `id`. Type checking
+rejects integer, plain string, nullable, missing and multiple primary keys before
+generating clients or executing queries. The requirement applies across all schema
+files in that namespace.
+
+For a server-owned database used through request/response queries, declare
+`@syncable(false)` at namespace scope. Integer and other primary-key types remain
+available there. This is an execution-mode choice, not a way to synchronize integer
+rows with the UUID-only worker.
+
+For an existing synced database, migrate primary keys and their foreign-key values
+together using an explicit old-to-new ID mapping; update stored session IDs and
+external references as well. A schema type change alone does not convert existing
+data or preserve its relationships. Regenerate clients/manifests and deploy the
+schema, server and client upgrade together. IndexedDB v3 discards legacy caches;
+the next initialization loads migrated authority.
+
+Trusted imports and named commands can supply explicit UUIDs of any version.
+Generated client creates allocate canonical lowercase UUIDv7 once, and their
+trusted manifest metadata requires UUIDv7 at execution. UUID ordering is an index
+locality optimization, not business ordering. A newly created ID cannot be used by
+another operation in the same batch without a future reference/placeholder API.
 
 Generated compile-positive/negative and wire checks:
 
