@@ -24,7 +24,7 @@ export interface PutRowsResult {
   skippedOlder: number;
 }
 
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 export class IndexedDBStorage {
   private dbName: string;
@@ -60,6 +60,14 @@ export class IndexedDBStorage {
 
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
+
+        // Integer-keyed caches cannot supply a UUID catchup cursor. Rebuild the
+        // authoritative cache, including its revision fences, in one upgrade.
+        if (event.oldVersion > 0 && event.oldVersion < 3) {
+          for (const name of ['tables', 'syncCursor', 'meta']) {
+            if (db.objectStoreNames.contains(name)) db.deleteObjectStore(name);
+          }
+        }
 
         if (!db.objectStoreNames.contains('tables')) {
           const tablesStore = db.createObjectStore('tables', { keyPath: ['tableName', 'id'] });
@@ -257,11 +265,11 @@ export class IndexedDBStorage {
     });
   }
 
-  async getRowRevisions(): Promise<Array<[string, number, number]>> {
+  async getRowRevisions(): Promise<Array<[string, string, number]>> {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
       const request = db.transaction(['meta'], 'readonly').objectStore('meta').get('rowRevisions');
-      request.onsuccess = () => resolve(Object.entries(request.result ?? {}).map(([key, revision]) => [...JSON.parse(key), revision] as [string, number, number]));
+      request.onsuccess = () => resolve(Object.entries(request.result ?? {}).map(([key, revision]) => [...JSON.parse(key), revision] as [string, string, number]));
       request.onerror = () => reject(request.error);
     });
   }

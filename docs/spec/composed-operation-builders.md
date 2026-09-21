@@ -80,10 +80,17 @@ write and rolls back the batch if it did not affect exactly one row. UUID create
 metadata additionally requires canonical lowercase UUIDv7. Named commands retain
 their existing behavior; recognition compares the full generated definition.
 
-This is a checkpoint in the full MEC-106 feature PR. Update prediction uses the
-existing worker. UUID row identity in that worker, create/delete prediction and
-incremental removals, broader submission/bridge conformance, and complete feature
-examples remain release work in this same PR.
+The existing worker now uses UUID row keys throughout its database, indices,
+query tracking, optimistic intents, row revision stamps and catchup cursors.
+Imported UUIDs may use any version; only generated creates require UUIDv7.
+IndexedDB version 3 clears older authoritative caches and their cursors/revisions
+atomically, then reloads authority from the server. Deploy the UUID server/schema
+migration with this client upgrade; integer-keyed synced caches are unsupported.
+
+This is a checkpoint in the full MEC-106 feature PR. Schema-level enforcement and
+the broader UUID fixture migration, create/delete prediction and incremental
+removals, broader submission/bridge conformance, and complete feature examples
+remain release work in this same PR.
 
 Generated compile-positive/negative and wire checks:
 

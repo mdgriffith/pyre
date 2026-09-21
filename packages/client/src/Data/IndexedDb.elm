@@ -30,7 +30,7 @@ type alias InitialData =
     , cursor : SyncCursor
     , lastAppliedServerRevision : Maybe Int
     , databaseEpoch : Maybe String
-    , rowRevisions : Dict ( String, Int ) Int
+    , rowRevisions : Dict ( String, String ) Int
     , revisionFloor : Maybe Int
     }
 
@@ -167,7 +167,7 @@ decodeInitialData =
                 (Decode.list
                     (Decode.map3 (\table id revision -> ( ( table, id ), revision ))
                         (Decode.index 0 Decode.string)
-                        (Decode.index 1 Decode.int)
+                        (Decode.index 1 Decode.string)
                         (Decode.index 2 Decode.int)
                     )
                 )

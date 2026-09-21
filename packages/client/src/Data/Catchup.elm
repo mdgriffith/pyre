@@ -635,13 +635,13 @@ resetCursorIfRowsAreMissing tableName entry cursor =
             cursor
 
 
-computeMaxCursor : Dict Int (Dict String Data.Value.Value) -> Maybe ( Float, Data.Value.Value )
+computeMaxCursor : Dict String (Dict String Data.Value.Value) -> Maybe ( Float, Data.Value.Value )
 computeMaxCursor tableData =
     Dict.toList tableData
         |> List.foldl updateMaxCursor Nothing
 
 
-updateMaxCursor : ( Int, Dict String Data.Value.Value ) -> Maybe ( Float, Data.Value.Value ) -> Maybe ( Float, Data.Value.Value )
+updateMaxCursor : ( String, Dict String Data.Value.Value ) -> Maybe ( Float, Data.Value.Value ) -> Maybe ( Float, Data.Value.Value )
 updateMaxCursor ( rowId, row ) currentMax =
     case Dict.get "updatedAt" row of
         Just value ->
@@ -649,11 +649,11 @@ updateMaxCursor ( rowId, row ) currentMax =
                 Just timestamp ->
                     let
                         candidate =
-                            ( timestamp, Data.Value.IntValue rowId )
+                            ( timestamp, Data.Value.StringValue rowId )
                     in
                     case currentMax of
                         Just ( existingTimestamp, existingPrimaryKey ) ->
-                            if timestamp > existingTimestamp || (timestamp == existingTimestamp && rowId > primaryKeyToInt existingPrimaryKey) then
+                            if timestamp > existingTimestamp || (timestamp == existingTimestamp && rowId > primaryKeyToString existingPrimaryKey) then
                                 Just candidate
 
                             else
@@ -669,14 +669,14 @@ updateMaxCursor ( rowId, row ) currentMax =
             currentMax
 
 
-primaryKeyToInt : Data.Value.Value -> Int
-primaryKeyToInt value =
+primaryKeyToString : Data.Value.Value -> String
+primaryKeyToString value =
     case value of
-        Data.Value.IntValue primaryKey ->
+        Data.Value.StringValue primaryKey ->
             primaryKey
 
         _ ->
-            -2147483648
+            ""
 
 
 valueToTimestamp : Data.Value.Value -> Maybe Float

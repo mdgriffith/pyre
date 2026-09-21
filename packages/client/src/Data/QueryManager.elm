@@ -1,6 +1,7 @@
 port module Data.QueryManager exposing (Incoming(..), Model, Msg(..), OptimisticMutation, OptimisticSetField, OptimisticWhere, QueryClientIncoming(..), QueryDeltaOp(..), QuerySubscription, ReExecuteDecision(..), decodeIncoming, decodeQueryClientIncoming, doesChangeAffectWhereClause, extractChangedRowIds, extractWhereClauseFields, init, mutationResult, notifyTablesChanged, queryClientDelta, queryClientFull, receiveIncoming, receiveQueryClientIncoming, shouldReExecuteQuery, update)
 
 import Data.Delta
+import Data.RowId
 import Data.Schema
 import Data.Value exposing (Value)
 import Db
@@ -25,7 +26,7 @@ type alias QuerySubscription =
     , query : Db.Query.Query
     , input : Encode.Value
     , callbackPort : String
-    , resultRowIds : Dict String (Set Int)
+    , resultRowIds : Dict String (Set String)
     , revision : Int
     , lastResult : Maybe (Dict String (List (Dict String Value)))
     }
@@ -618,7 +619,7 @@ sequenceMaybe values =
 
 {-| Extract row IDs that changed from a delta, grouped by table name.
 -}
-extractChangedRowIds : Data.Delta.Delta -> Dict String (Set Int)
+extractChangedRowIds : Data.Delta.Delta -> Dict String (Set String)
 extractChangedRowIds delta =
     List.foldl
         (\tableGroup acc ->
@@ -626,13 +627,10 @@ extractChangedRowIds delta =
                 changedIds =
                     List.filterMap
                         (\row ->
-                            -- Row is a list of values, first one should be id
-                            case row of
-                                (Data.Value.IntValue id) :: _ ->
-                                    Just id
-
-                                _ ->
-                                    Nothing
+                            List.map2 Tuple.pair tableGroup.headers row
+                                |> Dict.fromList
+                                |> Dict.get "id"
+                                |> Maybe.andThen Data.RowId.fromValue
                         )
                         tableGroup.rows
                         |> Set.fromList
@@ -793,7 +791,7 @@ fields are referenced in that clause.
 Also handles LIMIT/SORT edge cases.
 
 -}
-analyzeOverlappingChanges : Data.Schema.SchemaMetadata -> Db.Db -> QuerySubscription -> String -> Set Int -> Data.Delta.Delta -> Bool
+analyzeOverlappingChanges : Data.Schema.SchemaMetadata -> Db.Db -> QuerySubscription -> String -> Set String -> Data.Delta.Delta -> Bool
 analyzeOverlappingChanges schema db subscription tableName overlappingIds delta =
     let
         -- Get the field query for this table
@@ -861,7 +859,7 @@ analyzeOverlappingChanges schema db subscription tableName overlappingIds delta 
             True
 
 
-checkIfNewRowsMatchWhere : Data.Schema.SchemaMetadata -> Db.Db -> String -> Set Int -> QuerySubscription -> Data.Delta.Delta -> Bool
+checkIfNewRowsMatchWhere : Data.Schema.SchemaMetadata -> Db.Db -> String -> Set String -> QuerySubscription -> Data.Delta.Delta -> Bool
 checkIfNewRowsMatchWhere schema db tableName newRowIds subscription delta =
     if Set.isEmpty newRowIds then
         False
@@ -904,8 +902,8 @@ checkIfNewRowsMatchWhere schema db tableName newRowIds subscription delta =
                     Just _ ->
                         List.any
                             (\newRowArray ->
-                                case newRowArray of
-                                    (Data.Value.IntValue rowId) :: _ ->
+                                case rowArrayToDict tableGroup.headers newRowArray |> Dict.get "id" |> Maybe.andThen Data.RowId.fromValue of
+                                    Just rowId ->
                                         if Set.member rowId newRowIds then
                                             let
                                                 newRow =
@@ -934,7 +932,7 @@ Gets old row values from DB, new row values from delta, and compares
 fields referenced in the WHERE clause.
 
 -}
-checkIfFilteredFieldsChanged : Db.Db -> String -> Set Int -> Db.Query.WhereClause -> Data.Delta.Delta -> Bool
+checkIfFilteredFieldsChanged : Db.Db -> String -> Set String -> Db.Query.WhereClause -> Data.Delta.Delta -> Bool
 checkIfFilteredFieldsChanged db tableName overlappingIds whereClause delta =
     let
         -- Get the table data from DB (old values)
@@ -953,8 +951,8 @@ checkIfFilteredFieldsChanged db tableName overlappingIds whereClause delta =
                 Just tableGroup ->
                     List.any
                         (\newRowArray ->
-                            case newRowArray of
-                                (Data.Value.IntValue rowId) :: _ ->
+                            case rowArrayToDict tableGroup.headers newRowArray |> Dict.get "id" |> Maybe.andThen Data.RowId.fromValue of
+                                Just rowId ->
                                     if Set.member rowId overlappingIds then
                                         -- This row is in both delta and result set
                                         case Dict.get rowId oldTableData of
@@ -997,7 +995,7 @@ rowArrayToDict headers values =
 Used for SORT field change detection.
 
 -}
-checkIfSpecificFieldsChanged : Db.Db -> String -> Set Int -> Set String -> Data.Delta.Delta -> Bool
+checkIfSpecificFieldsChanged : Db.Db -> String -> Set String -> Set String -> Data.Delta.Delta -> Bool
 checkIfSpecificFieldsChanged db tableName overlappingIds fieldsToCheck delta =
     let
         -- Get the table data from DB (old values)
@@ -1016,8 +1014,8 @@ checkIfSpecificFieldsChanged db tableName overlappingIds fieldsToCheck delta =
                 Just tableGroup ->
                     List.any
                         (\newRowArray ->
-                            case newRowArray of
-                                (Data.Value.IntValue rowId) :: _ ->
+                            case rowArrayToDict tableGroup.headers newRowArray |> Dict.get "id" |> Maybe.andThen Data.RowId.fromValue of
+                                Just rowId ->
                                     if Set.member rowId overlappingIds then
                                         -- This row is in both delta and result set
                                         case Dict.get rowId oldTableData of

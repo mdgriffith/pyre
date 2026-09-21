@@ -3,6 +3,7 @@ module Db exposing (Db, Msg(..), QueryExecutionResult, executeQuery, executeQuer
 import Basics exposing (Order(..))
 import Data.Delta exposing (Delta, TableGroup)
 import Data.IndexedDb
+import Data.RowId
 import Data.Schema exposing (SchemaMetadata)
 import Data.Value exposing (Value)
 import Db.Index
@@ -22,7 +23,7 @@ type alias Db =
 
 
 type alias TableData =
-    Dict Int (Dict String Value)
+    Dict String (Dict String Value)
 
 
 
@@ -123,7 +124,7 @@ applyDelta delta db =
 
 type alias QueryExecutionResult =
     { results : Dict String (List (Dict String Value))
-    , rowIds : Dict String (Set Int)
+    , rowIds : Dict String (Set String)
     }
 
 
@@ -206,14 +207,9 @@ convertInitialDataToTableData initialData =
 -- Helper: Get row ID from a row dictionary
 
 
-getRowId : Dict String Value -> Maybe Int
+getRowId : Dict String Value -> Maybe String
 getRowId row =
-    case Dict.get "id" row of
-        Just (Data.Value.IntValue i) ->
-            Just i
-
-        _ ->
-            Nothing
+    Dict.get "id" row |> Maybe.andThen Data.RowId.fromValue
 
 
 
@@ -226,7 +222,7 @@ type alias IndexUpdate =
     { indexKey : ( String, String )
     , oldKey : Maybe String
     , newKey : Maybe String
-    , rowId : Int
+    , rowId : String
     }
 
 
@@ -234,7 +230,7 @@ type alias IndexUpdate =
 Compares the old row (if it exists) with the new row to determine
 which indices need to be updated.
 -}
-calculateIndexUpdates : Dict ( String, String ) Db.Index.Index -> String -> Int -> Maybe (Dict String Value) -> Dict String Value -> List IndexUpdate
+calculateIndexUpdates : Dict ( String, String ) Db.Index.Index -> String -> String -> Maybe (Dict String Value) -> Dict String Value -> List IndexUpdate
 calculateIndexUpdates indices tableName rowId existingRow newRow =
     Dict.foldl
         (\( idxTable, idxColumn ) _ acc ->
@@ -386,7 +382,7 @@ executeFieldQuery schema data indices queryFieldName fieldQuery =
             []
 
 
-executeFieldQueryWithTracking : SchemaMetadata -> Dict String TableData -> Dict ( String, String ) Db.Index.Index -> String -> Db.Query.FieldQuery -> ( List (Dict String Value), Set Int )
+executeFieldQueryWithTracking : SchemaMetadata -> Dict String TableData -> Dict ( String, String ) Db.Index.Index -> String -> Db.Query.FieldQuery -> ( List (Dict String Value), Set String )
 executeFieldQueryWithTracking schema data indices queryFieldName fieldQuery =
     case Dict.get queryFieldName schema.queryFieldToTable of
         Just tableName ->
@@ -449,7 +445,7 @@ applyWhereWithIndices indices tableName whereClause tableRows =
     List.map Tuple.second filteredRowsWithIds
 
 
-applyWhereWithIndicesWithIds : Dict ( String, String ) Db.Index.Index -> String -> Maybe Db.Query.WhereClause -> List ( Int, Dict String Value ) -> List ( Int, Dict String Value )
+applyWhereWithIndicesWithIds : Dict ( String, String ) Db.Index.Index -> String -> Maybe Db.Query.WhereClause -> List ( String, Dict String Value ) -> List ( String, Dict String Value )
 applyWhereWithIndicesWithIds indices tableName whereClause rowsWithIds =
     case whereClause of
         Just where_ ->
@@ -470,7 +466,7 @@ applyWhereWithIndicesWithIds indices tableName whereClause rowsWithIds =
             rowsWithIds
 
 
-collectIndexedRowIds : Dict ( String, String ) Db.Index.Index -> String -> Db.Query.WhereClause -> Maybe (Set Int)
+collectIndexedRowIds : Dict ( String, String ) Db.Index.Index -> String -> Db.Query.WhereClause -> Maybe (Set String)
 collectIndexedRowIds indices tableName whereClause =
     let
         directFieldOperators =
@@ -510,7 +506,7 @@ collectIndexedRowIds indices tableName whereClause =
             nestedAnd
 
 
-collectIndexedFromAnd : Dict ( String, String ) Db.Index.Index -> String -> List Db.Query.WhereClause -> Maybe (Set Int)
+collectIndexedFromAnd : Dict ( String, String ) Db.Index.Index -> String -> List Db.Query.WhereClause -> Maybe (Set String)
 collectIndexedFromAnd indices tableName clauses =
     case clauses of
         [] ->
@@ -525,7 +521,7 @@ collectIndexedFromAnd indices tableName clauses =
                     collectIndexedFromAnd indices tableName rest
 
 
-extractIndexedIdsFromOperators : Dict ( String, String ) Db.Index.Index -> String -> String -> Dict String Db.Query.FilterValue -> Maybe (Set Int)
+extractIndexedIdsFromOperators : Dict ( String, String ) Db.Index.Index -> String -> String -> Dict String Db.Query.FilterValue -> Maybe (Set String)
 extractIndexedIdsFromOperators indices tableName field operators =
     let
         indexKey =
@@ -595,7 +591,7 @@ rowMatchesWhere =
     evaluateWhereOnRow
 
 
-applySortWithIds : Maybe (List Db.Query.SortClause) -> List ( Int, Dict String Value ) -> List ( Int, Dict String Value )
+applySortWithIds : Maybe (List Db.Query.SortClause) -> List ( String, Dict String Value ) -> List ( String, Dict String Value )
 applySortWithIds sortClauses rowsWithIds =
     case sortClauses of
         Just clauses ->
@@ -650,7 +646,7 @@ applySortWithIds sortClauses rowsWithIds =
             rowsWithIds
 
 
-applyLimitWithIds : Maybe Int -> List ( Int, Dict String Value ) -> List ( Int, Dict String Value )
+applyLimitWithIds : Maybe Int -> List ( String, Dict String Value ) -> List ( String, Dict String Value )
 applyLimitWithIds limit rowsWithIds =
     case limit of
         Just n ->
@@ -900,7 +896,7 @@ lookupRowByPrimaryKey : Dict String TableData -> String -> String -> Value -> Ma
 lookupRowByPrimaryKey data tableName primaryKeyColumn primaryKeyValue =
     case Dict.get tableName data of
         Just tableRows ->
-            case valueToInt primaryKeyValue of
+            case valueToRowId primaryKeyValue of
                 Just id ->
                     Dict.get id tableRows
 
@@ -911,14 +907,9 @@ lookupRowByPrimaryKey data tableName primaryKeyColumn primaryKeyValue =
             Nothing
 
 
-valueToInt : Value -> Maybe Int
-valueToInt value =
-    case value of
-        Data.Value.IntValue i ->
-            Just i
-
-        _ ->
-            Nothing
+valueToRowId : Value -> Maybe String
+valueToRowId value =
+    Data.RowId.fromValue value
 
 
 applyWhere : Maybe Db.Query.WhereClause -> List (Dict String Value) -> List (Dict String Value)

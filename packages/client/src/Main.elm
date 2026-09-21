@@ -6,6 +6,7 @@ import Data.Error
 import Data.IndexedDb as IndexedDb exposing (Incoming(..))
 import Data.LiveSync as LiveSync exposing (Incoming(..))
 import Data.QueryManager as QueryManager exposing (Incoming(..), Msg(..))
+import Data.RowId
 import Data.Schema
 import Data.SyncState as SyncState
 import Data.Value
@@ -56,7 +57,7 @@ type alias Model =
     , optimisticOrder : List String
     , lastAppliedServerRevision : Maybe Int
     , generation : Int
-    , rowRevisions : Dict ( String, Int ) Int
+    , rowRevisions : Dict ( String, String ) Int
     , revisionFloor : Maybe Int
     }
 
@@ -69,7 +70,7 @@ type alias OptimisticInFlight =
 
 type alias FieldIntent =
     { tableName : String
-    , rowIds : List Int
+    , rowIds : List String
     , setValues : List ( String, Data.Value.Value )
     }
 
@@ -919,14 +920,14 @@ intentDelta authoritative acknowledgedServerRevision pending visible =
     deltaFromRows pending.tableName (List.filterMap updateRow pending.rowIds)
 
 
-filterAuthoritativeRows : Maybe Int -> Data.Delta.Delta -> Dict ( String, Int ) Int -> ( Data.Delta.Delta, Dict ( String, Int ) Int )
+filterAuthoritativeRows : Maybe Int -> Data.Delta.Delta -> Dict ( String, String ) Int -> ( Data.Delta.Delta, Dict ( String, String ) Int )
 filterAuthoritativeRows revision delta revisions =
     let
         filterGroup group ( accGroups, stamps ) =
             let
                 filterRow values ( accRows, currentStamps ) =
-                    case Dict.get "id" (Dict.fromList (List.map2 Tuple.pair group.headers values)) of
-                        Just (Data.Value.IntValue id) ->
+                    case Dict.get "id" (Dict.fromList (List.map2 Tuple.pair group.headers values)) |> Maybe.andThen Data.RowId.fromValue of
+                        Just id ->
                             let
                                 key =
                                     ( group.tableName, id )
@@ -945,7 +946,7 @@ filterAuthoritativeRows revision delta revisions =
                                 )
 
                         _ ->
-                            ( values :: accRows, currentStamps )
+                            ( accRows, currentStamps )
 
                 ( rows, nextStamps ) =
                     List.foldl filterRow ( [], stamps ) group.rows

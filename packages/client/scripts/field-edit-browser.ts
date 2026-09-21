@@ -18,7 +18,7 @@ Object.assign(window, {
     batches, results,
     get rows() { return rows; },
     get connected() { return connected; },
-    async batch(inputs: Array<{ id: number; title: string }>) {
+    async batch(inputs: Array<{ id: string; title: string }>) {
       const edits = inputs.map(input => operation({ operation: 'update', id: 'edit', optimistic: {
         queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }],
       } }, input));
@@ -29,7 +29,7 @@ Object.assign(window, {
     edit(title: string) {
       return client.run('proof', { operation: 'update', id: 'edit', optimistic: {
         queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }],
-      } }, { id: 1, title }, (result) => results.push(result));
+      } }, { id: '00000000-0000-7000-8000-000000000001', title }, (result) => results.push(result));
     },
     async late() {
       const received: any[] = [];
@@ -38,5 +38,35 @@ Object.assign(window, {
       return received;
     },
     persisted: () => storage.getAllRows('notes'),
+    async verifyIdentityMigration() {
+      const name = 'pyre-uuid-upgrade-proof';
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.open(name, 2);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          db.createObjectStore('tables', { keyPath: ['tableName', 'id'] });
+          db.createObjectStore('syncCursor');
+          db.createObjectStore('meta');
+        };
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => {
+          const db = request.result;
+          const tx = db.transaction(['tables', 'syncCursor', 'meta'], 'readwrite');
+          tx.objectStore('tables').put({ tableName: 'notes', id: 1, title: 'Legacy' });
+          tx.objectStore('syncCursor').put({ tables: { notes: { last_seen_primary_key: 1, last_seen_updated_at: 99, permission_hash: 'old' } } }, 'cursor');
+          tx.objectStore('meta').put(99, 'lastAppliedServerRevision');
+          tx.objectStore('meta').put({ '["notes",1]': 99 }, 'rowRevisions');
+          tx.oncomplete = () => { db.close(); resolve(); };
+          tx.onerror = () => reject(tx.error);
+        };
+      });
+      const migrated = new IndexedDBStorage(name);
+      const before = { rows: await migrated.getAllTables(), revision: await migrated.getServerRevision(), stamps: await migrated.getRowRevisions(), cursor: await migrated.getSyncCursor() };
+      const id = '00000000-0000-7000-8000-000000000001';
+      const group = (title: string) => [{ table_name: 'notes', headers: ['title', 'id'], rows: [[title, id]] }];
+      await migrated.putAuthoritativeDelta(group('Current'), 2);
+      await migrated.putAuthoritativeDelta(group('Stale'), 1);
+      return { before, rows: await migrated.getAllRows('notes'), stamps: await migrated.getRowRevisions() };
+    },
   },
 });

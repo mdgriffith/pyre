@@ -25,7 +25,7 @@ function deltaMessage(databaseId?: string) {
       {
         table_name: 'maps',
         headers: ['id', 'name', 'updatedAt'],
-        rows: [[1, 'World', 10]],
+        rows: [['00000000-0000-7000-8000-000000000001', 'World', 10]],
       },
     ],
   };
@@ -275,7 +275,7 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
         serverRevision: 1,
         tables: {
           maps: {
-            rows: [{ id: 1, name: 'Catchup Map', updatedAt: 1 }],
+            rows: [{ id: '00000000-0000-7000-8000-000000000001', name: 'Catchup Map', updatedAt: 1 }],
             permission_hash: 'allowed',
             last_seen_updated_at: 1,
           },
@@ -337,10 +337,10 @@ test('Elm catchup emits entity stream catchup notifications', async () => {
           {
             table_name: 'maps',
             headers: ['id', 'name', 'updatedAt'],
-            rows: [[1, 'Catchup Map', 1]],
+            rows: [['00000000-0000-7000-8000-000000000001', 'Catchup Map', 1]],
           },
         ],
-        snapshot: [{ table_name: 'maps', headers: ['id', 'name', 'updatedAt'], rows: [[1, 'Catchup Map', 1]] }],
+        snapshot: [{ table_name: 'maps', headers: ['id', 'name', 'updatedAt'], rows: [['00000000-0000-7000-8000-000000000001', 'Catchup Map', 1]] }],
       },
     ]);
   } finally {
@@ -426,7 +426,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       app.ports.receiveIndexedDbMessage.send({
         type: 'initialData',
         data: {
-          tables: { maps: [{ id: 1, name: 'Initial', updatedAt: 0 }] },
+          tables: { maps: [{ id: '00000000-0000-7000-8000-000000000001', name: 'Initial', updatedAt: 0 }] },
           cursor: { tables: {} },
           lastAppliedServerRevision: null,
         },
@@ -436,7 +436,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
     app.ports.receiveIndexedDbMessage.send({
       type: 'initialData',
       data: {
-        tables: { maps: [{ id: 1, name: 'Initial', updatedAt: 0 }] },
+        tables: { maps: [{ id: '00000000-0000-7000-8000-000000000001', name: 'Initial', updatedAt: 0 }] },
         cursor: { tables: {} },
         lastAppliedServerRevision: null,
       },
@@ -456,7 +456,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       requestId: 'a',
       mutationId: 'move',
       baseUrl: 'http://example.test/db',
-      input: { id: 1, name: 'A' },
+      input: { id: '00000000-0000-7000-8000-000000000001', name: 'A' },
       optimistic,
     });
     app.ports.receiveQueryManagerMessage.send({
@@ -464,7 +464,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
       requestId: 'b',
       mutationId: 'move',
       baseUrl: 'http://example.test/db',
-      input: { id: 1, name: 'B' },
+      input: { id: '00000000-0000-7000-8000-000000000001', name: 'B' },
       optimistic,
     });
     await nextElmTurn();
@@ -477,7 +477,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
         type: 'delta',
         serverRevision: 2,
         databaseId: 'campaign:123',
-        data: [{ table_name: 'maps', headers: ['id', 'name', 'updatedAt'], rows: [[1, 'B', 2]] }],
+        data: [{ table_name: 'maps', headers: ['id', 'name', 'updatedAt'], rows: [['00000000-0000-7000-8000-000000000001', 'B', 2]] }],
       },
       result: {},
     });
@@ -489,7 +489,7 @@ test('Elm mutation response sync preserves newer rapid optimistic state', async 
         type: 'delta',
         serverRevision: 1,
         databaseId: 'campaign:123',
-        data: [{ table_name: 'maps', headers: ['id', 'name', 'updatedAt'], rows: [[1, 'A', 1]] }],
+        data: [{ table_name: 'maps', headers: ['id', 'name', 'updatedAt'], rows: [['00000000-0000-7000-8000-000000000001', 'A', 1]] }],
       },
       result: {},
     });

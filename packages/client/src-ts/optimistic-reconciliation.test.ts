@@ -4,11 +4,13 @@ import loadElm from '../dist/engine.mjs';
 import { EntityStreamService } from './service/entity-stream';
 
 const turn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+const one = '00000000-0000-7000-8000-000000000001';
+const two = '00000000-0000-7000-8000-000000000002';
 const schema = {
   tables: { notes: { name: 'notes', links: {}, indices: [] } },
   queryFieldToTable: { notes: 'notes' },
 };
-const initial = [{ id: 1, title: 'Initial', other: 'Initial' }, { id: 2, title: 'Second', other: 'Initial' }];
+const initial = [{ id: one, title: 'Initial', other: 'Initial' }, { id: two, title: 'Second', other: 'Initial' }];
 const groups = (rows) => [{ table_name: 'notes', headers: ['id', 'title', 'other'], rows }];
 const envelope = (revision, rows) => ({
   serverRevision: revision,
@@ -81,7 +83,7 @@ async function harness(run) {
         });
         await turn();
       },
-      async edit(requestId, title, id = 1) {
+      async edit(requestId, title, id = one) {
         app.ports.receiveQueryManagerMessage.send({
           type: 'sendMutation', requestId, mutationId: 'update', baseUrl: 'http://test/db',
           input: { id, title }, optimistic: {
@@ -113,12 +115,12 @@ test('two clients share incremental authority; origin confirms without live deli
     expect((await a.rows())[0].title).toBe('Predicted');
     expect((await b.rows())[0].title).toBe('Initial');
     expect(a.writes.filter((m) => m.type === 'writeDelta').flatMap((m) => m.tableGroups).flatMap((g) => g.rows)).toEqual([]);
-    requests[0].complete(envelope(1, [[1, 'Normalized', 'Server']]));
+    requests[0].complete(envelope(1, [[one, 'Normalized', 'Server']]));
     await turn();
-    await b.live(1, [[1, 'Normalized', 'Server']]);
+    await b.live(1, [[one, 'Normalized', 'Server']]);
     expect(await a.rows()).toEqual(await b.rows());
-    expect((await a.rows())[0]).toEqual({ id: 1, title: 'Normalized', other: 'Server' });
-    expect(a.visible.at(-1).data).toEqual(groups([[1, 'Server', 'Normalized']]).map((g) => ({ ...g, headers: ['id', 'other', 'title'] })));
+    expect((await a.rows())[0]).toEqual({ id: one, title: 'Normalized', other: 'Server' });
+    expect(a.visible.at(-1).data).toEqual(groups([[one, 'Server', 'Normalized']]).map((g) => ({ ...g, headers: ['id', 'other', 'title'] })));
     expect(requests).toHaveLength(1);
   });
 });
@@ -128,21 +130,21 @@ test('batch captures repeated and multiple rows in order and publishes once; rej
     const a = await client();
     const before = a.visible.length;
     await a.batch('batch', [
-      { input: { id: 1, title: 'Intermediate' } },
-      { input: { id: 2, title: 'Other' } },
-      { input: { id: 1, title: 'Final' } },
+      { input: { id: one, title: 'Intermediate' } },
+      { input: { id: two, title: 'Other' } },
+      { input: { id: one, title: 'Final' } },
     ]);
     expect(a.visible.length - before).toBe(1);
     expect((await a.rows()).map(row => row.title)).toEqual(['Final', 'Other']);
     expect(requests).toHaveLength(1);
     expect(requests[0].input.map(op => op.input.title)).toEqual(['Intermediate', 'Other', 'Final']);
-    await a.edit('later', 'Later', 2);
+    await a.edit('later', 'Later', two);
     const rejecting = a.visible.length;
     requests[0].complete({}, 403);
     await turn();
     expect(a.visible.length - rejecting).toBe(1);
     expect((await a.rows()).map(row => row.title)).toEqual(['Initial', 'Later']);
-    requests[1].complete(envelope(2, [[2, 'Normalized later', 'Server']]));
+    requests[1].complete(envelope(2, [[two, 'Normalized later', 'Server']]));
     await turn();
     expect((await a.rows()).map(row => row.title)).toEqual(['Initial', 'Normalized later']);
   });
@@ -151,14 +153,14 @@ test('batch captures repeated and multiple rows in order and publishes once; rej
 test('later batch confirmation shields every affected field until an earlier batch settles', async () => {
   await harness(async ({ client, requests }) => {
     const a = await client();
-    await a.batch('earlier', [{ input: { id: 1, title: 'A' } }, { input: { id: 2, title: 'B' } }]);
-    await a.batch('later', [{ input: { id: 1, title: 'C' } }, { input: { id: 2, title: 'D' } }]);
+    await a.batch('earlier', [{ input: { id: one, title: 'A' } }, { input: { id: two, title: 'B' } }]);
+    await a.batch('later', [{ input: { id: one, title: 'C' } }, { input: { id: two, title: 'D' } }]);
     const before = a.visible.length;
-    requests[1].complete(envelope(2, [[1, 'Normalized C', 'Server'], [2, 'Normalized D', 'Server']]));
+    requests[1].complete(envelope(2, [[one, 'Normalized C', 'Server'], [two, 'Normalized D', 'Server']]));
     await turn();
     expect(a.visible.length - before).toBe(1);
     expect((await a.rows()).map(row => row.title)).toEqual(['Normalized C', 'Normalized D']);
-    requests[0].complete(envelope(1, [[1, 'Old A', 'Old'], [2, 'Old B', 'Old']]));
+    requests[0].complete(envelope(1, [[one, 'Old A', 'Old'], [two, 'Old B', 'Old']]));
     await turn();
     expect((await a.rows()).map(row => row.title)).toEqual(['Normalized C', 'Normalized D']);
   });
@@ -171,7 +173,7 @@ test('batch selection sees preceding operations before publication', async () =>
     a.app.ports.receiveQueryManagerMessage.send({
       type: 'sendMutation', requestId: 'dependent', mutationId: '$batch', baseUrl: 'http://test/db', input: [],
       optimistic: [
-        { input: { id: 1, title: 'Selected' }, optimistic: { queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }] } },
+        { input: { id: one, title: 'Selected' }, optimistic: { queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }] } },
         { input: { match: 'Selected', title: 'Final' }, optimistic: { queryField: 'notes', where: { field: 'title', input: 'match' }, set: [{ field: 'title', input: 'title' }] } },
       ],
     });
@@ -186,11 +188,11 @@ test('batch selection sees preceding operations before publication', async () =>
 test('invalidation fences a whole held batch from readers and persistence', async () => {
   await harness(async ({ client, requests }) => {
     const a = await client();
-    await a.batch('held-batch', [{ input: { id: 1, title: 'A' } }, { input: { id: 2, title: 'B' } }]);
+    await a.batch('held-batch', [{ input: { id: one, title: 'A' } }, { input: { id: two, title: 'B' } }]);
     a.app.ports.receiveSSEMessage.send({ type: 'invalidate', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 3 });
     await turn();
     const writes = a.writes.length;
-    requests[0].complete(envelope(2, [[1, 'Old A', 'Secret'], [2, 'Old B', 'Secret']]));
+    requests[0].complete(envelope(2, [[one, 'Old A', 'Secret'], [two, 'Old B', 'Secret']]));
     await turn();
     expect(await a.rows()).toEqual([]);
     expect(a.writes.length).toBe(writes);
@@ -201,14 +203,14 @@ test('invalidation fences a whole held batch from readers and persistence', asyn
 
 test('reload restores per-row revisions independently and keeps the invalidation floor', async () => {
   await harness(async ({ client }) => {
-    const a = await client({ lastAppliedServerRevision: 3, rowRevisions: [['notes', 1, 1], ['notes', 2, 3]] });
-    await a.live(2, [[1, 'Delayed valid', 'Server'], [2, 'Stale', 'Server']]);
+    const a = await client({ lastAppliedServerRevision: 3, rowRevisions: [['notes', one, 1], ['notes', two, 3]] });
+    await a.live(2, [[one, 'Delayed valid', 'Server'], [two, 'Stale', 'Server']]);
     expect((await a.rows()).map((row) => row.title)).toEqual(['Delayed valid', 'Second']);
-    const reset = await client({ tables: { notes: [initial[1]] }, lastAppliedServerRevision: 3, revisionFloor: 3, rowRevisions: [['notes', 2, 3]] });
+    const reset = await client({ tables: { notes: [initial[1]] }, lastAppliedServerRevision: 3, revisionFloor: 3, rowRevisions: [['notes', two, 3]] });
     reset.app.ports.receiveSSEMessage.send({ type: 'invalidate', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 1 });
     await turn();
-    await reset.live(2, [[1, 'Must not return', 'Secret']]);
-    expect((await reset.rows()).map((row) => row.id)).toEqual([2]);
+    await reset.live(2, [[one, 'Must not return', 'Secret']]);
+    expect((await reset.rows()).map((row) => row.id)).toEqual([two]);
   });
 });
 
@@ -228,7 +230,7 @@ test('engine snapshots include initial and late optimistic readers, rollback and
     await turn();
     expect(batches.at(-1).changes.map((change) => change.op)).toEqual(['remove', 'remove']);
     expect(a.entities.snapshot().size).toBe(0);
-    await a.live(4, [[1, 'During reset', 'Secret']]);
+    await a.live(4, [[one, 'During reset', 'Secret']]);
     expect(await a.rows()).toEqual([]);
   });
 });
@@ -236,9 +238,9 @@ test('engine snapshots include initial and late optimistic readers, rollback and
 test('catchup cannot replace a newer live row or persist a stale version', async () => {
   await harness(async ({ client, setCatchupResponse }) => {
     const a = await client();
-    await a.live(5, [[1, 'New', 'New']]);
+    await a.live(5, [[one, 'New', 'New']]);
     setCatchupResponse({ databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 4, has_more: false,
-      tables: { notes: { rows: [{ id: 1, title: 'Old', other: 'Old' }], permission_hash: '', last_seen_updated_at: null } } });
+      tables: { notes: { rows: [{ id: one, title: 'Old', other: 'Old' }], permission_hash: '', last_seen_updated_at: null } } });
     const before = a.writes.length;
     a.app.ports.receiveSSEMessage.send({ type: 'syncRequired', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 6 });
     await turn();
@@ -254,32 +256,32 @@ test('rejection preserves later intent and unrelated authoritative fields', asyn
     const a = await client();
     await a.edit('a', 'A');
     await a.edit('b', 'B');
-    await a.live(1, [[1, 'Remote', 'Changed remotely']]);
-    expect((await a.rows())[0]).toEqual({ id: 1, title: 'B', other: 'Changed remotely' });
+    await a.live(1, [[one, 'Remote', 'Changed remotely']]);
+    expect((await a.rows())[0]).toEqual({ id: one, title: 'B', other: 'Changed remotely' });
     requests[0].complete({}, 403);
     await turn();
-    expect((await a.rows())[0]).toEqual({ id: 1, title: 'B', other: 'Changed remotely' });
+    expect((await a.rows())[0]).toEqual({ id: one, title: 'B', other: 'Changed remotely' });
     requests[1].complete({}, 403);
     await turn();
-    expect((await a.rows())[0]).toEqual({ id: 1, title: 'Remote', other: 'Changed remotely' });
-    expect(a.visible.at(-1).data[0].rows).toEqual([[1, 'Changed remotely', 'Remote']]);
+    expect((await a.rows())[0]).toEqual({ id: one, title: 'Remote', other: 'Changed remotely' });
+    expect(a.visible.at(-1).data[0].rows).toEqual([[one, 'Changed remotely', 'Remote']]);
   });
 });
 
 test('out-of-order incremental responses retain distinct rows and server normalization', async () => {
   await harness(async ({ client, requests }) => {
     const a = await client();
-    await a.edit('a', 'A', 1);
-    await a.edit('b', 'B', 2);
-    requests[1].complete(envelope(2, [[2, 'Normalized B', 'Server B']]));
+    await a.edit('a', 'A', one);
+    await a.edit('b', 'B', two);
+    requests[1].complete(envelope(2, [[two, 'Normalized B', 'Server B']]));
     await turn();
-    requests[0].complete(envelope(1, [[1, 'Normalized A', 'Server A']]));
+    requests[0].complete(envelope(1, [[one, 'Normalized A', 'Server A']]));
     await turn();
     expect(await a.rows()).toEqual([
-      { id: 1, title: 'Normalized A', other: 'Server A' },
-      { id: 2, title: 'Normalized B', other: 'Server B' },
+      { id: one, title: 'Normalized A', other: 'Server A' },
+      { id: two, title: 'Normalized B', other: 'Server B' },
     ]);
-    await a.live(1, [[2, 'Stale', 'Stale']]);
+    await a.live(1, [[two, 'Stale', 'Stale']]);
     expect((await a.rows())[1].title).toBe('Normalized B');
   });
 });
@@ -289,7 +291,7 @@ test('later acknowledgement shields normalization until earlier rejection settle
     const a = await client();
     await a.edit('a', 'A');
     await a.edit('b', 'B');
-    requests[1].complete(envelope(2, [[1, 'Normalized B', 'Server']]));
+    requests[1].complete(envelope(2, [[one, 'Normalized B', 'Server']]));
     await turn();
     expect((await a.rows())[0].title).toBe('Normalized B');
     requests[0].complete({}, 403);
@@ -308,7 +310,7 @@ test('a held pre-reset response cannot restore query state or issue persistence 
     await turn();
     expect(await a.rows()).toEqual([]);
     const writesBefore = a.writes.length;
-    requests[0].complete(envelope(99, [[1, 'Must not return', 'Secret']]));
+    requests[0].complete(envelope(99, [[one, 'Must not return', 'Secret']]));
     await turn();
     expect(await a.rows()).toEqual([]);
     expect(a.writes.slice(writesBefore)).toEqual([]);

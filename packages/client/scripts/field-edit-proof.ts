@@ -22,19 +22,19 @@ record Note {
   @watch
   @allow(query) { title != "HIDDEN" || Session.admin == True }
   @allow(update, insert, delete) { True }
-  id Int @id
+   id Id.Uuid @id
   title String
   updatedAt Int
 }
 `);
-await db.execute("insert into notes (id, title, updatedAt) values (1, 'Initial', 1), (2, 'Untouched', 1)");
+await db.execute("insert into notes (id, title, updatedAt) values ('00000000-0000-7000-8000-000000000001', 'Initial', 1), ('00000000-0000-7000-8000-000000000002', 'Untouched', 1)");
 await loadSchemaFromDatabase('proof', db);
 // Precompiled one-field operation fixture, including its existing affected-row
 // output. No client-authored SQL or runtime query compilation is accepted.
 const queries = { edit: {
   generatedEdit: { writeStatement: 0 },
   id: 'edit', session_args: [], optional_input_args: [], json_input_args: [],
-  InputValidator: z.object({ id: z.number().int(), title: z.string() }), SessionValidator: z.object({ admin: z.boolean() }),
+  InputValidator: z.object({ id: z.string().uuid(), title: z.string() }), SessionValidator: z.object({ admin: z.boolean() }),
   sql: [
     { include: false, params: ['id', 'title'], sql: 'update notes set title = upper($title), updatedAt = updatedAt + 1 where id = $id' },
     { include: true, params: ['id'], sql: `select json_array(json_object('table_name', 'notes', 'headers', json_array('id', 'title', 'updatedAt'), 'rows', json_array(json_array(id, title, updatedAt)))) as _affectedRows from notes where id = $id` },
