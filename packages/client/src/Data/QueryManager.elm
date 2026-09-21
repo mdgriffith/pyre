@@ -48,6 +48,7 @@ type alias OptimisticMutation =
     { queryField : String
     , where_ : OptimisticWhere
     , set : List OptimisticSetField
+    , kind : String
     }
 
 
@@ -1179,10 +1180,11 @@ decodeIncoming =
 
 decodeOptimisticMutation : Decode.Decoder OptimisticMutation
 decodeOptimisticMutation =
-    Decode.map3 OptimisticMutation
+    Decode.map4 OptimisticMutation
         (Decode.field "queryField" Decode.string)
         (Decode.field "where" decodeOptimisticWhere)
         (Decode.field "set" (Decode.list decodeOptimisticSetField))
+        (Decode.oneOf [ Decode.field "kind" Decode.string, Decode.succeed "update" ])
 
 
 decodeOptimisticWhere : Decode.Decoder OptimisticWhere

@@ -616,7 +616,7 @@ fn to_query_metadata_file(
         meta_block.push_str("  queryShape,\n");
         meta_block.push_str("  toQueryShape: (_input: Input) => queryShape,\n");
     }
-    if let Some(optimistic) = to_optimistic_update_metadata(query) {
+    if let Some(optimistic) = to_optimistic_update_metadata(context, query) {
         meta_block.push_str(&format!("  optimistic: {},\n", optimistic));
     }
     meta_block.push_str("};\n");
@@ -823,7 +823,32 @@ struct OptimisticUpdateMetadata {
 }
 
 fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMetadata> {
-    if query.operation != ast::QueryOperation::Update {
+    if query.operation == ast::QueryOperation::Insert {
+        let [ast::TopLevelQueryField::Field(root)] = query.fields.as_slice() else {
+            return None;
+        };
+        let set_fields = ast::collect_query_fields(&root.fields)
+            .iter()
+            .map(|field| match &field.set {
+                Some(ast::QueryValue::Variable((_, variable)))
+                    if variable.session_field.is_none() =>
+                {
+                    Some((field.name.clone(), variable.name.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let (_, id_input) = set_fields.iter().find(|(field, _)| field == "id")?;
+        return Some(OptimisticUpdateMetadata {
+            query_field: root.name.clone(),
+            where_field: "id".into(),
+            where_input: id_input.clone(),
+            set_fields,
+        });
+    }
+    if query.operation != ast::QueryOperation::Update
+        && query.operation != ast::QueryOperation::Delete
+    {
         return None;
     }
 
@@ -864,7 +889,7 @@ fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMeta
         })
         .collect();
 
-    if set_fields.is_empty() {
+    if set_fields.is_empty() && query.operation != ast::QueryOperation::Delete {
         return None;
     }
 
@@ -876,7 +901,13 @@ fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMeta
     })
 }
 
-fn to_optimistic_update_metadata(query: &ast::Query) -> Option<String> {
+fn to_optimistic_update_metadata(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> Option<String> {
+    if query.operation == ast::QueryOperation::Insert {
+        crate::generated_queries::generated_crud_table(context, query)?;
+    }
     let metadata = optimistic_update_metadata(query)?;
     let set_fields = metadata
         .set_fields
@@ -892,11 +923,18 @@ fn to_optimistic_update_metadata(query: &ast::Query) -> Option<String> {
         .join(", ");
 
     Some(format!(
-        "{{ queryField: {}, where: {{ field: {}, input: {} }}, set: [{}] }}",
+        "{{ queryField: {}, where: {{ field: {}, input: {} }}, set: [{}], kind: {} }}",
         string::quote(&metadata.query_field),
         string::quote(&metadata.where_field),
         string::quote(&metadata.where_input),
-        set_fields
+        set_fields,
+        string::quote(if query.operation == ast::QueryOperation::Insert {
+            "create"
+        } else if query.operation == ast::QueryOperation::Delete {
+            "delete"
+        } else {
+            "update"
+        })
     ))
 }
 

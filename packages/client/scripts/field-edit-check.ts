@@ -25,6 +25,7 @@ try {
   assert.deepEqual(migration.before, { rows: {}, revision: null, stamps: [], cursor: { tables: {} } });
   assert.deepEqual(migration.rows, [{ id: '00000000-0000-7000-8000-000000000001', title: 'Current' }]);
   assert.deepEqual(migration.stamps, [['notes', '00000000-0000-7000-8000-000000000001', 2]]);
+  assert.deepEqual(await a.evaluate('proof.verifyRemovalPersistence()'), { rows: [], stamps: [['notes', '00000000-0000-7000-8000-000000000003', 3]] });
   const initial = await (await a.request.get(`${url}/stats`)).json();
   await a.evaluate("proof.edit('normalized')");
   await a.waitForFunction("proof.rows[0].title === 'NORMALIZED'");

@@ -38,6 +38,16 @@ Object.assign(window, {
       return received;
     },
     persisted: () => storage.getAllRows('notes'),
+    async verifyRemovalPersistence() {
+      const cache = new IndexedDBStorage('pyre-removal-proof');
+      const id = '00000000-0000-7000-8000-000000000003';
+      const row = [{ table_name: 'notes', headers: ['id', 'title'], rows: [[id, 'Old']] }];
+      await cache.putAuthoritativeDelta(row, 1);
+      await cache.putAuthoritativeDelta([{ table_name: 'notes', headers: ['id', '_pyre_removed'], rows: [[id, true]] }], 3);
+      const reloaded = new IndexedDBStorage('pyre-removal-proof');
+      await reloaded.putAuthoritativeDelta(row, 2);
+      return { rows: await reloaded.getAllRows('notes'), stamps: await reloaded.getRowRevisions() };
+    },
     async verifyIdentityMigration() {
       const name = 'pyre-uuid-upgrade-proof';
       await new Promise<void>((resolve, reject) => {

@@ -35,5 +35,4 @@ where
 delete from clocktowerLifecycles
 where
  "clocktowerLifecycles"."end" is null
- returning json_object() as "clocktowerLifecycle", json_array(json_object('table_name', 'clocktowerLifecycles', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt")))) as _affectedRows
-
+ returning json_object() as "clocktowerLifecycle", json_array(json_insert(json_object('table_name', 'clocktowerLifecycles', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt"))), '$.headers[#]', '_pyre_removed', '$.rows[0][#]', json('true'))) as _affectedRows

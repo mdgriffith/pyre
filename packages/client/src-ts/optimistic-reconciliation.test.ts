@@ -73,6 +73,14 @@ async function harness(run) {
     await turn();
     return {
       app, visible, writes, results, entities,
+      async crud(requestId, kind, input) {
+        app.ports.receiveQueryManagerMessage.send({
+          type: 'sendMutation', requestId, mutationId: kind, baseUrl: 'http://test/db', input,
+          optimistic: { queryField: 'notes', kind, where: { field: 'id', input: 'id' },
+            set: kind === 'delete' ? [] : ['id', 'title', 'other'].map(field => ({ field, input: field })) },
+        });
+        await turn();
+      },
       async batch(requestId, operations) {
         app.ports.receiveQueryManagerMessage.send({
           type: 'sendMutation', requestId, mutationId: '$batch', baseUrl: 'http://test/db',
@@ -122,6 +130,56 @@ test('two clients share incremental authority; origin confirms without live deli
     expect((await a.rows())[0]).toEqual({ id: one, title: 'Normalized', other: 'Server' });
     expect(a.visible.at(-1).data).toEqual(groups([[one, 'Server', 'Normalized']]).map((g) => ({ ...g, headers: ['id', 'other', 'title'] })));
     expect(requests).toHaveLength(1);
+  });
+});
+
+test('create/delete replay shares query visibility; removals fence stale upserts and rejected deletes restore rows', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client();
+    const b = await client();
+    const id = '00000000-0000-7000-8000-000000000003';
+    await a.crud('create', 'create', { id, title: 'New', other: 'Local' });
+    expect((await a.rows()).map(row => row.id)).toEqual([one, two, id]);
+    expect((await b.rows()).map(row => row.id)).toEqual([one, two]);
+    requests[0].complete(envelope(1, [[id, 'Normalized', 'Server']]));
+    await turn();
+    await b.live(1, [[id, 'Normalized', 'Server']]);
+    await a.crud('reject-delete', 'delete', { id });
+    expect((await a.rows()).map(row => row.id)).toEqual([one, two]);
+    requests[1].complete({}, 403);
+    await turn();
+    expect((await a.rows()).at(-1).title).toBe('Normalized');
+    await a.crud('delete', 'delete', { id });
+    const response = envelope(3, []);
+    response.sync.data = [{ table_name: 'notes', headers: ['id', '_pyre_removed'], rows: [[id, true]] }];
+    requests[2].complete(response);
+    b.app.ports.receiveSSEMessage.send(response.sync);
+    await turn();
+    await a.live(2, [[id, 'Stale', 'Old']]);
+    await b.live(2, [[id, 'Stale', 'Old']]);
+    expect(await a.rows()).toEqual(await b.rows());
+    expect((await a.rows()).map(row => row.id)).toEqual([one, two]);
+    expect(a.writes.filter(m => m.type === 'writeDelta' && m.serverRevision === 3).some(m => m.tableGroups.some(g => g.headers.includes('_pyre_removed')))).toBe(true);
+  });
+});
+
+test('incomplete creates stay server-only; removal cannot be undone by pending create replay', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client();
+    const id = '00000000-0000-7000-8000-000000000003';
+    await a.crud('incomplete', 'create', { id, title: 'Missing default' });
+    expect((await a.rows()).map(row => row.id)).toEqual([one, two]);
+    requests[0].complete({}, 403);
+    await turn();
+    await a.crud('create', 'create', { id, title: 'New', other: 'Local' });
+    const response = envelope(2, []);
+    response.sync.data = [{ table_name: 'notes', headers: ['id', '_pyre_removed'], rows: [[id, true]] }];
+    a.app.ports.receiveSSEMessage.send(response.sync);
+    await turn();
+    expect((await a.rows()).map(row => row.id)).toEqual([one, two]);
+    requests[1].complete(envelope(1, [[id, 'Created', 'Server']]));
+    await turn();
+    expect((await a.rows()).map(row => row.id)).toEqual([one, two]);
   });
 });
 

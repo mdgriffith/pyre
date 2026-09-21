@@ -336,11 +336,24 @@ applyTableGroupRows indices tableName table headers rows =
 
                         -- Calculate index updates for this row
                         indexUpdates =
-                            calculateIndexUpdates indices tableName rowId existingRow rowObj
+                            calculateIndexUpdates indices
+                                tableName
+                                rowId
+                                existingRow
+                                (if Dict.get "_pyre_removed" rowObj == Just (Data.Value.BoolValue True) then
+                                    Dict.empty
+
+                                 else
+                                    rowObj
+                                )
 
                         -- Update table
                         updatedTable =
-                            Dict.insert rowId rowObj accTable
+                            if Dict.get "_pyre_removed" rowObj == Just (Data.Value.BoolValue True) then
+                                Dict.remove rowId accTable
+
+                            else
+                                Dict.insert rowId rowObj accTable
                     in
                     ( updatedTable, accUpdates ++ indexUpdates )
 

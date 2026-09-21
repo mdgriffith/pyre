@@ -31,6 +31,22 @@ function countRows(tableGroups: unknown): number {
   }, 0);
 }
 
+// Authorization runs against deleted preimages. Only then strip their contents
+// and publish identity-only tombstones to sessions that could read those rows.
+function removalDeltas(data: any[], affected: any[]): any[] {
+  const removed = new Set(affected.filter(group => group.headers.includes("_pyre_removed")).flatMap(group =>
+    group.rows.map((row: unknown[]) => JSON.stringify([group.table_name, row[group.headers.indexOf("id")]]))));
+  return data.flatMap(group => {
+    const idIndex = group.headers.indexOf("id");
+    const deleted = group.rows.filter((row: unknown[]) => removed.has(JSON.stringify([group.table_name, row[idIndex]])));
+    const rows = group.rows.filter((row: unknown[]) => !removed.has(JSON.stringify([group.table_name, row[idIndex]])));
+    return [
+      ...(rows.length ? [{ ...group, rows }] : []),
+      ...(deleted.length ? [{ table_name: group.table_name, headers: ["id", "_pyre_removed"], rows: deleted.map((row: unknown[]) => [row[idIndex], true]) }] : []),
+    ];
+  });
+}
+
 function liveSyncRequiresCatchup(message: unknown, rowCount: number, recipientCount: number): boolean {
   if (rowCount > MAX_LIVE_SYNC_DELTA_ROWS) {
     return true;
@@ -93,7 +109,7 @@ function syncWithWasmForDatabase(databaseId?: DatabaseId): SyncDeltasFn {
       databaseEpoch,
       ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
     };
-    const affectedCount = countRows(affectedRowGroups);
+    const affectedCount = countRows(affectedRowGroups.filter(group => !group.headers.includes("_pyre_removed")));
     const deltasResult = wasm.calculate_sync_deltas(
       affectedRowGroups,
       normalizeSessions(broadcastSessions),
@@ -133,10 +149,10 @@ function syncWithWasmForDatabase(databaseId?: DatabaseId): SyncDeltasFn {
         serverRevision,
         databaseEpoch,
         ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-        data,
+        data: removalDeltas(data, affectedRowGroups),
       };
 
-      const message = countRows(group.table_groups) < affectedCount
+      const message = countRows(removalDeltas(group.table_groups, affectedRowGroups).filter(group => !group.headers.includes("_pyre_removed"))) < affectedCount
         ? invalidation
         : liveSyncRequiresCatchup(deltaMessage, countRows(data), group.session_ids.length)
         ? {
@@ -154,10 +170,10 @@ function syncWithWasmForDatabase(databaseId?: DatabaseId): SyncDeltasFn {
     }
 
     for (const sessionId of broadcastSessions.keys()) {
-      if (!delivered.has(sessionId)) sendToSession(sessionId, invalidation);
+      if (!delivered.has(sessionId)) sendToSession(sessionId, affectedCount ? invalidation : { ...invalidation, type: "delta", data: [] });
     }
 
-    let originMessage: unknown = originSession ? invalidation : undefined;
+    let originMessage: unknown = originSession ? (affectedCount ? invalidation : { ...invalidation, type: "delta", data: [] }) : undefined;
     if (originSession) {
       const originDeltasResult = wasm.calculate_sync_deltas(
         affectedRowGroups,
@@ -184,9 +200,9 @@ function syncWithWasmForDatabase(databaseId?: DatabaseId): SyncDeltasFn {
               serverRevision,
               databaseEpoch,
               ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-              data,
+              data: removalDeltas(data, affectedRowGroups),
             };
-            originMessage = countRows(originGroup.table_groups) < affectedCount
+            originMessage = countRows(removalDeltas(originGroup.table_groups, affectedRowGroups).filter(group => !group.headers.includes("_pyre_removed"))) < affectedCount
               ? invalidation
               : liveSyncRequiresCatchup(deltaMessage, countRows(data), originGroup.session_ids.length)
               ? {

@@ -298,9 +298,11 @@ export class IndexedDBStorage {
         for (const group of groups) {
           for (const values of group.rows) {
             const row = Object.fromEntries(group.headers.map((header, index) => [header, values[index]]));
+            if (typeof row.id !== 'string') throw new Error('Authoritative row requires UUID identity');
             const key = JSON.stringify([group.table_name, row.id]);
             if (stamps[key] !== undefined && stamps[key] >= revision) continue;
-            rows.put({ ...row, tableName: group.table_name });
+            if (row._pyre_removed === true) rows.delete([group.table_name, row.id]);
+            else rows.put({ ...row, tableName: group.table_name });
             stamps[key] = revision;
           }
         }

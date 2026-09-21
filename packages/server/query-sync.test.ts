@@ -78,7 +78,7 @@ function withoutServerRevision(message: unknown): unknown {
   return rest;
 }
 
-function syncDb() {
+function syncDb(removed = false) {
   let revision = 0;
   const executedSql: string[] = [];
   return {
@@ -90,8 +90,8 @@ function syncDb() {
       rows: [{
         _affectedRows: JSON.stringify([{
           table_name: "maps",
-          headers: ["id", "name", "tiling", "tiling__tileRootKey", "tiling__tileWidth", "tiling__format"],
-          rows: [[1, "World", "Tiling", "tiles/root", 256, "Png"]],
+          headers: ["id", "name", "tiling", "tiling__tileRootKey", "tiling__tileWidth", "tiling__format", ...(removed ? ["_pyre_removed"] : [])],
+          rows: [[1, "World", "Tiling", "tiles/root", 256, "Png", ...(removed ? [true] : [])]],
         }]),
       }],
     }, { rows: [{ database_epoch: "test-epoch", server_revision: revision }] }];
@@ -130,6 +130,21 @@ const schemaDb = {
     return { rows: [{ result: JSON.stringify(introspectionResult) }] };
   }),
 };
+
+test('deleted preimages produce only authorized identity removals, including the HTTP origin', async () => {
+  await loadSchemaFromDatabase(schemaDb as any);
+  sessionIds = ['origin', 'peer'];
+  const result = await runWithSync(syncDb(true) as any, queryMap, 'query-id', {}, {},
+    new Map(['origin', 'peer', 'hidden'].map(id => [id, { session: {} }])), undefined, 'origin');
+  const sent = new Map();
+  const sync = await result.sync((id, message) => sent.set(id, message));
+  expect(sync.originMessage.type).toBe('delta');
+  expect(sync.originMessage.data).toEqual([{ table_name: 'maps', headers: ['id', '_pyre_removed'], rows: [[1, true]] }]);
+  expect(sent.get('peer')).toEqual(sync.originMessage);
+  expect(sent.get('hidden').type).toBe('delta');
+  expect(sent.get('hidden').data).toEqual([]);
+  expect(JSON.stringify(sent.get('hidden'))).not.toContain('maps');
+});
 
 test('commit order determines revisions even when fanout is reversed or repeated', async () => {
   await loadSchemaFromDatabase(schemaDb as any);

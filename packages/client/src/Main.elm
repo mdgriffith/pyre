@@ -72,6 +72,7 @@ type alias FieldIntent =
     { tableName : String
     , rowIds : List String
     , setValues : List ( String, Data.Value.Value )
+    , kind : String
     }
 
 
@@ -654,13 +655,26 @@ applyOptimisticMutation requestId operations model =
                                             )
 
                                 matchingRows =
-                                    Dict.get tableName visible.tables
-                                        |> Maybe.withDefault Dict.empty
-                                        |> Dict.toList
-                                        |> List.filter
-                                            (\( _, row ) -> Dict.get optimistic.where_.field row == Just whereValue)
+                                    if optimistic.kind == "create" then
+                                        case Data.RowId.fromValue whereValue of
+                                            Just id ->
+                                                if List.length setValues == List.length optimistic.set then
+                                                    [ ( id, Dict.fromList setValues ) ]
+
+                                                else
+                                                    []
+
+                                            Nothing ->
+                                                []
+
+                                    else
+                                        Dict.get tableName visible.tables
+                                            |> Maybe.withDefault Dict.empty
+                                            |> Dict.toList
+                                            |> List.filter
+                                                (\( _, row ) -> Dict.get optimistic.where_.field row == Just whereValue)
                             in
-                            if List.isEmpty setValues || List.isEmpty matchingRows then
+                            if (List.isEmpty setValues && optimistic.kind /= "delete") || List.isEmpty matchingRows then
                                 ( visible, intents )
 
                             else
@@ -669,10 +683,11 @@ applyOptimisticMutation requestId operations model =
                                         { tableName = tableName
                                         , rowIds = List.map Tuple.first matchingRows
                                         , setValues = setValues
+                                        , kind = optimistic.kind
                                         }
 
                                     ( nextVisible, _ ) =
-                                        Db.update (Db.LocalDeltaReceived (intentDelta model.authoritativeDb Nothing pending visible)) visible
+                                        Db.update (Db.LocalDeltaReceived (intentDelta model.authoritativeDb model.rowRevisions Nothing pending visible)) visible
                                 in
                                 ( nextVisible, pending :: intents )
 
@@ -869,7 +884,7 @@ replayOptimisticMutations model db =
                             (\intent ( visible, commands ) ->
                                 let
                                     ( nextDb, cmd ) =
-                                        Db.update (Db.LocalDeltaReceived (intentDelta model.authoritativeDb optimistic.acknowledgedServerRevision intent visible)) visible
+                                        Db.update (Db.LocalDeltaReceived (intentDelta model.authoritativeDb model.rowRevisions optimistic.acknowledgedServerRevision intent visible)) visible
                                 in
                                 ( nextDb, cmd :: commands )
                             )
@@ -888,8 +903,8 @@ removeOptimisticMutation requestId model =
     }
 
 
-intentDelta : Db.Db -> Maybe Int -> FieldIntent -> Db.Db -> Data.Delta.Delta
-intentDelta authoritative acknowledgedServerRevision pending visible =
+intentDelta : Db.Db -> Dict ( String, String ) Int -> Maybe Int -> FieldIntent -> Db.Db -> Data.Delta.Delta
+intentDelta authoritative revisions acknowledgedServerRevision pending visible =
     let
         table db =
             Dict.get pending.tableName db.tables |> Maybe.withDefault Dict.empty
@@ -917,7 +932,40 @@ intentDelta authoritative acknowledgedServerRevision pending visible =
                                 applySetValues confirmedValues row
                     )
     in
-    deltaFromRows pending.tableName (List.filterMap updateRow pending.rowIds)
+    if pending.kind == "create" then
+        deltaFromRows pending.tableName
+            (List.filterMap
+                (\id ->
+                    case Dict.get id (table authoritative) of
+                        Just row ->
+                            Just row
+
+                        Nothing ->
+                            if acknowledgedServerRevision /= Nothing || Dict.member ( pending.tableName, id ) revisions then
+                                Nothing
+
+                            else
+                                Just (Dict.fromList pending.setValues)
+                )
+                pending.rowIds
+            )
+
+    else if pending.kind == "delete" then
+        deltaFromRows pending.tableName
+            (List.filterMap
+                (\id ->
+                    case acknowledgedServerRevision of
+                        Nothing ->
+                            Just (removedRow id)
+
+                        Just _ ->
+                            Just (Dict.get id (table authoritative) |> Maybe.withDefault (removedRow id))
+                )
+                pending.rowIds
+            )
+
+    else
+        deltaFromRows pending.tableName (List.filterMap updateRow pending.rowIds)
 
 
 filterAuthoritativeRows : Maybe Int -> Data.Delta.Delta -> Dict ( String, String ) Int -> ( Data.Delta.Delta, Dict ( String, String ) Int )
@@ -973,10 +1021,16 @@ publishVisible source model =
                             previous =
                                 Dict.get tableName model.db.tables |> Maybe.withDefault Dict.empty
                         in
-                        rows
+                        ((rows
                             |> Dict.toList
                             |> List.filter (\( id, row ) -> Dict.get id previous /= Just row)
                             |> List.map Tuple.second
+                         )
+                            ++ (Dict.keys previous
+                                    |> List.filter (\id -> not (Dict.member id rows))
+                                    |> List.map removedRow
+                               )
+                        )
                             |> deltaFromRows tableName
                             |> .tableGroups
                     )
@@ -1169,6 +1223,11 @@ applySetValues setValues row =
         (\( field, value ) acc -> Dict.insert field value acc)
         row
         setValues
+
+
+removedRow : String -> Dict String Data.Value.Value
+removedRow id =
+    Dict.fromList [ ( "id", Data.Value.StringValue id ), ( "_pyre_removed", Data.Value.BoolValue True ) ]
 
 
 deltaFromRows : String -> List (Dict String Data.Value.Value) -> Data.Delta.Delta

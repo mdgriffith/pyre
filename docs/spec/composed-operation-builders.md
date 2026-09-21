@@ -87,9 +87,23 @@ IndexedDB version 3 clears older authoritative caches and their cursors/revision
 atomically, then reloads authority from the server. Deploy the UUID server/schema
 migration with this client upgrade; integer-keyed synced caches are unsupported.
 
-This is a checkpoint in the full MEC-106 feature PR. Create/delete prediction and incremental
-removals, broader submission/bridge conformance, and complete feature examples
-remain release work in this same PR.
+The existing engine also captures delete intent and complete scalar generated-create
+intent. A create is predicted only when every selected scalar value comes from a
+captured input and every value is present, including explicit nullable values. An
+omitted default or server-managed value keeps that create server-only. Rejection
+replays the remaining operations; a newer authoritative removal suppresses pending
+create replay.
+
+Deleted preimages pass through query-permission filtering before becoming
+identity-only tombstones (`id`, `_pyre_removed`) in the existing delta format. The
+worker removes rows and index entries, publishes removals to query/entity readers,
+and persists deletion plus its revision stamp atomically. Old upserts cannot restore
+a tombstoned row, including after cache reload.
+
+This is a checkpoint in the full MEC-106 feature PR. Transaction-start permission
+preimages for access-changing updates and mixed update/delete batches, broader
+submission/bridge conformance, Rust generated-create execution parity, and complete
+feature examples remain release work in this same PR.
 
 ## Schema identity migration
 

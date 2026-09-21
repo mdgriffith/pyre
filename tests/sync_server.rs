@@ -1508,6 +1508,14 @@ delete RemoveNote($id: Note.id) {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].session_id, "user-1");
     assert_eq!(messages[0].message.data[0].rows[0][0], row_id(1));
+    assert_eq!(
+        messages[0].message.data[0].headers,
+        vec!["id", "_pyre_removed"]
+    );
+    assert_eq!(
+        messages[0].message.data[0].rows,
+        vec![vec![row_id(1), json!(true)]]
+    );
 
     Ok(())
 }
