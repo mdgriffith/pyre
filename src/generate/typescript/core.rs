@@ -48,7 +48,8 @@ pub fn generate_queries(
             .find(|column| ast::is_primary_key(column))
             .unwrap();
         let uuid = matches!(key.type_, ast::ColumnType::IdUuid { .. });
-        let base = if uuid { "string" } else { "number" };
+        let text = uuid || matches!(key.type_, ast::ColumnType::String);
+        let base = if text { "string" } else { "number" };
         edits.push_str(&format!(
             "export type {name}Id = Id<{}, {}, {base}>;\n",
             string::quote(&table.schema),
@@ -56,26 +57,29 @@ pub fn generate_queries(
         ));
         let validation = if uuid {
             "typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)"
+        } else if text {
+            "typeof value !== 'string'"
         } else {
             "!Number.isSafeInteger(value)"
         };
         edits.push_str(&format!("export function {}Id(value: {base}): {name}Id {{ if ({validation}) throw new Error('Invalid {name} identity'); return value as {name}Id; }}\n", string::decapitalize(name)));
         let mut ids = Vec::new();
         for column in columns {
-            let target = match &column.type_ {
-                ast::ColumnType::IdInt { .. } | ast::ColumnType::IdUuid { .. } => {
-                    Some(name.as_str())
+            let target = if ast::is_primary_key(&column) {
+                Some(name.as_str())
+            } else {
+                match &column.type_ {
+                    ast::ColumnType::ForeignKey { table, field, .. } => context
+                        .tables
+                        .get(&string::decapitalize(table))
+                        .filter(|target| {
+                            ast::collect_columns(&target.record.fields)
+                                .iter()
+                                .any(|key| key.name == *field && ast::is_primary_key(key))
+                        })
+                        .map(|_| table.as_str()),
+                    _ => None,
                 }
-                ast::ColumnType::ForeignKey { table, field, .. } => context
-                    .tables
-                    .get(&string::decapitalize(table))
-                    .filter(|target| {
-                        ast::collect_columns(&target.record.fields)
-                            .iter()
-                            .any(|key| key.name == *field && ast::is_primary_key(key))
-                    })
-                    .map(|_| table.as_str()),
-                _ => None,
             };
             if let Some(target) = target {
                 ids.push(format!("{}: {target}Id", string::quote(&column.name)));

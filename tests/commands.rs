@@ -134,9 +134,19 @@ fn free_loopback_port() -> u16 {
 }
 
 fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    http_request_with_headers(port, method, path, body, "")
+}
+
+fn http_request_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    extra_headers: &str,
+) -> (u16, String) {
     let body = body.unwrap_or("");
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
         body.as_bytes().len()
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -1380,6 +1390,142 @@ query GetUsers {
     assert_eq!(query_status, 200, "query body: {}", query_body);
     let result: serde_json::Value = serde_json::from_str(&query_body).unwrap();
     assert_eq!(result["user"], serde_json::json!([]));
+}
+
+#[test]
+fn test_serve_http_authority_without_sse_and_untrusted_connection_id() {
+    use base64::Engine;
+    use std::io::{BufRead, BufReader};
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n    userId Int\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+record Note {
+    @allow(query) { owner == Session.userId }
+    @allow(insert, update, delete) { True }
+    key Id.Uuid @id
+    owner Int
+    title String
+}
+"#,
+    )
+    .unwrap();
+    let db_path = ctx.workspace_path.join("db/app.db");
+    ctx.run_command("migrate")
+        .arg(&db_path)
+        .arg("--push")
+        .assert()
+        .success();
+    ctx.run_command("generate").assert().success();
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let create = manifest["queries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|q| q["operation"] == "insert")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let port = free_loopback_port();
+    let child = StdCommand::new(assert_cmd::cargo::cargo_bin("pyre"))
+        .current_dir(&ctx.workspace_path)
+        .arg("serve")
+        .arg(&db_path)
+        .args([
+            "--port",
+            &port.to_string(),
+            "--session-header",
+            "x-pyre-session",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server = ServerGuard { child };
+    wait_for_health(port);
+    let auth = |id| {
+        format!(
+            "x-pyre-session: {}\r\n",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(format!(r#"{{"userId":{id}}}"#))
+        )
+    };
+    let mutate = |key: &str, owner, connection: &str| {
+        let input = serde_json::json!({"key":key,"owner":owner,"title":"private"}).to_string();
+        let (status, body) = http_request_with_headers(
+            port,
+            "POST",
+            &format!("/db/{create}?sync=true{connection}"),
+            Some(&input),
+            &auth(1),
+        );
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()
+    };
+    // The first write has no SSE connections at all, but must settle from HTTP authority.
+    let first = mutate("01900000-0000-7000-8000-000000000001", 1, "");
+    assert_eq!(first["sync"]["type"], "delta", "{first}");
+    assert!(
+        first["sync"]["data"][0]["rows"][0]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("private")),
+        "{first}"
+    );
+    assert!(first["sync"]["serverRevision"].as_i64().unwrap() > 0);
+    assert!(first["sync"]["databaseEpoch"].is_string());
+
+    // Connect a different reader, then maliciously name its connection as the origin.
+    let mut peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    peer.write_all(
+        format!(
+            "GET /sync/events HTTP/1.1\r\nHost: localhost\r\n{}\r\n",
+            auth(2)
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut peer = BufReader::new(peer);
+    let mut event = || loop {
+        let mut line = String::new();
+        assert!(peer.read_line(&mut line).unwrap() > 0);
+        if let Some(data) = line.strip_prefix("data:") {
+            break serde_json::from_str::<serde_json::Value>(data.trim()).unwrap();
+        }
+    };
+    let connected = event();
+    let forged = format!(
+        "&connectionId={}",
+        connected["connectionId"].as_str().unwrap()
+    );
+    let second = mutate("01900000-0000-7000-8000-000000000002", 2, &forged);
+    assert_eq!(second["sync"]["type"], "delta", "{second}");
+    assert_eq!(
+        second["sync"]["data"],
+        serde_json::json!([]),
+        "HTTP cannot borrow peer authority: {second}"
+    );
+    let broadcast = event();
+    assert!(
+        broadcast["data"][0]["rows"][0]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("private")),
+        "peer broadcast was suppressed: {broadcast}"
+    );
+    assert_eq!(
+        broadcast["serverRevision"],
+        second["sync"]["serverRevision"]
+    );
 }
 
 #[test]

@@ -167,6 +167,13 @@ transaction; `SyncServer::calculate_deltas` publishes that captured revision.
 Include the authenticated origin in the logical session map when requesting HTTP
 origin authority, even if it has no SSE connection. Catchup uses a read transaction.
 
+The built-in Rust HTTP adapter uses a server-created logical origin with the
+authenticated request session. A supplied `connectionId` neither selects response
+permissions nor suppresses a live recipient. All live connections receive their
+own permission-filtered broadcast, including the caller's connection; the worker
+fences duplicate HTTP/SSE authority by revision. Commit-unknown errors return HTTP
+500 so clients recover authority instead of treating the write as rejected.
+
 ## Outcomes and limits
 
 Pending intent is memory-only. A success confirms the server transaction, not

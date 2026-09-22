@@ -86,8 +86,6 @@ struct SyncRequest {
 struct RequestQuery {
     #[serde(rename = "databaseId")]
     database_id: Option<String>,
-    #[serde(rename = "connectionId")]
-    connection_id: Option<String>,
     sync: Option<String>,
 }
 
@@ -392,10 +390,14 @@ async fn run_query(
     } else {
         pyre::server::query::run(&conn, &state.manifest, &query_id, input, &session).await
     }
-    .map_err(|error| ServeError::BadRequest(error.to_string()))?;
+    .map_err(query_error)?;
 
     if query.sync.as_deref() == Some("true") {
-        let connected_sessions = connected_sessions(&state).await;
+        let mut connected_sessions = connected_sessions(&state).await;
+        // HTTP authority belongs to the authenticated request, even without SSE.
+        // Never use a client connectionId to select authority or suppress a peer.
+        let origin_id = new_connection_id();
+        connected_sessions.insert(origin_id.clone(), session.logical().clone());
         let context = state
             .loaded_schema
             .context()
@@ -407,7 +409,7 @@ async fn run_query(
                 &mut result,
                 &connected_sessions,
                 &state.database_id,
-                query.connection_id.as_deref(),
+                Some(&origin_id),
             )
             .await
             .map_err(|error| ServeError::Internal(error.to_string()))?;
@@ -429,6 +431,13 @@ async fn connected_sessions(state: &AppState) -> ConnectedSessions {
         .iter()
         .map(|(id, connection)| (id.clone(), connection.session.clone()))
         .collect()
+}
+
+fn query_error(error: pyre::server::query::Error) -> ServeError {
+    match error {
+        pyre::server::query::Error::OutcomeUnknown(_) => ServeError::Internal(error.to_string()),
+        _ => ServeError::BadRequest(error.to_string()),
+    }
 }
 
 async fn send_messages(state: &AppState, messages: Vec<pyre::server::sync::SessionDeltaMessage>) {
@@ -592,6 +601,22 @@ fn with_cors(state: &AppState, request_headers: &HeaderMap, mut response: Respon
 mod tests {
     use super::*;
     use pyre::server::manifest::FieldSchema;
+
+    #[tokio::test]
+    async fn unknown_commit_outcome_is_not_an_http_rejection() {
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let error = conn.execute("COMMIT", ()).await.unwrap_err();
+        let response =
+            query_error(pyre::server::query::Error::OutcomeUnknown(error)).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let rejected =
+            query_error(pyre::server::query::Error::InvalidInput("invalid".into())).into_response();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
 
     fn manifest_with_session() -> Manifest {
         Manifest {

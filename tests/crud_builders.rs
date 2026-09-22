@@ -2,6 +2,132 @@ use pyre::{ast, generate, generated_queries, parser, typecheck};
 use std::process::Command;
 
 #[test]
+fn query_only_identity_builders_match_schema() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+@syncable(false)
+record Note {
+    @public
+    key String @id
+    id String
+    title String
+}
+record Counter {
+    @public
+    key Int @id
+    title String
+}
+record Account {
+    @public
+    key Id.Int @id
+    title String
+}
+record Document {
+    @public
+    key Id.Uuid @id
+    title String
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut queries = ast::QueryList { queries: vec![] };
+    generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = vec![];
+    generate::generate_schema(&context, &database, &mut files);
+    generate::write_queries(&context, &queries, &info, &mut files);
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    for file in files {
+        let path = dir.path().join(file.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file.contents).unwrap();
+    }
+    std::fs::write(dir.path().join("verify.ts"), r#"
+import assert from 'node:assert/strict';
+import { Note, Counter, Account, Document, noteId, counterId, accountId, documentId, type NoteId } from './typescript/core/edits';
+import { captureOperations, type Operation } from '@pyre/client/operations';
+import { meta as create } from './typescript/core/queries/metadata/noteCreate';
+import { meta as update } from './typescript/core/queries/metadata/noteUpdate';
+import { meta as remove } from './typescript/core/queries/metadata/noteDelete';
+import { meta as counterUpdate } from './typescript/core/queries/metadata/counterUpdate';
+import { meta as accountUpdate } from './typescript/core/queries/metadata/accountUpdate';
+import { meta as documentUpdate } from './typescript/core/queries/metadata/documentUpdate';
+const key = noteId('arbitrary-string-key');
+const edits = [Note.create({key, id: 'ordinary', title: 'First'}), Note.update(key, {id: 'other', title: 'Next'}), Note.delete(key)];
+for (const [i, validator] of [create, update, remove].entries()) assert(validator.InputValidator.safeParse(captureOperations([edits[i]])[0].input).success);
+assert.deepEqual(captureOperations([edits[1]])[0].input, {key: 'arbitrary-string-key', id: 'other', title: 'Next'});
+for (const [edit, validator] of [
+    [Counter.update(counterId(42), {title: 'Int'}), counterUpdate],
+    [Account.update(accountId(43), {title: 'Id.Int'}), accountUpdate],
+    [Document.update(documentId('01900000-0000-7000-8000-000000000001'), {title: 'UUID'}), documentUpdate],
+] as const) assert(validator.InputValidator.safeParse(captureOperations([edit])[0].input).success);
+type ResultOf<T> = T extends Operation<any, infer R> ? R : never;
+function typedResult(result: ResultOf<ReturnType<typeof Note.create>>) {
+    const id: NoteId = result.note[0].key;
+    Note.update(id, {id: result.note[0].id});
+}
+if (false) {
+    // @ts-expect-error String keys require strings
+    noteId(1);
+    // @ts-expect-error Integer keys require numbers
+    counterId('1');
+    // @ts-expect-error UUID keys require strings
+    documentId(1);
+    // @ts-expect-error Create primary keys retain their brand
+    Note.create({key: 'raw', id: 'ordinary', title: 'Wrong'});
+    // @ts-expect-error Cannot use another record's identity
+    Note.delete(documentId('01900000-0000-7000-8000-000000000001'));
+}
+assert.throws(() => noteId(1 as any));
+assert.throws(() => counterId(1.5));
+assert.throws(() => accountId(Number.MAX_SAFE_INTEGER + 1));
+assert.throws(() => documentId('not-a-uuid'));
+"#).unwrap();
+    for (command, args) in [
+        (
+            "node_modules/.bin/tsc",
+            vec![
+                "--noEmit",
+                "--strict",
+                "--skipLibCheck",
+                "--target",
+                "ES2022",
+                "--module",
+                "ESNext",
+                "--moduleResolution",
+                "Bundler",
+                "verify.ts",
+            ],
+        ),
+        ("bun", vec!["verify.ts"]),
+    ] {
+        let executable = if command.contains('/') {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(command)
+        } else {
+            command.into()
+        };
+        let output = Command::new(executable)
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn generated_builders_compile() {
     let mut schema = ast::Schema::default();
     parser::run(
