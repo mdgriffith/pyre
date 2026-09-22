@@ -18,7 +18,9 @@ const envelope = (revision, rows) => ({
   sync: { type: 'delta', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: revision, data: groups(rows) },
 });
 
-async function harness(run) {
+async function harness(run, key = 'id') {
+  const clientSchema = { ...schema, tables: { notes: { ...schema.tables.notes, indices: [{ field: key, primary: true, unique: true }] } } };
+  const initialRows = initial.map(({ id, ...row }) => ({ ...row, [key]: id, ...(key === 'id' ? {} : { id: 'ordinary' }) }));
   const original = globalThis.XMLHttpRequest;
   const requests = [];
   let catchupResponse = { databaseId: 'test', databaseEpoch: 'epoch-1', tables: {}, has_more: false };
@@ -50,14 +52,14 @@ async function harness(run) {
   async function client(restored = {}) {
     const Elm = loadElm(Object.create(globalThis));
     const app = Elm.Main.init({ flags: {
-      schema, server: { baseUrl: 'http://test', catchupPath: '/sync', databaseId: 'test' },
+      schema: clientSchema, server: { baseUrl: 'http://test', catchupPath: '/sync', databaseId: 'test' },
       liveSync: { transport: 'sse' }, sync: { autoStart: false },
     } });
     const visible = [];
     const writes = [];
     const results = [];
     const queryResults = [];
-    const entities = new EntityStreamService();
+    const entities = new EntityStreamService({ notes: key });
     app.ports.visibleStateOut.subscribe((message) => {
       visible.push(message);
       entities.handleVisibleState(message.snapshot, message.source, 'test');
@@ -66,7 +68,7 @@ async function harness(run) {
     app.ports.queryManagerOut.subscribe((message) => results.push(message));
     app.ports.queryClientOut.subscribe((message) => queryResults.push(message));
     app.ports.receiveIndexedDbMessage.send({ type: 'initialData', data: {
-      tables: { notes: initial }, cursor: { tables: {} }, databaseEpoch: 'epoch-1', lastAppliedServerRevision: null,
+      tables: { notes: initialRows }, cursor: { tables: {} }, databaseEpoch: 'epoch-1', lastAppliedServerRevision: null,
       ...restored,
     } });
     await turn();
@@ -76,8 +78,8 @@ async function harness(run) {
       async crud(requestId, kind, input) {
         app.ports.receiveQueryManagerMessage.send({
           type: 'sendMutation', requestId, mutationId: kind, baseUrl: 'http://test/db', input,
-          optimistic: { queryField: 'notes', kind, where: { field: 'id', input: 'id' },
-            set: kind === 'delete' ? [] : ['id', 'title', 'other'].map(field => ({ field, input: field })) },
+           optimistic: { queryField: 'notes', kind, where: { field: key, input: key },
+             set: kind === 'delete' ? [] : [...new Set([key, 'id', 'title', 'other'])].map(field => ({ field, input: field })) },
         });
         await turn();
       },
@@ -106,7 +108,7 @@ async function harness(run) {
       },
       async rows() {
         app.ports.receiveQueryClientMessage.send({ type: 'register', queryId: 'notes',
-          querySource: { notes: { id: true, title: true, other: true } }, queryInput: {} });
+           querySource: { notes: { [key]: true, id: true, title: true, other: true } }, queryInput: {} });
         await turn();
         return queryResults.at(-1).result.notes;
       },
@@ -114,6 +116,42 @@ async function harness(run) {
   }
   try { await run({ client, requests, setCatchupResponse: (response) => { catchupResponse = response; } }); } finally { globalThis.XMLHttpRequest = original; }
 }
+
+test('custom-key create/delete, query tracking, entity removals and restored fences ignore ordinary id', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client();
+    const events = [];
+    a.entities.subscribe({ tables: [{ tableName: 'notes' }] }, event => events.push(event));
+    const key = '00000000-0000-7000-8000-000000000003';
+    const row = { noteKey: key, id: 'ordinary', title: 'Created', other: 'Value' };
+    const response = (revision, removed = false) => ({
+      ...envelope(revision, []),
+      sync: { ...envelope(revision, []).sync, data: [{ table_name: 'notes',
+        headers: removed ? ['noteKey', '_pyre_removed'] : ['noteKey', 'id', 'title', 'other'],
+        rows: removed ? [[key, true]] : [[key, 'ordinary', 'Created', 'Value']] }] },
+    });
+    await a.rows(); // Keep a subscribed query across the create and deletion.
+    await a.crud('create', 'create', row);
+    expect((await a.rows()).at(-1)).toEqual(row);
+    expect(events.at(-1).changes[0].id).toBe(key);
+    requests[0].complete(response(1));
+    await turn();
+    await a.crud('delete-rejected', 'delete', { noteKey: key });
+    expect((await a.rows()).map(row => row.noteKey)).toEqual([one, two]);
+    expect(events.at(-1).changes).toEqual([{ tableName: 'notes', id: key, op: 'remove', row: { noteKey: key } }]);
+    requests[1].complete({}, 403);
+    await turn();
+    expect((await a.rows()).at(-1)).toEqual(row);
+    await a.crud('delete', 'delete', { noteKey: key });
+    requests[2].complete(response(3, true));
+    await turn();
+    const restored = await client({ rowRevisions: [['notes', key, 3]] });
+    restored.app.ports.receiveSSEMessage.send(response(2).sync);
+    await turn();
+    expect((await restored.rows()).map(row => row.noteKey)).toEqual([one, two]);
+    expect((await a.rows()).map(row => row.noteKey)).toEqual([one, two]);
+  }, 'noteKey');
+});
 
 test('two clients share incremental authority; origin confirms without live delivery', async () => {
   await harness(async ({ client, requests }) => {

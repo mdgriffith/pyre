@@ -83,7 +83,7 @@ their existing behavior; recognition compares the full generated definition.
 The existing worker now uses UUID row keys throughout its database, indices,
 query tracking, optimistic intents, row revision stamps and catchup cursors.
 Imported UUIDs may use any version; only generated creates require UUIDv7.
-IndexedDB version 3 clears older authoritative caches and their cursors/revisions
+IndexedDB version 4 clears older authoritative caches and their cursors/revisions
 atomically, then reloads authority from the server. Deploy the UUID server/schema
 migration with this client upgrade; integer-keyed synced caches are unsupported.
 
@@ -99,7 +99,7 @@ executor retains each row's first observation and its final value; rows created 
 the batch have no committed preimage. Original and final visibility are authorized
 separately. Intermediate grants cannot reveal an identity, and former readers get
 incremental removals rather than a full invalidation. Deleted preimages pass through query-permission filtering before becoming
-identity-only tombstones (`id`, `_pyre_removed`) in the existing delta format. The
+identity-only tombstones (the schema primary-key field and `_pyre_removed`) in the existing delta format. The
 worker removes rows and index entries, publishes removals to query/entity readers,
 and persists deletion plus its revision stamp atomically. Old upserts cannot restore
 a tombstoned row, including after cache reload.
@@ -110,8 +110,15 @@ transaction and rolls back zero-row generated writes. Named commands retain thei
 existing explicit-identity behavior. Native permission delivery also compares
 original and final visibility before emitting removals.
 
-This is a checkpoint in the full MEC-106 feature PR. Custom-primary-key client
-consistency, broader submission/bridge conformance, complete feature examples and
+Primary-key field names come from schema indices throughout row storage, query
+tracking, relationships, optimistic CRUD, revision fences and entity streams.
+An ordinary field named `id` is not treated as identity when another field is the
+primary key. IndexedDB stores an envelope separate from application columns;
+reload preserves both custom keys and per-row tombstones. Entity changes retain
+the generic `change.id` identity, while their `row` uses the actual schema field.
+
+This is a checkpoint in the full MEC-106 feature PR. Broader submission/bridge
+conformance, complete feature examples and
 the final cross-runtime release review remain work in this same PR.
 
 ## Schema identity migration
@@ -131,7 +138,7 @@ For an existing synced database, migrate primary keys and their foreign-key valu
 together using an explicit old-to-new ID mapping; update stored session IDs and
 external references as well. A schema type change alone does not convert existing
 data or preserve its relationships. Regenerate clients/manifests and deploy the
-schema, server and client upgrade together. IndexedDB v3 discards legacy caches;
+schema, server and client upgrade together. IndexedDB v4 discards legacy caches;
 the next initialization loads migrated authority.
 
 Trusted imports and named commands can supply explicit UUIDs of any version.

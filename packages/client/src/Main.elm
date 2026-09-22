@@ -113,8 +113,8 @@ type SyncControlMessage
 init : Flags -> ( Model, Cmd Msg )
 init flags =
     ( { schema = flags.schema
-      , db = Db.init
-      , authoritativeDb = Db.init
+      , db = Db.initWithSchema flags.schema
+      , authoritativeDb = Db.initWithSchema flags.schema
       , queryManager = QueryManager.init
       , catchup = Catchup.init flags.server
       , syncStatus = SyncState.NotStarted
@@ -856,7 +856,7 @@ applyAuthoritativeDelta : Maybe Int -> Data.Delta.Delta -> Model -> ( Model, Lis
 applyAuthoritativeDelta revision delta model =
     let
         ( accepted, rowRevisions ) =
-            filterAuthoritativeRows revision delta model.rowRevisions
+            filterAuthoritativeRows model.schema revision delta model.rowRevisions
 
         ( authoritativeDb, _ ) =
             Db.update (Db.LocalDeltaReceived accepted) model.authoritativeDb
@@ -956,10 +956,10 @@ intentDelta authoritative revisions acknowledgedServerRevision pending visible =
                 (\id ->
                     case acknowledgedServerRevision of
                         Nothing ->
-                            Just (removedRow id)
+                            Just (removedRow (Db.primaryKey authoritative pending.tableName) id)
 
                         Just _ ->
-                            Just (Dict.get id (table authoritative) |> Maybe.withDefault (removedRow id))
+                            Just (Dict.get id (table authoritative) |> Maybe.withDefault (removedRow (Db.primaryKey authoritative pending.tableName) id))
                 )
                 pending.rowIds
             )
@@ -968,13 +968,13 @@ intentDelta authoritative revisions acknowledgedServerRevision pending visible =
         deltaFromRows pending.tableName (List.filterMap updateRow pending.rowIds)
 
 
-filterAuthoritativeRows : Maybe Int -> Data.Delta.Delta -> Dict ( String, String ) Int -> ( Data.Delta.Delta, Dict ( String, String ) Int )
-filterAuthoritativeRows revision delta revisions =
+filterAuthoritativeRows : Data.Schema.SchemaMetadata -> Maybe Int -> Data.Delta.Delta -> Dict ( String, String ) Int -> ( Data.Delta.Delta, Dict ( String, String ) Int )
+filterAuthoritativeRows schema revision delta revisions =
     let
         filterGroup group ( accGroups, stamps ) =
             let
                 filterRow values ( accRows, currentStamps ) =
-                    case Dict.get "id" (Dict.fromList (List.map2 Tuple.pair group.headers values)) |> Maybe.andThen Data.RowId.fromValue of
+                    case Dict.get (Data.Schema.primaryKey schema group.tableName) (Dict.fromList (List.map2 Tuple.pair group.headers values)) |> Maybe.andThen Data.RowId.fromValue of
                         Just id ->
                             let
                                 key =
@@ -1028,7 +1028,7 @@ publishVisible source model =
                          )
                             ++ (Dict.keys previous
                                     |> List.filter (\id -> not (Dict.member id rows))
-                                    |> List.map removedRow
+                                    |> List.map (removedRow (Data.Schema.primaryKey model.schema tableName))
                                )
                         )
                             |> deltaFromRows tableName
@@ -1225,9 +1225,9 @@ applySetValues setValues row =
         setValues
 
 
-removedRow : String -> Dict String Data.Value.Value
-removedRow id =
-    Dict.fromList [ ( "id", Data.Value.StringValue id ), ( "_pyre_removed", Data.Value.BoolValue True ) ]
+removedRow : String -> String -> Dict String Data.Value.Value
+removedRow key id =
+    Dict.fromList [ ( key, Data.Value.StringValue id ), ( "_pyre_removed", Data.Value.BoolValue True ) ]
 
 
 deltaFromRows : String -> List (Dict String Data.Value.Value) -> Data.Delta.Delta

@@ -31,6 +31,7 @@ suite =
                     initial =
                         { tables = Dict.empty
                         , indices = Dict.singleton ( "notes", "owner" ) Db.Index.empty
+                        , primaryKeys = Dict.empty
                         }
 
                     apply rows db =

@@ -190,6 +190,7 @@ dbWithEmptyRelatedTable =
             , ( "game_members", Dict.empty )
             ]
     , indices = Dict.empty
+    , primaryKeys = Dict.empty
     }
 
 
@@ -209,6 +210,7 @@ dbWithoutRelatedTable =
               )
             ]
     , indices = Dict.empty
+    , primaryKeys = Dict.empty
     }
 
 
@@ -239,6 +241,7 @@ dbWithRelatedRows =
               )
             ]
     , indices = Dict.empty
+    , primaryKeys = Dict.empty
     }
 
 

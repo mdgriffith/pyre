@@ -23,12 +23,13 @@ record Note {
   @watch
   @allow(query) { title != "HIDDEN" || Session.admin == True }
   @allow(update, insert, delete) { True }
-  id Id.Uuid @id
+   noteKey Id.Uuid @id
+   id String
   title String
   updatedAt Int
 }
 `);
-await db.execute("insert into notes (id, title, updatedAt) values ('00000000-0000-7000-8000-000000000001', 'Initial', 1), ('00000000-0000-7000-8000-000000000002', 'Untouched', 1)");
+await db.execute("insert into notes (noteKey, id, title, updatedAt) values ('00000000-0000-7000-8000-000000000001', 'ordinary', 'Initial', 1), ('00000000-0000-7000-8000-000000000002', 'ordinary', 'Untouched', 1)");
 await loadSchemaFromDatabase('proof', db);
 // Precompiled one-field operation fixture, including its existing affected-row
 // output. No client-authored SQL or runtime query compilation is accepted.
@@ -37,17 +38,17 @@ const queries = { edit: {
   id: 'edit', session_args: [], optional_input_args: [], json_input_args: [],
   InputValidator: z.object({ id: z.string().uuid(), title: z.string() }), SessionValidator: z.object({ admin: z.boolean() }),
   sql: [
-    { include: true, params: ['id'], sql: `select json_array(json_object('table_name', 'notes', 'headers', json_array('id', 'title', 'updatedAt', '_pyre_preimage'), 'rows', json_array(json_array(id, title, updatedAt, json('true'))))) as _affectedRows from notes where id = $id` },
-    { include: false, params: ['id', 'title'], sql: 'update notes set title = upper($title), updatedAt = updatedAt + 1 where id = $id' },
-    { include: true, params: ['id'], sql: `select json_array(json_object('table_name', 'notes', 'headers', json_array('id', 'title', 'updatedAt'), 'rows', json_array(json_array(id, title, updatedAt)))) as _affectedRows from notes where id = $id` },
+    { include: true, params: ['id'], sql: `select json_array(json_object('table_name', 'notes', 'primary_key', 'noteKey', 'headers', json_array('noteKey', 'id', 'title', 'updatedAt', '_pyre_preimage'), 'rows', json_array(json_array(noteKey, id, title, updatedAt, json('true'))))) as _affectedRows from notes where noteKey = $id` },
+    { include: false, params: ['id', 'title'], sql: 'update notes set title = upper($title), updatedAt = updatedAt + 1 where noteKey = $id' },
+    { include: true, params: ['id'], sql: `select json_array(json_object('table_name', 'notes', 'primary_key', 'noteKey', 'headers', json_array('noteKey', 'id', 'title', 'updatedAt'), 'rows', json_array(json_array(noteKey, id, title, updatedAt)))) as _affectedRows from notes where noteKey = $id` },
   ],
 } };
 // Real permission evaluator + SQLite: authorize only transaction-start and final
 // values, including delete/recreate and create/delete of an unseen identity.
 const removal = { ...queries.edit, id: 'remove', generatedEdit: { writeStatement: 0 },
-  sql: [{ include: true, params: ['id'], sql: `delete from notes where id = $id returning json_array(json_object('table_name', 'notes', 'headers', json_array('id', 'title', 'updatedAt', '_pyre_removed'), 'rows', json_array(json_array(id, title, updatedAt, json('true'))))) as _affectedRows` }] };
+  sql: [{ include: true, params: ['id'], sql: `delete from notes where noteKey = $id returning json_array(json_object('table_name', 'notes', 'primary_key', 'noteKey', 'headers', json_array('noteKey', 'id', 'title', 'updatedAt', '_pyre_removed'), 'rows', json_array(json_array(noteKey, id, title, updatedAt, json('true'))))) as _affectedRows` }] };
 const insert = { ...queries.edit, id: 'insert', generatedEdit: { writeStatement: 0, createId: 'id' },
-  sql: [{ include: true, params: ['id', 'title'], sql: `insert into notes values ($id, $title, 1) returning json_array(json_object('table_name', 'notes', 'headers', json_array('id', 'title', 'updatedAt'), 'rows', json_array(json_array(id, title, updatedAt)))) as _affectedRows` }] };
+  sql: [{ include: true, params: ['id', 'title'], sql: `insert into notes values ($id, 'ordinary', $title, 1) returning json_array(json_object('table_name', 'notes', 'primary_key', 'noteKey', 'headers', json_array('noteKey', 'id', 'title', 'updatedAt'), 'rows', json_array(json_array(noteKey, id, title, updatedAt)))) as _affectedRows` }] };
 const probeId = '00000000-0000-7000-8000-000000000009';
 for (const [initial, operations, visible] of [
   ['Visible', ['HIDDEN'], true],
@@ -56,15 +57,15 @@ for (const [initial, operations, visible] of [
   ['HIDDEN', ['remove', 'insert'], false],
   [null, ['insert', 'remove'], false],
 ] as const) {
-  if (initial !== null) await db.execute({ sql: 'insert into notes values ($id, $title, 1)', args: { id: probeId, title: initial } });
+  if (initial !== null) await db.execute({ sql: "insert into notes values ($id, 'ordinary', $title, 1)", args: { id: probeId, title: initial } });
   const result = await runWithSync(db, { ...queries, remove: removal, insert }, operations.map(op => ({ queryId: op === 'remove' || op === 'insert' ? op : 'edit', input: { id: probeId, title: op === 'insert' ? 'HIDDEN' : op } })), undefined,
     { admin: true }, new Map([['admin', { session: { admin: true } }], ['reader', { session: { admin: false } }]]), 'proof', 'admin');
   assert.equal(result.kind, 'success');
   const sent = new Map();
   await result.sync((id, message) => sent.set(id, message));
   assert.equal(sent.get('reader').type, 'delta');
-  assert.deepEqual(sent.get('reader').data, visible ? [{ table_name: 'notes', headers: ['id', '_pyre_removed'], rows: [[probeId, true]] }] : []);
-  await db.execute({ sql: 'delete from notes where id = $id', args: { id: probeId } });
+  assert.deepEqual(sent.get('reader').data, visible ? [{ table_name: 'notes', headers: ['noteKey', '_pyre_removed'], rows: [[probeId, true]] }] : []);
+  await db.execute({ sql: 'delete from notes where noteKey = $id', args: { id: probeId } });
 }
 const bundle = await Bun.build({ entrypoints: [new URL('./field-edit-browser.ts', import.meta.url).pathname], target: 'browser' });
 if (!bundle.success) throw new Error(bundle.logs.join('\n'));

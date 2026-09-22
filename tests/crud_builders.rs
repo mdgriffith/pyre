@@ -21,6 +21,12 @@ record Account {
     id Id.Uuid @id
     name String
 }
+record Note {
+    @public
+    noteKey Id.Uuid @id
+    id String
+    title String
+}
 "#,
         &mut schema,
     )
@@ -50,6 +56,7 @@ record Account {
 import Db.Edit
 import Db.Edit.Document as Document
 import Db.Edit.Account as Account
+import Db.Edit.Note as Note
 import Db.Edit.Internal as Internal
 import Db.Id
 import Db.Database
@@ -59,7 +66,7 @@ import Query.DocumentDelete
 port output : Encode.Value -> Cmd msg
 main =
     Platform.worker
-        { init = \() -> ( (), output (Encode.list identity [ Internal.encode create, Internal.encode (Document.update (Db.Id.uuid "01900000-0000-7000-8000-000000000000") patch), receiptCheck ]) )
+        { init = \() -> ( (), output (Encode.list identity [ Internal.encode create, Internal.encode (Document.update (Db.Id.uuid "01900000-0000-7000-8000-000000000000") patch), receiptCheck, Internal.encode (Note.create { id = "ordinary", title = "Custom key" } []) ]) )
         , update = \() model -> ( model, Cmd.none )
         , subscriptions = \_ -> Sub.none
         }
@@ -130,6 +137,9 @@ import type { PyreClient } from '@pyre/client';
 import { meta as createMeta } from './typescript/core/queries/metadata/documentCreate';
 import { meta as updateMeta } from './typescript/core/queries/metadata/documentUpdate';
 import { meta as deleteMeta } from './typescript/core/queries/metadata/documentDelete';
+import { Note } from './typescript/core/edits';
+const custom: any = captureOperations([Note.create({ id: 'ordinary', title: 'Custom key' })])[0];
+if (custom.optimistic.where.field !== 'noteKey' || custom.input.id !== 'ordinary' || !custom.input.noteKey) throw new Error('Custom create identity');
 if (createMeta.optimistic.kind !== 'create' || deleteMeta.optimistic.kind !== 'delete') throw new Error('Missing CRUD prediction');
 const created = documentCreate({ title: 'Title', owner: 'Owner', tags: [], summary: null });
 const id = documentId('01900000-0000-7000-8000-000000000000');
@@ -197,6 +207,9 @@ assert.equal(edits[0].optimistic.kind, 'create');
 assert.deepEqual(edits[1].input, { id: '01900000-0000-7000-8000-000000000000', title: 'New title', summary: null, tags: ['tag'] });
 assert(!('owner' in edits[1].input));
 assert.equal(edits[2], true, 'typed receipt must reject another database and wrong operation accessor');
+assert.equal(edits[3].createId, 'noteKey');
+assert.equal(edits[3].optimistic.where.field, 'noteKey');
+assert.deepEqual(edits[3].input, { id: 'ordinary', title: 'Custom key' });
 "#).unwrap();
     for script in ["verify.ts", "verify-elm.ts"] {
         let output = Command::new("bun")

@@ -276,7 +276,7 @@ extractChangedRowIdsTests =
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds { tables = Dict.empty, queryFieldToTable = Dict.empty } delta
                 in
                 Expect.equal
                     (Dict.fromList [ ( "users", Uuid.set [ 1, 2 ] ) ])
@@ -301,7 +301,7 @@ extractChangedRowIdsTests =
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds { tables = Dict.empty, queryFieldToTable = Dict.empty } delta
                 in
                 Expect.equal
                     (Dict.fromList
@@ -317,7 +317,7 @@ extractChangedRowIdsTests =
                         { tableGroups = [] }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds { tables = Dict.empty, queryFieldToTable = Dict.empty } delta
                 in
                 Expect.equal Dict.empty result
         , test "skips rows without valid ID" <|
@@ -337,7 +337,7 @@ extractChangedRowIdsTests =
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds { tables = Dict.empty, queryFieldToTable = Dict.empty } delta
                 in
                 Expect.equal
                     (Dict.fromList [ ( "users", Uuid.set [ 1, 3 ] ) ])
@@ -389,7 +389,7 @@ shouldReExecuteQueryTests =
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -432,7 +432,7 @@ shouldReExecuteQueryTests =
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -513,7 +513,7 @@ shouldReExecuteQueryTests =
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -563,7 +563,7 @@ shouldReExecuteQueryTests =
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -637,6 +637,7 @@ integrationTests =
                                   )
                                 ]
                         , indices = Dict.empty
+                        , primaryKeys = Dict.empty
                         }
 
                     -- Delta: user 1 changes email (NOT role)
@@ -706,6 +707,7 @@ integrationTests =
                                   )
                                 ]
                         , indices = Dict.empty
+                        , primaryKeys = Dict.empty
                         }
 
                     -- Delta: user 1 changes role from admin to user

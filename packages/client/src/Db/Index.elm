@@ -247,7 +247,7 @@ buildIndicesFromSchema schema tables =
                                             Dict.insert indexKey index innerAcc
 
                                         Nothing ->
-                                            innerAcc
+                                            Dict.insert ( linkInfo.to.table, linkInfo.to.column ) empty innerAcc
 
                                 _ ->
                                     -- ManyToOne and OneToOne use primary key lookups (already O(1))
@@ -271,7 +271,7 @@ buildIndicesFromSchema schema tables =
                                     Dict.insert indexKey index innerAcc
 
                                 Nothing ->
-                                    innerAcc
+                                    Dict.insert ( tableName, indexInfo.field ) empty innerAcc
                         )
                         accWithLinks
                         tableMeta.indices

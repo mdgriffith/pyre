@@ -1,4 +1,5 @@
 import loadElm from '../dist/engine.mjs';
+import { primaryKeys } from './service/identity';
 import {
   captureOperations,
   createId,
@@ -246,6 +247,7 @@ export interface ElmBridgeMutationMessage {
 
 export interface ElmBridgeMutationResultMessage {
   type: 'mutation-result';
+  databaseId: DatabaseId;
   requestId: string;
   mutationId: string;
   mutationName: string | null;
@@ -448,8 +450,9 @@ class SingleDatabasePyreClient {
       throw new Error(`[PyreClient ctor] Elm.Main.init failed: ${message}`);
     }
 
-    this.storage = new IndexedDBStorage(dbName);
-    this.entityStream = new EntityStreamService();
+    const keys = primaryKeys(config.schema);
+    this.storage = new IndexedDBStorage(dbName, keys);
+    this.entityStream = new EntityStreamService(keys);
     this.indexedDbService = new IndexedDbService(this.storage, this.logDebug);
     this.sseManager = new SSEManager({
       baseUrl: config.server.baseUrl,
@@ -1201,6 +1204,7 @@ class SingleDatabasePyreClient {
           });
           mutationResultPort?.send?.({
             type: 'mutation-result',
+            databaseId: message.databaseId,
             requestId: message.requestId,
             mutationId: message.mutationId,
             mutationName: message.mutationName ?? null,
@@ -1213,6 +1217,7 @@ class SingleDatabasePyreClient {
       );
     })().catch((error) => {
       mutationResultPort?.send?.({
+        databaseId: message.databaseId,
         type: 'mutation-result', requestId: message.requestId, mutationId: message.mutationId,
         mutationName: message.mutationName ?? null, result: { ok: false, error: String(error) },
       } satisfies ElmBridgeMutationResultMessage);
@@ -1628,6 +1633,7 @@ export class PyreClient {
                 (result) => {
                   mutationResultPort?.send?.({
                     type: 'mutation-result',
+                    databaseId: message.databaseId,
                     requestId: message.requestId,
                     mutationId: message.mutationId,
                     mutationName: message.mutationName ?? null,

@@ -141,7 +141,7 @@ notifyTablesChanged schema db model delta =
                         deltaOutcome =
                             case subscription.lastResult of
                                 Just previousResult ->
-                                    buildDeltaOps previousResult executionResult.results
+                                    buildDeltaOps schema subscription.query previousResult executionResult.results
 
                                 Nothing ->
                                     Err "Missing previous result"
@@ -284,8 +284,8 @@ type Id
     | IdString String
 
 
-buildDeltaOps : Dict String (List (Dict String Value)) -> Dict String (List (Dict String Value)) -> Result String (List QueryDeltaOp)
-buildDeltaOps previousResult nextResult =
+buildDeltaOps : Data.Schema.SchemaMetadata -> Db.Query.Query -> Dict String (List (Dict String Value)) -> Dict String (List (Dict String Value)) -> Result String (List QueryDeltaOp)
+buildDeltaOps schema query previousResult nextResult =
     let
         allFields =
             List.foldl
@@ -306,7 +306,7 @@ buildDeltaOps previousResult nextResult =
                     acc
 
                 Ok opsSoFar ->
-                    case diffField field previousResult nextResult of
+                    case diffField (projectedPrimaryKey schema query field) field previousResult nextResult of
                         Ok fieldOps ->
                             Ok (opsSoFar ++ fieldOps)
 
@@ -317,8 +317,43 @@ buildDeltaOps previousResult nextResult =
         allFields
 
 
-diffField : String -> Dict String (List (Dict String Value)) -> Dict String (List (Dict String Value)) -> Result String (List QueryDeltaOp)
-diffField fieldName previousResult nextResult =
+projectedPrimaryKey : Data.Schema.SchemaMetadata -> Db.Query.Query -> String -> Maybe String
+projectedPrimaryKey schema query fieldName =
+    Dict.get fieldName schema.queryFieldToTable
+        |> Maybe.andThen
+            (\tableName ->
+                Dict.get fieldName query
+                    |> Maybe.andThen
+                        (\field ->
+                            let
+                                key =
+                                    Data.Schema.primaryKey schema tableName
+                            in
+                            if Dict.isEmpty field.selections then
+                                Just key
+
+                            else
+                                Dict.toList field.selections
+                                    |> List.filterMap
+                                        (\( alias, selection ) ->
+                                            case selection of
+                                                Db.Query.SelectField source ->
+                                                    if Maybe.withDefault alias source == key then
+                                                        Just alias
+
+                                                    else
+                                                        Nothing
+
+                                                _ ->
+                                                    Nothing
+                                        )
+                                    |> List.head
+                        )
+            )
+
+
+diffField : Maybe String -> String -> Dict String (List (Dict String Value)) -> Dict String (List (Dict String Value)) -> Result String (List QueryDeltaOp)
+diffField key fieldName previousResult nextResult =
     let
         oldRows =
             Dict.get fieldName previousResult |> Maybe.withDefault []
@@ -326,7 +361,7 @@ diffField fieldName previousResult nextResult =
         newRows =
             Dict.get fieldName nextResult |> Maybe.withDefault []
     in
-    case ( listRowIds oldRows, listRowIds newRows ) of
+    case ( Maybe.andThen (\name -> listRowIds name oldRows) key, Maybe.andThen (\name -> listRowIds name newRows) key ) of
         ( Just oldIds, Just newIds ) ->
             let
                 listOps =
@@ -482,16 +517,16 @@ listValueEquals left right =
         List.all identity (List.map2 valueEquals left right)
 
 
-listRowIds : List (Dict String Value) -> Maybe (List Id)
-listRowIds rows =
+listRowIds : String -> List (Dict String Value) -> Maybe (List Id)
+listRowIds key rows =
     rows
-        |> List.map extractRowId
+        |> List.map (extractRowId key)
         |> sequenceMaybe
 
 
-extractRowId : Dict String Value -> Maybe Id
-extractRowId row =
-    case Dict.get "id" row of
+extractRowId : String -> Dict String Value -> Maybe Id
+extractRowId key row =
+    case Dict.get key row of
         Just (Data.Value.IntValue id) ->
             Just (IdInt id)
 
@@ -620,8 +655,8 @@ sequenceMaybe values =
 
 {-| Extract row IDs that changed from a delta, grouped by table name.
 -}
-extractChangedRowIds : Data.Delta.Delta -> Dict String (Set String)
-extractChangedRowIds delta =
+extractChangedRowIds : Data.Schema.SchemaMetadata -> Data.Delta.Delta -> Dict String (Set String)
+extractChangedRowIds schema delta =
     List.foldl
         (\tableGroup acc ->
             let
@@ -630,7 +665,7 @@ extractChangedRowIds delta =
                         (\row ->
                             List.map2 Tuple.pair tableGroup.headers row
                                 |> Dict.fromList
-                                |> Dict.get "id"
+                                |> Dict.get (Data.Schema.primaryKey schema tableGroup.tableName)
                                 |> Maybe.andThen Data.RowId.fromValue
                         )
                         tableGroup.rows
@@ -737,7 +772,7 @@ shouldReExecuteQuery schema db subscription delta =
 
         -- Get changed row IDs grouped by table
         changedRowIds =
-            extractChangedRowIds delta
+            extractChangedRowIds schema delta
 
         -- Check each table used by the query
         hasRelevantChanges =
@@ -903,7 +938,7 @@ checkIfNewRowsMatchWhere schema db tableName newRowIds subscription delta =
                     Just _ ->
                         List.any
                             (\newRowArray ->
-                                case rowArrayToDict tableGroup.headers newRowArray |> Dict.get "id" |> Maybe.andThen Data.RowId.fromValue of
+                                case rowArrayToDict tableGroup.headers newRowArray |> Dict.get (Db.primaryKey db tableName) |> Maybe.andThen Data.RowId.fromValue of
                                     Just rowId ->
                                         if Set.member rowId newRowIds then
                                             let
@@ -952,7 +987,7 @@ checkIfFilteredFieldsChanged db tableName overlappingIds whereClause delta =
                 Just tableGroup ->
                     List.any
                         (\newRowArray ->
-                            case rowArrayToDict tableGroup.headers newRowArray |> Dict.get "id" |> Maybe.andThen Data.RowId.fromValue of
+                            case rowArrayToDict tableGroup.headers newRowArray |> Dict.get (Db.primaryKey db tableName) |> Maybe.andThen Data.RowId.fromValue of
                                 Just rowId ->
                                     if Set.member rowId overlappingIds then
                                         -- This row is in both delta and result set
@@ -1015,7 +1050,7 @@ checkIfSpecificFieldsChanged db tableName overlappingIds fieldsToCheck delta =
                 Just tableGroup ->
                     List.any
                         (\newRowArray ->
-                            case rowArrayToDict tableGroup.headers newRowArray |> Dict.get "id" |> Maybe.andThen Data.RowId.fromValue of
+                            case rowArrayToDict tableGroup.headers newRowArray |> Dict.get (Db.primaryKey db tableName) |> Maybe.andThen Data.RowId.fromValue of
                                 Just rowId ->
                                     if Set.member rowId overlappingIds then
                                         -- This row is in both delta and result set

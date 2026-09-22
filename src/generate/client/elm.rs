@@ -716,7 +716,7 @@ fn database_column_type(
 fn entity_stream_id_type(fields: &Vec<ast::Field>) -> Option<(String, &'static str)> {
     for field in fields {
         if let ast::Field::Column(column) = field {
-            if column.name != "id" {
+            if !ast::is_primary_key(column) {
                 continue;
             }
 
@@ -971,22 +971,16 @@ fn find_table<'a>(lookup: &'a ElmLookup, table_name: &str) -> Option<&'a ast::Re
     lookup.records_by_name.get(&table_name.to_ascii_lowercase())
 }
 
-fn get_id_kind_for_brand(lookup: &ElmLookup, brand: &str) -> Option<IdKind> {
-    let table = find_table(lookup, brand)?;
-
-    for field in &table.fields {
-        if let ast::Field::Column(column) = field {
-            if column.name == "id" {
-                return match &column.type_ {
-                    ast::ColumnType::IdInt { .. } => Some(IdKind::Int),
-                    ast::ColumnType::IdUuid { .. } => Some(IdKind::Uuid),
-                    _ => None,
-                };
-            }
-        }
+fn branded_column_type(type_: &ast::ColumnType, record: &str) -> ast::ColumnType {
+    match type_ {
+        ast::ColumnType::IdUuid { table } if table.is_empty() => ast::ColumnType::IdUuid {
+            table: record.into(),
+        },
+        ast::ColumnType::IdInt { table } if table.is_empty() => ast::ColumnType::IdInt {
+            table: record.into(),
+        },
+        _ => type_.clone(),
     }
-
-    None
 }
 
 fn resolve_foreign_key_column_type(lookup: &ElmLookup, type_: &str) -> Option<ast::ColumnType> {
@@ -996,26 +990,12 @@ fn resolve_foreign_key_column_type(lookup: &ElmLookup, type_: &str) -> Option<as
     for field in &table.fields {
         if let ast::Field::Column(column) = field {
             if column.name == field_name {
-                return Some(column.type_.clone());
+                return Some(branded_column_type(&column.type_, &table.name));
             }
         }
     }
 
     None
-}
-
-fn id_encoder(kind: IdKind) -> &'static str {
-    match kind {
-        IdKind::Int => "Db.Id.encodeInt",
-        IdKind::Uuid => "Db.Id.encodeUuid",
-    }
-}
-
-fn id_decoder(kind: IdKind) -> &'static str {
-    match kind {
-        IdKind::Int => "Db.Id.decodeInt",
-        IdKind::Uuid => "Db.Id.decodeUuid",
-    }
 }
 
 pub fn write_schema(database: &ast::Database) -> String {
@@ -1404,7 +1384,7 @@ fn id_kind_for_brand(database: &ast::Database, brand: &str) -> Option<IdKind> {
 
                     for field in fields {
                         if let ast::Field::Column(column) = field {
-                            if column.name == "id" {
+                            if ast::is_primary_key(column) {
                                 return match &column.type_ {
                                     ast::ColumnType::IdInt { .. } => Some(IdKind::Int),
                                     ast::ColumnType::IdUuid { .. } => Some(IdKind::Uuid),
@@ -1623,13 +1603,7 @@ fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
         ),
         ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.encodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(kind) = get_id_kind_for_brand(lookup, table) {
-                    return id_encoder(kind).to_string();
-                }
-            }
-
+        ast::ColumnType::ForeignKey { .. } => {
             if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
                 return to_elm_encoder(lookup, &col_type);
             }
@@ -1723,6 +1697,14 @@ fn to_edit_module(
         "createResult",
         "updateResult",
         "deleteResult",
+        "optimisticCreate",
+        "optimisticDelete",
+        "id",
+        "value",
+        "input",
+        "options",
+        "patches",
+        "pair",
     ]
     .into_iter()
     .map(str::to_string)
@@ -2161,7 +2143,10 @@ fn optimistic_update_metadata(
     query: &ast::Query,
 ) -> Option<OptimisticUpdateMetadata> {
     if query.operation == ast::QueryOperation::Insert {
-        crate::generated_queries::generated_crud_table(context, query)?;
+        let table = crate::generated_queries::generated_crud_table(context, query)?;
+        let key = ast::collect_columns(&table.record.fields)
+            .into_iter()
+            .find(|column| ast::is_primary_key(column))?;
         let [ast::TopLevelQueryField::Field(root)] = query.fields.as_slice() else {
             return None;
         };
@@ -2176,10 +2161,10 @@ fn optimistic_update_metadata(
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
-        let (_, id_input) = set_fields.iter().find(|(field, _)| field == "id")?;
+        let (_, id_input) = set_fields.iter().find(|(field, _)| field == &key.name)?;
         return Some(OptimisticUpdateMetadata {
             query_field: root.name.clone(),
-            where_field: "id".into(),
+            where_field: key.name.clone(),
             where_input: id_input.clone(),
             set_fields,
         });
@@ -2433,14 +2418,7 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
                 "String".to_string()
             }
         }
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(table_def) = find_table(lookup, table) {
-                    return format!("Db.Id.{}", table_def.name);
-                }
-                return format!("Db.Id.{}", table);
-            }
-
+        ast::ColumnType::ForeignKey { .. } => {
             if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
                 return to_elm_type_from_column_type(lookup, &col_type);
             }
@@ -2489,13 +2467,7 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
         }
         ast::ColumnType::IdInt { .. } => "Db.Id.decodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.decodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(kind) = get_id_kind_for_brand(lookup, table) {
-                    return id_decoder(kind).to_string();
-                }
-            }
-
+        ast::ColumnType::ForeignKey { .. } => {
             if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
                 return to_elm_decoder_from_column_type(lookup, &col_type);
             }

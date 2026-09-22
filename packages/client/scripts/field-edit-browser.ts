@@ -2,7 +2,7 @@ import { operation, PyreClient } from '../src-ts/index';
 import { IndexedDBStorage } from '../src-ts/service/indexeddb';
 
 const who = location.pathname.slice(1) || 'a';
-const schema = { tables: { notes: { name: 'notes', links: {}, indices: [] } }, queryFieldToTable: { notes: 'notes' } };
+const schema = { tables: { notes: { name: 'notes', links: {}, indices: [{ field: 'noteKey', primary: true, unique: true }] } }, queryFieldToTable: { notes: 'notes' } };
 const client = await PyreClient.create({ schema, cacheNamespace: who, server: { baseUrl: `${location.origin}/${who}`, endpoints: { events: '/events' } } });
 const batches: any[] = [];
 const results: any[] = [];
@@ -10,9 +10,9 @@ let rows: any[] = [];
 let connected = false;
 client.onSyncState((state) => { connected = state.status === 'live'; });
 await client.onEntityChanges('proof', { tables: [{ tableName: 'notes' }] }, (batch) => batches.push(batch));
-await client.run('proof', { operation: 'query', queryShape: { notes: { id: true, title: true, updatedAt: true } } }, {}, (result: any) => { rows = result.notes; });
+await client.run('proof', { operation: 'query', queryShape: { notes: { noteKey: true, id: true, title: true, updatedAt: true } } }, {}, (result: any) => { rows = result.notes; });
 await client.syncDatabase('proof');
-const storage = new IndexedDBStorage(client.getInternalIndexedDbName('proof'));
+const storage = new IndexedDBStorage(client.getInternalIndexedDbName('proof'), { notes: 'noteKey' });
 Object.assign(window, {
   proof: {
     batches, results,
@@ -20,7 +20,7 @@ Object.assign(window, {
     get connected() { return connected; },
     async batch(inputs: Array<{ id: string; title: string }>) {
       const edits = inputs.map(input => operation({ operation: 'update', id: 'edit', optimistic: {
-        queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }],
+        queryField: 'notes', where: { field: 'noteKey', input: 'id' }, set: [{ field: 'title', input: 'title' }],
       } }, input));
       const result = await client.submit('proof', edits);
       results.push(result);
@@ -28,7 +28,7 @@ Object.assign(window, {
     },
     edit(title: string) {
       return client.run('proof', { operation: 'update', id: 'edit', optimistic: {
-        queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }],
+        queryField: 'notes', where: { field: 'noteKey', input: 'id' }, set: [{ field: 'title', input: 'title' }],
       } }, { id: '00000000-0000-7000-8000-000000000001', title }, (result) => results.push(result));
     },
     async late() {
@@ -39,12 +39,12 @@ Object.assign(window, {
     },
     persisted: () => storage.getAllRows('notes'),
     async verifyRemovalPersistence() {
-      const cache = new IndexedDBStorage('pyre-removal-proof');
+      const cache = new IndexedDBStorage('pyre-removal-proof', { notes: 'noteKey' });
       const id = '00000000-0000-7000-8000-000000000003';
-      const row = [{ table_name: 'notes', headers: ['id', 'title'], rows: [[id, 'Old']] }];
+      const row = [{ table_name: 'notes', headers: ['noteKey', 'id', 'title'], rows: [[id, 'ordinary', 'Old']] }];
       await cache.putAuthoritativeDelta(row, 1);
-      await cache.putAuthoritativeDelta([{ table_name: 'notes', headers: ['id', '_pyre_removed'], rows: [[id, true]] }], 3);
-      const reloaded = new IndexedDBStorage('pyre-removal-proof');
+      await cache.putAuthoritativeDelta([{ table_name: 'notes', headers: ['noteKey', '_pyre_removed'], rows: [[id, true]] }], 3);
+      const reloaded = new IndexedDBStorage('pyre-removal-proof', { notes: 'noteKey' });
       await reloaded.putAuthoritativeDelta(row, 2);
       return { rows: await reloaded.getAllRows('notes'), stamps: await reloaded.getRowRevisions() };
     },

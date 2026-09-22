@@ -657,6 +657,7 @@ test('Elm bridge routes mutation messages by databaseId', async () => {
   expect(results.sent).toEqual([
     {
       type: 'mutation-result',
+      databaseId: 'campaign:123',
       requestId: 'm1',
       mutationId: 'CreateNote',
       mutationName: 'CreateNote',
@@ -668,6 +669,7 @@ test('Elm bridge routes mutation messages by databaseId', async () => {
 test('Elm edit submission allocates UUIDv7 once and shares captured input with prediction', async () => {
   const received: any[] = [];
   const outbound = fakePort();
+  const results = fakePort();
   await PyreClient.create({
     schema, server, cacheNamespace: 'edit-bridge',
     createInternalClient: async config => ({
@@ -677,7 +679,7 @@ test('Elm edit submission allocates UUIDv7 once and shares captured input with p
         callback({ ok: true, value: [] });
       },
     }),
-    elm: { app: { ports: { pyreStoreOut: outbound.port } } },
+    elm: { app: { ports: { pyreStoreOut: outbound.port, pyre_receiveMutationResult: results.port } } },
   });
   const prediction = { queryField: 'notes', where: { field: 'id', input: 'id' }, set: [] };
   outbound.emit({ type: 'submit', databaseId: 'campaign:123', requestId: 'create-batch', operations: [
@@ -692,6 +694,7 @@ test('Elm edit submission allocates UUIDv7 once and shares captured input with p
   expect(sent.queryModule.optimistic[0].input).toEqual(sent.input[0].input);
   expect(sent.input[0]).not.toHaveProperty('createId');
   expect(sent.input[1].input).toEqual({ id: 'existing', title: 'Updated' });
+  expect(results.sent[0]).toMatchObject({ databaseId: 'campaign:123', requestId: 'create-batch', result: { ok: true } });
 });
 
 test('Elm bridge routes entity stream registrations and batches by streamId', async () => {

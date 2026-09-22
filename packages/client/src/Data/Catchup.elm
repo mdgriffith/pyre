@@ -5,6 +5,7 @@ import Data.IndexedDb
 import Data.LiveSync as LiveSync
 import Data.Value
 import Db
+import Db.Index
 import Dict exposing (Dict)
 import Http
 import Json.Decode as Decode
@@ -280,7 +281,7 @@ handleCatchupResponse result model db =
                             , inProgress = True
                             , tablesSynced = 0
                         }
-                    , db = Db.init
+                    , db = { db | tables = Dict.empty, indices = Dict.map (\_ _ -> Db.Index.empty) db.indices }
                     , cmd = Cmd.none
                     , dbCmds = [ Data.IndexedDb.resetForDatabaseEpoch reset.databaseEpoch ]
                     , delta = Nothing

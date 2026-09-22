@@ -24,14 +24,14 @@ export interface PutRowsResult {
   skippedOlder: number;
 }
 
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 
 export class IndexedDBStorage {
   private dbName: string;
   private db: IDBDatabase | null = null;
   private initPromise: Promise<IDBDatabase> | null = null;
 
-  constructor(dbName: string) {
+  constructor(dbName: string, private primaryKeys: Record<string, string> = {}) {
     this.dbName = dbName;
   }
 
@@ -61,18 +61,18 @@ export class IndexedDBStorage {
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
 
-        // Integer-keyed caches cannot supply a UUID catchup cursor. Rebuild the
-        // authoritative cache, including its revision fences, in one upgrade.
-        if (event.oldVersion > 0 && event.oldVersion < 3) {
+        // Rebuild legacy flattened rows and their fences atomically. The envelope
+        // keeps storage identity separate from all application column names.
+        if (event.oldVersion > 0 && event.oldVersion < 4) {
           for (const name of ['tables', 'syncCursor', 'meta']) {
             if (db.objectStoreNames.contains(name)) db.deleteObjectStore(name);
           }
         }
 
         if (!db.objectStoreNames.contains('tables')) {
-          const tablesStore = db.createObjectStore('tables', { keyPath: ['tableName', 'id'] });
+          const tablesStore = db.createObjectStore('tables', { keyPath: ['tableName', 'key'] });
           tablesStore.createIndex('byTable', 'tableName', { unique: false });
-          tablesStore.createIndex('byUpdatedAt', 'updatedAt', { unique: false });
+          tablesStore.createIndex('byUpdatedAt', 'row.updatedAt', { unique: false });
         }
 
         if (!db.objectStoreNames.contains('syncCursor')) {
@@ -109,10 +109,7 @@ export class IndexedDBStorage {
 
       request.onsuccess = () => {
         const result = request.result || [];
-        resolve(result.map((row) => {
-          const { tableName, ...rest } = row as { tableName: string };
-          return rest;
-        }));
+        resolve(result.map((entry) => entry.row));
       };
 
       request.onerror = () => {
@@ -154,8 +151,7 @@ export class IndexedDBStorage {
           return;
         }
 
-        const { tableName: _, ...rest } = cursor.value as { tableName: string };
-        rows.push(rest);
+        rows.push(cursor.value.row);
         cursor.continue();
       };
 
@@ -200,8 +196,7 @@ export class IndexedDBStorage {
           if (!tables[tableName]) {
             tables[tableName] = [];
           }
-          const { tableName: _, ...rest } = row as { tableName: string };
-          tables[tableName].push(rest);
+          tables[tableName].push(row.row);
         }
 
         resolve(tables);
@@ -298,11 +293,12 @@ export class IndexedDBStorage {
         for (const group of groups) {
           for (const values of group.rows) {
             const row = Object.fromEntries(group.headers.map((header, index) => [header, values[index]]));
-            if (typeof row.id !== 'string') throw new Error('Authoritative row requires UUID identity');
-            const key = JSON.stringify([group.table_name, row.id]);
+            const id = row[this.primaryKeys[group.table_name] ?? 'id'];
+            if (typeof id !== 'string') { tx.abort(); return; }
+            const key = JSON.stringify([group.table_name, id]);
             if (stamps[key] !== undefined && stamps[key] >= revision) continue;
-            if (row._pyre_removed === true) rows.delete([group.table_name, row.id]);
-            else rows.put({ ...row, tableName: group.table_name });
+            if (row._pyre_removed === true) rows.delete([group.table_name, id]);
+            else rows.put({ row, key: id, tableName: group.table_name });
             stamps[key] = revision;
           }
         }
@@ -402,9 +398,9 @@ export class IndexedDBStorage {
       };
 
       rows.forEach((row, index) => {
-        const request = store.get([tableName, row.id as IDBValidKey]);
+        const request = store.get([tableName, row[this.primaryKeys[tableName] ?? 'id'] as IDBValidKey]);
         request.onsuccess = () => {
-          existingRows[index] = request.result || null;
+          existingRows[index] = request.result?.row || null;
           readsCompleted += 1;
 
           if (readsCompleted === rows.length) {
@@ -442,7 +438,7 @@ export class IndexedDBStorage {
             return;
           }
 
-          const rowWithTable = { ...row, tableName };
+          const rowWithTable = { row, tableName, key: row[this.primaryKeys[tableName] ?? 'id'] };
           const request = store.put(rowWithTable);
 
           request.onsuccess = () => {

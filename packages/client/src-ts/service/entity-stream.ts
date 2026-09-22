@@ -50,6 +50,8 @@ interface EntityStreamRegistration {
 }
 
 export class EntityStreamService {
+  constructor(private primaryKeys: Record<string, string> = {}) {}
+
   private registrations: Set<EntityStreamRegistration> = new Set();
   private sequence = 0;
   private visibleRows = new Map<string, Array<Record<string, unknown>>>();
@@ -63,13 +65,13 @@ export class EntityStreamService {
     const previous = this.visibleRows;
     this.visibleRows = next;
     this.registrations.forEach(({ subscription, callback }) => {
-      const before = collectChanges(subscription, previous);
-      const after = collectChanges(subscription, next);
+      const before = collectChanges(subscription, previous, this.primaryKeys);
+      const after = collectChanges(subscription, next, this.primaryKeys);
       const key = (change: EntityChange) => JSON.stringify([change.tableName, change.id]);
       const oldRows = new Map(before.map((change) => [key(change), change]));
       const newRows = new Map(after.map((change) => [key(change), change]));
       const changes: EntityChange[] = [
-        ...before.filter((change) => !newRows.has(key(change))).map((change): EntityChange => ({ ...change, op: 'remove', row: { id: change.id } })),
+        ...before.filter((change) => !newRows.has(key(change))).map((change): EntityChange => ({ ...change, op: 'remove', row: { [this.primaryKeys[change.tableName] ?? 'id']: change.id } })),
         ...after.filter((change) => JSON.stringify(oldRows.get(key(change))?.row) !== JSON.stringify(change.row)),
       ];
       if (changes.length > 0) callback({ type: 'entity-change-batch', databaseId, sequence: this.reserveSequence(), source, changes: structuredClone(changes) });
@@ -98,7 +100,7 @@ export class EntityStreamService {
     sequence = this.reserveSequence()
   ): EntityChangeBatch | null {
     validateEntitySubscription(subscription);
-    const changes = collectChanges(subscription, rowsByTable);
+    const changes = collectChanges(subscription, rowsByTable, this.primaryKeys);
     if (changes.length === 0) {
       return null;
     }
@@ -230,7 +232,8 @@ function expandTableGroups(tableGroups: ServerTableGroup[]): Map<string, Array<R
 
 function collectChanges(
   subscription: EntitySubscription,
-  rowsByTable: Map<string, Array<Record<string, unknown>>>
+  rowsByTable: Map<string, Array<Record<string, unknown>>>,
+  primaryKeys: Record<string, string>
 ): EntityChange[] {
   const changes: EntityChange[] = [];
   const emitted = new Set<string>();
@@ -242,7 +245,7 @@ function collectChanges(
     }
 
     rows.forEach((row) => {
-      const id = row.id;
+      const id = row[primaryKeys[tableSubscription.tableName] ?? 'id'];
       if ((typeof id !== 'string' && typeof id !== 'number') || !matchesWhere(row, tableSubscription.where)) {
         return;
       }

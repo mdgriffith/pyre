@@ -1,4 +1,4 @@
-module Db exposing (Db, Msg(..), QueryExecutionResult, executeQuery, executeQueryWithTracking, extractAffectedTables, fromInitialData, init, rowMatchesWhere, update)
+module Db exposing (Db, Msg(..), QueryExecutionResult, executeQuery, executeQueryWithTracking, extractAffectedTables, fromInitialData, init, initWithSchema, primaryKey, rowMatchesWhere, update)
 
 import Basics exposing (Order(..))
 import Data.Delta exposing (Delta, TableGroup)
@@ -19,6 +19,7 @@ import Set exposing (Set)
 type alias Db =
     { tables : Dict String TableData
     , indices : Dict ( String, String ) Db.Index.Index
+    , primaryKeys : Dict String String
     }
 
 
@@ -44,7 +45,21 @@ init : Db
 init =
     { tables = Dict.empty
     , indices = Dict.empty
+    , primaryKeys = Dict.empty
     }
+
+
+initWithSchema : SchemaMetadata -> Db
+initWithSchema schema =
+    { init
+        | primaryKeys = Dict.map (\name _ -> Data.Schema.primaryKey schema name) schema.tables
+        , indices = Db.Index.buildIndicesFromSchema schema Dict.empty
+    }
+
+
+primaryKey : Db -> String -> String
+primaryKey db tableName =
+    Dict.get tableName db.primaryKeys |> Maybe.withDefault "id"
 
 
 
@@ -90,13 +105,14 @@ fromInitialData : SchemaMetadata -> Data.IndexedDb.InitialData -> Db
 fromInitialData schema initialData =
     let
         tables =
-            convertInitialDataToTableData initialData
+            convertInitialDataToTableData schema initialData
 
         indices =
             Db.Index.buildIndicesFromSchema schema tables
     in
     { tables = tables
     , indices = indices
+    , primaryKeys = (initWithSchema schema).primaryKeys
     }
 
 
@@ -108,13 +124,14 @@ applyDelta : Data.Delta.Delta -> Db -> Db
 applyDelta delta db =
     let
         ( updatedTables, indexUpdates ) =
-            applyDeltaToTableData db.indices db.tables delta
+            applyDeltaToTableData db db.indices db.tables delta
 
         updatedIndices =
             applyIndexUpdates indexUpdates db.indices
     in
-    { tables = updatedTables
-    , indices = updatedIndices
+    { db
+        | tables = updatedTables
+        , indices = updatedIndices
     }
 
 
@@ -184,13 +201,13 @@ extractAffectedTables delta =
 -- Helper: Convert initial data format to TableData format
 
 
-convertInitialDataToTableData : Data.IndexedDb.InitialData -> Dict String TableData
-convertInitialDataToTableData initialData =
+convertInitialDataToTableData : SchemaMetadata -> Data.IndexedDb.InitialData -> Dict String TableData
+convertInitialDataToTableData schema initialData =
     Dict.map
         (\tableName rows ->
             List.filterMap
                 (\row ->
-                    case getRowId row of
+                    case getRowId (Data.Schema.primaryKey schema tableName) row of
                         Just id ->
                             Just ( id, row )
 
@@ -207,9 +224,9 @@ convertInitialDataToTableData initialData =
 -- Helper: Get row ID from a row dictionary
 
 
-getRowId : Dict String Value -> Maybe String
-getRowId row =
-    Dict.get "id" row |> Maybe.andThen Data.RowId.fromValue
+getRowId : String -> Dict String Value -> Maybe String
+getRowId key row =
+    Dict.get key row |> Maybe.andThen Data.RowId.fromValue
 
 
 
@@ -294,8 +311,8 @@ applyIndexUpdates updates indices =
 -- Helper: Apply delta to TableData
 
 
-applyDeltaToTableData : Dict ( String, String ) Db.Index.Index -> Dict String TableData -> Data.Delta.Delta -> ( Dict String TableData, List IndexUpdate )
-applyDeltaToTableData indices data delta =
+applyDeltaToTableData : Db -> Dict ( String, String ) Db.Index.Index -> Dict String TableData -> Data.Delta.Delta -> ( Dict String TableData, List IndexUpdate )
+applyDeltaToTableData db indices data delta =
     List.foldl
         (\tableGroup ( accTables, accUpdates ) ->
             let
@@ -306,7 +323,7 @@ applyDeltaToTableData indices data delta =
                     Dict.get tableName accTables |> Maybe.withDefault Dict.empty
 
                 ( updatedTable, indexUpdates ) =
-                    applyTableGroupRows indices tableName currentTable tableGroup.headers tableGroup.rows
+                    applyTableGroupRows (primaryKey db tableName) indices tableName currentTable tableGroup.headers tableGroup.rows
             in
             ( Dict.insert tableName updatedTable accTables
             , accUpdates ++ indexUpdates
@@ -320,15 +337,15 @@ applyDeltaToTableData indices data delta =
 Converts row arrays to row objects using headers.
 Returns the updated table and a list of index updates that need to be applied.
 -}
-applyTableGroupRows : Dict ( String, String ) Db.Index.Index -> String -> TableData -> List String -> List (List Value) -> ( TableData, List IndexUpdate )
-applyTableGroupRows indices tableName table headers rows =
+applyTableGroupRows : String -> Dict ( String, String ) Db.Index.Index -> String -> TableData -> List String -> List (List Value) -> ( TableData, List IndexUpdate )
+applyTableGroupRows key indices tableName table headers rows =
     List.foldl
         (\rowArray ( accTable, accUpdates ) ->
             let
                 rowObj =
                     rowArrayToObject headers rowArray
             in
-            case getRowId rowObj of
+            case getRowId key rowObj of
                 Just rowId ->
                     let
                         existingRow =
@@ -762,7 +779,7 @@ projectNestedRows schema tableName fieldName nestedFieldQuery relatedRows data i
             getRelatedTableName schema tableName fieldName
 
         projected =
-            List.map (\r -> projectRow schema relatedTableName r nestedFieldQuery.selections data indices) relatedRows
+            projectFields schema relatedTableName nestedFieldQuery.selections data indices relatedRows
     in
     Data.Value.ArrayValue (List.map Data.Value.ObjectValue projected)
 
@@ -787,7 +804,7 @@ resolveRelationship schema tableName fieldName row data indices =
                 Just linkInfo ->
                     case linkInfo.type_ of
                         Data.Schema.OneToMany ->
-                            case Dict.get "id" row of
+                            case Dict.get linkInfo.from row of
                                 Just idValue ->
                                     lookupRowsByForeignKeyIndexed indices data linkInfo.to.table linkInfo.to.column idValue
                                         |> Maybe.withDefault []

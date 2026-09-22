@@ -824,8 +824,15 @@ struct OptimisticUpdateMetadata {
     set_fields: Vec<(String, String)>,
 }
 
-fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMetadata> {
+fn optimistic_update_metadata(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> Option<OptimisticUpdateMetadata> {
     if query.operation == ast::QueryOperation::Insert {
+        let table = crate::generated_queries::generated_crud_table(context, query)?;
+        let key = ast::collect_columns(&table.record.fields)
+            .into_iter()
+            .find(|column| ast::is_primary_key(column))?;
         let [ast::TopLevelQueryField::Field(root)] = query.fields.as_slice() else {
             return None;
         };
@@ -840,10 +847,10 @@ fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMeta
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
-        let (_, id_input) = set_fields.iter().find(|(field, _)| field == "id")?;
+        let (_, id_input) = set_fields.iter().find(|(field, _)| field == &key.name)?;
         return Some(OptimisticUpdateMetadata {
             query_field: root.name.clone(),
-            where_field: "id".into(),
+            where_field: key.name.clone(),
             where_input: id_input.clone(),
             set_fields,
         });
@@ -910,7 +917,7 @@ fn to_optimistic_update_metadata(
     if query.operation == ast::QueryOperation::Insert {
         crate::generated_queries::generated_crud_table(context, query)?;
     }
-    let metadata = optimistic_update_metadata(query)?;
+    let metadata = optimistic_update_metadata(context, query)?;
     let set_fields = metadata
         .set_fields
         .iter()
