@@ -735,6 +735,10 @@ fn write_elm_build_files(ctx: &TestContext) {
 }
 
 fn run_elm_make_check(ctx: &TestContext) {
+    // These tests have separate output directories but share Elm's package cache.
+    // Concurrent cold builds can race while compiling dependency artifacts.
+    static ELM_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _build = ELM_BUILD.lock().unwrap();
     let elm_root = ctx.workspace_path.join("pyre/generated/client/elm");
     let output = StdCommand::new("elm")
         .arg("make")
