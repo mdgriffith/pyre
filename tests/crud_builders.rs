@@ -2,6 +2,138 @@ use pyre::{ast, generate, generated_queries, parser, typecheck};
 use std::process::Command;
 
 #[test]
+fn query_shapes_and_effects_are_rendered_from_structure() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+record Parent {
+    @public
+    id Id.Uuid @id
+    name String
+    children @link(Child.parentId)
+}
+record Child {
+    @public
+    id Id.Uuid @id
+    parentId Parent.id
+    title String
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).unwrap();
+    let queries = parser::parse_query(
+        "query.pyre",
+        r#"
+query AliasGraph($title: String) {
+    parent {
+        label: name
+        selected: children {
+            @where { title == $title }
+            @sort(title, Asc)
+            @limit(2)
+            caption: title
+        }
+    }
+}
+query PlainGraph {
+    parent {
+        children { title }
+    }
+}
+update Rename($title: String) {
+    child { title = $title }
+}
+transaction Mixed($title: String) {
+    update child { title = $title }
+    delete parent { name }
+}
+"#,
+    )
+    .unwrap();
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = vec![];
+    generate::generate_schema(&context, &database, &mut files);
+    generate::write_queries(&context, &queries, &info, &mut files);
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    for file in files {
+        let path = dir.path().join(file.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file.contents).unwrap();
+    }
+    std::fs::write(dir.path().join("elm.json"), r#"{
+      "type": "application", "source-directories": ["client/elm", "."], "elm-version": "0.19.1",
+      "dependencies": {"direct": {"elm/core": "1.0.5", "elm/json": "1.1.3", "elm/time": "1.0.0"}, "indirect": {}},
+      "test-dependencies": {"direct": {}, "indirect": {}}
+    }"#).unwrap();
+    std::fs::write(dir.path().join("Main.elm"), r#"
+port module Main exposing (main)
+import Json.Encode as Encode
+import Platform
+import Query.AliasGraph
+import Query.PlainGraph
+port output : Encode.Value -> Cmd msg
+main : Program () () ()
+main = Platform.worker
+    { init = \_ -> ( (), output (Encode.list identity [ Query.AliasGraph.queryShape, Query.PlainGraph.queryShape ]) )
+    , update = \_ model -> ( model, Cmd.none )
+    , subscriptions = \_ -> Sub.none
+    }
+"#).unwrap();
+    let output = Command::new("elm")
+        .args(["make", "Main.elm", "--output=elm.js"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::write(dir.path().join("verify.ts"), r#"
+import assert from 'node:assert/strict';
+import { Elm } from './elm.js';
+import { meta as alias } from './typescript/core/queries/metadata/aliasGraph';
+import { meta as plain } from './typescript/core/queries/metadata/plainGraph';
+import { meta as rename } from './typescript/core/queries/metadata/rename';
+import { meta as mixed } from './typescript/core/queries/metadata/mixed';
+const app = Elm.Main.init({ flags: null });
+const shapes: any[] = await new Promise(resolve => app.ports.output.subscribe(resolve));
+assert.deepEqual(shapes, [alias.queryShape, plain.queryShape]);
+assert.equal(shapes[0].parent.selected['@source'], 'children');
+assert.deepEqual(shapes[0].parent.selected.caption, { '@source': 'title', '@select': true });
+assert(shapes[0].parent.selected['@where']);
+assert(shapes[0].parent.selected['@sort']);
+assert.equal(shapes[0].parent.selected['@limit'], 2);
+assert.deepEqual(shapes[1].parent.children, { title: true });
+for (const meta of [alias, plain]) assert.deepEqual(meta.syncEffects, { sql: false, syncSql: false });
+for (const meta of [rename, mixed]) assert.deepEqual(meta.syncEffects, { sql: false, syncSql: true });
+// Named operations retain their existing strip-unknown input policy.
+for (const meta of [alias, rename, mixed]) {
+  assert.deepEqual(meta.InputValidator.parse({ title: 'value', extra: true }), { title: 'value' });
+}
+assert.deepEqual(plain.InputValidator.parse({ extra: true }), {});
+"#).unwrap();
+    let output = Command::new("bun")
+        .arg("verify.ts")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn elm_edit_builders_preserve_schema_names() {
     let names = [
         "identity",
@@ -432,6 +564,11 @@ const edits = batch([created, documentUpdate(id, { summary: null })]);
 const captured = captureOperations(edits);
 if (captured.length !== 2) throw new Error('Missing operations');
 if (!createMeta.InputValidator.safeParse(captured[0].input).success) throw new Error('Create input rejected');
+for (const [meta, input] of [[createMeta, captured[0].input], [updateMeta, { id }], [deleteMeta, { id }]] as const) {
+  if (!meta.InputValidator.safeParse(input).success) throw new Error('Valid CRUD input rejected');
+  if (meta.InputValidator.safeParse({ ...(input as object), extra: 'forged' }).success) throw new Error('Unknown CRUD input accepted');
+  if (meta.syncEffects.sql || !meta.syncEffects.syncSql) throw new Error('Incorrect CRUD sync effects');
+}
 if (updateMeta.InputValidator.safeParse({ id: '01900000-0000-7000-8000-000000000000', owner: 'forged' }).success) throw new Error('Protected input accepted');
 // @ts-expect-error ID is allocated by the runtime
 documentCreate({ id: 'forged', title: 'Title', owner: 'Owner', tags: [] });

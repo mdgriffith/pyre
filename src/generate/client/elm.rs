@@ -2547,6 +2547,7 @@ fn to_query_shape_json(context: &typecheck::Context, query: &ast::Query) -> Stri
                         query_field,
                         context.tables.get(&query_field.name),
                         3,
+                        None,
                     )
                 ));
             }
@@ -2563,10 +2564,20 @@ fn to_query_field_spec_json(
     query_field: &ast::QueryField,
     table: Option<&typecheck::Table>,
     indent_level: usize,
+    source: Option<&str>,
 ) -> String {
     let indent = "    ".repeat(indent_level);
     let mut result = format!("Encode.object\n{}[ ", indent);
     let mut is_first = true;
+
+    if let Some(source) = source {
+        result.push_str(&format!(
+            "({}, Encode.string {})",
+            string::quote("@source"),
+            string::quote(source)
+        ));
+        is_first = false;
+    }
 
     // Get table info for relationship detection
     let table = table.or_else(|| context.tables.get(&query_field.name));
@@ -2672,6 +2683,9 @@ fn to_query_field_spec_json(
     }
 
     if let Some(where_clause) = where_clause {
+        if !is_first {
+            result.push_str(&format!("\n{}, ", indent));
+        }
         result.push_str(&format!("({}, {})", string::quote("@where"), where_clause));
         is_first = false;
     }
@@ -2706,7 +2720,7 @@ fn to_query_field_spec_json(
                 result.push_str(&format!(
                     "({}, {})",
                     string::quote(&aliased_name),
-                    to_query_field_spec_json_with_source(
+                    to_query_field_spec_json(
                         context,
                         nested_field,
                         nested_table,
@@ -2929,29 +2943,6 @@ fn to_query_delta_types(context: &typecheck::Context, query: &ast::Query) -> Str
     // Generate applyDelta function with lens-based approach
     result.push_str(&to_apply_delta_function_with_lenses(context, query));
 
-    result
-}
-
-fn to_query_field_spec_json_with_source(
-    context: &typecheck::Context,
-    query_field: &ast::QueryField,
-    table: Option<&typecheck::Table>,
-    indent_level: usize,
-    source: Option<&str>,
-) -> String {
-    let mut result = to_query_field_spec_json(context, query_field, table, indent_level);
-    if let Some(source_name) = source {
-        let indent = "    ".repeat(indent_level);
-        let marker = format!("Encode.object\n{}[ ", indent);
-        let replacement = format!(
-            "Encode.object\n{}[ ({}, Encode.string {})\n{}, ",
-            indent,
-            string::quote("@source"),
-            string::quote(source_name),
-            indent,
-        );
-        result = result.replacen(&marker, &replacement, 1);
-    }
     result
 }
 

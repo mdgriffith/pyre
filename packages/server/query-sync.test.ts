@@ -112,6 +112,7 @@ function syncDb(removed = false) {
 const queryMap = {
   "query-id": {
     id: "query-id",
+    syncEffects: { sql: true, syncSql: true },
     sql: [{ include: true, params: [], sql: "select _affectedRows" }],
     session_args: [],
     optional_input_args: [],

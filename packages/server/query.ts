@@ -25,6 +25,8 @@ export interface QueryMetadata {
     attached_dbs?: string[];
     sql: SqlInfo[];
     syncSql?: SqlInfo[];
+    /** Compiler-owned sync effects for each SQL variant; never inferred from SQL text. */
+    syncEffects?: { sql: boolean; syncSql: boolean };
     session_args: string[];
     optional_input_args: string[];
     json_input_args: string[];
@@ -289,7 +291,7 @@ export async function run(
     const useSyncMode = options.mode === "sync";
     const activeSql = useSyncMode ? query.syncSql ?? query.sql : query.sql;
     const sqlStatements: InStatement[] = toSqlStatements(activeSql, validArgs);
-    const allocateRevision = options.allocateSyncRevision && activeSql.some((statement) => statement.sql.includes("_affectedRows"));
+    const allocateRevision = options.allocateSyncRevision && hasSyncEffect(query, options.mode);
 
     // Execute query
     // Allocate in the mutation's transaction, never in the later fanout callback.
@@ -492,7 +494,7 @@ async function runOperations(
             finalGroups = combineAffectedRows(affected);
             if (options.allocateSyncRevision && operations.some(op => {
                 const query = queryMap[op.queryId];
-                return (query.syncSql ?? query.sql).some(statement => statement.sql.includes("_affectedRows"));
+                return hasSyncEffect(query, options.mode);
             })) {
                 const stamp = (await tx.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision")).rows[0];
                 const serverRevision = Number(stamp?.server_revision);
@@ -505,6 +507,12 @@ async function runOperations(
         return fail("TransactionFailed", "Operation batch failed", operationIndex);
     }
     return executionResult(single ? responses[0].result : responses, finalGroups, connectedSessions, syncDeltas, originSessionId, revision);
+}
+
+function hasSyncEffect(query: QueryMetadata, mode?: "sync" | "normal"): boolean {
+    return (mode === "sync" && query.syncSql !== undefined
+        ? query.syncEffects?.syncSql
+        : query.syncEffects?.sql) ?? false;
 }
 
 function combineAffectedRows(affected: any[]): any[] {

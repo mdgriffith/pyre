@@ -517,12 +517,13 @@ fn to_query_metadata_file(
     }
     imports.push_str("import * as Decode from '../../decode';\n");
 
-    let mut input_block = to_param_type_alias(context, &query.args)
-        .trim_end()
-        .to_string();
-    if crate::generated_queries::generated_crud_table(context, query).is_some() {
-        input_block = input_block.replace("\n});", "\n}).strict();");
-    }
+    let input_block = to_param_type_alias(
+        context,
+        &query.args,
+        crate::generated_queries::generated_crud_table(context, query).is_some(),
+    )
+    .trim_end()
+    .to_string();
 
     let query_shape_block = if query.operation == ast::QueryOperation::Query {
         Some(to_query_shape(context, query).trim_end().to_string())
@@ -597,6 +598,19 @@ fn to_query_metadata_file(
     meta_block.push_str("  InputValidator,\n");
     meta_block.push_str("  SessionValidator: Decode.SessionValidator,\n");
     meta_block.push_str("  ReturnData,\n");
+    // Normal SQL omits affected rows; sync SQL tracks each mutation field,
+    // including writes inside heterogeneous transactions.
+    let has_sync_effect = query.fields.iter().any(|field| match field {
+        ast::TopLevelQueryField::Field(field) => matches!(
+            ast::query_field_operation(query, field),
+            ast::QueryOperation::Insert | ast::QueryOperation::Update | ast::QueryOperation::Delete
+        ),
+        _ => false,
+    });
+    meta_block.push_str(&format!(
+        "  syncEffects: {{ sql: false, syncSql: {} }},\n",
+        bool_to_ts_bool(has_sync_effect)
+    ));
     if let Some(table) = crate::generated_queries::generated_crud_table(context, query) {
         if let Some(info) = query_info {
             // Generated CRUD is one scalar write after any ATTACH statements.
@@ -1612,6 +1626,7 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
 fn to_param_type_alias(
     context: &typecheck::Context,
     args: &Vec<ast::QueryParamDefinition>,
+    strict: bool,
 ) -> String {
     let mut result = "const RawInputValidator = z.object({".to_string();
     let mut is_first = true;
@@ -1635,7 +1650,11 @@ fn to_param_type_alias(
             result.push_str(&format!(",\n  {}: {}", arg.name, type_string));
         }
     }
-    result.push_str("\n});\n");
+    result.push_str(if strict {
+        "\n}).strict();\n"
+    } else {
+        "\n});\n"
+    });
 
     result.push_str("const InputValidator = z.object({");
     let mut is_first = true;
@@ -1659,7 +1678,11 @@ fn to_param_type_alias(
             result.push_str(&format!(",\n  {}: {}", arg.name, type_string));
         }
     }
-    result.push_str("\n});\n");
+    result.push_str(if strict {
+        "\n}).strict();\n"
+    } else {
+        "\n});\n"
+    });
 
     result.push_str("export type Input = z.infer<typeof RawInputValidator>;");
     result

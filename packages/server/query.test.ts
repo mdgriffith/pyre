@@ -26,6 +26,7 @@ test("composed operations commit once, retain indexed results, and publish only 
     ];
     const queries = { edit: {
       id: "edit", operation: "update", primary_db: "Main", sql, syncSql: sql,
+      syncEffects: { sql: true, syncSql: true },
       generatedEdit: { writeStatement: 0 },
       session_args: ["userId"], optional_input_args: [], json_input_args: [],
       InputValidator: z.object({ id: z.number(), body: z.string() }).strict(),
@@ -86,6 +87,49 @@ test("composed operations commit once, retain indexed results, and publish only 
     const missingRevision = await execute([{ queryId: "edit", input: { id: 1, body: "must not commit" } }]);
     expect(missingRevision.kind).toBe("error");
     expect((await db.execute("select body from notes where id = 1")).rows[0].body).toBe("last");
+  } finally {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("revision allocation follows active compiler effects, not SQL literals", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pyre-effects-"));
+  const db = createClient({ url: `file:${join(directory, "test.db")}` });
+  try {
+    await db.batch([
+      "create table _pyre_sync (id integer primary key, database_epoch text, server_revision integer)",
+      "insert into _pyre_sync values (1, 'epoch', 0)",
+      "create table notes (body text)",
+    ]);
+    const base = {
+      id: "query", session_args: [], optional_input_args: [], json_input_args: [],
+      InputValidator: z.object({}), SessionValidator: z.object({}),
+    };
+    const read = { ...base, sql: [{ include: true, params: [], sql: "select json_quote('_affectedRows') as literal" }], syncEffects: { sql: false, syncSql: false } };
+    const write = {
+      ...base,
+      sql: [{ include: false, params: [], sql: "insert into notes values ('normal')" }],
+      syncSql: [{ include: false, params: [], sql: "insert into notes values ('sync')" }],
+      syncEffects: { sql: false, syncSql: true },
+    };
+    const revision = async () => Number((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision);
+    for (const composed of [false, true]) {
+      const execute = (query: typeof read | typeof write, mode: "sync" | "normal") => run(
+        db, { query }, composed ? [{ queryId: "query", input: {} }] : "query", {}, {},
+        undefined, undefined, undefined, { mode, allocateSyncRevision: true },
+      );
+      const before = await revision();
+      expect((await execute(read, "sync")).kind).toBe("success");
+      expect(await revision()).toBe(before);
+      expect((await execute(write, "normal")).kind).toBe("success");
+      expect(await revision()).toBe(before);
+      expect((await execute(write, "sync")).kind).toBe("success");
+      expect(await revision()).toBe(before + 1);
+      // A sync request can fall back to the normal SQL variant.
+      expect((await execute({ ...read, sql: write.syncSql, syncEffects: { sql: true, syncSql: false } }, "sync")).kind).toBe("success");
+      expect(await revision()).toBe(before + 2);
+    }
   } finally {
     db.close();
     rmSync(directory, { recursive: true, force: true });
