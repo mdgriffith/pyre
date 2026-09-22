@@ -256,6 +256,14 @@ export async function catchup(
 ): Promise<CatchupResult> {
     validateSyncCursor(syncCursor);
     normalizePageSize(pageSize);
+    // Local interactive transactions detach the client's connection. A subsequent
+    // use would open an empty private in-memory database, so reject it first.
+    if (db.protocol === "file") {
+        const databases = await db.execute("pragma database_list");
+        if (!databases.rows.some(row => row.name === "main" && typeof row.file === "string" && row.file.length > 0)) {
+            throw new Error("Catchup requires a file-backed local database");
+        }
+    }
     const tx = await db.transaction("read");
     try {
         const result = await catchupSnapshot(tx, syncCursor, session, pageSize, databaseId, clientDatabaseEpoch);

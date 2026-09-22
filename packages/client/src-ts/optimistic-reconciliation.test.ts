@@ -74,7 +74,7 @@ async function harness(run, key = 'id') {
     await turn();
     await turn();
     return {
-      app, visible, writes, results, entities,
+      app, visible, writes, results, entities, queryResults,
       async crud(requestId, kind, input) {
         app.ports.receiveQueryManagerMessage.send({
           type: 'sendMutation', requestId, mutationId: kind, baseUrl: 'http://test/db', input,
@@ -116,6 +116,31 @@ async function harness(run, key = 'id') {
   }
   try { await run({ client, requests, setCatchupResponse: (response) => { catchupResponse = response; } }); } finally { globalThis.XMLHttpRequest = original; }
 }
+
+test('rejecting the first optimistic create removes it from an existing query subscription', async () => {
+  await harness(async ({ client, requests }) => {
+    const a = await client({ tables: {} });
+    expect(await a.rows()).toEqual([]);
+    const events = [];
+    a.entities.subscribe({ tables: [{ tableName: 'notes' }] }, event => events.push(event));
+    await a.crud('first-create', 'create', { id: one, title: 'Created', other: 'Local' });
+    expect(a.queryResults.at(-1).delta.ops).toEqual([
+      { op: 'insert-row', path: '.notes', index: 0, row: { id: one, title: 'Created', other: 'Local' } },
+    ]);
+    const notifications = a.queryResults.length;
+    requests[0].complete({}, 403);
+    await turn();
+    // Inspect the active subscription: registering again would mask a missed removal.
+    expect(a.queryResults.length).toBe(notifications + 1);
+    expect(a.queryResults.at(-1).delta.ops).toEqual([
+      { op: 'remove-row-by-index', path: '.notes', index: 0 },
+    ]);
+    expect(a.visible.at(-1).snapshot).toEqual([]);
+    expect(events.at(-1).changes).toEqual([
+      { tableName: 'notes', id: one, op: 'remove', row: { id: one } },
+    ]);
+  });
+});
 
 test('custom-key create/delete, query tracking, entity removals and restored fences ignore ordinary id', async () => {
   await harness(async ({ client, requests }) => {

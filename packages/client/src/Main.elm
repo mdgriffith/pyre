@@ -1076,10 +1076,14 @@ publishVisible source model =
             replayOptimisticMutations model model.authoritativeDb
 
         changed =
-            Dict.toList visibleDb.tables
+            -- A rejected create can remove an optimistic-only table entirely.
+            Dict.keys (Dict.union visibleDb.tables model.db.tables)
                 |> List.concatMap
-                    (\( tableName, rows ) ->
+                    (\tableName ->
                         let
+                            rows =
+                                Dict.get tableName visibleDb.tables |> Maybe.withDefault Dict.empty
+
                             previous =
                                 Dict.get tableName model.db.tables |> Maybe.withDefault Dict.empty
                         in
