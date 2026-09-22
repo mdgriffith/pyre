@@ -2,7 +2,7 @@ use pyre::{ast, generate, generated_queries, parser, typecheck};
 use std::process::Command;
 
 #[test]
-fn elm_edit_builders_disambiguate_prelude_names() {
+fn elm_edit_builders_preserve_schema_names() {
     let names = [
         "identity",
         "always",
@@ -49,7 +49,7 @@ fn elm_edit_builders_disambiguate_prelude_names() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        &format!("record PreludeNames {{\n    @public\n    id Id.Uuid @id\n{fields}}}\n"),
+        &format!("record PreludeNames {{\n    @public\n    id Id.Uuid @id\n{fields}}}\nrecord OptimisticNote {{\n    @public\n    optimisticKey Id.Uuid @id\n    optimistic String\n}}\n"),
         &mut schema,
     )
     .unwrap();
@@ -84,6 +84,30 @@ fn elm_edit_builders_disambiguate_prelude_names() {
     .unwrap();
     assert!(metadata.contains("\"identity\""));
     assert!(!metadata.contains("identity__"));
+    let edits =
+        std::fs::read_to_string(dir.path().join("client/elm/Db/Edit/OptimisticNote.elm")).unwrap();
+    // Helper names and signatures must not rewrite quoted schema metadata.
+    for helper in ["optimistic", "optimisticCreate", "optimisticDelete"] {
+        let declaration = format!("{helper} : () -> Encode.Value\n{helper} _ =\n");
+        let body = edits
+            .split(&declaration)
+            .nth(1)
+            .unwrap()
+            .split("\n\n\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("( \"queryField\", Encode.string \"optimisticNote\" )"));
+        assert!(body.contains("( \"field\", Encode.string \"optimisticKey\" )"));
+        assert!(body.contains("( \"input\", Encode.string \"optimisticKey\" )"));
+        if helper != "optimisticDelete" {
+            assert!(body.contains("( \"field\", Encode.string \"optimistic\" )"));
+            assert!(body.contains("( \"input\", Encode.string \"optimistic\" )"));
+        }
+    }
+    let command =
+        std::fs::read_to_string(dir.path().join("client/elm/Query/OptimisticNoteUpdate.elm"))
+            .unwrap();
+    assert!(command.contains("optimistic : Input -> Encode.Value\noptimistic _ ="));
     std::fs::write(dir.path().join("elm.json"), r#"{
       "type": "application", "source-directories": ["client/elm"], "elm-version": "0.19.1",
       "dependencies": {"direct": {"elm/core": "1.0.5", "elm/json": "1.1.3", "elm/time": "1.0.0"}, "indirect": {}},
@@ -93,6 +117,7 @@ fn elm_edit_builders_disambiguate_prelude_names() {
         .args([
             "make",
             "client/elm/Db/Edit/PreludeNames.elm",
+            "client/elm/Db/Edit/OptimisticNote.elm",
             "--output=/dev/null",
         ])
         .current_dir(dir.path())

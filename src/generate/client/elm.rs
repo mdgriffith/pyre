@@ -1811,12 +1811,13 @@ fn to_edit_module(
                 let key_pair = format!("( {}, {} id )", string::quote(&key.name), key_encoder);
                 if query.operation == ast::QueryOperation::Update {
                     exposing.push("update".into());
-                    let optimistic = to_optimistic_update_elm(context, query).unwrap_or_else(|| "optimistic : Input -> Encode.Value\noptimistic _ =\n    Encode.null\n\n\n".into());
                     // Prediction is compiler-owned and independent of argument values.
-                    body.push_str(&optimistic.replace(
-                        "optimistic : Input -> Encode.Value",
-                        "optimistic : () -> Encode.Value",
-                    ));
+                    let optimistic = to_optimistic_update_elm(context, query, "optimistic", "()")
+                        .unwrap_or_else(|| {
+                            "optimistic : () -> Encode.Value\noptimistic _ =\n    Encode.null\n\n\n"
+                                .into()
+                        });
+                    body.push_str(&optimistic);
                     body.push_str(&format!("update : ({key_type}) -> List Patch -> {edit_type}\nupdate id patches =\n    {}\n\n\n", construct(&format!("(Encode.object ({key_pair} :: List.map (\\(Patch pair) -> pair) patches))"), "(optimistic ())", "Nothing")));
                     for arg in query.args.iter().filter(|arg| arg.omittable) {
                         let name = builder_names[&("patch", arg.name.clone())].clone();
@@ -1837,13 +1838,8 @@ fn to_edit_module(
                 } else {
                     exposing.push("delete".into());
                     body.push_str(
-                        &to_optimistic_update_elm(context, query)
-                            .unwrap()
-                            .replace(
-                                "optimistic : Input -> Encode.Value",
-                                "optimistic : () -> Encode.Value",
-                            )
-                            .replace("optimistic", "optimisticDelete"),
+                        &to_optimistic_update_elm(context, query, "optimisticDelete", "()")
+                            .unwrap(),
                     );
                     body.push_str(&format!(
                         "delete : ({key_type}) -> {edit_type}\ndelete id =\n    {}\n\n\n",
@@ -1898,16 +1894,10 @@ fn to_edit_module(
                         )
                     })
                     .collect();
-                let prediction = if let Some(optimistic) = to_optimistic_update_elm(context, query)
+                let prediction = if let Some(optimistic) =
+                    to_optimistic_update_elm(context, query, "optimisticCreate", "()")
                 {
-                    body.push_str(
-                        &optimistic
-                            .replace(
-                                "optimistic : Input -> Encode.Value",
-                                "optimistic : () -> Encode.Value",
-                            )
-                            .replace("optimistic", "optimisticCreate"),
-                    );
+                    body.push_str(&optimistic);
                     "(optimisticCreate ())"
                 } else {
                     "Encode.null"
@@ -2103,7 +2093,7 @@ fn to_query_file(
             "mutationRequest : {} -> RequestId -> Input -> Encode.Value\nmutationRequest databaseId requestId input =\n    Encode.object\n        [ ( \"type\", Encode.string \"mutate\" )\n        , ( \"databaseId\", Db.Database.encode databaseId )\n        , ( \"requestId\", Encode.string requestId )\n        , ( \"mutationId\", Encode.string id )\n        , ( \"mutationName\", Encode.string name )\n        , ( \"mutationInput\", encode input )\n{}        ]\n\n\n",
             database_type, optimistic_field
         ));
-        if let Some(optimistic) = to_optimistic_update_elm(context, query) {
+        if let Some(optimistic) = to_optimistic_update_elm(context, query, "optimistic", "Input") {
             result.push_str(&optimistic);
         }
         result.push_str(
@@ -2266,7 +2256,12 @@ fn optimistic_update_metadata(
     })
 }
 
-fn to_optimistic_update_elm(context: &typecheck::Context, query: &ast::Query) -> Option<String> {
+fn to_optimistic_update_elm(
+    context: &typecheck::Context,
+    query: &ast::Query,
+    name: &str,
+    argument_type: &str,
+) -> Option<String> {
     let metadata = optimistic_update_metadata(context, query)?;
     let set_fields = metadata
         .set_fields
@@ -2282,7 +2277,7 @@ fn to_optimistic_update_elm(context: &typecheck::Context, query: &ast::Query) ->
         .join("\n                , ");
 
     Some(format!(
-        "optimistic : Input -> Encode.Value\noptimistic _ =\n    Encode.object\n        [ ( \"kind\", Encode.string {} )\n        , ( \"queryField\", Encode.string {} )\n        , ( \"where\"\n          , Encode.object\n                [ ( \"field\", Encode.string {} )\n                , ( \"input\", Encode.string {} )\n                ]\n          )\n        , ( \"set\"\n          , Encode.list identity\n                [ {}\n                ]\n          )\n        ]\n\n\n",
+        "{name} : {argument_type} -> Encode.Value\n{name} _ =\n    Encode.object\n        [ ( \"kind\", Encode.string {} )\n        , ( \"queryField\", Encode.string {} )\n        , ( \"where\"\n          , Encode.object\n                [ ( \"field\", Encode.string {} )\n                , ( \"input\", Encode.string {} )\n                ]\n          )\n        , ( \"set\"\n          , Encode.list identity\n                [ {}\n                ]\n          )\n        ]\n\n\n",
         string::quote(match query.operation { ast::QueryOperation::Insert => "create", ast::QueryOperation::Delete => "delete", _ => "update" }),
         string::quote(&metadata.query_field),
         string::quote(&metadata.where_field),
