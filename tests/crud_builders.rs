@@ -2,6 +2,111 @@ use pyre::{ast, generate, generated_queries, parser, typecheck};
 use std::process::Command;
 
 #[test]
+fn elm_edit_builders_disambiguate_prelude_names() {
+    let names = [
+        "identity",
+        "always",
+        "never",
+        "not",
+        "xor",
+        "compare",
+        "min",
+        "max",
+        "clamp",
+        "toFloat",
+        "round",
+        "floor",
+        "ceiling",
+        "truncate",
+        "modBy",
+        "remainderBy",
+        "negate",
+        "abs",
+        "sqrt",
+        "logBase",
+        "e",
+        "pi",
+        "cos",
+        "sin",
+        "tan",
+        "acos",
+        "asin",
+        "atan",
+        "atan2",
+        "degrees",
+        "radians",
+        "turns",
+        "toPolar",
+        "fromPolar",
+        "isNaN",
+        "isInfinite",
+        "identity_",
+    ];
+    let fields = names
+        .iter()
+        .map(|name| format!("    {name} String\n"))
+        .collect::<String>();
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        &format!("record PreludeNames {{\n    @public\n    id Id.Uuid @id\n{fields}}}\n"),
+        &mut schema,
+    )
+    .unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).unwrap();
+    let mut queries = ast::QueryList { queries: vec![] };
+    generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = vec![];
+    generate::generate_schema(&context, &database, &mut files);
+    generate::write_queries(&context, &queries, &info, &mut files);
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    for file in files {
+        let path = dir.path().join(file.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file.contents).unwrap();
+    }
+    let module =
+        std::fs::read_to_string(dir.path().join("client/elm/Db/Edit/PreludeNames.elm")).unwrap();
+    for name in names {
+        assert!(module.contains(&format!("\n{name}_ : (String) -> Patch")));
+        // Only the Elm function name changes, including when a suffixed schema
+        // name itself collides with a previously allocated builder name.
+        assert!(module.contains(&format!("Patch ( \"{name}\", Encode.string value )")));
+    }
+    let metadata = std::fs::read_to_string(
+        dir.path()
+            .join("typescript/core/queries/metadata/preludeNamesUpdate.ts"),
+    )
+    .unwrap();
+    assert!(metadata.contains("\"identity\""));
+    assert!(!metadata.contains("identity__"));
+    std::fs::write(dir.path().join("elm.json"), r#"{
+      "type": "application", "source-directories": ["client/elm"], "elm-version": "0.19.1",
+      "dependencies": {"direct": {"elm/core": "1.0.5", "elm/json": "1.1.3", "elm/time": "1.0.0"}, "indirect": {}},
+      "test-dependencies": {"direct": {}, "indirect": {}}
+    }"#).unwrap();
+    let output = Command::new("elm")
+        .args([
+            "make",
+            "client/elm/Db/Edit/PreludeNames.elm",
+            "--output=/dev/null",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("elm must be on PATH");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn query_only_identity_builders_match_schema() {
     let mut schema = ast::Schema::default();
     parser::run(

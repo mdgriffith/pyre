@@ -1681,6 +1681,47 @@ pub fn generate_queries(
     }
 }
 
+// Named values exposed by Elm 0.19's default Basics import. Keep this exception
+// local to Elm identifier generation; schema and wire names remain unchanged.
+const ELM_PRELUDE_VALUE_NAMES: &[&str] = &[
+    "identity",
+    "always",
+    "never",
+    "not",
+    "xor",
+    "compare",
+    "min",
+    "max",
+    "clamp",
+    "toFloat",
+    "round",
+    "floor",
+    "ceiling",
+    "truncate",
+    "modBy",
+    "remainderBy",
+    "negate",
+    "abs",
+    "sqrt",
+    "logBase",
+    "e",
+    "pi",
+    "cos",
+    "sin",
+    "tan",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "degrees",
+    "radians",
+    "turns",
+    "toPolar",
+    "fromPolar",
+    "isNaN",
+    "isInfinite",
+];
+
 fn to_edit_module(
     context: &typecheck::Context,
     info: &HashMap<String, typecheck::QueryInfo>,
@@ -1707,6 +1748,7 @@ fn to_edit_module(
         "pair",
     ]
     .into_iter()
+    .chain(ELM_PRELUDE_VALUE_NAMES.iter().copied())
     .map(str::to_string)
     .collect();
     let mut builder_names = HashMap::new();
