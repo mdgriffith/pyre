@@ -61,6 +61,11 @@ pub fn response_expression(
 pub fn affected_rows_expression(context: &typecheck::Context, table: &typecheck::Table) -> String {
     let table_name = ast::get_tablename(&table.record.name, &table.record.fields);
     let columns = typecheck::to_sql_column_info(context, &table.record.fields);
+    let primary_key = ast::collect_columns(&table.record.fields)
+        .into_iter()
+        .find(|column| ast::is_primary_key(column))
+        .map(|column| column.name)
+        .unwrap_or_else(|| "id".into());
     let headers = columns
         .iter()
         .map(|column| format!("'{}'", column.name))
@@ -73,7 +78,7 @@ pub fn affected_rows_expression(context: &typecheck::Context, table: &typecheck:
         .join(", ");
 
     format!(
-        "json_object('table_name', '{}', 'headers', json_array({}), 'rows', json_array(json_array({})))",
-        table_name, headers, values
+        "json_object('table_name', '{}', 'primary_key', '{}', 'headers', json_array({}), 'rows', json_array(json_array({})))",
+        table_name, primary_key, headers, values
     )
 }

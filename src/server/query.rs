@@ -136,14 +136,21 @@ async fn run_inner(
     };
 
     if query.operation == "query" {
-        return execute_generated_sql(conn, sql, &args).await;
+        return execute_generated_sql(conn, sql, &args, None).await;
     }
 
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
         .map_err(|error| Error::Database(error).execution("begin transaction", None))?;
-    match execute_generated_sql(&tx, sql, &args).await {
+    let checked_write = query.generated_edit.as_ref().map(|edit| {
+        if sync_mode {
+            edit.sync_write_statement
+        } else {
+            edit.write_statement
+        }
+    });
+    match execute_generated_sql(&tx, sql, &args, checked_write).await {
         Ok(result) => {
             tx.commit()
                 .await
@@ -161,7 +168,13 @@ async fn execute_generated_sql(
     conn: &libsql::Connection,
     sql: &[SqlInfo],
     args: &HashMap<String, JsonValue>,
+    checked_write: Option<usize>,
 ) -> Result<QueryResult, Error> {
+    if checked_write.is_some_and(|index| index >= sql.len()) {
+        return Err(Error::InvalidInput(
+            "invalid generated edit metadata".into(),
+        ));
+    }
     let mut included_result_sets = Vec::new();
 
     for (index, statement) in sql.iter().enumerate() {
@@ -175,6 +188,22 @@ async fn execute_generated_sql(
                 while rows.next().await.map_err(Error::Database)?.is_some() {}
             } else {
                 execute_statement(conn, &sql, values).await?;
+            }
+            if checked_write == Some(index) {
+                let mut count = conn
+                    .query("select changes()", ())
+                    .await
+                    .map_err(Error::Database)?;
+                let count = count
+                    .next()
+                    .await
+                    .map_err(Error::Database)?
+                    .ok_or_else(|| Error::InvalidInput("missing write cardinality".into()))?;
+                if count.get::<i64>(0).map_err(Error::Database)? != 1 {
+                    return Err(Error::InvalidInput(
+                        "generated edit must affect exactly one row".into(),
+                    ));
+                }
             }
             Ok::<_, Error>(())
         }
@@ -199,6 +228,33 @@ fn build_args(
         ));
     };
     let mut args = HashMap::new();
+    if let Some(field) = query
+        .generated_edit
+        .as_ref()
+        .and_then(|edit| edit.create_id.as_ref())
+    {
+        let valid = input_object
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .is_some_and(|id| {
+                let bytes = id.as_bytes();
+                bytes.len() == 36
+                    && bytes[14] == b'7'
+                    && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+                    && bytes.iter().enumerate().all(|(index, byte)| {
+                        if matches!(index, 8 | 13 | 18 | 23) {
+                            *byte == b'-'
+                        } else {
+                            byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+                        }
+                    })
+            });
+        if !valid {
+            return Err(Error::InvalidInput(
+                "generated creates require a canonical UUIDv7".into(),
+            ));
+        }
+    }
     let optional_args = query
         .optional_input_args
         .iter()

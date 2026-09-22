@@ -61,7 +61,8 @@ try {
   assert.deepEqual(await a.evaluate('proof.rows'), await b.evaluate('proof.rows'));
   await a.waitForFunction("async () => (await proof.persisted())[0].title === 'FINAL'");
 
-  // Keep the committed HTTP response held across a permission-loss reset.
+  // Keep the committed HTTP response held across an incremental permission loss.
+  const beforeRemoval = await (await a.request.get(`${url}/stats`)).json();
   await b.evaluate("proof.edit('hold')");
   await b.waitForFunction("proof.rows[0].title === 'hold'");
   await a.waitForFunction("proof.rows[0].title === 'HOLD'");
@@ -73,9 +74,13 @@ try {
   assert(await b.evaluate("proof.batches.some(b => b.changes.some(c => c.id === '00000000-0000-7000-8000-000000000001' && c.op === 'remove'))"));
   await b.request.get(`${url}/release`);
   await b.waitForFunction('proof.results.length === 1');
-  assert.equal(await b.evaluate('proof.results[0].ok'), false);
+  // The write committed successfully; its older authority cannot undo removal.
+  assert.equal(await b.evaluate('proof.results[0].ok'), true);
   assert.equal(await b.evaluate('proof.rows[0].id'), '00000000-0000-7000-8000-000000000002');
   assert.deepEqual(await b.evaluate('(async () => (await proof.persisted()).map(r => r.id))()'), ['00000000-0000-7000-8000-000000000002']);
+  const afterRemoval = await (await a.request.get(`${url}/stats`)).json();
+  assert.equal(afterRemoval.catchup, beforeRemoval.catchup);
+  assert.equal(afterRemoval.invalidation, beforeRemoval.invalidation);
 
   await b.reload();
   await b.waitForFunction('window.proof?.connected && proof.rows?.length === 1');

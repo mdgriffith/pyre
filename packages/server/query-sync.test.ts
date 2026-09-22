@@ -201,7 +201,7 @@ test("runWithSync publishes an atomic repeated-operation batch once to origin an
   }
 });
 
-test('permission-filtered recipients get identity-free invalidation while visible edits remain incremental', async () => {
+test('never-visible recipients get an empty delta while visible edits remain incremental', async () => {
   await loadSchemaFromDatabase(schemaDb as any);
   const result = await runWithSync(syncDb() as any, queryMap, 'query-id', {}, {}, new Map([
     ['s1', { session: {} }], ['denied', { session: {} }],
@@ -209,7 +209,7 @@ test('permission-filtered recipients get identity-free invalidation while visibl
   const sent: any[] = [];
   await result.sync((id, message) => sent.push({ id, message }));
   expect(sent.find((entry) => entry.id === 's1').message.type).toBe('delta');
-  expect(withoutServerRevision(sent.find((entry) => entry.id === 'denied').message)).toEqual({ type: 'invalidate' });
+  expect(withoutServerRevision(sent.find((entry) => entry.id === 'denied').message)).toEqual({ type: 'delta', data: [] });
 });
 
 test("runWithSync sends reshaped sync deltas", async () => {

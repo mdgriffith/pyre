@@ -31,7 +31,7 @@ export interface QueryMetadata {
     InputValidator: Validator<any>;
     SessionValidator: Validator<any>;
     /** Compiler-owned index of the direct write whose cardinality must be one. */
-    generatedEdit?: { writeStatement: number; createId?: string };
+    generatedEdit?: { writeStatement: number; syncWriteStatement?: number; createId?: string };
 }
 
 /**
@@ -309,7 +309,7 @@ export async function run(
     const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
     const response = formatResultData(activeSql, resultSets);
 
-    return executionResult(response, affectedRowGroups, connectedSessions, syncDeltas, originSessionId, committedRevision);
+    return executionResult(response, combineAffectedRows(affectedRowGroups), connectedSessions, syncDeltas, originSessionId, committedRevision);
 }
 
 function executionResult(
@@ -479,7 +479,7 @@ async function runOperations(
                 // This facade executes within the outer transaction; it never commits.
                 const executor = {
                     batch: (statements: InStatement[]) => metadata.generatedEdit
-                        ? executeCheckedStatements(tx, statements, metadata.generatedEdit.writeStatement)
+                        ? executeCheckedStatements(tx, statements, options.mode === "sync" ? metadata.generatedEdit.syncWriteStatement ?? metadata.generatedEdit.writeStatement : metadata.generatedEdit.writeStatement)
                         : tx.batch(statements),
                 } as Client;
                 const result = await run(executor, { [operation.queryId]: { ...metadata, generatedEdit: undefined } }, operation.queryId, operation.input, executingSession,
@@ -511,15 +511,25 @@ function combineAffectedRows(affected: any[]): any[] {
     // Only final row versions may be authorized/published: intermediate versions
     // could leak data after a later operation revokes access to the same row.
     const finalGroups = new Map<string, any>();
+    const preimages = new Map<string, any>();
+    const seen = new Set<string>();
     for (const group of affected) {
-        const idIndex = group.headers.indexOf("id");
+        const idIndex = group.headers.indexOf(group.primary_key ?? "id");
         if (idIndex < 0) throw new Error("Affected rows require identity");
         for (const row of group.rows) {
-            finalGroups.set(JSON.stringify([group.table_name, row[idIndex]]), { ...group, rows: [row] });
+            const key = JSON.stringify([group.table_name, row[idIndex]]);
+            const preimage = group.headers.includes("_pyre_preimage");
+            const removed = group.headers.includes("_pyre_removed");
+            if (!seen.has(key) && (preimage || removed)) {
+                const headers = group.headers.filter((header: string) => !header.startsWith("_pyre_"));
+                preimages.set(key, { ...group, headers: [...headers, "_pyre_preimage"], rows: [[...headers.map((header: string) => row[group.headers.indexOf(header)]), true]] });
+            }
+            seen.add(key);
+            if (!preimage) finalGroups.set(key, { ...group, rows: [row] });
         }
     }
     const tables = new Map<string, any>();
-    for (const group of finalGroups.values()) {
+    for (const group of [...preimages.values(), ...finalGroups.values()]) {
         const key = JSON.stringify([group.table_name, group.headers]);
         const table = tables.get(key);
         if (table) table.rows.push(...group.rows);

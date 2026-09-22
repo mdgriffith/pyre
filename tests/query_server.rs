@@ -51,6 +51,153 @@ fn only_query(manifest: &Manifest) -> &QueryManifest {
 }
 
 #[tokio::test]
+async fn generated_uuid_creates_validate_manifest_identity_and_cardinality_in_both_modes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    key Id.Uuid @id
+    body String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = query_by_operation(&manifest, "insert");
+    assert_eq!(
+        create.generated_edit.as_ref().unwrap().create_id.as_deref(),
+        Some("key")
+    );
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    for sync in [false, true] {
+        for invalid in [
+            "01900000-0000-4000-8000-000000000001",
+            "01900000-0000-7000-0000-000000000001",
+            "01900000-0000-7000-C000-000000000001",
+            "01900000-0000-7000-8000-00000000000A",
+            "01900000000070008000000000000001",
+            "",
+            "not-a-uuid",
+        ] {
+            let input = json!({"key": invalid, "body": "invalid"});
+            let result = if sync {
+                query::run_sync(&conn, &manifest, &create.id, input, &session).await
+            } else {
+                query::run(&conn, &manifest, &create.id, input, &session).await
+            };
+            assert!(result.is_err(), "accepted {invalid}");
+        }
+        let id = if sync {
+            "01900000-0000-7000-b000-000000000002"
+        } else {
+            "01900000-0000-7000-8000-000000000001"
+        };
+        let input = json!({"key": id, "body": "created"});
+        let result = if sync {
+            query::run_sync(&conn, &manifest, &create.id, input, &session).await?
+        } else {
+            query::run(&conn, &manifest, &create.id, input, &session).await?
+        };
+        assert_eq!(result.response["note"][0]["key"], id);
+        for operation in ["update", "delete"] {
+            let metadata = query_by_operation(&manifest, operation);
+            let input = if operation == "update" {
+                json!({"key": "01900000-0000-7000-8000-000000000099", "body": "missing"})
+            } else {
+                json!({"key": "01900000-0000-7000-8000-000000000099"})
+            };
+            let result = if sync {
+                query::run_sync(&conn, &manifest, &metadata.id, input, &session).await
+            } else {
+                query::run(&conn, &manifest, &metadata.id, input, &session).await
+            };
+            assert!(result.is_err(), "zero-row {operation} must reject");
+        }
+    }
+    let count = conn
+        .query("select count(*) from notes", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<i64>(0)?;
+    assert_eq!(count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_mixed_writes_authorize_removals_from_original_visibility(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    key Id.Uuid @id
+    body String
+    @allow(query) { body != "hidden" }
+    @allow(insert, update, delete) { True }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+transaction ChangeAndDelete($key: Note.key, $body: String) {
+    update changed: note {
+        @where { key == $key }
+        body = $body
+        key
+    }
+    delete removed: note {
+        @where { key == $key }
+        key
+    }
+}
+"#,
+        false,
+    )?;
+    let id = "01900000-0000-7000-8000-000000000001";
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let sessions = ConnectedSessions::from([("reader".into(), SyncSession::new())]);
+    for (initial, intermediate, expected) in
+        [("hidden", "visible", false), ("visible", "hidden", true)]
+    {
+        conn.execute(
+            "insert into notes (key, body) values (?, ?)",
+            libsql::params![id, initial],
+        )
+        .await?;
+        let mut result = query::run_sync(
+            &conn,
+            &manifest,
+            &only_query(&manifest).id,
+            json!({"key": id, "body": intermediate}),
+            &session,
+        )
+        .await?;
+        let messages = SyncServer::new(&db.context)
+            .calculate_deltas(&conn, &mut result, &sessions, "main", None)
+            .await?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(!messages[0].message.data.is_empty(), expected);
+        if expected {
+            assert_eq!(
+                messages[0].message.data[0].headers,
+                vec!["key", "_pyre_removed"]
+            );
+            assert_eq!(
+                messages[0].message.data[0].rows,
+                vec![vec![json!(id), json!(true)]]
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_insert_roundtrips_nested_zero_field_union() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
@@ -1895,10 +2042,11 @@ transaction Apply($id: Note.id, $counterId: Counter.id, $pendingId: Pending.id, 
         result.response["removed"][0]["id"],
         json!("01900000-0000-7000-8000-000000000001")
     );
-    assert_eq!(result.affected_rows.len(), 3);
+    assert_eq!(result.affected_rows.len(), 4);
     assert_eq!(result.affected_rows[0].table_name, "notes");
     assert_eq!(result.affected_rows[1].table_name, "counters");
-    assert_eq!(result.affected_rows[2].table_name, "pendings");
+    assert_eq!(result.affected_rows[2].table_name, "counters");
+    assert_eq!(result.affected_rows[3].table_name, "pendings");
     Ok(())
 }
 
@@ -2834,7 +2982,8 @@ record Note {
         json!({ "ownerId": 2, "body": "denied" }),
         &session,
     )
-    .await?;
+    .await
+    .expect_err("denied generated create must reject rather than succeed with zero rows");
 
     let mut rows = conn.query("select count(*) from notes", ()).await?;
     let row = rows.next().await?.expect("count row should exist");
@@ -3113,7 +3262,10 @@ update EndLifecycle {
         &session,
     )
     .await?;
-    assert_eq!(updated.affected_rows.len(), 1);
+    assert_eq!(updated.affected_rows.len(), 2);
+    assert!(updated.affected_rows[0]
+        .headers
+        .contains(&"_pyre_preimage".into()));
     assert_eq!(updated.affected_rows[0].rows.len(), 1);
 
     let mut status_rows = conn

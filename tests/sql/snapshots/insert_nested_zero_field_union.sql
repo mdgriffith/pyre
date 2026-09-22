@@ -14,4 +14,4 @@ values (case when json_valid($payload) then json_extract($payload, '$._type') el
         when events.payload__state = 'HandRaised' then json_object('_type', 'HandRaised')
       end)
       )
-  end)) as "event", json_array(json_object('table_name', 'events', 'headers', json_array('id', 'payload', 'payload__authorParticipantId', 'payload__voteId', 'payload__state', 'updatedAt'), 'rows', json_array(json_array("id", "payload", "payload__authorParticipantId", "payload__voteId", "payload__state", "updatedAt")))) as _affectedRows
+  end)) as "event", json_array(json_object('table_name', 'events', 'primary_key', 'id', 'headers', json_array('id', 'payload', 'payload__authorParticipantId', 'payload__voteId', 'payload__state', 'updatedAt'), 'rows', json_array(json_array("id", "payload", "payload__authorParticipantId", "payload__voteId", "payload__state", "updatedAt")))) as _affectedRows

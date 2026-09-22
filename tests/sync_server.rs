@@ -1052,7 +1052,8 @@ record Game {
         .calculate_deltas(&conn, &mut result, &connected_sessions, "main", None)
         .await?;
 
-    assert_eq!(messages.len(), 1);
+    assert_eq!(messages.len(), 2);
+    assert!(messages[1].message.data.is_empty());
     assert_eq!(messages[0].session_id, "allowed");
     assert_eq!(messages[0].message.data[0].rows[0][0], row_id(1));
 
@@ -1432,7 +1433,8 @@ update UpdateNote($id: Note.id) {
 
     assert_eq!(affected_rows.len(), 1);
     assert_eq!(affected_rows[0].table_name, "notes");
-    assert_eq!(messages.len(), 1);
+    assert_eq!(messages.len(), 2);
+    assert!(messages[1].message.data.is_empty());
     assert_eq!(messages[0].session_id, "user-1");
     assert_eq!(messages[0].message.data[0].rows.len(), 1);
 
@@ -1505,7 +1507,8 @@ delete RemoveNote($id: Note.id) {
     assert_eq!(affected_rows.len(), 1);
     assert_eq!(affected_rows[0].table_name, "notes");
     assert_eq!(affected_rows[0].rows.len(), 1);
-    assert_eq!(messages.len(), 1);
+    assert_eq!(messages.len(), 2);
+    assert!(messages[1].message.data.is_empty());
     assert_eq!(messages[0].session_id, "user-1");
     assert_eq!(messages[0].message.data[0].rows[0][0], row_id(1));
     assert_eq!(

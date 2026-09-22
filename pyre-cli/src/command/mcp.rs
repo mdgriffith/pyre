@@ -944,6 +944,7 @@ fn dynamic_query_manifest(
             .collect(),
         sql,
         sync_sql: None,
+        generated_edit: None,
     })
 }
 

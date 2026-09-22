@@ -606,8 +606,10 @@ fn to_query_metadata_file(
                 .map(|column| format!(", createId: {}", string::quote(&column.name)))
                 .unwrap_or_default();
             meta_block.push_str(&format!(
-                "  generatedEdit: {{ writeStatement: {}{} }},\n",
+                "  generatedEdit: {{ writeStatement: {}, syncWriteStatement: {}{} }},\n",
                 sql::to_sql::format_attach(info).len(),
+                sql::to_sql::format_attach(info).len()
+                    + usize::from(query.operation == ast::QueryOperation::Update),
                 create_id
             ));
         }

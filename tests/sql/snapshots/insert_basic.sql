@@ -10,4 +10,4 @@ values ($name, 'Active', unixepoch()) returning json_object('name', "name", 'sta
         '_type', 'Special',
         'reason', users.status__reason
       )
-  end)) as "user", json_array(json_object('table_name', 'users', 'headers', json_array('id', 'name', 'status', 'status__reason', 'updatedAt'), 'rows', json_array(json_array("id", "name", "status", "status__reason", "updatedAt")))) as _affectedRows
+  end)) as "user", json_array(json_object('table_name', 'users', 'primary_key', 'id', 'headers', json_array('id', 'name', 'status', 'status__reason', 'updatedAt'), 'rows', json_array(json_array("id", "name", "status", "status__reason", "updatedAt")))) as _affectedRows

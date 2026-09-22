@@ -94,16 +94,25 @@ omitted default or server-managed value keeps that create server-only. Rejection
 replays the remaining operations; a newer authoritative removal suppresses pending
 create replay.
 
-Deleted preimages pass through query-permission filtering before becoming
+Updates capture permission preimages before writing. Across an ordered batch, the
+executor retains each row's first observation and its final value; rows created in
+the batch have no committed preimage. Original and final visibility are authorized
+separately. Intermediate grants cannot reveal an identity, and former readers get
+incremental removals rather than a full invalidation. Deleted preimages pass through query-permission filtering before becoming
 identity-only tombstones (`id`, `_pyre_removed`) in the existing delta format. The
 worker removes rows and index entries, publishes removals to query/entity readers,
 and persists deletion plus its revision stamp atomically. Old upserts cannot restore
 a tombstoned row, including after cache reload.
 
-This is a checkpoint in the full MEC-106 feature PR. Transaction-start permission
-preimages for access-changing updates and mixed update/delete batches, broader
-submission/bridge conformance, Rust generated-create execution parity, and complete
-feature examples remain release work in this same PR.
+Rust manifests now carry generated-create UUIDv7 validation and normal/sync direct
+write indices. Native execution validates the captured identity before starting a
+transaction and rolls back zero-row generated writes. Named commands retain their
+existing explicit-identity behavior. Native permission delivery also compares
+original and final visibility before emitting removals.
+
+This is a checkpoint in the full MEC-106 feature PR. Custom-primary-key client
+consistency, broader submission/bridge conformance, complete feature examples and
+the final cross-runtime release review remain work in this same PR.
 
 ## Schema identity migration
 

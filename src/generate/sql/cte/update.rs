@@ -56,6 +56,18 @@ pub fn update_to_string(
     );
     result.push_str(&where_clause);
 
+    // Capture the row before its first write. The executor keeps only the first
+    // observation of each identity across a transaction, never an intermediate
+    // owner/permission value from a later operation in a composed batch.
+    if include_affected_rows {
+        statements.push(to_sql::include(format!(
+            "select json_array(json_insert({}, '$.headers[#]', '_pyre_preimage', '$.rows[0][#]', json('true'))) as _affectedRows from {}\n{}",
+            returning::affected_rows_expression(context, table),
+            table_name,
+            where_clause
+        )));
+    }
+
     let response = returning::response_expression(context, table, query_field);
     result.push_str(&format!(
         " returning {} as {}",

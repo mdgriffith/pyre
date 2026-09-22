@@ -58,9 +58,9 @@ record Document {
     assert!(builders.contains("patch: Omit<BindIds<DocumentUpdate.Input, DocumentIds>, \"id\">"));
     assert!(builders.contains("documentDelete(id: DocumentId)"));
     assert!(file("metadata/documentCreate.ts")
-        .contains("generatedEdit: { writeStatement: 0, createId: \"id\" }"));
+        .contains("generatedEdit: { writeStatement: 0, syncWriteStatement: 0, createId: \"id\" }"));
     let update = file("metadata/documentUpdate.ts");
-    assert!(update.contains("generatedEdit: { writeStatement: 0 }"));
+    assert!(update.contains("generatedEdit: { writeStatement: 0, syncWriteStatement: 1 }"));
     assert!(update.contains("summary: z.string().nullable().optional()"));
     assert!(!update
         .split("export type Input")

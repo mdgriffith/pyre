@@ -3,221 +3,76 @@ import * as wasm from "./wasm/pyre_wasm.js";
 import { normalizeForWasmJson } from "./wasm-json";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
 import { activateSchemaForDatabase } from "./schema";
-import {
-  run,
-  type QueryMap,
-  type OperationDescriptor,
-  type QueryResult,
-  type Session,
-  type SessionValue,
-  type SyncDeltasFn,
-} from "./query";
+import { run, type QueryMap, type OperationDescriptor, type QueryResult, type Session, type SessionValue, type SyncDeltasFn } from "./query";
 
 export const MAX_LIVE_SYNC_DELTA_ROWS = 5000;
 export const MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES = 1024 * 1024;
 export const MAX_LIVE_SYNC_FANOUT_RECIPIENTS = 1000;
 
-function countRows(tableGroups: unknown): number {
-  if (!Array.isArray(tableGroups)) {
-    return 0;
-  }
-
-  return tableGroups.reduce((total, tableGroup) => {
-    if (typeof tableGroup !== "object" || tableGroup == null || !("rows" in tableGroup)) {
-      return total;
-    }
-
-    return total + (Array.isArray(tableGroup.rows) ? tableGroup.rows.length : 0);
-  }, 0);
+function countRows(groups: any[]): number {
+  return groups.reduce((total, group) => total + group.rows.length, 0);
 }
 
-// Authorization runs against deleted preimages. Only then strip their contents
-// and publish identity-only tombstones to sessions that could read those rows.
-function removalDeltas(data: any[], affected: any[]): any[] {
-  const removed = new Set(affected.filter(group => group.headers.includes("_pyre_removed")).flatMap(group =>
-    group.rows.map((row: unknown[]) => JSON.stringify([group.table_name, row[group.headers.indexOf("id")]]))));
-  return data.flatMap(group => {
-    const idIndex = group.headers.indexOf("id");
-    const deleted = group.rows.filter((row: unknown[]) => removed.has(JSON.stringify([group.table_name, row[idIndex]])));
-    const rows = group.rows.filter((row: unknown[]) => !removed.has(JSON.stringify([group.table_name, row[idIndex]])));
-    return [
-      ...(rows.length ? [{ ...group, rows }] : []),
-      ...(deleted.length ? [{ table_name: group.table_name, headers: ["id", "_pyre_removed"], rows: deleted.map((row: unknown[]) => [row[idIndex], true]) }] : []),
-    ];
-  });
+function parseWasm(value: any): any {
+  if (typeof value === "string" && value.startsWith("Error:")) throw new Error(value);
+  return typeof value === "string" ? JSON.parse(value) : value;
 }
 
-function liveSyncRequiresCatchup(message: unknown, rowCount: number, recipientCount: number): boolean {
-  if (rowCount > MAX_LIVE_SYNC_DELTA_ROWS) {
-    return true;
-  }
-
-  if (recipientCount > MAX_LIVE_SYNC_FANOUT_RECIPIENTS) {
-    return true;
-  }
-
-  return new TextEncoder().encode(JSON.stringify(message)).byteLength > MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES;
+function rowKey(group: any, row: any[], primaryKeys: Map<string, string>): string {
+  return JSON.stringify([group.table_name, row[group.headers.indexOf(primaryKeys.get(group.table_name) ?? "id")]]);
 }
 
-function sessionsWithoutOrigin(
-  connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
-  originSessionId?: string,
-): Map<string, { session: Record<string, SessionValue>; [key: string]: any }> {
-  if (!originSessionId || !connectedSessions.has(originSessionId)) {
-    return connectedSessions;
+// Authorize original committed preimages separately from final row values.
+// Intermediate permission values must never grant even identity-only delivery.
+function visibleBySession(groups: any[], sessions: Map<string, any>): Map<string, any[]> {
+  if (!groups.length) return new Map();
+  const result = parseWasm(wasm.calculate_sync_deltas(groups, sessions));
+  const visible = new Map<string, any[]>();
+  for (const group of result.groups ?? []) {
+    const data = parseWasm(wasm.reshape_sync_table_groups(normalizeForWasmJson(group.table_groups)));
+    for (const id of group.session_ids) visible.set(id, [...(visible.get(id) ?? []), ...data]);
   }
-
-  const recipients = new Map(connectedSessions);
-  recipients.delete(originSessionId);
-  return recipients;
-}
-
-function singleOriginSession(
-  connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
-  originSessionId?: string,
-): Map<string, { session: Record<string, SessionValue>; [key: string]: any }> | undefined {
-  if (!originSessionId) {
-    return undefined;
-  }
-
-  const origin = connectedSessions.get(originSessionId);
-  return origin ? new Map([[originSessionId, origin]]) : undefined;
+  return visible;
 }
 
 function syncWithWasmForDatabase(databaseId?: DatabaseId): SyncDeltasFn {
   const normalizedDatabaseId = databaseId ? requireDatabaseId(databaseId) : undefined;
-
-  return async (affectedRowGroups, connectedSessions, sendToSession, originSessionId, committedRevision) => {
+  return async (affected, connectedSessions, sendToSession, originSessionId, committedRevision) => {
     activateSchemaForDatabase(normalizedDatabaseId);
-
-    const broadcastSessions = sessionsWithoutOrigin(connectedSessions, originSessionId);
-    const originSession = singleOriginSession(connectedSessions, originSessionId);
-    const normalizeSessions = (sessions: typeof broadcastSessions) => new Map(
-      Array.from(sessions, ([id, data]) => [
-        id,
-        { ...data, session: normalizeForWasmJson(data.session) },
-      ]),
-    );
     if (!committedRevision) throw new Error("Missing committed sync revision");
-    const { databaseEpoch, serverRevision } = committedRevision;
-    // The affected-row format contains only post-update rows. If a session
-    // cannot see all of them, it may have lost access to a cached row. Do not
-    // disclose that row's identity: invalidate the cache and catch up instead.
-    const invalidation = {
-      type: "invalidate",
-      serverRevision,
-      databaseEpoch,
-      ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-    };
-    const affectedCount = countRows(affectedRowGroups.filter(group => !group.headers.includes("_pyre_removed")));
-    const deltasResult = wasm.calculate_sync_deltas(
-      affectedRowGroups,
-      normalizeSessions(broadcastSessions),
-    );
-
-    if (typeof deltasResult === "string" && deltasResult.startsWith("Error:")) {
-      console.error("[SyncDeltas] Failed to calculate sync deltas:", deltasResult);
-      const message = invalidation;
-      for (const sessionId of broadcastSessions.keys()) {
-        sendToSession(sessionId, message);
-      }
-      return {
-        databaseEpoch,
-        serverRevision,
-        ...(originSession ? { originMessage: message } : {}),
-      };
+    const stamp = { ...committedRevision, ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}) };
+    const sessions = new Map(Array.from(connectedSessions, ([id, data]) => [id, { ...data, session: normalizeForWasmJson(data.session) }]));
+    const primaryKeys = new Map<string, string>(affected.map(group => [group.table_name, group.primary_key ?? "id"]));
+    let before: Map<string, any[]>;
+    let after: Map<string, any[]>;
+    try {
+      before = visibleBySession(affected.filter(group => group.headers.includes("_pyre_preimage")), sessions);
+      after = visibleBySession(affected.filter(group => !group.headers.includes("_pyre_preimage") && !group.headers.includes("_pyre_removed")), sessions);
+    } catch (error) {
+      console.error("[SyncDeltas] Failed to calculate sync deltas:", error);
+      const message = { type: "invalidate", ...stamp };
+      for (const id of sessions.keys()) if (id !== originSessionId) sendToSession(id, message);
+      return { ...committedRevision, ...(sessions.has(originSessionId!) ? { originMessage: message } : {}) };
     }
-
-    const result = typeof deltasResult === "string" ? JSON.parse(deltasResult) : deltasResult;
-
-    const delivered = new Set<string>();
-
-    for (const group of Array.isArray(result.groups) ? result.groups : []) {
-      const reshapedTableGroupsResult = wasm.reshape_sync_table_groups(normalizeForWasmJson(group.table_groups));
-
-      if (typeof reshapedTableGroupsResult === "string" && reshapedTableGroupsResult.startsWith("Error:")) {
-        console.error("[SyncDeltas] Failed to reshape sync deltas:", reshapedTableGroupsResult);
-        continue;
-      }
-
-      const data = typeof reshapedTableGroupsResult === "string"
-        ? JSON.parse(reshapedTableGroupsResult)
-        : reshapedTableGroupsResult;
-
-      const deltaMessage = {
-        type: "delta",
-        serverRevision,
-        databaseEpoch,
-        ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-        data: removalDeltas(data, affectedRowGroups),
-      };
-
-      const message = countRows(removalDeltas(group.table_groups, affectedRowGroups).filter(group => !group.headers.includes("_pyre_removed"))) < affectedCount
-        ? invalidation
-        : liveSyncRequiresCatchup(deltaMessage, countRows(data), group.session_ids.length)
-        ? {
-          type: "syncRequired",
-          serverRevision,
-          databaseEpoch,
-          ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-        }
-        : deltaMessage;
-
-      for (const sessionId of group.session_ids) {
-        sendToSession(sessionId, message);
-        delivered.add(sessionId);
-      }
+    let originMessage: unknown;
+    for (const id of sessions.keys()) {
+      const rows = after.get(id) ?? [];
+      const finalKeys = new Set(rows.flatMap(group => group.rows.map((row: any[]) => rowKey(group, row, primaryKeys))));
+      const removals = (before.get(id) ?? []).flatMap(group => {
+        const key = primaryKeys.get(group.table_name) ?? "id";
+        const removed = group.rows.filter((row: any[]) => !finalKeys.has(rowKey(group, row, primaryKeys)));
+        return removed.length ? [{ table_name: group.table_name, headers: [key, "_pyre_removed"], rows: removed.map((row: any[]) => [row[group.headers.indexOf(key)], true]) }] : [];
+      });
+      const data = [...rows, ...removals];
+      const delta = { type: "delta", ...stamp, data };
+      const message = countRows(data) > MAX_LIVE_SYNC_DELTA_ROWS
+        || sessions.size > MAX_LIVE_SYNC_FANOUT_RECIPIENTS
+        || new TextEncoder().encode(JSON.stringify(delta)).byteLength > MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES
+        ? { type: "syncRequired", ...stamp } : delta;
+      if (id === originSessionId) originMessage = message;
+      else sendToSession(id, message);
     }
-
-    for (const sessionId of broadcastSessions.keys()) {
-      if (!delivered.has(sessionId)) sendToSession(sessionId, affectedCount ? invalidation : { ...invalidation, type: "delta", data: [] });
-    }
-
-    let originMessage: unknown = originSession ? (affectedCount ? invalidation : { ...invalidation, type: "delta", data: [] }) : undefined;
-    if (originSession) {
-      const originDeltasResult = wasm.calculate_sync_deltas(
-        affectedRowGroups,
-        normalizeSessions(originSession),
-      );
-
-      if (typeof originDeltasResult === "string" && originDeltasResult.startsWith("Error:")) {
-        console.error("[SyncDeltas] Failed to calculate origin sync delta:", originDeltasResult);
-      } else {
-        const originResult = typeof originDeltasResult === "string" ? JSON.parse(originDeltasResult) : originDeltasResult;
-        const originGroup = Array.isArray(originResult.groups) ? originResult.groups[0] : undefined;
-
-        if (originGroup) {
-          const reshapedTableGroupsResult = wasm.reshape_sync_table_groups(normalizeForWasmJson(originGroup.table_groups));
-
-          if (typeof reshapedTableGroupsResult === "string" && reshapedTableGroupsResult.startsWith("Error:")) {
-            console.error("[SyncDeltas] Failed to reshape origin sync delta:", reshapedTableGroupsResult);
-          } else {
-            const data = typeof reshapedTableGroupsResult === "string"
-              ? JSON.parse(reshapedTableGroupsResult)
-              : reshapedTableGroupsResult;
-            const deltaMessage = {
-              type: "delta",
-              serverRevision,
-              databaseEpoch,
-              ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-              data: removalDeltas(data, affectedRowGroups),
-            };
-            originMessage = countRows(removalDeltas(originGroup.table_groups, affectedRowGroups).filter(group => !group.headers.includes("_pyre_removed"))) < affectedCount
-              ? invalidation
-              : liveSyncRequiresCatchup(deltaMessage, countRows(data), originGroup.session_ids.length)
-              ? {
-                type: "syncRequired",
-                serverRevision,
-                databaseEpoch,
-                ...(normalizedDatabaseId ? { databaseId: normalizedDatabaseId } : {}),
-              }
-              : deltaMessage;
-          }
-        }
-      }
-    }
-
-    return { databaseEpoch, serverRevision, ...(originMessage === undefined ? {} : { originMessage }) };
+    return { ...committedRevision, ...(originMessage === undefined ? {} : { originMessage }) };
   };
 }
 
@@ -234,6 +89,5 @@ export async function runWithSync(
   const syncSessions = connectedSessions ? new Map(connectedSessions) : new Map();
   const responseSessionId = originSessionId ?? `__pyre_response_${crypto.randomUUID()}`;
   syncSessions.set(responseSessionId, { session: executingSession as Record<string, SessionValue> });
-
   return run(db, queryMap, queryId, args, executingSession, syncSessions, syncWithWasmForDatabase(databaseId), responseSessionId, { mode: "sync", allocateSyncRevision: true });
 }
