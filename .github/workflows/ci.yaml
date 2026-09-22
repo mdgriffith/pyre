@@ -33,6 +33,15 @@ jobs:
       - name: Install TypeScript test dependencies
         run: bun install --frozen-lockfile
 
+      - name: Install Elm and browser test tools
+        run: |
+          npm install --global elm@0.19.1-6 elm-test@0.19.1-revision17 playwright@1.62.1
+          playwright install --with-deps chromium
+
+      - name: Build client worker
+        working-directory: packages/client
+        run: bash scripts/build.sh
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -50,6 +59,16 @@ jobs:
 
       - name: Test server package
         run: bun run --cwd packages/server test
+
+      - name: Test client worker and bridge
+        working-directory: packages/client
+        run: |
+          elm-test
+          bun test src-ts
+
+      - name: Native two-client proof
+        working-directory: packages/client
+        run: bun scripts/field-edit-proof.ts
 
       - name: Run tests
         run: cargo test --locked
