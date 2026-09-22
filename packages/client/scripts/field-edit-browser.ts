@@ -6,16 +6,17 @@ const schema = { tables: { notes: { name: 'notes', links: {}, indices: [{ field:
 const client = await PyreClient.create({ schema, cacheNamespace: who, server: { baseUrl: `${location.origin}/${who}`, endpoints: { events: '/events' } } });
 const batches: any[] = [];
 const results: any[] = [];
+const rowHistory: any[][] = [];
 let rows: any[] = [];
 let connected = false;
 client.onSyncState((state) => { connected = state.status === 'live'; });
 await client.onEntityChanges('proof', { tables: [{ tableName: 'notes' }] }, (batch) => batches.push(batch));
-await client.run('proof', { operation: 'query', queryShape: { notes: { noteKey: true, id: true, title: true, updatedAt: true } } }, {}, (result: any) => { rows = result.notes; });
+await client.run('proof', { operation: 'query', queryShape: { notes: { noteKey: true, id: true, title: true, updatedAt: true } } }, {}, (result: any) => { rows = result.notes; rowHistory.push(rows); });
 await client.syncDatabase('proof');
 const storage = new IndexedDBStorage(client.getInternalIndexedDbName('proof'), { notes: 'noteKey' });
 Object.assign(window, {
   proof: {
-    batches, results,
+    batches, results, rowHistory,
     get rows() { return rows; },
     get connected() { return connected; },
     async batch(inputs: Array<{ id: string; title: string }>) {
@@ -31,9 +32,6 @@ Object.assign(window, {
         queryField: 'notes', where: { field: 'noteKey', input: 'id' }, set: [{ field: 'title', input: 'title' }],
       } }, { id: '00000000-0000-7000-8000-000000000001', title }, (result) => results.push(result));
     },
-    remove(id: string) {
-      return client.run('proof', { operation: 'delete', id: 'remove' }, { id, title: '' }, result => results.push(result));
-    },
     async late() {
       const received: any[] = [];
       const off = await client.onEntityChanges('proof', { tables: [{ tableName: 'notes' }] }, (batch) => received.push(batch));
@@ -41,7 +39,6 @@ Object.assign(window, {
       return received;
     },
     persisted: () => storage.getAllRows('notes'),
-    persistedFloor: () => storage.getRevisionFloor(),
     async verifyRemovalPersistence() {
       const cache = new IndexedDBStorage('pyre-removal-proof', { notes: 'noteKey' });
       const id = '00000000-0000-7000-8000-000000000003';

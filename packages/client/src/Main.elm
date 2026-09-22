@@ -348,10 +348,13 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    -- A new subscription cannot prove that removals were delivered
-                    -- while disconnected (including the initial catchup/connect gap).
-                    -- Keep the subscription open while rebuilding from empty authority.
-                    recoverLiveContinuity messageEpoch model
+                    if liveEpochMismatch model messageEpoch then
+                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.authoritativeDb) model
+
+                    else
+                        -- Reconnecting within an epoch preserves readers and pending
+                        -- writes. Missed-removal recovery is a separate sync concern.
+                        ( model, Cmd.none )
 
         LiveSync.LiveSyncError error ->
             ( { model | syncError = Just error }
@@ -419,27 +422,6 @@ liveEpochMismatch model messageEpoch =
 
         _ ->
             False
-
-
-recoverLiveContinuity : Maybe String -> Model -> ( Model, Cmd Msg )
-recoverLiveContinuity messageEpoch model =
-    case messageEpoch of
-        Nothing ->
-            ( model, Data.Error.sendError "Live sync connected message missing databaseEpoch" )
-
-        Just epoch ->
-            let
-                floor =
-                    if liveEpochMismatch model messageEpoch then
-                        0
-
-                    else
-                        Maybe.withDefault 0 model.lastAppliedServerRevision
-
-                ( resetModel, cmd ) =
-                    applyCatchupUpdate (Catchup.update (Catchup.Invalidate epoch floor) model.catchup model.authoritativeDb) model
-            in
-            ( { resetModel | revisionFloor = Just floor, lastAppliedServerRevision = Just floor, awaitingRecoverySnapshot = True }, cmd )
 
 
 validateLiveSyncDatabaseId : Model -> Maybe String -> String -> Maybe String

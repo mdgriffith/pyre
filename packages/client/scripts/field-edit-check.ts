@@ -13,6 +13,14 @@ try {
   const b = await bContext.newPage();
   for (const [page, name] of [[a, 'a'], [b, 'b']] as const) {
     page.on('pageerror', console.error);
+    const wait = page.waitForFunction.bind(page);
+    page.waitForFunction = async (...args) => {
+      try { return await wait(...args); }
+      catch (error) {
+        console.error('Wait failed', name, String(args[0]), await page.evaluate('window.proof && { rows: proof.rows, connected: proof.connected, results: proof.results }'));
+        throw error;
+      }
+    };
     await page.goto(`${url}/${name}`);
     try {
       await page.waitForFunction('window.proof?.rows?.length === 2 && proof.connected');
@@ -89,27 +97,31 @@ try {
   assert.equal(await b.evaluate('proof.rows[0].noteKey'), '00000000-0000-7000-8000-000000000002');
   assert.deepEqual(await b.evaluate('(async () => (await proof.late())[0].changes.map(c => c.id))()'), ['00000000-0000-7000-8000-000000000002']);
 
-  // Miss both kinds of removal while disconnected, then recover in the same
-  // worker and again from persisted state. No server removal log is available.
+  // A normal reconnect must not empty query/entity readers or reload the cache.
+  // Recovery of removals missed while offline is tracked separately.
   await a.evaluate("proof.edit('visible')");
   await b.waitForFunction('proof.connected && proof.rows.length === 2');
   await b.waitForFunction('async () => (await proof.persisted()).length === 2');
-  const beforeReconnectFloor = await b.evaluate('proof.persistedFloor()');
+  const beforeReconnect = await (await a.request.get(`${url}/stats`)).json();
+  const beforeRows = await b.evaluate('proof.rows');
+  await b.evaluate('proof.rowHistory.length = 0; proof.batches.length = 0');
   await bContext.setOffline(true);
   await a.request.get(`${url}/disconnect-b`);
-  await a.evaluate("proof.edit('hidden')");
-  await a.waitForFunction("proof.rows[0].title === 'HIDDEN'");
-  await a.evaluate("proof.remove('00000000-0000-7000-8000-000000000002')");
-  await a.waitForFunction('proof.rows.length === 1');
-  assert.equal(await b.evaluate('proof.rows.length'), 2);
+  assert.deepEqual(await b.evaluate('proof.rows'), beforeRows);
   await bContext.setOffline(false);
-  await b.waitForFunction('proof.connected && proof.rows.length === 0');
-  await b.waitForFunction('async () => (await proof.persisted()).length === 0');
-  const recoveredFloor = await b.evaluate('proof.persistedFloor()');
-  assert(recoveredFloor > beforeReconnectFloor);
-  await b.reload();
-  await b.waitForFunction('window.proof?.connected && proof.rows.length === 0');
-  assert.deepEqual(await b.evaluate('proof.persisted()'), []);
-  assert.equal(await b.evaluate('proof.persistedFloor()'), recoveredFloor);
-  console.log('PASS: two native clients, atomic submission/rollback, incremental authority, held-response safety, missed deletion/permission removal recovery, persistence and reload');
+  const reconnectDeadline = Date.now() + 30000;
+  while (true) {
+    const stats = await (await a.request.get(`${url}/stats`)).json();
+    if (stats.handshakes > beforeReconnect.handshakes && stats.connections.includes('b')) break;
+    assert(Date.now() < reconnectDeadline, 'Reader must re-establish its SSE connection');
+    await Bun.sleep(50);
+  }
+  await a.evaluate("proof.edit('after reconnect')");
+  await a.waitForFunction("proof.rows[0].title === 'AFTER RECONNECT'");
+  await b.waitForFunction("proof.rows[0].title === 'AFTER RECONNECT'");
+  assert(await b.evaluate('proof.rowHistory.every(rows => rows.length === 2)'));
+  assert(await b.evaluate("proof.batches.every(batch => batch.changes.every(change => change.op !== 'remove'))"));
+  assert.equal((await (await a.request.get(`${url}/stats`)).json()).catchup, beforeReconnect.catchup);
+  await b.waitForFunction("async () => (await proof.persisted())[0].title === 'AFTER RECONNECT'");
+  console.log('PASS: two native clients, atomic submission/rollback, incremental authority, held-response safety, reconnect reader continuity, persistence and reload');
 } finally { await browser.close(); }

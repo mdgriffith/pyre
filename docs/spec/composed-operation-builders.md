@@ -184,22 +184,25 @@ write; this also recovers deletions missed with the response. Ordinary updates
 and removals stay incremental. Permission-evaluation failure or an oversized
 removal batch uses exceptional invalidation.
 
-Live connection establishment (including reconnection and the initial
-catchup-to-subscription gap) also uses fenced invalidation and a full authorized
-reload. The server does not retain a removal replay log, so an incremental catchup
-cannot prove that cached identities are still visible after a delivery gap.
-The worker keeps the new subscription open during recovery, buffers live/HTTP
-authority until the first snapshot revision is known, and persists that revision
-as a lower bound against stale resurrection. Later pages do not advance this
-bound: valid delayed updates may fall between page revisions. Normal connected
-mutations still use incremental rows/removals without catchup.
+Ordinary live handshakes within the same database epoch preserve cached rows,
+visible query/entity state and pending requests. They do not trigger a destructive
+reload or turn otherwise valid pending write responses into unknown outcomes.
+Connected mutations continue to deliver incremental rows/removals.
 
-This recovery temporarily clears cached query/entity state. Pending requests
-crossing the reset report an unknown outcome when they complete and are never
-automatically replayed. Direct catchup consumers must likewise rebuild from empty
-authority when live-delivery continuity is lost; merging a catchup page into an
-old cache cannot recover missed deletions or permission revocations. A future
-durable removal-log/replay protocol could avoid these reconnect reloads.
+Recovery of deletions or permission removals missed while disconnected, including
+the initial catchup-to-subscription gap, is separate work tracked in
+[MEC-157](https://linear.app/mechanical-elephant/issue/MEC-157/recover-missed-sync-removals-without-clearing-readers-on-reconnect).
+The server does not retain a removal replay log: merging incremental catchup into
+an old cache cannot prove that omitted identities remain visible. This PR does not
+solve that delivery-gap limitation. The follow-up must preserve readers during
+same-session recovery rather than emptying lists on every reconnect.
+
+Explicit invalidation, database-epoch changes and genuinely unknown write outcomes
+retain exceptional reset/recovery behavior. A reset clears readers and fences
+pre-reset responses; authority is buffered until the first recovery snapshot
+revision, and that baseline is persisted against stale resurrection. Pending writes
+are never automatically replayed. These exceptional paths are distinct from an
+ordinary reconnect.
 
 Callers may ignore returned success values, but should handle rejected promises
 and `ok: false` completions. The client emits mutation failure events even for

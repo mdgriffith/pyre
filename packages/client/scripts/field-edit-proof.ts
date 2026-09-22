@@ -71,7 +71,7 @@ const bundle = await Bun.build({ entrypoints: [new URL('./field-edit-browser.ts'
 if (!bundle.success) throw new Error(bundle.logs.join('\n'));
 const script = await bundle.outputs[0].text();
 const streams = new Map<string, ReadableStreamDefaultController>();
-const counts = { catchup: 0, delta: 0, invalidation: 0, mutations: 0 };
+const counts = { catchup: 0, delta: 0, invalidation: 0, mutations: 0, handshakes: 0 };
 const sessions = new Map([['a', { session: { admin: true } }], ['b', { session: { admin: false } }]]);
 let release: (() => void) | undefined;
 let held = false;
@@ -96,15 +96,18 @@ const server = Bun.serve({ port: 0, idleTimeout: 0, async fetch(request) {
       return Response.json(await catchup(db, body.syncCursor, session, 100, 'proof', body.databaseEpoch));
     }
     if (endpoint === 'events') {
+      counts.handshakes++;
+      let current: ReadableStreamDefaultController;
       return new Response(new ReadableStream({ start(controller) {
+        current = controller;
         streams.set(who, controller);
         void db.execute('select database_epoch from _pyre_sync').then((result) => send(who, { type: 'connected', connectionId: who, databaseId: 'proof', databaseEpoch: result.rows[0].database_epoch }));
-      }, cancel() { streams.delete(who); } }), { headers: { 'content-type': 'text/event-stream' } });
+      }, cancel() { if (streams.get(who) === current) streams.delete(who); } }), { headers: { 'content-type': 'text/event-stream' } });
     }
     counts.mutations++;
     const input = await request.json();
     if (input.title === 'reject') return Response.json({ error: 'Rejected' }, { status: 403 });
-    const result = await runWithSync(db, { ...queries, remove: removal }, Array.isArray(input) ? input : url.pathname.endsWith('/remove') ? 'remove' : 'edit', input, session, sessions, 'proof', who);
+    const result = await runWithSync(db, queries, Array.isArray(input) ? input : 'edit', input, session, sessions, 'proof', who);
     if (result.kind === 'error') return Response.json(result.error, { status: 400 });
     await result.sync(send);
     if (input.title === 'hold') { held = true; await new Promise<void>((resolve) => { release = resolve; }); held = false; }

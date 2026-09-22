@@ -349,13 +349,42 @@ test('unknown commit outcomes clear stale rows and recover without replaying the
   });
 });
 
-test('a live handshake recovers missed removals, fences held writes and persists the snapshot floor', async () => {
+test('same-epoch live handshakes preserve readers, cached authority and pending write settlement', async () => {
+  await harness(async ({ client, requests, setCatchupResponse }) => {
+    const a = await client();
+    await a.rows();
+    await a.edit('held-before-reconnect', 'Pending');
+    const expected = [{ ...initial[0], title: 'Pending' }, initial[1]];
+    const events = [];
+    a.entities.subscribe({ tables: [{ tableName: 'notes' }] }, event => events.push(event));
+    const beforeWrites = a.writes.length;
+    const beforeVisible = a.visible.length;
+    let catchups = 0;
+    setCatchupResponse(() => { catchups++; });
+    for (const connectionId of ['initial', 'reconnect']) {
+      a.app.ports.receiveSSEMessage.send({ type: 'connected', databaseId: 'test', databaseEpoch: 'epoch-1', connectionId });
+      await turn(); await turn();
+      expect(await a.rows()).toEqual(expected);
+    }
+    expect(events).toEqual([]);
+    expect(a.visible).toHaveLength(beforeVisible);
+    expect(a.writes).toHaveLength(beforeWrites);
+    expect(catchups).toBe(0);
+    requests[0].complete(envelope(4, [[one, 'Committed', 'Initial']]));
+    await turn(); await turn();
+    expect(a.results.at(-1).result.ok).toBe(true);
+    expect((await a.rows())[0].title).toBe('Committed');
+    expect(requests).toHaveLength(1);
+  });
+});
+
+test('explicit invalidation fences held writes and persists the recovery snapshot floor', async () => {
   await harness(async ({ client, requests, setCatchupResponse }) => {
     const a = await client();
     await a.edit('held-before-reconnect', 'Pending');
     setCatchupResponse({ databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 5, has_more: false,
       tables: { notes: { rows: [initial[1]], permission_hash: '', last_seen_updated_at: null } } });
-    a.app.ports.receiveSSEMessage.send({ type: 'connected', databaseId: 'test', databaseEpoch: 'epoch-1', connectionId: 'new' });
+    a.app.ports.receiveSSEMessage.send({ type: 'invalidate', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 3 });
     await turn();
     expect(await a.rows()).toEqual([]);
     a.app.ports.receiveIndexedDbMessage.send({ type: 'databaseEpochResetCompleted', databaseEpoch: 'epoch-1' });
@@ -375,7 +404,7 @@ test('recovery buffers live authority until the first snapshot and does not adva
     const a = await client();
     const pages = [];
     setCatchupResponse(complete => pages.push(complete));
-    a.app.ports.receiveSSEMessage.send({ type: 'connected', databaseId: 'test', databaseEpoch: 'epoch-1', connectionId: 'new' });
+    a.app.ports.receiveSSEMessage.send({ type: 'invalidate', databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 3 });
     await turn();
     a.app.ports.receiveIndexedDbMessage.send({ type: 'databaseEpochResetCompleted', databaseEpoch: 'epoch-1' });
     await turn(); await turn();
