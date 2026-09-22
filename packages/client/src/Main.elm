@@ -59,6 +59,8 @@ type alias Model =
     , generation : Int
     , rowRevisions : Dict ( String, String ) Int
     , revisionFloor : Maybe Int
+    , awaitingRecoverySnapshot : Bool
+    , deferredAuthority : List ( Maybe Int, Data.Delta.Delta )
     }
 
 
@@ -129,6 +131,8 @@ init flags =
       , generation = 0
       , rowRevisions = Dict.empty
       , revisionFloor = Nothing
+      , awaitingRecoverySnapshot = False
+      , deferredAuthority = []
       }
     , Cmd.batch
         [ if flags.sync.autoStart then
@@ -323,7 +327,7 @@ handleLiveSyncIncoming incoming model =
                     else
                         let
                             ( authoritativeModel, dbCmds ) =
-                                applyAuthoritativeDelta serverRevision delta model
+                                receiveAuthoritativeDelta serverRevision delta model
 
                             ( updatedModel, visibleCmds ) =
                                 publishVisible "live" authoritativeModel
@@ -344,11 +348,10 @@ handleLiveSyncIncoming incoming model =
                     )
 
                 Nothing ->
-                    if liveEpochMismatch model messageEpoch then
-                        applyCatchupUpdate (Catchup.update Catchup.CatchupRequired model.catchup model.authoritativeDb) model
-
-                    else
-                        ( model, Cmd.none )
+                    -- A new subscription cannot prove that removals were delivered
+                    -- while disconnected (including the initial catchup/connect gap).
+                    -- Keep the subscription open while rebuilding from empty authority.
+                    recoverLiveContinuity messageEpoch model
 
         LiveSync.LiveSyncError error ->
             ( { model | syncError = Just error }
@@ -416,6 +419,27 @@ liveEpochMismatch model messageEpoch =
 
         _ ->
             False
+
+
+recoverLiveContinuity : Maybe String -> Model -> ( Model, Cmd Msg )
+recoverLiveContinuity messageEpoch model =
+    case messageEpoch of
+        Nothing ->
+            ( model, Data.Error.sendError "Live sync connected message missing databaseEpoch" )
+
+        Just epoch ->
+            let
+                floor =
+                    if liveEpochMismatch model messageEpoch then
+                        0
+
+                    else
+                        Maybe.withDefault 0 model.lastAppliedServerRevision
+
+                ( resetModel, cmd ) =
+                    applyCatchupUpdate (Catchup.update (Catchup.Invalidate epoch floor) model.catchup model.authoritativeDb) model
+            in
+            ( { resetModel | revisionFloor = Just floor, lastAppliedServerRevision = Just floor, awaitingRecoverySnapshot = True }, cmd )
 
 
 validateLiveSyncDatabaseId : Model -> Maybe String -> String -> Maybe String
@@ -808,7 +832,11 @@ settleSuccessfulMutationWithEnvelope requestId mutationId response serverRevisio
                 Just syncMessage ->
                     case syncMessage.delta of
                         Just delta ->
-                            applyAuthoritativeDelta serverRevision delta model
+                            if model.revisionFloor /= Nothing && (serverRevision == Nothing || isStaleServerRevision serverRevision model.revisionFloor) then
+                                ( model, [] )
+
+                            else
+                                receiveAuthoritativeDelta serverRevision delta model
 
                         Nothing ->
                             ( model, [] )
@@ -908,6 +936,18 @@ applyAuthoritativeDelta revision delta model =
       }
     , [ IndexedDb.writeAuthoritativeDelta revision accepted.tableGroups ]
     )
+
+
+receiveAuthoritativeDelta : Maybe Int -> Data.Delta.Delta -> Model -> ( Model, List (Cmd Msg) )
+receiveAuthoritativeDelta revision delta model =
+    if model.awaitingRecoverySnapshot then
+        -- The first snapshot supplies the lower bound for the entire rebuild.
+        -- Buffer newer live/HTTP authority until that bound is known, rather than
+        -- installing an old upsert for an identity omitted by the snapshot.
+        ( { model | deferredAuthority = ( revision, delta ) :: model.deferredAuthority }, [] )
+
+    else
+        applyAuthoritativeDelta revision delta model
 
 
 replayOptimisticMutations : Model -> Db.Db -> ( Db.Db, List (Cmd Db.Msg) )
@@ -1308,6 +1348,13 @@ uniqueStrings values =
 applyCatchupUpdate : Catchup.UpdateResult -> Model -> ( Model, Cmd Msg )
 applyCatchupUpdate result model =
     let
+        recoveryRevision =
+            if model.awaitingRecoverySnapshot && not result.destructiveReset && result.error == Nothing then
+                result.serverRevision
+
+            else
+                Nothing
+
         nextSyncStatus =
             syncStatusFromCatchup result.model
 
@@ -1322,13 +1369,34 @@ applyCatchupUpdate result model =
                 SyncState.Live ->
                     SyncState.markAllTablesLive model.tableSyncStatuses
 
-        ( reconciledModel, authoritativeCmds ) =
+        ( snapshotModel, snapshotCmds ) =
             case result.delta of
                 Just delta ->
                     applyAuthoritativeDelta result.serverRevision delta model
 
                 Nothing ->
                     ( { model | authoritativeDb = result.db }, [] )
+
+        ( reconciledModel, authoritativeCmds ) =
+            case recoveryRevision of
+                Nothing ->
+                    ( snapshotModel, snapshotCmds )
+
+                Just baseline ->
+                    List.foldl
+                        (\( revision, delta ) ( current, commands ) ->
+                            if revision == Nothing || isStaleServerRevision revision (Just baseline) then
+                                ( current, commands )
+
+                            else
+                                let
+                                    ( next, writes ) =
+                                        applyAuthoritativeDelta revision delta current
+                                in
+                                ( next, commands ++ writes )
+                        )
+                        ( snapshotModel, snapshotCmds )
+                        (List.reverse model.deferredAuthority)
 
         ( replayedDb, replayDbCmds ) =
             if result.destructiveReset then
@@ -1359,7 +1427,19 @@ applyCatchupUpdate result model =
                         Nothing
 
                     else
-                        model.revisionFloor
+                        updateLastAppliedServerRevision recoveryRevision model.revisionFloor
+                , awaitingRecoverySnapshot =
+                    if result.destructiveReset then
+                        True
+
+                    else
+                        model.awaitingRecoverySnapshot && recoveryRevision == Nothing
+                , deferredAuthority =
+                    if result.destructiveReset || recoveryRevision /= Nothing then
+                        []
+
+                    else
+                        model.deferredAuthority
                 , syncStatus = nextSyncStatus
                 , tableSyncStatuses = nextTableSyncStatuses
                 , lastAppliedServerRevision =
@@ -1367,7 +1447,7 @@ applyCatchupUpdate result model =
                         Nothing
 
                     else
-                        updateLastAppliedServerRevision result.serverRevision model.lastAppliedServerRevision
+                        updateLastAppliedServerRevision result.serverRevision reconciledModel.lastAppliedServerRevision
                 , inFlightOptimistic =
                     if result.destructiveReset then
                         Dict.empty
@@ -1397,7 +1477,7 @@ applyCatchupUpdate result model =
             startLiveSyncIfReady updatedModel
 
         ( updatedQueryManager, triggerCmds ) =
-            if result.destructiveReset then
+            if result.destructiveReset || recoveryRevision /= Nothing then
                 reExecuteAllQueries model.schema replayedDb model.queryManager
 
             else
@@ -1434,6 +1514,7 @@ applyCatchupUpdate result model =
 
         cmds =
             [ Cmd.map CatchupMsg result.cmd
+            , recoveryRevision |> Maybe.map IndexedDb.writeRevisionFloor |> Maybe.withDefault Cmd.none
             , emitVisibleState "catchup" replayedDb (Maybe.withDefault { tableGroups = [] } result.delta)
             , errorCmd
             , Cmd.batch triggerCmds

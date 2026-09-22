@@ -31,6 +31,9 @@ Object.assign(window, {
         queryField: 'notes', where: { field: 'noteKey', input: 'id' }, set: [{ field: 'title', input: 'title' }],
       } }, { id: '00000000-0000-7000-8000-000000000001', title }, (result) => results.push(result));
     },
+    remove(id: string) {
+      return client.run('proof', { operation: 'delete', id: 'remove' }, { id, title: '' }, result => results.push(result));
+    },
     async late() {
       const received: any[] = [];
       const off = await client.onEntityChanges('proof', { tables: [{ tableName: 'notes' }] }, (batch) => received.push(batch));
@@ -38,6 +41,7 @@ Object.assign(window, {
       return received;
     },
     persisted: () => storage.getAllRows('notes'),
+    persistedFloor: () => storage.getRevisionFloor(),
     async verifyRemovalPersistence() {
       const cache = new IndexedDBStorage('pyre-removal-proof', { notes: 'noteKey' });
       const id = '00000000-0000-7000-8000-000000000003';

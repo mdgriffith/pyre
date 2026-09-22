@@ -87,6 +87,7 @@ const server = Bun.serve({ port: 0, idleTimeout: 0, async fetch(request) {
     if (who === 'bundle.js') return new Response(script, { headers: { 'content-type': 'text/javascript' } });
     if (who === 'stats') return Response.json({ ...counts, held, connections: [...streams.keys()] });
     if (who === 'release') { release?.(); release = undefined; return new Response('ok'); }
+    if (who === 'disconnect-b') { streams.get('b')?.close(); streams.delete('b'); return new Response('ok'); }
     if (!endpoint) return new Response('<script type="module" src="/bundle.js"></script>', { headers: { 'content-type': 'text/html' } });
     const session = sessions.get(who)!.session;
     if (endpoint === 'sync') {
@@ -103,7 +104,7 @@ const server = Bun.serve({ port: 0, idleTimeout: 0, async fetch(request) {
     counts.mutations++;
     const input = await request.json();
     if (input.title === 'reject') return Response.json({ error: 'Rejected' }, { status: 403 });
-    const result = await runWithSync(db, queries, Array.isArray(input) ? input : 'edit', input, session, sessions, 'proof', who);
+    const result = await runWithSync(db, { ...queries, remove: removal }, Array.isArray(input) ? input : url.pathname.endsWith('/remove') ? 'remove' : 'edit', input, session, sessions, 'proof', who);
     if (result.kind === 'error') return Response.json(result.error, { status: 400 });
     await result.sync(send);
     if (input.title === 'hold') { held = true; await new Promise<void>((resolve) => { release = resolve; }); held = false; }

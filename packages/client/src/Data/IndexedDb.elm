@@ -10,6 +10,7 @@ port module Data.IndexedDb exposing
     , writeDatabaseEpoch
     , writeDelta
     , writeDeltaWithEntityNotification
+    , writeRevisionFloor
     , writeServerRevision
     , writeSyncCursor
     )
@@ -196,6 +197,16 @@ writeAuthoritativeDelta revision groups =
             [ ( "type", Encode.string "writeDelta" )
             , ( "tableGroups", Encode.list Data.Delta.encodeTableGroup groups )
             , ( "serverRevision", Maybe.map Encode.int revision |> Maybe.withDefault Encode.null )
+            ]
+        )
+
+
+writeRevisionFloor : Int -> Cmd msg
+writeRevisionFloor revision =
+    indexedDbOut
+        (Encode.object
+            [ ( "type", Encode.string "writeRevisionFloor" )
+            , ( "revisionFloor", Encode.int revision )
             ]
         )
 

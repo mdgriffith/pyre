@@ -312,6 +312,19 @@ export class IndexedDBStorage {
     });
   }
 
+  async putRevisionFloor(revision: number): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['meta'], 'readwrite');
+      const meta = tx.objectStore('meta');
+      const request = meta.get('revisionFloor');
+      request.onsuccess = () => meta.put(Math.max(request.result ?? 0, revision), 'revisionFloor');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('Revision floor write aborted'));
+    });
+  }
+
   async putServerRevision(serverRevision: number): Promise<void> {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
@@ -529,6 +542,11 @@ export class IndexedDbService {
 
     if (message.type === 'writeServerRevision' && typeof message.serverRevision === 'number') {
       await this.writeServerRevision(message.serverRevision);
+      return;
+    }
+
+    if (message.type === 'writeRevisionFloor' && typeof message.revisionFloor === 'number') {
+      await this.storage.putRevisionFloor(message.revisionFloor);
       return;
     }
 

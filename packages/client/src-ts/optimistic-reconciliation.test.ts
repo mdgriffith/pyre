@@ -42,7 +42,7 @@ async function harness(run, key = 'id') {
         (this.listeners.load ?? []).forEach((callback) => callback());
       };
       if (this.responseURL.endsWith('/sync')) {
-        queueMicrotask(() => complete(catchupResponse));
+        queueMicrotask(() => typeof catchupResponse === 'function' ? catchupResponse(complete) : complete(catchupResponse));
       } else {
         requests.push({ input: JSON.parse(body), complete });
       }
@@ -346,6 +346,51 @@ test('unknown commit outcomes clear stale rows and recover without replaying the
     await turn(); await turn();
     expect(await a.rows()).toEqual([initial[1]]);
     expect(requests).toHaveLength(1);
+  });
+});
+
+test('a live handshake recovers missed removals, fences held writes and persists the snapshot floor', async () => {
+  await harness(async ({ client, requests, setCatchupResponse }) => {
+    const a = await client();
+    await a.edit('held-before-reconnect', 'Pending');
+    setCatchupResponse({ databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 5, has_more: false,
+      tables: { notes: { rows: [initial[1]], permission_hash: '', last_seen_updated_at: null } } });
+    a.app.ports.receiveSSEMessage.send({ type: 'connected', databaseId: 'test', databaseEpoch: 'epoch-1', connectionId: 'new' });
+    await turn();
+    expect(await a.rows()).toEqual([]);
+    a.app.ports.receiveIndexedDbMessage.send({ type: 'databaseEpochResetCompleted', databaseEpoch: 'epoch-1' });
+    await turn(); await turn();
+    expect(await a.rows()).toEqual([initial[1]]);
+    requests[0].complete(envelope(4, [[one, 'Old committed row', 'Secret']]));
+    await a.live(4, [[one, 'Delayed live row', 'Secret']]);
+    expect(await a.rows()).toEqual([initial[1]]);
+    expect(a.results.at(-1).result.error).toContain('outcome unknown');
+    expect(a.writes.some(message => message.type === 'writeRevisionFloor' && message.revisionFloor === 5)).toBe(true);
+    expect(requests).toHaveLength(1);
+  });
+});
+
+test('recovery buffers live authority until the first snapshot and does not advance its floor on later pages', async () => {
+  await harness(async ({ client, setCatchupResponse }) => {
+    const a = await client();
+    const pages = [];
+    setCatchupResponse(complete => pages.push(complete));
+    a.app.ports.receiveSSEMessage.send({ type: 'connected', databaseId: 'test', databaseEpoch: 'epoch-1', connectionId: 'new' });
+    await turn();
+    a.app.ports.receiveIndexedDbMessage.send({ type: 'databaseEpochResetCompleted', databaseEpoch: 'epoch-1' });
+    await turn(); await turn();
+    await a.live(4, [[one, 'Removed before snapshot', 'Secret']]);
+    await a.live(6, [[two, 'After snapshot', 'Current']]);
+    expect(await a.rows()).toEqual([]);
+    pages.shift()({ databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 5, has_more: true,
+      tables: { notes: { rows: [initial[1]], permission_hash: '', last_seen_updated_at: null } } });
+    await turn(); await turn();
+    expect((await a.rows()).map(row => row.title)).toEqual(['After snapshot']);
+    pages.shift()({ databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 8, has_more: false, tables: {} });
+    await turn(); await turn();
+    await a.live(7, [[two, 'Valid delayed post-snapshot update', 'Current']]);
+    expect((await a.rows()).map(row => row.title)).toEqual(['Valid delayed post-snapshot update']);
+    expect(a.writes.filter(message => message.type === 'writeRevisionFloor').map(message => message.revisionFloor)).toEqual([5]);
   });
 });
 

@@ -9,7 +9,8 @@ const browser = await chromium.launch({ headless: true });
 try {
   const context = await browser.newContext();
   const a = await context.newPage();
-  const b = await context.newPage();
+  const bContext = await browser.newContext();
+  const b = await bContext.newPage();
   for (const [page, name] of [[a, 'a'], [b, 'b']] as const) {
     page.on('pageerror', console.error);
     await page.goto(`${url}/${name}`);
@@ -87,5 +88,28 @@ try {
   await b.waitForFunction('window.proof?.connected && proof.rows?.length === 1');
   assert.equal(await b.evaluate('proof.rows[0].noteKey'), '00000000-0000-7000-8000-000000000002');
   assert.deepEqual(await b.evaluate('(async () => (await proof.late())[0].changes.map(c => c.id))()'), ['00000000-0000-7000-8000-000000000002']);
-  console.log('PASS: two native clients, atomic repeated/multi-row submission and rollback, incremental HTTP/SSE, normalization, rejection, late readers, permission removal, held-response IndexedDB safety and reload');
+
+  // Miss both kinds of removal while disconnected, then recover in the same
+  // worker and again from persisted state. No server removal log is available.
+  await a.evaluate("proof.edit('visible')");
+  await b.waitForFunction('proof.connected && proof.rows.length === 2');
+  await b.waitForFunction('async () => (await proof.persisted()).length === 2');
+  const beforeReconnectFloor = await b.evaluate('proof.persistedFloor()');
+  await bContext.setOffline(true);
+  await a.request.get(`${url}/disconnect-b`);
+  await a.evaluate("proof.edit('hidden')");
+  await a.waitForFunction("proof.rows[0].title === 'HIDDEN'");
+  await a.evaluate("proof.remove('00000000-0000-7000-8000-000000000002')");
+  await a.waitForFunction('proof.rows.length === 1');
+  assert.equal(await b.evaluate('proof.rows.length'), 2);
+  await bContext.setOffline(false);
+  await b.waitForFunction('proof.connected && proof.rows.length === 0');
+  await b.waitForFunction('async () => (await proof.persisted()).length === 0');
+  const recoveredFloor = await b.evaluate('proof.persistedFloor()');
+  assert(recoveredFloor > beforeReconnectFloor);
+  await b.reload();
+  await b.waitForFunction('window.proof?.connected && proof.rows.length === 0');
+  assert.deepEqual(await b.evaluate('proof.persisted()'), []);
+  assert.equal(await b.evaluate('proof.persistedFloor()'), recoveredFloor);
+  console.log('PASS: two native clients, atomic submission/rollback, incremental authority, held-response safety, missed deletion/permission removal recovery, persistence and reload');
 } finally { await browser.close(); }
