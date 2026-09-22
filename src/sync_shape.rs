@@ -165,10 +165,30 @@ fn reshape_table_group(
         .iter()
         .any(|header| header == "_pyre_removed")
     {
-        if let Some(id_index) = table_group.headers.iter().position(|header| header == "id") {
+        let primary = context
+            .tables
+            .values()
+            .find(|table| {
+                ast::get_tablename(&table.record.name, &table.record.fields)
+                    == table_group.table_name
+            })
+            .and_then(|table| {
+                ast::collect_columns(&table.record.fields)
+                    .into_iter()
+                    .find(|column| ast::is_primary_key(column))
+            })
+            .map(|column| column.name.clone());
+        if let Some(id_index) = table_group
+            .headers
+            .iter()
+            .position(|header| Some(header) == primary.as_ref())
+        {
             return AffectedRowTableGroup {
                 table_name: table_group.table_name.clone(),
-                headers: vec!["id".into(), "_pyre_removed".into()],
+                headers: vec![
+                    table_group.headers[id_index].clone(),
+                    "_pyre_removed".into(),
+                ],
                 rows: table_group
                     .rows
                     .iter()

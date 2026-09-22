@@ -68,7 +68,7 @@ function syncWithWasmForDatabase(databaseId?: DatabaseId): SyncDeltasFn {
       const message = countRows(data) > MAX_LIVE_SYNC_DELTA_ROWS
         || sessions.size > MAX_LIVE_SYNC_FANOUT_RECIPIENTS
         || new TextEncoder().encode(JSON.stringify(delta)).byteLength > MAX_LIVE_SYNC_DELTA_PAYLOAD_BYTES
-        ? { type: "syncRequired", ...stamp } : delta;
+        ? { type: removals.length > 0 ? "invalidate" : "syncRequired", ...stamp } : delta;
       if (id === originSessionId) originMessage = message;
       else sendToSession(id, message);
     }

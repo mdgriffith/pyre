@@ -226,7 +226,11 @@ update msg model =
                         settleSuccessfulMutation requestId mutationId response model
 
                     Err error ->
-                        rollbackOptimisticMutation requestId mutationId (httpErrorToString error) model
+                        if uncertainMutationOutcome error then
+                            recoverUnknownMutation requestId mutationId model
+
+                        else
+                            rollbackOptimisticMutation requestId mutationId (httpErrorToString error) model
 
         Error errorMessage ->
             ( model
@@ -465,7 +469,11 @@ handleQueryManagerIncoming incoming model =
                                         Err Http.NetworkError
 
                                     Http.BadStatus_ metadata body ->
-                                        Err (Http.BadStatus metadata.statusCode)
+                                        if Decode.decodeString (Decode.field "errorType" Decode.string) body == Ok "OutcomeUnknown" then
+                                            Err (Http.BadBody "Commit outcome unknown")
+
+                                        else
+                                            Err (Http.BadStatus metadata.statusCode)
 
                                     Http.GoodStatus_ _ body ->
                                         case Decode.decodeString Decode.value body of
@@ -703,6 +711,38 @@ applyOptimisticMutation requestId operations model =
                 | inFlightOptimistic = Dict.insert requestId { intents = List.reverse captured, acknowledgedServerRevision = Nothing } model.inFlightOptimistic
                 , optimisticOrder = appendUnique requestId model.optimisticOrder
             }
+
+
+uncertainMutationOutcome : Http.Error -> Bool
+uncertainMutationOutcome error =
+    case error of
+        Http.BadUrl _ ->
+            False
+
+        Http.BadStatus status ->
+            status >= 500
+
+        _ ->
+            True
+
+
+recoverUnknownMutation : String -> String -> Model -> ( Model, Cmd Msg )
+recoverUnknownMutation requestId mutationId model =
+    let
+        ( rolledBack, resultCmd ) =
+            rollbackOptimisticMutation requestId mutationId "Mutation outcome unknown; do not automatically replay" model
+
+        ( recovered, recoveryCmd ) =
+            case Catchup.databaseEpoch model.catchup of
+                Just epoch ->
+                    applyCatchupUpdate
+                        (Catchup.update (Catchup.Invalidate epoch (Maybe.withDefault 0 model.lastAppliedServerRevision)) rolledBack.catchup rolledBack.authoritativeDb)
+                        rolledBack
+
+                Nothing ->
+                    ( rolledBack, Cmd.none )
+    in
+    ( { recovered | revisionFloor = model.lastAppliedServerRevision }, Cmd.batch [ resultCmd, recoveryCmd ] )
 
 
 rollbackOptimisticMutation : String -> String -> String -> Model -> ( Model, Cmd Msg )

@@ -41,11 +41,11 @@ initial IndexedDB / paged catchup ────────────▲
 - Ordinary visible field updates send affected rows, not a replacement scope.
   The origin receives authority in its HTTP response even without an SSE origin
   connection. Fanout is idempotent for a returned execution result.
-- If permission filtering omits affected rows, the server cannot safely infer
-  which omitted identities a recipient previously knew. It sends an
-  identity-free `invalidate` message instead. That recipient clears its cache,
-  advances its generation, and catches up from an empty cursor. Permission
-  evaluation failures also invalidate. Payload/fanout caps use ordinary catchup.
+- Transaction-start preimages and final rows authorize incremental removals.
+  Intermediate permission grants cannot reveal identities. Permission evaluation
+  failures and oversized removal deliveries use identity-free `invalidate`:
+  clear the cache, advance generation, and catch up from an empty cursor.
+  Row-only payload/fanout caps can use ordinary catchup.
 - Mutation and catchup responses captured before invalidation cannot restore
   state. Live deltas are fenced during reset. The invalidation revision floor
   survives reload, as do each row's revision stamps. IndexedDB commits row data
@@ -59,16 +59,15 @@ including initialization, late subscription snapshots, optimism, rejection,
 catchup, and reset. This local port currently carries a visible snapshot; network
 updates remain incremental. The projection does not reconcile mutations itself.
 
-Entity batches now include `{ op: 'remove', tableName, id, row: { id } }` when a
+Entity batches include `{ op: 'remove', tableName, id, row: { [primaryKey]: id } }` when a
 row leaves a subscription, including local filter exit or reset. Consumers must
 remove that identity. Regenerate Elm streams and handle `EntityRemoved table id`.
 Deploy the client support for `invalidate` with the server change; older clients
 cannot perform this permission-loss recovery.
 
-The proof now uses UUID identities throughout the existing worker and its
-persistence path. Ordered field batches use the same engine. Insert/delete
-prediction and a general incremental deletion protocol remain subsequent work
-in this feature PR.
+The proof uses a custom UUID key plus an ordinary `id` field throughout the
+existing worker and persistence path. Ordered batches, supported create/delete
+prediction and incremental removals share that engine.
 
 ## Composed server execution (MEC-108)
 
@@ -134,8 +133,8 @@ Predictions remain memory-only; only accepted authoritative rows are persisted.
 
 Generated record-specific builders, typed results, and compiler metadata are
 documented in `composed-operation-builders.md`, including the enforced synced
-UUID identity rule and migration guidance. CRUD removal delivery remains work in
-the same feature PR.
+UUID identity rule, custom-key support, runnable generated TS/Elm/seed integration
+examples and migration guidance.
 
 ## Reproduce the native proof
 

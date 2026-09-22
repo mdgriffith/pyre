@@ -172,7 +172,17 @@ executeQueryWithTracking schema db query =
             Dict.map (\_ ( rows, _ ) -> rows) resultsWithIds
 
         rowIds =
-            Dict.map (\_ ( _, ids ) -> ids) resultsWithIds
+            Dict.foldl
+                (\field ( _, ids ) accumulated ->
+                    case Dict.get field schema.queryFieldToTable of
+                        Just table ->
+                            Dict.update table (\previous -> Just (Set.union ids (Maybe.withDefault Set.empty previous))) accumulated
+
+                        Nothing ->
+                            accumulated
+                )
+                Dict.empty
+                resultsWithIds
     in
     { results = results
     , rowIds = rowIds

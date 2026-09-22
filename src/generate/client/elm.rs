@@ -3332,12 +3332,12 @@ fn generate_pyre_module(
         let field_name = string::decapitalize(name);
         if i == 0 {
             result.push_str(&format!(
-                " {} : Dict String (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
+                " {} : Dict ( String, String ) (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
                 field_name, name, name
             ));
         } else {
             result.push_str(&format!(
-                "    , {} : Dict String (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
+                "    , {} : Dict ( String, String ) (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
                 field_name, name, name
             ));
         }
@@ -3384,7 +3384,7 @@ fn generate_pyre_module(
     result.push_str("    = QueryUpdate Query\n");
     for name in query_names {
         result.push_str(&format!(
-            "    | {}_DataReceived QueryId Query.{}.QueryDelta\n",
+            "    | {}_DataReceived String QueryId Query.{}.QueryDelta\n",
             name, name
         ));
         let database_type = all_query_info
@@ -3404,7 +3404,7 @@ fn generate_pyre_module(
     result.push_str("type Effect\n");
     result.push_str("    = NoEffect\n");
     result.push_str("    | Send Encode.Value\n");
-    result.push_str("    | QueryUpdated QueryId\n");
+    result.push_str("    | QueryUpdated String QueryId\n");
     result.push_str("    | LogError Encode.Value\n\n\n");
 
     // Error type
@@ -3441,9 +3441,12 @@ fn generate_pyre_module(
         let field_name = string::decapitalize(name);
 
         // DataReceived
-        result.push_str(&format!("        {}_DataReceived queryId delta ->\n", name));
         result.push_str(&format!(
-            "            case Dict.get queryId model.{} of\n",
+            "        {}_DataReceived databaseId queryId delta ->\n",
+            name
+        ));
+        result.push_str(&format!(
+            "            case Dict.get ( databaseId, queryId ) model.{} of\n",
             field_name
         ));
         result.push_str("                Just queryModel ->\n");
@@ -3467,10 +3470,10 @@ fn generate_pyre_module(
         result.push_str("                                            rev\n");
         result.push_str("                            in\n");
         result.push_str(&format!(
-            "                            ( {{ model | {} = Dict.insert queryId {{ queryModel | result = newResult, revision = newRevision }} model.{} }}\n",
+            "                            ( {{ model | {} = Dict.insert ( databaseId, queryId ) {{ queryModel | result = newResult, revision = newRevision }} model.{} }}\n",
             field_name, field_name
         ));
-        result.push_str("                            , QueryUpdated queryId\n");
+        result.push_str("                            , QueryUpdated databaseId queryId\n");
         result.push_str("                            )\n\n");
         result.push_str("                        Err errMsg ->\n");
         result.push_str("                            ( model\n");
@@ -3485,7 +3488,7 @@ fn generate_pyre_module(
             name
         ));
         result.push_str(&format!(
-            "            ( {{ model | {} = Dict.remove queryId model.{} }}\n",
+            "            ( {{ model | {} = Dict.remove ( Db.Database.toString databaseId, queryId ) model.{} }}\n",
             field_name, field_name
         ));
         result.push_str("            , Send (encodeUnregister databaseId queryId)\n");
@@ -3511,17 +3514,20 @@ fn generate_pyre_module(
 
     result.push_str("incomingDeltaDecoder : Decode.Decoder Msg\n");
     result.push_str("incomingDeltaDecoder =\n");
-    result.push_str("    Decode.map2 Tuple.pair\n");
+    result.push_str(
+        "    Decode.map3 (\\source queryId databaseId -> ( source, queryId, databaseId ))\n",
+    );
     result.push_str("        (Decode.field \"queryName\" Decode.string)\n");
     result.push_str("        (Decode.field \"queryId\" Decode.string)\n");
+    result.push_str("        (Decode.field \"databaseId\" Decode.string)\n");
     result.push_str("        |> Decode.andThen\n");
-    result.push_str("            (\\( source, queryId ) ->\n");
+    result.push_str("            (\\( source, queryId, databaseId ) ->\n");
     result.push_str("                case source of\n");
 
     for name in query_names {
         result.push_str(&format!("                    \"{}\" ->\n", name));
         result.push_str(&format!(
-            "                        Decode.map ({}_DataReceived queryId) Query.{}.decodeQueryDelta\n\n",
+            "                        Decode.map ({}_DataReceived databaseId queryId) Query.{}.decodeQueryDelta\n\n",
             name, name
         ));
     }
@@ -3551,12 +3557,12 @@ fn generate_pyre_module(
 
         result.push_str(&format!("        {} databaseId queryId input ->\n", name));
         result.push_str(&format!(
-            "            case Dict.get queryId model.{} of\n",
+            "            case Dict.get ( Db.Database.toString databaseId, queryId ) model.{} of\n",
             field_name
         ));
         result.push_str("                Just queryModel ->\n");
         result.push_str(&format!(
-            "                    ( {{ model | {} = Dict.insert queryId {{ queryModel | input = input }} model.{} }}\n",
+            "                    ( {{ model | {} = Dict.insert ( Db.Database.toString databaseId, queryId ) {{ queryModel | input = input }} model.{} }}\n",
             field_name, field_name
         ));
         result.push_str(&format!(
@@ -3573,7 +3579,7 @@ fn generate_pyre_module(
         ));
         result.push_str("                    in\n");
         result.push_str(&format!(
-            "                    ( {{ model | {} = Dict.insert queryId queryModel model.{} }}\n",
+            "                    ( {{ model | {} = Dict.insert ( Db.Database.toString databaseId, queryId ) queryModel model.{} }}\n",
             field_name, field_name
         ));
         result.push_str(&format!(
@@ -3584,10 +3590,10 @@ fn generate_pyre_module(
     }
 
     result.push_str(
-        "getResult : QueryId -> Dict QueryId (QueryModel input result) -> Maybe result\n",
+        "getResult : DatabaseId namespace -> QueryId -> Dict ( String, String ) (QueryModel input result) -> Maybe result\n",
     );
-    result.push_str("getResult queryId queries =\n");
-    result.push_str("    Dict.get queryId queries\n");
+    result.push_str("getResult databaseId queryId queries =\n");
+    result.push_str("    Dict.get ( Db.Database.toString databaseId, queryId ) queries\n");
     result.push_str("        |> Maybe.map .result\n\n\n");
 
     // Encoders

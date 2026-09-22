@@ -44,6 +44,7 @@ record Job {
 
 fn query_result(affected_rows: Vec<AffectedRowTableGroup>) -> QueryResult {
     QueryResult {
+        committed_revision: None,
         response: json!({}),
         affected_rows,
     }

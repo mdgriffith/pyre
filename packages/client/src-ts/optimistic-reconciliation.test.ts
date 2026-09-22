@@ -331,6 +331,24 @@ test('engine snapshots include initial and late optimistic readers, rollback and
   });
 });
 
+test('unknown commit outcomes clear stale rows and recover without replaying the write', async () => {
+  await harness(async ({ client, requests, setCatchupResponse }) => {
+    const a = await client();
+    await a.edit('unknown', 'Possibly committed');
+    requests[0].complete({ errorType: 'OutcomeUnknown' }, 400);
+    await turn();
+    expect(a.results.at(-1).result.error).toContain('outcome unknown');
+    expect(await a.rows()).toEqual([]);
+    expect(a.writes.some(message => message.type === 'resetForDatabaseEpoch')).toBe(true);
+    setCatchupResponse({ databaseId: 'test', databaseEpoch: 'epoch-1', serverRevision: 2, has_more: false,
+      tables: { notes: { rows: [initial[1]], permission_hash: '', last_seen_updated_at: null } } });
+    a.app.ports.receiveIndexedDbMessage.send({ type: 'databaseEpochResetCompleted', databaseEpoch: 'epoch-1' });
+    await turn(); await turn();
+    expect(await a.rows()).toEqual([initial[1]]);
+    expect(requests).toHaveLength(1);
+  });
+});
+
 test('catchup cannot replace a newer live row or persist a stale version', async () => {
   await harness(async ({ client, setCatchupResponse }) => {
     const a = await client();

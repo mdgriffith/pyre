@@ -1714,7 +1714,8 @@ export class PyreClient {
             const querySource = asQueryShape(message.querySource);
             resolveLocalQuerySource(message.queryId, querySource, message.queryInput ?? {});
 
-            const existingRegistration = registrations.get(message.queryId);
+            const registrationKey = JSON.stringify([message.databaseId, message.queryId]);
+            const existingRegistration = registrations.get(registrationKey);
             if (existingRegistration) {
               void existingRegistration.then((subscription) => subscription?.unsubscribe());
             }
@@ -1729,6 +1730,7 @@ export class PyreClient {
               (result) => {
                 queryResultPort?.send?.({
                   type: 'full',
+                  databaseId: message.databaseId,
                   queryId: message.queryId,
                   queryName,
                   revision: Date.now(),
@@ -1736,18 +1738,18 @@ export class PyreClient {
                 });
               }
             )).catch((error) => {
-              if (registrations.get(message.queryId) === subscriptionPromise) {
-                registrations.delete(message.queryId);
+              if (registrations.get(registrationKey) === subscriptionPromise) {
+                registrations.delete(registrationKey);
               }
               reportElmBridgeError(config, error, 'incoming-message');
             });
 
-            registrations.set(message.queryId, subscriptionPromise);
+            registrations.set(registrationKey, subscriptionPromise);
             return;
           }
 
           if (message.type === 'update-input') {
-            const registration = registrations.get(message.queryId);
+            const registration = registrations.get(JSON.stringify([message.databaseId, message.queryId]));
             if (!registration) {
               throw new Error(`update-input for unknown query id: ${message.queryId}`);
             }
@@ -1757,14 +1759,15 @@ export class PyreClient {
             return;
           }
 
-          const registration = registrations.get(message.queryId);
+          const registrationKey = JSON.stringify([message.databaseId, message.queryId]);
+          const registration = registrations.get(registrationKey);
           if (!registration) {
             return;
           }
 
           const subscription = await registration;
           subscription?.unsubscribe();
-          registrations.delete(message.queryId);
+          registrations.delete(registrationKey);
         } catch (error) {
           reportElmBridgeError(config, error, 'incoming-message');
         }

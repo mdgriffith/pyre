@@ -604,6 +604,7 @@ test('Elm bridge routes register messages by databaseId', async () => {
   expect(results.sent).toEqual([
     {
       type: 'full',
+      databaseId: 'campaign:123',
       queryId: 'q1',
       queryName: 'CampaignNotes',
       revision: expect.any(Number),

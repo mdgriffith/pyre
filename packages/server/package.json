@@ -13,6 +13,10 @@
   "module": "./index.ts",
   "types": "./index.ts",
   "exports": {
+    "./operations": {
+      "types": "./operations.ts",
+      "default": "./operations.ts"
+    },
     "./context": {
       "types": "./context.ts",
       "default": "./context.ts"
@@ -51,6 +55,7 @@
     }
   },
   "dependencies": {
+    "@pyre/client": "0.1.19",
     "@pyre/core": "0.1.19",
     "@libsql/client": "^0.14.0"
   },
@@ -63,6 +68,7 @@
   "files": [
     "context.ts",
     "index.ts",
+    "operations.ts",
     "init.ts",
     "database-id.ts",
     "query-sync.ts",

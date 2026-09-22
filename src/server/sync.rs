@@ -143,7 +143,7 @@ pub struct DeltaMessage {
     pub database_epoch: Option<String>,
     #[serde(rename = "databaseId", skip_serializing_if = "Option::is_none")]
     pub database_id: Option<DatabaseId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub data: Vec<AffectedRowTableGroup>,
 }
 
@@ -224,6 +224,29 @@ pub struct SessionDeltaMessage {
 
 /// Run a catchup sync request using a client cursor and logical session values.
 pub async fn catchup(
+    conn: &libsql::Connection,
+    context: &typecheck::Context,
+    sync_cursor: &SyncCursor,
+    session: &SyncSession,
+    page_size: usize,
+) -> Result<SyncPageResult, Error> {
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
+        .await
+        .map_err(Error::Database)?;
+    match catchup_snapshot(&tx, context, sync_cursor, session, page_size).await {
+        Ok(page) => {
+            tx.commit().await.map_err(Error::Database)?;
+            Ok(page)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+async fn catchup_snapshot(
     conn: &libsql::Connection,
     context: &typecheck::Context,
     sync_cursor: &SyncCursor,
@@ -393,7 +416,11 @@ async fn stamp_messages_and_response_with_next_server_revision(
         return Ok(messages);
     }
 
-    let (database_epoch, server_revision) = next_server_revision(conn).await?;
+    let (database_epoch, server_revision) = match &query_result.committed_revision {
+        Some(revision) => revision.clone(),
+        None => next_server_revision(conn).await?,
+    };
+    query_result.committed_revision = Some((database_epoch.clone(), server_revision));
     for message in &mut messages {
         message.message.server_revision = Some(server_revision);
         message.message.database_epoch = Some(database_epoch.clone());
@@ -403,6 +430,14 @@ async fn stamp_messages_and_response_with_next_server_revision(
         origin_message.database_epoch = Some(database_epoch.clone());
     }
 
+    if query_result
+        .response
+        .get("serverRevision")
+        .and_then(JsonValue::as_i64)
+        == Some(server_revision)
+    {
+        return Ok(messages);
+    }
     let mut envelope = serde_json::Map::new();
     envelope.insert(
         "serverRevision".to_string(),
@@ -507,8 +542,25 @@ fn build_delta_messages(
         }
         Ok(sessions)
     };
-    let before = visible(&before)?;
-    let after = visible(&after)?;
+    let (before, after) = match (visible(&before), visible(&after)) {
+        (Ok(before), Ok(after)) => (before, after),
+        _ => {
+            return connected_sessions
+                .keys()
+                .map(|id| {
+                    let mut message = match &database_id {
+                        Some(database) => DeltaMessage::delta_for_database(database, Vec::new())?,
+                        None => DeltaMessage::delta(Vec::new()),
+                    };
+                    message.type_ = "invalidate".into();
+                    Ok(SessionDeltaMessage {
+                        session_id: id.clone(),
+                        message,
+                    })
+                })
+                .collect();
+        }
+    };
     let mut messages = Vec::new();
 
     for session_id in connected_sessions.keys() {
@@ -543,10 +595,18 @@ fn build_delta_messages(
             None => DeltaMessage::delta(reshaped_table_groups),
         };
         let message = if live_sync_requires_catchup(&delta_message, connected_sessions.len())? {
-            match &database_id {
+            let mut recovery = match &database_id {
                 Some(database_id) => DeltaMessage::sync_required_for_database(database_id)?,
                 None => DeltaMessage::sync_required(),
+            };
+            if delta_message
+                .data
+                .iter()
+                .any(|group| group.headers.iter().any(|header| header == "_pyre_removed"))
+            {
+                recovery.type_ = "invalidate".into();
             }
+            recovery
         } else {
             delta_message
         };

@@ -7,6 +7,9 @@ fn generated_builders_compile() {
     parser::run(
         "schema.pyre",
         r#"
+session {
+    write Bool
+}
 record Document {
     @public
     id Id.Uuid @id
@@ -22,7 +25,8 @@ record Account {
     name String
 }
 record Note {
-    @public
+    @allow(query) { True }
+    @allow(insert, update, delete) { Session.write == True }
     noteKey Id.Uuid @id
     id String
     title String
@@ -35,7 +39,11 @@ record Note {
         schemas: vec![schema],
     };
     let context = typecheck::check_schema(&database).unwrap();
-    let mut queries = ast::QueryList { queries: vec![] };
+    let mut queries = parser::parse_query(
+        "queries.pyre",
+        "query Notes { note { @where { id == \"ordinary\" } noteKey id title } }",
+    )
+    .unwrap();
     generated_queries::append_generated_crud_queries(&mut queries, &context);
     let info = typecheck::check_queries(&queries, &context).unwrap();
     let mut files = vec![];
@@ -107,6 +115,21 @@ receiptCheck =
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::write(
+        dir.path().join("ComposedExample.elm"),
+        include_str!("fixtures/ComposedExample.elm"),
+    )
+    .unwrap();
+    let example = Command::new("elm")
+        .args(["make", "ComposedExample.elm", "--output=example.js"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        example.status.success(),
+        "{}",
+        String::from_utf8_lossy(&example.stderr)
     );
     let main = std::fs::read_to_string(dir.path().join("Main.elm")).unwrap();
     for invalid in [
@@ -211,7 +234,17 @@ assert.equal(edits[3].createId, 'noteKey');
 assert.equal(edits[3].optimistic.where.field, 'noteKey');
 assert.deepEqual(edits[3].input, { id: 'ordinary', title: 'Custom key' });
 "#).unwrap();
-    for script in ["verify.ts", "verify-elm.ts"] {
+    std::fs::write(
+        dir.path().join("composed-browser.ts"),
+        include_str!("fixtures/composed-browser.ts"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("composed-conformance.ts"),
+        include_str!("fixtures/composed-conformance.ts"),
+    )
+    .unwrap();
+    for script in ["verify.ts", "verify-elm.ts", "composed-conformance.ts"] {
         let output = Command::new("bun")
             .arg(script)
             .current_dir(dir.path())

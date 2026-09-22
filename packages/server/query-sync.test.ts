@@ -146,6 +146,16 @@ test('deleted preimages produce only authorized identity removals, including the
   expect(JSON.stringify(sent.get('hidden'))).not.toContain('maps');
 });
 
+test('capped removal delivery invalidates instead of leaving stale rows behind an incremental catchup', async () => {
+  await loadSchemaFromDatabase(schemaDb as any);
+  sessionIds = ['s1'];
+  const sessions = new Map(Array.from({ length: 1001 }, (_, index) => [`s${index}`, { session: {} }]));
+  const result = await runWithSync(syncDb(true) as any, queryMap, 'query-id', {}, {}, sessions, undefined, 's1');
+  const sync = await result.sync(() => {});
+  expect(sync.originMessage.type).toBe('invalidate');
+  expect(sync.originMessage).not.toHaveProperty('data');
+});
+
 test('commit order determines revisions even when fanout is reversed or repeated', async () => {
   await loadSchemaFromDatabase(schemaDb as any);
   const db = syncDb();

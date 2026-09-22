@@ -51,6 +51,115 @@ fn only_query(manifest: &Manifest) -> &QueryManifest {
 }
 
 #[tokio::test]
+async fn native_composed_generated_writes_are_atomic_and_revision_order_is_commit_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    @public
+    key Id.Uuid @id
+    id String
+    title String
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = &query_by_operation(&manifest, "insert").id;
+    let update = &query_by_operation(&manifest, "update").id;
+    let delete = &query_by_operation(&manifest, "delete").id;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let key = "01900000-0000-7000-8000-000000000001";
+    let mut first = query::run_sync(
+        &conn,
+        &manifest,
+        "$batch",
+        json!([
+        {"queryId":create,"input":{"key":key,"id":"ordinary","title":"Initial"}},
+            {"queryId":update,"input":{"key":key,"title":"Final"}}
+        ]),
+        &session,
+    )
+    .await?;
+    assert_eq!(first.response[0]["index"], 0);
+    assert_eq!(first.response[1]["result"]["note"][0]["title"], "Final");
+    let mut second = query::run_sync(
+        &conn,
+        &manifest,
+        update,
+        json!({"key":key,"title":"Later"}),
+        &session,
+    )
+    .await?;
+    assert!(
+        first.committed_revision.as_ref().unwrap().1
+            < second.committed_revision.as_ref().unwrap().1
+    );
+    let committed = second.committed_revision.clone();
+    let failed = query::run_sync(
+        &conn,
+        &manifest,
+        "$batch",
+        json!([
+            {"queryId":update,"input":{"key":key,"title":"Rollback"}},
+            {"queryId":delete,"input":{"key":"01900000-0000-7000-8000-000000000999"}}
+        ]),
+        &session,
+    )
+    .await;
+    assert!(failed.is_err());
+    let mut rows = conn.query("select title from notes", ()).await?;
+    assert_eq!(rows.next().await?.unwrap().get::<String>(0)?, "Later");
+    let sessions: ConnectedSessions =
+        std::collections::HashMap::from([("origin".into(), SyncSession::new())]);
+    let server = SyncServer::new(&db.context);
+    server
+        .calculate_deltas(&conn, &mut second, &sessions, "test", Some("origin"))
+        .await?;
+    server
+        .calculate_deltas(&conn, &mut first, &sessions, "test", Some("origin"))
+        .await?;
+    let response = first.response.clone();
+    server
+        .calculate_deltas(&conn, &mut first, &sessions, "test", Some("origin"))
+        .await?;
+    assert_eq!(first.response, response);
+    assert_eq!(second.committed_revision, committed);
+    assert!(first.response["serverRevision"].as_i64() < second.response["serverRevision"].as_i64());
+    assert_eq!(
+        first.response["sync"]["data"][0]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut removed =
+        query::run_sync(&conn, &manifest, delete, json!({"key":key}), &session).await?;
+    server
+        .calculate_deltas(&conn, &mut removed, &sessions, "test", Some("origin"))
+        .await?;
+    assert_eq!(
+        removed.response["sync"]["data"][0]["headers"],
+        json!(["key", "_pyre_removed"])
+    );
+    assert_eq!(
+        removed.response["sync"]["data"][0]["rows"],
+        json!([[key, true]])
+    );
+    let many = (0..=pyre::server::sync::MAX_LIVE_SYNC_FANOUT_RECIPIENTS)
+        .map(|index| (format!("peer-{index}"), SyncSession::new()))
+        .collect();
+    let capped = server
+        .calculate_deltas(&conn, &mut removed, &many, "test", None)
+        .await?;
+    assert!(capped
+        .iter()
+        .all(|message| message.message.type_ == "invalidate"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn generated_uuid_creates_validate_manifest_identity_and_cardinality_in_both_modes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(

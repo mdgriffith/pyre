@@ -72,7 +72,7 @@ request. `Document.createResult 0 receipt`, `updateResult`, and `deleteResult`
 return the corresponding generated `Result String ReturnData`, checking both the
 index and compiled query identity. Rejections remain ordinary `Err` values.
 
-## Execution and current feature work
+## Execution
 
 Compiler-owned CRUD definitions emit strict input validators and a direct-write
 statement index. The existing executor checks cardinality immediately after that
@@ -117,9 +117,80 @@ primary key. IndexedDB stores an envelope separate from application columns;
 reload preserves both custom keys and per-row tombstones. Entity changes retain
 the generic `change.id` identity, while their `row` uses the actual schema field.
 
-This is a checkpoint in the full MEC-106 feature PR. Broader submission/bridge
-conformance, complete feature examples and
-the final cross-runtime release review remain work in this same PR.
+## Runnable integration examples
+
+`tests/fixtures/ComposedExample.elm` is a complete model/effect/port example.
+`composed-browser.ts` attaches its bridge and submits generated TypeScript edits;
+`composed-conformance.ts` supplies the real HTTP adapter and explicit-session seed
+execution. `cargo test --test crud_builders` generates their schema modules,
+compiles the Elm application, and runs them in Chromium against SQLite/WASM.
+It verifies typed receipts, optimistic updates, atomic rejection, nullable/JSON
+replacement and equal query IDs in two database instances. Install Playwright and
+build the client worker and server WASM first (see the field-edit proof guide).
+
+For application-side query storage, regenerated `Pyre.getResult` now takes
+`databaseId` before `queryId`. `QueryUpdated` carries both instance and query ID;
+incoming bridge messages include `databaseId`. Keep that discriminator when
+forwarding messages through custom bridges. Ordinary `run` callbacks still work;
+move to `submit` when composing operations and consume its typed indexed results.
+
+## Explicit-session server execution and seeds
+
+```ts
+import { executeOperations } from '@pyre/server/operations';
+import { queries } from './generated/typescript/server';
+import { Document, database } from './generated/typescript/core/edits';
+
+const result = await executeOperations(
+  authorizedConnection, queries, database('_default', databaseId),
+  [Document.create({ title: 'Seed', owner: 'Owner', tags: [], summary: null })],
+  authenticatedSession,
+  { mode: 'sync', sessions: connectedSessions, publish: sendToSession },
+);
+if (!result.ok) throw new Error(result.error.message);
+const createdId = result.value[0].result.document[0].id;
+```
+
+The application authorizes and resolves the database connection and session; a
+typed target is not an access token. Sync execution works with no connected
+clients and preserves normal publication when readers exist. Use `{ mode:
+'normal' }` for simple request/response/server-owned execution. The import-oriented
+legacy `seed` helper bypasses query permissions; `executeOperations` instead uses
+the exact compiled validators, permissions and atomic transaction executor used
+for client submissions. Never automatically retry `OutcomeUnknown`; publication
+or result-decoding errors after commit do not mean rollback.
+
+Rust applications can pass `$batch` and the descriptor-array input to existing
+`query::run` / `query::run_sync`, or use `query::run_operations`. Results preserve
+the same indexed operation list. `run_sync` allocates its revision in the write
+transaction; `SyncServer::calculate_deltas` publishes that captured revision.
+Include the authenticated origin in the logical session map when requesting HTTP
+origin authority, even if it has no SSE connection. Catchup uses a read transaction.
+
+## Outcomes and limits
+
+Pending intent is memory-only. A success confirms the server transaction, not
+durable offline delivery or the continued visibility of every written row.
+Rejections replay later pending intent. Unknown transport/commit outcomes clear
+and reload authority with generation/revision fencing rather than replaying the
+write; this also recovers deletions missed with the response. Ordinary updates
+and removals stay incremental. Permission-evaluation failure or an oversized
+removal batch uses exceptional invalidation.
+
+Callers may ignore returned success values, but should handle rejected promises
+and `ok: false` completions. The client emits mutation failure events even for
+fire-and-forget calls; Elm receives failures on `pyre_receiveMutationResult` and
+bridge dispatch errors through the configured error callback. No application-side
+optimistic cache is required. Creates requiring omitted defaults or managed
+`updatedAt` remain server-only; complete scalar creates and existing-row updates/
+deletes can be predicted. JSON and tagged unions replace whole logical values,
+so concurrent replacements are last-authority wins, not field merges.
+
+Generated CRUD obeys schema permissions but can bypass business invariants present
+only in named commands. Exclusive command ownership is a separate write-policy
+follow-up (MEC-117), not a guarantee of the generic route. Local TS interactive
+transactions require file-backed libSQL. Remote libSQL/deployed application auth
+is not part of the verified local SQLite/browser matrix.
 
 ## Schema identity migration
 
@@ -152,3 +223,16 @@ Generated compile-positive/negative and wire checks:
 ```sh
 npm exec --yes --package=elm@0.19.1-6 --package=bun@latest -- cargo test --test crud_builders --test elm_client --test typescript_db
 ```
+
+## Conformance evidence
+
+| Contract | Executable coverage |
+| --- | --- |
+| Generated TS/Elm types, protected fields, custom keys, nullable inputs and receipts | `tests/crud_builders.rs`, `tests/elm_client.rs`, `tests/typescript_db.rs` |
+| Actual generated bridge, two database instances, optimistic updates and typed completion | `tests/fixtures/ComposedExample.elm` + Chromium `composed-conformance.ts` |
+| Compiled seed permissions, normal/sync results, JSON replacement and operation-N rollback | `composed-conformance.ts`, `packages/server/query.test.ts` |
+| Native Rust ordered execution, UUIDv7/cardinality, atomic rollback and commit-order revisions | `tests/query_server.rs` |
+| Original/final visibility, mixed writes, hidden grants, custom-key removals and caps | `tests/sync_server.rs`, `tests/query_server.rs`, `packages/client/scripts/field-edit-proof.ts`, `packages/server/query-sync.test.ts` |
+| Overlapping/reordered intent, normalization, rejection, duplicate authority, catchup and unknown-outcome recovery | `packages/client/src-ts/optimistic-reconciliation.test.ts` |
+| Native browser HTTP/SSE, late readers, held responses, persistence/migration/reload | `packages/client/scripts/field-edit-proof.ts` |
+| Synced UUID namespace invariant and query-only integer compatibility | `tests/typecheck.rs`, `tests/id_types.rs`, full Rust fixture suite |

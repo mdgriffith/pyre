@@ -790,8 +790,10 @@ shouldReExecuteQuery schema db subscription delta =
                                     not (Set.isEmpty (Set.diff deltaIds resultIds))
                             in
                             if not (Set.isEmpty overlappingIds) then
-                                -- Rows in result set changed - need to check WHERE clause
-                                analyzeOverlappingChanges schema db subscription tableName overlappingIds delta
+                                -- The database already contains the new visible state.
+                                -- Any result row may have changed a selected value or
+                                -- left the query; result diffing suppresses true no-ops.
+                                True
 
                             else if hasNewRows then
                                 -- New rows that aren't in result set - only re-execute if they match WHERE

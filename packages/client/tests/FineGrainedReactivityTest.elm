@@ -579,7 +579,7 @@ shouldReExecuteQueryTests =
 integrationTests : Test
 integrationTests =
     describe "Integration: Full query reactivity flow"
-        [ test "query with WHERE clause skips re-execution when non-filtered field changes" <|
+        [ test "query with WHERE clause updates selected values when non-filtered field changes" <|
             \_ ->
                 let
                     -- Schema setup
@@ -658,8 +658,8 @@ integrationTests =
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
                 in
-                -- Should NOT re-execute because 'role' didn't change
-                Expect.equal Data.QueryManager.NoReExecute result
+                -- The selected email changed even though membership did not.
+                Expect.equal Data.QueryManager.ReExecuteFull result
         , test "query with WHERE clause triggers re-execution when filtered field changes" <|
             \_ ->
                 let
