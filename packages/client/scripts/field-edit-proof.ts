@@ -35,6 +35,7 @@ await loadSchemaFromDatabase('proof', db);
 // output. No client-authored SQL or runtime query compilation is accepted.
 const queries = { edit: {
   generatedEdit: { writeStatement: 1 },
+  syncEffects: { sql: true, syncSql: false },
   id: 'edit', session_args: [], optional_input_args: [], json_input_args: [],
   InputValidator: z.object({ id: z.string().uuid(), title: z.string() }), SessionValidator: z.object({ admin: z.boolean() }),
   sql: [
