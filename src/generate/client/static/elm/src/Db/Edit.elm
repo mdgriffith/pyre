@@ -1,7 +1,7 @@
 module Db.Edit exposing (Edit, Receipt, receive, result, submit)
 
 import Db.Database
-import Db.Edit.Internal as Internal
+import Db.Internal.Edit as Internal
 import Json.Decode as Decode
 import Json.Encode as Encode
 

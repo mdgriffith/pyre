@@ -1630,8 +1630,8 @@ pub fn generate_queries(
         include_str!("./static/elm/src/Db/Edit.elm"),
     ));
     files.push(generate_text_file(
-        base_out_dir.join("Db/Edit/Internal.elm"),
-        include_str!("./static/elm/src/Db/Edit/Internal.elm"),
+        base_out_dir.join("Db/Internal/Edit.elm"),
+        include_str!("./static/elm/src/Db/Internal/Edit.elm"),
     ));
 
     let mut edit_modules: HashMap<String, Vec<&ast::Query>> = HashMap::new();
@@ -1773,7 +1773,7 @@ fn to_edit_module(
             }
         }
     }
-    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Edit.Internal as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict\nimport Json.Encode as Encode\nimport Time\n");
+    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Internal.Edit as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict\nimport Json.Encode as Encode\nimport Time\n");
     for query in queries {
         body.push_str(&format!("import Query.{}\n", query.name));
     }

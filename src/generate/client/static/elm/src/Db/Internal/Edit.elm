@@ -1,4 +1,4 @@
-module Db.Edit.Internal exposing (Edit(..), encode)
+module Db.Internal.Edit exposing (Edit(..), encode)
 
 import Json.Encode as Encode
 

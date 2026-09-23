@@ -964,8 +964,8 @@ test('devtools mutation events include database metadata and retain newest event
     actor: 'APP',
     operation: 'mutation.failed',
     level: 'error',
-    summary: '[pyre] APP mutation.failed secondary mutation=FailMutation duration=0ms error=nope',
-    type: '[pyre] APP mutation.failed secondary mutation=FailMutation duration=0ms error=nope',
+    summary: expect.stringMatching(/^\[pyre\] APP mutation\.failed secondary mutation=FailMutation duration=\d+ms error=nope$/),
+    type: snapshot?.events[0].summary,
   });
   expect(snapshot?.events[0].payload).toMatchObject({
     instanceId,

@@ -181,7 +181,7 @@ fn elm_edit_builders_preserve_schema_names() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        &format!("record PreludeNames {{\n    @public\n    id Id.Uuid @id\n{fields}}}\nrecord OptimisticNote {{\n    @public\n    optimisticKey Id.Uuid @id\n    optimistic String\n}}\n"),
+        &format!("record PreludeNames {{\n    @public\n    id Id.Uuid @id\n{fields}}}\nrecord OptimisticNote {{\n    @public\n    optimisticKey Id.Uuid @id\n    optimistic String\n}}\nrecord Internal {{\n    @public\n    id Id.Uuid @id\n    title String\n}}\n"),
         &mut schema,
     )
     .unwrap();
@@ -250,6 +250,7 @@ fn elm_edit_builders_preserve_schema_names() {
             "make",
             "client/elm/Db/Edit/PreludeNames.elm",
             "client/elm/Db/Edit/OptimisticNote.elm",
+            "client/elm/Db/Edit/Internal.elm",
             "--output=/dev/null",
         ])
         .current_dir(dir.path())
@@ -453,7 +454,7 @@ import Db.Edit
 import Db.Edit.Document as Document
 import Db.Edit.Account as Account
 import Db.Edit.Note as Note
-import Db.Edit.Internal as Internal
+import Db.Internal.Edit as Internal
 import Db.Id
 import Db.Database
 import Json.Encode as Encode
