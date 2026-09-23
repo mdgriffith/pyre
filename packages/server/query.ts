@@ -384,23 +384,6 @@ function executionResult(
     return queryResult;
 }
 
-async function executeCheckedStatements(db: Pick<Client, "execute">, statements: InStatement[], writeStatement: number) {
-    if (!Number.isInteger(writeStatement) || writeStatement < 0 || writeStatement >= statements.length) {
-        throw new Error("Invalid generated edit metadata");
-    }
-    const results = [];
-    for (const [index, statement] of statements.entries()) {
-        results.push(await db.execute(statement));
-        if (index === writeStatement) {
-            // libsql RETURNING may report rowsAffected=0. changes() is the direct
-            // write count, excluding triggers, on this transaction connection.
-            const count = await db.execute("select changes() as count");
-            if (Number(count.rows[0]?.count) !== 1) throw new Error("Generated edit must affect exactly one row");
-        }
-    }
-    return results;
-}
-
 async function writeTransaction<T>(db: Client, execute: (tx: Transaction) => Promise<T>): Promise<T> {
     // The local adapter detaches the client's connection for an interactive
     // transaction. Private in-memory databases would silently lose their state.
@@ -471,32 +454,66 @@ async function runOperations(
     const responses: Array<{ index: number; queryId: string; result: unknown }> = [];
     const affected: any[] = [];
     let finalGroups: any[] = [];
-    let operationIndex = 0;
+    let operationIndex: number | undefined;
     let revision: { databaseEpoch: string; serverRevision: number } | undefined;
     try {
-        await writeTransaction(db, async tx => {
-            for (const operation of operations) {
-                const metadata = queryMap[operation.queryId];
-                // Reuse validation, binding, SQL selection and result formatting.
-                // This facade executes within the outer transaction; it never commits.
-                const executor = {
-                    batch: (statements: InStatement[]) => metadata.generatedEdit
-                        ? executeCheckedStatements(tx, statements, options.mode === "sync" ? metadata.generatedEdit.syncWriteStatement ?? metadata.generatedEdit.writeStatement : metadata.generatedEdit.writeStatement)
-                        : tx.batch(statements),
-                } as Client;
-                const result = await run(executor, { [operation.queryId]: { ...metadata, generatedEdit: undefined } }, operation.queryId, operation.input, executingSession,
-                    undefined, async groups => { affected.push(...groups); }, undefined, { mode: options.mode });
-                if (result.kind === "error") throw new Error("Operation validation failed");
-                responses.push({ index: operationIndex, queryId: operation.queryId, result: result.response });
-                await result.sync(() => {});
-                operationIndex += 1;
+        const statements: InStatement[] = [];
+        const prepared = operations.map((operation, index) => {
+            operationIndex = index;
+            const metadata = queryMap[operation.queryId];
+            const input = metadata.InputValidator.safeParse(operation.input);
+            const session = metadata.SessionValidator.safeParse(executingSession);
+            if (!input.success || !session.success) throw new Error("Operation validation failed");
+            const args = buildArgs(input.data ?? {}, session.data ?? {}, metadata.session_args, metadata.optional_input_args, metadata.json_input_args);
+            const sql = options.mode === "sync" ? metadata.syncSql ?? metadata.sql : metadata.sql;
+            const bound = toSqlStatements(sql, args);
+            const checked = metadata.generatedEdit && (options.mode === "sync"
+                ? metadata.generatedEdit.syncWriteStatement ?? metadata.generatedEdit.writeStatement
+                : metadata.generatedEdit.writeStatement);
+            if (checked !== undefined && (!Number.isInteger(checked) || checked < 0 || checked >= bound.length)) {
+                throw new Error("Invalid generated edit metadata");
             }
+            const resultIndexes: number[] = [];
+            let countIndex: number | undefined;
+            for (const [statementIndex, statement] of bound.entries()) {
+                resultIndexes.push(statements.length);
+                statements.push(statement);
+                if (statementIndex === checked) {
+                    // Capture immediately: later writes would overwrite changes().
+                    // RETURNING rowsAffected is not reliable in every adapter.
+                    countIndex = statements.length;
+                    statements.push("select changes() as count");
+                }
+            }
+            return { operation, sql, resultIndexes, countIndex };
+        });
+        const allocateRevision = options.allocateSyncRevision && operations.some(op => {
+            const query = queryMap[op.queryId];
+            return hasSyncEffect(query, options.mode);
+        });
+        const revisionIndex = statements.length;
+        if (allocateRevision) statements.push("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
+        // Database-level batch errors may not carry a statement index. Do not
+        // attribute those to an arbitrary operation; our own checks retain it.
+        operationIndex = undefined;
+        await writeTransaction(db, async tx => {
+            // One execution request, then one commit/rollback request. Keep all
+            // checks and result formatting before commit, including sync metadata.
+            const results = await tx.batch(statements);
+            if (results.length !== statements.length) throw new Error("Invalid batch result count");
+            for (const [index, item] of prepared.entries()) {
+                operationIndex = index;
+                if (item.countIndex !== undefined && Number(results[item.countIndex].rows[0]?.count) !== 1) {
+                    throw new Error("Generated edit must affect exactly one row");
+                }
+                const output = item.resultIndexes.map(index => results[index]);
+                responses.push({ index, queryId: item.operation.queryId, result: formatResultData(item.sql, output) });
+                affected.push(...extractAffectedRowGroups(item.sql, output));
+            }
+            operationIndex = undefined;
             finalGroups = combineAffectedRows(affected);
-            if (options.allocateSyncRevision && operations.some(op => {
-                const query = queryMap[op.queryId];
-                return hasSyncEffect(query, options.mode);
-            })) {
-                const stamp = (await tx.execute("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision")).rows[0];
+            if (allocateRevision) {
+                const stamp = results[revisionIndex].rows[0];
                 const serverRevision = Number(stamp?.server_revision);
                 if (typeof stamp?.database_epoch !== "string" || !Number.isSafeInteger(serverRevision)) throw new Error("Invalid sync revision");
                 revision = { databaseEpoch: stamp.database_epoch, serverRevision };

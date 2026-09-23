@@ -160,6 +160,18 @@ the exact compiled validators, permissions and atomic transaction executor used
 for client submissions. Never automatically retry `OutcomeUnknown`; publication
 or result-decoding errors after commit do not mean rollback.
 
+The TypeScript composed executor prepares all SQL, captures `changes()` immediately
+after each generated write, and includes revision allocation in one interactive
+transaction batch. It validates the returned counts, formats results and combines
+sync rows before explicitly committing or rolling back. The HTTP libSQL driver
+therefore uses two transaction requests on an established connection: execution
+(including BEGIN), then COMMIT or ROLLBACK. Request count does not grow with the
+number of operations; SQL work and payload size still do. The write transaction
+remains open during application validation. No assertion tables are required.
+Cardinality/validation failures retain their operation index; database batch errors
+omit it when the adapter does not identify the failing statement. HTTP request-count
+tests use the real driver with a protocol fixture, not a hosted Turso database.
+
 Rust applications can pass `$batch` and the descriptor-array input to existing
 `query::run` / `query::run_sync`, or use `query::run_operations`. Results preserve
 the same indexed operation list. `run_sync` allocates its revision in the write

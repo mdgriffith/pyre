@@ -55,6 +55,9 @@ test("composed operations commit once, retain indexed results, and publish only 
     const rejected = await execute([
       { queryId: "edit", input: { id: 1, body: "must roll back" } },
       { queryId: "edit", input: { id: 2, body: "missing" } },
+      // This later successful write and revision allocation execute before the
+      // application checks counts. Neither may survive the rejected middle edit.
+      { queryId: "edit", input: { id: 1, body: "also must roll back" } },
     ]);
     expect(rejected.error).toMatchObject({ errorType: "TransactionFailed", operationIndex: 1 });
     await rejected.sync(() => {});
@@ -71,7 +74,9 @@ test("composed operations commit once, retain indexed results, and publish only 
       { queryId: "edit", input: { id: 1, body: "temporary" } },
       { queryId: "edit", input: { id: 2, body: "temporary" } },
     ]);
-    expect(constraint.error).toMatchObject({ errorType: "TransactionFailed", operationIndex: 1 });
+    // The adapter's batch SQL error does not identify its failing statement.
+    expect(constraint.error).toMatchObject({ errorType: "TransactionFailed" });
+    expect(constraint.error?.operationIndex).toBeUndefined();
     expect((await db.execute("select body from notes order by id")).rows).toEqual([{ body: "last" }, { body: "taken" }]);
 
     const broad = { ...queries.edit, sql: [{ include: false, params: [], sql: "update notes set owner = 8" }], syncSql: undefined };
