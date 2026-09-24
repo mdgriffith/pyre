@@ -2121,6 +2121,24 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
 
 // Check for duplicate variants
 fn check_schema_definitions(context: &Context, database: &ast::Database, errors: &mut Vec<Error>) {
+    const STATE_GENERATED_TYPESCRIPT_NAMES: &[&str] = &[
+        "Connection",
+        "ConnectionPatch",
+        "Shared",
+        "SharedPatch",
+        "StateTypes",
+        "StateName",
+        "PatchField",
+        "StateMetadata",
+    ];
+    const STATE_GENERATED_RUST_NAMES: &[&str] = &[
+        "Connection",
+        "ConnectionPatch",
+        "Shared",
+        "SharedPatch",
+        "PatchField",
+        "StateMetadata",
+    ];
     let vars = context.variants.clone();
     for (_variant_name, (maybe_type_range, mut instances)) in vars {
         if instances.len() > 1 {
@@ -2160,14 +2178,54 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
         }
     }
 
+    let has_state = database.schemas.iter().any(|schema| {
+        schema.files.iter().any(|file| {
+            file.definitions
+                .iter()
+                .any(|definition| matches!(definition, ast::Definition::State { .. }))
+        })
+    });
     let mut session_found = false;
     let mut state_definitions = HashSet::new();
+    let mut generated_rust_type_names: HashMap<String, String> = HashMap::new();
 
     // Check definitions
     for schema in database.schemas.iter() {
         for file in schema.files.iter() {
             for definition in &file.definitions {
                 match definition {
+                    ast::Definition::Tagged {
+                        name, start, end, ..
+                    } if has_state => {
+                        let rust_name = generated_rust_type_name(name);
+                        let fixed_collision = STATE_GENERATED_TYPESCRIPT_NAMES
+                            .contains(&name.as_str())
+                            || STATE_GENERATED_RUST_NAMES.contains(&rust_name.as_str());
+                        let custom_collision = generated_rust_type_names
+                            .get(&rust_name)
+                            .filter(|existing| *existing != name);
+                        if fixed_collision {
+                            errors.push(invalid_type_usage_error(
+                                &file.path,
+                                format!(
+                                    "Type '{name}' emits the generated identifier '{rust_name}', which conflicts with an ephemeral state declaration."
+                                ),
+                                to_range(start, end),
+                                to_range(start, end),
+                            ));
+                        } else if let Some(existing) = custom_collision {
+                            errors.push(invalid_type_usage_error(
+                                &file.path,
+                                format!(
+                                    "Types '{existing}' and '{name}' both emit the generated Rust identifier '{rust_name}'."
+                                ),
+                                to_range(start, end),
+                                to_range(start, end),
+                            ));
+                        } else {
+                            generated_rust_type_names.insert(rust_name, name.clone());
+                        }
+                    }
                     ast::Definition::Session(session) => {
                         if session_found {
                             errors.push(Error {
@@ -2598,6 +2656,24 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
             }
         }
     }
+}
+
+fn generated_rust_type_name(name: &str) -> String {
+    let mut result = String::new();
+    let mut capitalize_next = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if capitalize_next {
+                result.push(ch.to_ascii_uppercase());
+                capitalize_next = false;
+            } else {
+                result.push(ch);
+            }
+        } else {
+            capitalize_next = true;
+        }
+    }
+    result
 }
 
 pub fn check_queries<'a>(

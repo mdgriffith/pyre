@@ -14,6 +14,7 @@ export interface LiveSyncMessage {
   type: string;
   databaseId?: string;
   connectionId?: string;
+  ephemeralCapability?: string;
   serverRevision?: number;
   databaseEpoch?: string;
   data?: unknown;
@@ -26,6 +27,7 @@ export class SSEManager {
   private config: SSEConfig | null = null;
   private shouldReconnect = true;
   private onMessage: ((message: LiveSyncMessage) => void) | null = null;
+  private onEphemeralMessage: ((message: LiveSyncMessage) => void) | null = null;
   private elmApp: ElmApp | null = null;
   private debugLog: (...args: unknown[]) => void;
   private onStateChange: ((state: 'connecting' | 'disconnected') => void) | null = null;
@@ -43,6 +45,10 @@ export class SSEManager {
 
   setOnMessage(callback: (message: LiveSyncMessage) => void): void {
     this.onMessage = callback;
+  }
+
+  setOnEphemeralMessage(callback: (message: LiveSyncMessage) => void): void {
+    this.onEphemeralMessage = callback;
   }
 
   setOnStateChange(callback: (state: 'connecting' | 'disconnected') => void): void {
@@ -73,20 +79,26 @@ export class SSEManager {
   connect(): void {
     this.shouldReconnect = true;
     this.debugLog('[PyreClient] SSE connect requested');
-    this.setState('connecting');
     if (this.eventSource) {
-      this.eventSource.close();
+      const eventSource = this.eventSource;
       this.eventSource = null;
       this.connectionId = null;
+      eventSource.close();
+      this.setState('disconnected');
     }
+    this.setState('connecting');
     this.attemptConnect();
   }
 
   private emitMessage(message: LiveSyncMessage): void {
-    this.onMessage?.(message);
+    if (message.type === 'connected' || message.type.startsWith('ephemeral')) {
+      this.onEphemeralMessage?.(message);
+    }
+    const publicMessage = redactEphemeralCapability(message);
+    this.onMessage?.(publicMessage);
     if (!message.type.startsWith('ephemeral')) {
-      this.elmApp?.ports.receiveSSEMessage?.send(message);
-      this.debugLog('[PyreClient] port receiveSSEMessage ->', message);
+      this.elmApp?.ports.receiveSSEMessage?.send(publicMessage);
+      this.debugLog('[PyreClient] port receiveSSEMessage ->', publicMessage);
     }
   }
 
@@ -194,4 +206,10 @@ export function buildSSEUrl(config: SSEConfig): string {
 
 function shouldIncludeCredentials(config: SSEConfig): boolean {
   return config.credentials === 'include' || config.withCredentials === true;
+}
+
+export function redactEphemeralCapability(message: LiveSyncMessage): LiveSyncMessage {
+  if (!Object.prototype.hasOwnProperty.call(message, 'ephemeralCapability')) return message;
+  const { ephemeralCapability: _ephemeralCapability, ...publicMessage } = message;
+  return publicMessage;
 }

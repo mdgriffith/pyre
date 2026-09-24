@@ -1,8 +1,9 @@
+use pyre::server::manifest::{Manifest, PyreSession};
 use pyre::server::runtime::{
     DatabaseRuntime, Delivery, JoinEvidence, RuntimeConfig, RuntimeEnvironment, RuntimeError,
     RuntimeTime, SharedWritePolicy,
 };
-use pyre::{ast, ephemeral::Contract, parser, typecheck};
+use pyre::{ast, ephemeral::Contract, generate, parser, typecheck};
 use serde_json::json;
 use std::{
     sync::{
@@ -298,6 +299,52 @@ fn participant_bound_is_checked_before_mutation_and_shared_survives_zero() {
     let empty = runtime.snapshot().unwrap();
     assert!(empty.connections.is_empty());
     assert_eq!(empty.shared.unwrap()["label"], "resident");
+}
+
+#[test]
+fn participant_bound_and_join_collisions_include_standalone_subscriptions() {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment.clone());
+    runtime_config.max_participants = 2;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let standalone = runtime.subscribe("subscriber", true).unwrap();
+    let joined = runtime.join(evidence("joined", 1, true)).unwrap();
+    let before = runtime.snapshot().unwrap();
+
+    assert_eq!(
+        runtime.join(evidence("full", 2, true)),
+        Err(RuntimeError::Capacity)
+    );
+    assert_eq!(runtime.subscribe("full", true), Err(RuntimeError::Capacity));
+    assert_eq!(runtime.snapshot().unwrap(), before);
+
+    assert_eq!(
+        runtime.unsubscribe(&joined.subscription),
+        Err(RuntimeError::UnknownConnection)
+    );
+    assert_eq!(RuntimeError::UnknownConnection.code(), "unknown_connection");
+    assert_eq!(
+        runtime.join(evidence("still-full", 3, true)),
+        Err(RuntimeError::Capacity)
+    );
+    assert_eq!(
+        runtime.subscribe("still-full", true),
+        Err(RuntimeError::Capacity)
+    );
+    assert_eq!(runtime.snapshot().unwrap(), before);
+
+    runtime.leave(&joined.participant).unwrap();
+    environment.ids.store(1, Ordering::SeqCst);
+    let before_collision = runtime.snapshot().unwrap();
+    assert_eq!(
+        runtime.join(evidence("collision", 3, true)),
+        Err(RuntimeError::IdCollision)
+    );
+    assert_eq!(runtime.snapshot().unwrap(), before_collision);
+    assert_eq!(runtime.poll(&standalone.subscription).unwrap(), None);
+    runtime
+        .renew_subscription(&standalone.subscription, "subscriber")
+        .unwrap();
 }
 
 #[test]
@@ -845,10 +892,8 @@ fn payload_and_transport_bounds_fail_explicitly() {
 
     let mut snapshot_limited = config(environment.clone());
     snapshot_limited.max_delivery_bytes = 1;
-    let runtime = DatabaseRuntime::new("tiny", (), contract(), snapshot_limited).unwrap();
-    assert_eq!(runtime.snapshot(), Err(RuntimeError::PayloadTooLarge));
     assert!(matches!(
-        runtime.join(evidence("owner", 1, true)),
+        DatabaseRuntime::new("tiny", (), contract(), snapshot_limited),
         Err(RuntimeError::PayloadTooLarge)
     ));
 
@@ -857,17 +902,206 @@ fn payload_and_transport_bounds_fail_explicitly() {
     delivery_limited.max_delivery_bytes = 1024;
     let runtime = DatabaseRuntime::new("bounded", (), contract(), delivery_limited).unwrap();
     let observer = runtime.join(evidence("observer", 1, true)).unwrap();
-    runtime
-        .patch_shared(&json!({"label": "x".repeat(5_000)}))
-        .unwrap();
-    assert!(matches!(
-        runtime.poll(&observer.subscription).unwrap(),
-        Some(Delivery::ResyncRequired { .. })
-    ));
+    let before = runtime.snapshot().unwrap();
     assert_eq!(
-        runtime.resubscribe(&observer.subscription, "observer"),
+        runtime.patch_shared(&json!({"label": "x".repeat(5_000)})),
         Err(RuntimeError::PayloadTooLarge)
     );
+    assert_eq!(runtime.snapshot().unwrap(), before);
+    assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
+    assert_eq!(
+        runtime.patch_connection(
+            &observer.participant,
+            "observer",
+            &json!({"cursor": "x".repeat(5_000)}),
+        ),
+        Err(RuntimeError::PayloadTooLarge)
+    );
+    assert_eq!(runtime.snapshot().unwrap(), before);
+    assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
+    let recovered = runtime
+        .resubscribe(&observer.subscription, "observer")
+        .unwrap();
+    assert_eq!(recovered.snapshot, before);
+}
+
+#[test]
+fn oversized_join_and_refresh_are_rejected_atomically() {
+    let environment = Arc::new(Environment::default());
+    let large_default = contract_with_states(&format!(
+        "state Connection {{\n    value String @default({:?})\n}}\n",
+        "x".repeat(5_000)
+    ));
+    let mut runtime_config = config(environment.clone());
+    runtime_config.max_delivery_bytes = 1024;
+    let runtime = DatabaseRuntime::new("join", (), large_default, runtime_config).unwrap();
+    let before = runtime.snapshot().unwrap();
+    assert!(matches!(
+        runtime.join(evidence("owner", 1, true)),
+        Err(RuntimeError::PayloadTooLarge)
+    ));
+    assert_eq!(runtime.snapshot().unwrap(), before);
+
+    let mut refresh_config = config(environment.clone());
+    refresh_config.max_delivery_bytes = 1024;
+    let runtime = DatabaseRuntime::new("refresh", (), contract(), refresh_config).unwrap();
+    let joined = runtime.join(evidence("owner", 1, true)).unwrap();
+    let before = runtime.snapshot().unwrap();
+    assert_eq!(
+        runtime.refresh_connection(
+            &joined.participant,
+            "owner",
+            &json!({"userId": 1, "role": "x".repeat(5_000)}),
+        ),
+        Err(RuntimeError::PayloadTooLarge)
+    );
+    assert_eq!(runtime.snapshot().unwrap(), before);
+    assert_eq!(runtime.poll(&joined.subscription).unwrap(), None);
+
+    environment.advance(9_000);
+    assert_eq!(
+        runtime.refresh_and_renew(
+            &joined.participant,
+            "owner",
+            &json!({"userId": 1, "role": "x".repeat(5_000)}),
+        ),
+        Err(RuntimeError::PayloadTooLarge)
+    );
+    assert_eq!(runtime.snapshot().unwrap(), before);
+    environment.advance(1_000);
+    assert_eq!(
+        runtime.renew(&joined.participant, "owner"),
+        Err(RuntimeError::LeaseExpired)
+    );
+}
+
+#[test]
+fn pyre_session_canonicalizes_json_for_connection_derivation() {
+    let source = r#"type Role
+   = Admin
+   | Member
+
+type Detail
+   = Timed { at DateTime, enabled Bool, role Role }
+
+type Presence
+   = Online { since DateTime, detail Detail, until DateTime? }
+   | Away { note String? }
+
+session {
+    userId Int
+    joinedAt DateTime
+    numericAt DateTime
+    integerAt DateTime
+    omittedAt DateTime?
+    enabled Bool
+    role Role
+    presence Presence?
+}
+
+state Connection {
+    userId Int = Session.userId
+    joinedAt DateTime = Session.joinedAt
+    enabled Bool = Session.enabled
+    role Role = Session.role
+    presence Presence? = Session.presence
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap();
+    let contract = Contract::from_context(&context).unwrap();
+    let mut files = Vec::new();
+    generate::manifest::generate_schema(&context, &mut files);
+    let manifest: Manifest = serde_json::from_str(
+        &files
+            .iter()
+            .find(|file| file.path.ends_with("manifest.json"))
+            .unwrap()
+            .contents,
+    )
+    .unwrap();
+    let session = PyreSession::new(
+        json!({
+            "userId": 7,
+            "joinedAt": "2025-01-02T03:04:05Z",
+            "numericAt": "1735787046",
+            "integerAt": 1735787047,
+            "enabled": 1,
+            "role": "Admin",
+            "presence": {
+                "_type": "Online",
+                "since": "2025-01-02T03:04:08.999Z",
+                "detail": {
+                    "_type": "Timed",
+                    "at": "1735787049",
+                    "enabled": 0,
+                    "role": "Member",
+                    "unknownNested": "discarded"
+                },
+                "note": "inactive variant field",
+                "unknownVariant": "discarded"
+            },
+            "unknownSession": "discarded"
+        }),
+        &manifest.session_schema,
+    )
+    .unwrap();
+    assert_eq!(
+        session.json(),
+        &json!({
+            "userId": 7,
+            "joinedAt": 1735787045,
+            "numericAt": 1735787046,
+            "integerAt": 1735787047,
+            "omittedAt": null,
+            "enabled": true,
+            "role": { "_type": "Admin" },
+            "presence": {
+                "_type": "Online",
+                "since": 1735787048,
+                "detail": {
+                    "_type": "Timed",
+                    "at": 1735787049,
+                    "enabled": false,
+                    "role": { "_type": "Member" }
+                },
+                "until": null
+            }
+        })
+    );
+    assert_eq!(session.sql_args()["session_joinedAt"], 1735787045);
+    assert_eq!(session.sql_args()["session_enabled"], 1);
+    assert_eq!(session.sql_args()["session_role"], "Admin");
+    assert_eq!(session.sql_args()["session_presence__since"], 1735787048);
+    assert_eq!(
+        session.sql_args()["session_presence__detail__at"],
+        1735787049
+    );
+    assert!(matches!(
+        session.logical().get("joinedAt"),
+        Some(pyre::sync::SessionValue::Integer(1735787045))
+    ));
+    assert!(PyreSession::new(json!({"presence": null}), &manifest.session_schema).is_err());
+
+    let environment = Arc::new(Environment::default());
+    let runtime = DatabaseRuntime::new("session", (), contract, config(environment)).unwrap();
+    let joined = runtime
+        .join(JoinEvidence {
+            owner_id: "owner".to_string(),
+            trusted_session: session.json().clone(),
+            writable: true,
+        })
+        .unwrap();
+    let connection = &joined.snapshot.connections[joined.participant.connection_id()];
+    assert_eq!(connection["userId"], 7);
+    assert_eq!(connection["joinedAt"], 1735787045);
+    assert_eq!(connection["enabled"], true);
+    assert_eq!(connection["role"], json!({ "_type": "Admin" }));
+    assert_eq!(connection["presence"], session.json()["presence"]);
 }
 
 #[test]

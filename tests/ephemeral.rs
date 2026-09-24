@@ -68,7 +68,7 @@ fn initializes_defaults_nulls_and_trusted_derivations_canonically() {
         .initialize_connection(
             &json!({
                 "userId": 42,
-                "mood": {"_type": "Away", "since": "2026-09-24T12:00:03+02:00"}
+                "mood": {"_type": "Away", "since": 1_790_244_003_i64}
             }),
             1234,
         )
@@ -229,15 +229,11 @@ fn patches_are_atomic_top_level_replacements_and_reject_derived_or_unknown_field
 }
 
 #[test]
-fn complete_values_and_patches_normalize_datetime_and_reject_noncanonical_shapes() {
+fn complete_values_and_patches_require_canonical_datetime_seconds() {
     let contract = Contract::from_context(&fixture()).unwrap();
     let current = contract.initialize_shared(0).unwrap();
     let patched = contract
-        .apply_patch(
-            "Shared",
-            &current,
-            &json!({"started": "1970-01-01T00:01:40Z"}),
-        )
+        .apply_patch("Shared", &current, &json!({"started": 100}))
         .unwrap();
     assert_eq!(patched.value["started"], 100);
 
@@ -246,6 +242,8 @@ fn complete_values_and_patches_normalize_datetime_and_reject_noncanonical_shapes
         json!({"day": "24/09/2026"}),
         json!({"root": "Text"}),
         json!({"count": null}),
+        json!({"started": "1970-01-01T00:01:40Z"}),
+        json!({"started": "100"}),
     ] {
         assert!(contract.apply_patch("Shared", &current, &patch).is_err());
     }

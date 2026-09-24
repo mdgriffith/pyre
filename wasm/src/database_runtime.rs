@@ -7,6 +7,7 @@ use pyre::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use js_sys::{Function, Reflect};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -69,13 +70,16 @@ impl JsRuntimeConfig {
 
 struct WasmEnvironment {
     started_millis: u64,
+    uses_performance_clock: bool,
     last_millis: AtomicU64,
 }
 
 impl Default for WasmEnvironment {
     fn default() -> Self {
+        let performance_millis = performance_clock_millis();
         Self {
-            started_millis: wall_clock_millis(),
+            started_millis: performance_millis.unwrap_or_else(wall_clock_millis),
+            uses_performance_clock: performance_millis.is_some(),
             last_millis: AtomicU64::new(0),
         }
     }
@@ -83,7 +87,13 @@ impl Default for WasmEnvironment {
 
 impl RuntimeEnvironment for WasmEnvironment {
     fn now(&self) -> RuntimeTime {
-        let elapsed = wall_clock_millis().saturating_sub(self.started_millis);
+        let current = if self.uses_performance_clock {
+            performance_clock_millis()
+        } else {
+            Some(wall_clock_millis())
+        };
+        let previous = self.last_millis.load(Ordering::Relaxed);
+        let elapsed = monotonic_elapsed(self.started_millis, current, previous);
         let monotonic_millis = self
             .last_millis
             .fetch_max(elapsed, Ordering::Relaxed)
@@ -103,6 +113,28 @@ impl RuntimeEnvironment for WasmEnvironment {
 
 fn wall_clock_millis() -> u64 {
     js_sys::Date::now().max(0.0).min(u64::MAX as f64) as u64
+}
+
+fn performance_clock_millis() -> Option<u64> {
+    let global = js_sys::global();
+    let performance = Reflect::get(&global, &JsValue::from_str("performance")).ok()?;
+    if performance.is_null() || performance.is_undefined() {
+        return None;
+    }
+    let now = Reflect::get(&performance, &JsValue::from_str("now")).ok()?;
+    let now: Function = now.dyn_into().ok()?;
+    let millis = now.call0(&performance).ok()?.as_f64()?;
+    if !millis.is_finite() || millis < 0.0 {
+        return None;
+    }
+    Some(millis.min(u64::MAX as f64) as u64)
+}
+
+fn monotonic_elapsed(started_millis: u64, current_millis: Option<u64>, previous: u64) -> u64 {
+    current_millis
+        .map(|current| current.saturating_sub(started_millis))
+        .unwrap_or(previous)
+        .max(previous)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -149,6 +181,7 @@ enum Response<T> {
 #[serde(rename_all = "camelCase")]
 struct Connected {
     connection_id: String,
+    handle: String,
     snapshot: Snapshot,
 }
 
@@ -206,54 +239,75 @@ impl RuntimeBridge {
         trusted_session: Value,
         writable: bool,
     ) -> Result<Connected, BridgeError> {
+        let handle = self.new_handle()?;
         let joined = self.runtime.join(JoinEvidence {
             owner_id,
             trusted_session,
             writable,
         })?;
         let connection_id = joined.participant.connection_id().to_string();
-        self.participants
-            .insert(connection_id.clone(), joined.participant);
-        self.subscriptions
-            .insert(connection_id.clone(), joined.subscription);
+        self.participants.insert(handle.clone(), joined.participant);
+        self.subscriptions.insert(handle.clone(), joined.subscription);
         Ok(Connected {
             connection_id,
+            handle,
             snapshot: joined.snapshot,
         })
     }
 
     fn subscribe(&mut self, owner_id: &str, writable: bool) -> Result<Connected, BridgeError> {
+        let handle = self.new_handle()?;
         let subscribed = self.runtime.subscribe(owner_id, writable)?;
         let connection_id = subscribed.subscription.connection_id().to_string();
-        self.subscriptions
-            .insert(connection_id.clone(), subscribed.subscription);
+        self.subscriptions.insert(handle.clone(), subscribed.subscription);
         Ok(Connected {
             connection_id,
+            handle,
             snapshot: subscribed.snapshot,
         })
     }
 
-    fn participant(&self, connection_id: &str) -> Result<&Participant, BridgeError> {
+    fn participant(&self, handle: &str) -> Result<&Participant, BridgeError> {
         self.participants
-            .get(connection_id)
+            .get(handle)
             .ok_or_else(|| BridgeError::from(RuntimeError::UnknownConnection))
     }
 
-    fn subscription(&self, connection_id: &str) -> Result<&Subscription, BridgeError> {
+    fn subscription(&self, handle: &str) -> Result<&Subscription, BridgeError> {
         self.subscriptions
-            .get(connection_id)
+            .get(handle)
             .ok_or_else(|| BridgeError::from(RuntimeError::UnknownSubscription))
+    }
+
+    fn new_handle(&self) -> Result<String, BridgeError> {
+        for _ in 0..4 {
+            let mut bytes = [0_u8; 32];
+            getrandom::getrandom(&mut bytes)
+                .map_err(|error| BridgeError::from(RuntimeError::IdGeneration(error.to_string())))?;
+            let handle: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            if !self.participants.contains_key(&handle) && !self.subscriptions.contains_key(&handle)
+            {
+                return Ok(handle);
+            }
+        }
+        Err(BridgeError::from(RuntimeError::IdCollision))
     }
 
     fn expire(&mut self) -> Result<Expired, BridgeError> {
         let expired = self.runtime.expire_leases_detailed()?;
-        for id in &expired.connection_ids {
-            self.participants.remove(id);
-            self.subscriptions.remove(id);
-        }
-        for id in &expired.subscription_ids {
-            self.subscriptions.remove(id);
-        }
+        self.participants.retain(|_, participant| {
+            !expired
+                .connection_ids
+                .iter()
+                .any(|id| id == participant.connection_id())
+        });
+        self.subscriptions.retain(|_, subscription| {
+            !expired
+                .connection_ids
+                .iter()
+                .chain(&expired.subscription_ids)
+                .any(|id| id == subscription.connection_id())
+        });
         Ok(Expired {
             change: expired.change,
             connection_ids: expired.connection_ids,
@@ -293,14 +347,14 @@ impl WasmDatabaseRuntime {
 
     pub fn patch_connection(
         &self,
-        connection_id: String,
+        handle: String,
         owner_id: String,
         patch: JsValue,
     ) -> JsValue {
         response(value_from_js(patch).and_then(|patch| {
             self.bridge
                 .runtime
-                .patch_connection(self.bridge.participant(&connection_id)?, &owner_id, &patch)
+                .patch_connection(self.bridge.participant(&handle)?, &owner_id, &patch)
                 .map_err(Into::into)
         }))
     }
@@ -314,7 +368,7 @@ impl WasmDatabaseRuntime {
 
     pub fn patch_shared_from_participant(
         &self,
-        connection_id: String,
+        handle: String,
         owner_id: String,
         patch: JsValue,
     ) -> JsValue {
@@ -322,7 +376,7 @@ impl WasmDatabaseRuntime {
             self.bridge
                 .runtime
                 .patch_shared_from_participant(
-                    self.bridge.participant(&connection_id)?,
+                    self.bridge.participant(&handle)?,
                     &owner_id,
                     &patch,
                 )
@@ -332,7 +386,7 @@ impl WasmDatabaseRuntime {
 
     pub fn patch_shared_from_subscription(
         &self,
-        connection_id: String,
+        handle: String,
         owner_id: String,
         patch: JsValue,
     ) -> JsValue {
@@ -340,7 +394,7 @@ impl WasmDatabaseRuntime {
             self.bridge
                 .runtime
                 .patch_shared_from_subscription(
-                    self.bridge.subscription(&connection_id)?,
+                    self.bridge.subscription(&handle)?,
                     &owner_id,
                     &patch,
                 )
@@ -350,7 +404,7 @@ impl WasmDatabaseRuntime {
 
     pub fn refresh_and_renew(
         &self,
-        connection_id: String,
+        handle: String,
         owner_id: String,
         trusted_session: JsValue,
     ) -> JsValue {
@@ -358,7 +412,7 @@ impl WasmDatabaseRuntime {
             self.bridge
                 .runtime
                 .refresh_and_renew(
-                    self.bridge.participant(&connection_id)?,
+                    self.bridge.participant(&handle)?,
                     &owner_id,
                     &session,
                 )
@@ -370,10 +424,10 @@ impl WasmDatabaseRuntime {
         }))
     }
 
-    pub fn renew(&self, connection_id: String, owner_id: String) -> JsValue {
+    pub fn renew(&self, handle: String, owner_id: String) -> JsValue {
         response(
             self.bridge
-                .participant(&connection_id)
+                .participant(&handle)
                 .and_then(|participant| {
                     self.bridge
                         .runtime
@@ -384,10 +438,10 @@ impl WasmDatabaseRuntime {
         )
     }
 
-    pub fn renew_subscription(&self, connection_id: String, owner_id: String) -> JsValue {
+    pub fn renew_subscription(&self, handle: String, owner_id: String) -> JsValue {
         response(
             self.bridge
-                .subscription(&connection_id)
+                .subscription(&handle)
                 .and_then(|subscription| {
                     self.bridge
                         .runtime
@@ -398,10 +452,10 @@ impl WasmDatabaseRuntime {
         )
     }
 
-    pub fn resubscribe(&mut self, connection_id: String, owner_id: String) -> JsValue {
+    pub fn resubscribe(&mut self, handle: String, owner_id: String) -> JsValue {
         let result = self
             .bridge
-            .subscription(&connection_id)
+            .subscription(&handle)
             .cloned()
             .and_then(|subscription| {
                 self.bridge
@@ -410,43 +464,45 @@ impl WasmDatabaseRuntime {
                     .map_err(Into::into)
             });
         response(result.map(|subscribed| {
+            let connection_id = subscribed.subscription.connection_id().to_string();
             self.bridge
                 .subscriptions
-                .insert(connection_id.clone(), subscribed.subscription);
+                .insert(handle.clone(), subscribed.subscription);
             Connected {
                 connection_id,
+                handle,
                 snapshot: subscribed.snapshot,
             }
         }))
     }
 
-    pub fn poll(&self, connection_id: String) -> JsValue {
+    pub fn poll(&self, handle: String) -> JsValue {
         response(
             self.bridge
-                .subscription(&connection_id)
+                .subscription(&handle)
                 .and_then(|subscription| {
                     self.bridge.runtime.poll(subscription).map_err(Into::into)
                 }),
         )
     }
 
-    pub fn leave(&mut self, connection_id: String) -> JsValue {
+    pub fn leave(&mut self, handle: String) -> JsValue {
         let result = self
             .bridge
-            .participant(&connection_id)
+            .participant(&handle)
             .cloned()
             .and_then(|participant| self.bridge.runtime.leave(&participant).map_err(Into::into));
         if result.is_ok() {
-            self.bridge.participants.remove(&connection_id);
-            self.bridge.subscriptions.remove(&connection_id);
+            self.bridge.participants.remove(&handle);
+            self.bridge.subscriptions.remove(&handle);
         }
         response(result)
     }
 
-    pub fn unsubscribe(&mut self, connection_id: String) -> JsValue {
+    pub fn unsubscribe(&mut self, handle: String) -> JsValue {
         let result = self
             .bridge
-            .subscription(&connection_id)
+            .subscription(&handle)
             .cloned()
             .and_then(|subscription| {
                 self.bridge
@@ -455,7 +511,7 @@ impl WasmDatabaseRuntime {
                     .map_err(Into::into)
             });
         if result.is_ok() {
-            self.bridge.subscriptions.remove(&connection_id);
+            self.bridge.subscriptions.remove(&handle);
         }
         response(result.map(|_| ()))
     }
@@ -578,27 +634,54 @@ mod tests {
         let joined = bridge
             .join("owner".to_string(), serde_json::json!({}), true)
             .unwrap();
-        let id = joined.connection_id;
+        let connection_id = joined.connection_id;
+        let handle = joined.handle;
+        assert_ne!(connection_id, handle);
         bridge
             .runtime
             .patch_connection(
-                bridge.participant(&id).unwrap(),
+                bridge.participant(&handle).unwrap(),
                 "owner",
                 &serde_json::json!({"cursor": "x"}),
             )
             .unwrap();
-        let participant = bridge.participant(&id).unwrap().clone();
+        let participant = bridge.participant(&handle).unwrap().clone();
         bridge.runtime.leave(&participant).unwrap();
-        bridge.participants.remove(&id);
-        bridge.subscriptions.remove(&id);
+        bridge.participants.remove(&handle);
+        bridge.subscriptions.remove(&handle);
         assert_eq!(
-            bridge.participant(&id).unwrap_err().code,
+            bridge.participant(&handle).unwrap_err().code,
             "unknown_connection"
         );
         assert_eq!(
-            bridge.subscription(&id).unwrap_err().code,
+            bridge.subscription(&handle).unwrap_err().code,
             "unknown_subscription"
         );
+    }
+
+    #[test]
+    fn visible_ids_unknown_handles_and_subscription_handles_cannot_resolve_participants() {
+        let mut bridge =
+            RuntimeBridge::new("db".to_string(), contract(), RuntimeConfig::default()).unwrap();
+        let joined = bridge
+            .join("same-owner".to_string(), serde_json::json!({}), true)
+            .unwrap();
+        let subscribed = bridge.subscribe("same-owner", false).unwrap();
+
+        assert_eq!(
+            bridge.participant(&joined.connection_id).unwrap_err().code,
+            "unknown_connection"
+        );
+        assert_eq!(
+            bridge.participant(&subscribed.handle).unwrap_err().code,
+            "unknown_connection"
+        );
+        assert_eq!(
+            bridge.subscription("unknown-handle").unwrap_err().code,
+            "unknown_subscription"
+        );
+        assert!(bridge.participant(&joined.handle).is_ok());
+        assert!(bridge.subscription(&joined.handle).is_ok());
     }
 
     #[test]
@@ -612,6 +695,24 @@ mod tests {
                 "message": "trusted owner does not own the connection"
             })
         );
+    }
+
+    #[test]
+    fn joined_subscription_cannot_be_unsubscribed_and_keeps_its_handle() {
+        let mut bridge =
+            RuntimeBridge::new("db".to_string(), contract(), RuntimeConfig::default()).unwrap();
+        let joined = bridge
+            .join("owner".to_string(), serde_json::json!({}), true)
+            .unwrap();
+        let error = bridge
+            .runtime
+            .unsubscribe(bridge.subscription(&joined.handle).unwrap())
+            .unwrap_err();
+        let error = BridgeError::from(error);
+
+        assert_eq!(error.code, "unknown_connection");
+        assert!(bridge.participant(&joined.handle).is_ok());
+        assert!(bridge.subscription(&joined.handle).is_ok());
     }
 
     #[test]
@@ -632,8 +733,15 @@ mod tests {
             expired.subscription_ids,
             [subscribed.connection_id.as_str()]
         );
-        assert!(!bridge.participants.contains_key(&joined.connection_id));
-        assert!(!bridge.subscriptions.contains_key(&joined.connection_id));
-        assert!(!bridge.subscriptions.contains_key(&subscribed.connection_id));
+        assert!(!bridge.participants.contains_key(&joined.handle));
+        assert!(!bridge.subscriptions.contains_key(&joined.handle));
+        assert!(!bridge.subscriptions.contains_key(&subscribed.handle));
+    }
+
+    #[test]
+    fn monotonic_elapsed_clamps_backward_or_temporarily_unavailable_sources() {
+        assert_eq!(monotonic_elapsed(100, Some(125), 20), 25);
+        assert_eq!(monotonic_elapsed(100, Some(110), 25), 25);
+        assert_eq!(monotonic_elapsed(100, None, 25), 25);
     }
 }

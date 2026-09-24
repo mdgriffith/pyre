@@ -39,6 +39,8 @@ export interface ServerConfig {
   ephemeralMaxUpdateCadenceMs?: number;
   /** Time between independent ephemeral lease renewals. Defaults to 10 seconds. */
   ephemeralLeaseCadenceMs?: number;
+  /** Maximum time for ephemeral headers, fetch, and response body. Defaults to 8 seconds. */
+  ephemeralRequestTimeoutMs?: number;
 }
 
 export interface SyncProgress {

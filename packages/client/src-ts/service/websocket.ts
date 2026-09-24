@@ -1,4 +1,4 @@
-import type { LiveSyncMessage } from './sse';
+import { redactEphemeralCapability, type LiveSyncMessage } from './sse';
 import { resolveEndpointUrl, type DatabaseId } from '../routing';
 
 export interface WebSocketConfig {
@@ -19,6 +19,7 @@ export class WebSocketManager {
   private shouldReconnect = true;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private onMessage: ((message: LiveSyncMessage) => void) | null = null;
+  private onEphemeralMessage: ((message: LiveSyncMessage) => void) | null = null;
   private elmApp: ElmApp | null = null;
   private debugLog: (...args: unknown[]) => void;
   private onStateChange: ((state: LiveTransportState) => void) | null = null;
@@ -40,6 +41,10 @@ export class WebSocketManager {
 
   setOnMessage(callback: (message: LiveSyncMessage) => void): void {
     this.onMessage = callback;
+  }
+
+  setOnEphemeralMessage(callback: (message: LiveSyncMessage) => void): void {
+    this.onEphemeralMessage = callback;
   }
 
   setOnStateChange(callback: (state: LiveTransportState) => void): void {
@@ -64,15 +69,29 @@ export class WebSocketManager {
 
   connect(): void {
     this.shouldReconnect = true;
+    if (this.reconnectTimer !== null) {
+      globalThis.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.socket) {
+      const socket = this.socket;
+      this.socket = null;
+      socket.close();
+      this.setState('disconnected');
+    }
     this.setState('connecting');
     this.openSocket();
   }
 
   private emitMessage(message: LiveSyncMessage): void {
-    this.onMessage?.(message);
+    if (message.type === 'connected' || message.type.startsWith('ephemeral')) {
+      this.onEphemeralMessage?.(message);
+    }
+    const publicMessage = redactEphemeralCapability(message);
+    this.onMessage?.(publicMessage);
     if (!message.type.startsWith('ephemeral')) {
-      this.elmApp?.ports.receiveWebSocketMessage?.send(message);
-      this.debugLog('[PyreClient] port receiveWebSocketMessage ->', message);
+      this.elmApp?.ports.receiveWebSocketMessage?.send(publicMessage);
+      this.debugLog('[PyreClient] port receiveWebSocketMessage ->', publicMessage);
     }
   }
 

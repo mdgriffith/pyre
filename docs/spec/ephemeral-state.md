@@ -43,7 +43,10 @@ is the default. A participant may subscribe without write access.
 Connection IDs are assigned by the authoritative server and are not credentials.
 Every write must be bound to the authenticated session, database runtime,
 participation generation, and current ephemeral epoch. A client-supplied
-connection ID cannot confer authority.
+connection ID cannot confer authority. Each participation has an independent
+high-entropy bearer capability disclosed only in its own `connected` message and
+required for upstream operations; it is never included in snapshots or peer
+changes.
 
 ## Schema contract
 
@@ -168,8 +171,9 @@ unless participant writes are enabled and the trusted owner and lease also match
 - `POST /ephemeral/resnapshot` replaces the subscription ordering boundary and
   returns a complete snapshot.
 
-Each request includes `databaseId`, `ephemeralEpoch`, `connectionId`, and
-`clientRequestSequence`; patch requests also include `patch`. The server echoes the
+Each request includes `databaseId`, `ephemeralEpoch`, `connectionId`,
+`ephemeralCapability`, and `clientRequestSequence`; patch requests also include
+`patch`. The server echoes the
 sequence in `ephemeralAccepted` or `ephemeralRejected`. The live stream uses the
 explicit envelope types `ephemeralSnapshot`, `ephemeralChanges`, and
 `ephemeralResyncRequired`, with payloads under fields of the same name. Durable

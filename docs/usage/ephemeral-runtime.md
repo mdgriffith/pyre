@@ -28,17 +28,22 @@ const runtime = createDatabaseRuntime<typeof database, StateTypes>({
   },
 });
 
-const { connectionId, snapshot } = runtime.join({
+const { connectionId, handle, snapshot } = runtime.join({
   ownerId: authenticatedSessionId,
   trustedSession: resolvedSession,
   writable: true,
 });
 ```
 
-Only `connectionId` crosses the application boundary. Participant and
-subscription capabilities stay private in WASM. Handle-based operations resolve
-those capabilities before Rust performs the applicable owner, epoch, generation,
-and lease checks.
+`connectionId` is public routing and snapshot identity. `handle` is an independent
+opaque participation capability used by `patchConnection`, participant Shared
+writes, lease renewal, polling, resubscription, and leave/unsubscribe. Keep the
+handle server-private whenever the adapter can do so. If an HTTP or stream adapter
+sends it to a client, treat it as a high-entropy bearer capability: disclose it only
+to that participation, require it on every related request, and never publish it in
+snapshots or peer changes. The WASM bridge resolves the handle before Rust performs
+the applicable owner, epoch, generation, and lease checks. A visible connection ID
+alone cannot resolve a private `Participant` or `Subscription`.
 
 Retain one runtime owner for each resident database. The owner decides when to
 poll deliveries, sweep leases with `expire`, process transport closure with
@@ -49,3 +54,10 @@ ephemeral state, and fences old connections.
 Use `DatabaseRuntimeError.code` for stable error handling and inspect
 `validationErrors` for contract validation details. `ContextManager` can resolve
 trusted sessions, but it does not own or retain database runtimes.
+
+`PyreSession` is the canonical boundary for application session values: accepted
+`DateTime` inputs, including JavaScript `Date` values converted to RFC 3339 by the
+JSON/WASM boundary, become integer Unix seconds before `pyre serve` derives
+`Connection` state. A custom runtime that calls `join` directly must provide this
+canonical trusted-session JSON; in particular, its `DateTime` values are integer
+Unix seconds.

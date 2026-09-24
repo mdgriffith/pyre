@@ -1,5 +1,6 @@
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -104,6 +105,7 @@ impl DatabaseOwner {
 
 #[derive(Clone)]
 struct EphemeralTransport {
+    capability: [u8; 32],
     participant: Option<Participant>,
     subscription: Arc<StdMutex<Subscription>>,
 }
@@ -143,6 +145,7 @@ struct EphemeralRequest {
     database_id: String,
     ephemeral_epoch: String,
     connection_id: String,
+    ephemeral_capability: String,
     #[serde(deserialize_with = "deserialize_client_request_sequence")]
     client_request_sequence: u64,
     #[serde(default)]
@@ -171,6 +174,7 @@ enum ServeError {
     Forbidden(String),
     Conflict(String),
     PayloadTooLarge(String),
+    Unavailable(String),
     Internal(String),
 }
 
@@ -182,6 +186,7 @@ impl ServeError {
             ServeError::Forbidden(_) => StatusCode::FORBIDDEN,
             ServeError::Conflict(_) => StatusCode::CONFLICT,
             ServeError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ServeError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -193,6 +198,7 @@ impl ServeError {
             | ServeError::Forbidden(message)
             | ServeError::Conflict(message)
             | ServeError::PayloadTooLarge(message)
+            | ServeError::Unavailable(message)
             | ServeError::Internal(message) => message,
         }
     }
@@ -278,7 +284,41 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
         cors_origins: options.cors_origins.clone(),
     });
 
-    let app = Router::new()
+    let app = serve_router(Arc::clone(&state));
+
+    println!("Pyre server listening on http://{}", addr);
+    println!("Database ID: {}", options.database_id);
+    println!("SSE endpoint: http://{}/sync/events", addr);
+
+    let lease_sweeper = state.database.ephemeral().map(|_| {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(EPHEMERAL_POLL_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if expire_leases_and_transports(&state).is_err() {
+                    break;
+                }
+            }
+        })
+    });
+    let result = axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error));
+    if let Some(sweeper) = lease_sweeper {
+        sweeper.abort();
+        let _ = sweeper.await;
+    }
+    if let Some(runtime) = state.database.ephemeral() {
+        let _ = runtime.close();
+    }
+    result
+}
+
+fn serve_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/health", get(health).options(cors_preflight))
         .route("/sync", post(sync).options(cors_preflight))
         .route("/sync/events", get(sync_events).options(cors_preflight))
@@ -299,40 +339,11 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
             post(resnapshot).options(cors_preflight),
         )
         .route("/db/:query_id", post(run_query).options(cors_preflight))
-        .with_state(Arc::clone(&state));
-
-    println!("Pyre server listening on http://{}", addr);
-    println!("Database ID: {}", options.database_id);
-    println!("SSE endpoint: http://{}/sync/events", addr);
-
-    let lease_sweeper = state.database.ephemeral().map(|_| {
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(EPHEMERAL_POLL_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let Some(runtime) = state.database.ephemeral() else {
-                    break;
-                };
-                if runtime.expire_leases().is_err() {
-                    break;
-                }
-            }
-        })
-    });
-    let result = axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error));
-    if let Some(sweeper) = lease_sweeper {
-        sweeper.abort();
-        let _ = sweeper.await;
-    }
-    if let Some(runtime) = state.database.ephemeral() {
-        let _ = runtime.close();
-    }
-    result
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            apply_cors,
+        ))
+        .with_state(state)
 }
 
 fn session_source(
@@ -398,20 +409,16 @@ fn session_source(
     }
 }
 
-async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    with_cors(
-        &state,
-        &headers,
-        Json(HealthResponse {
-            ok: true,
-            database_id: &state.database_id,
-        })
-        .into_response(),
-    )
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    Json(HealthResponse {
+        ok: true,
+        database_id: &state.database_id,
+    })
+    .into_response()
 }
 
-async fn cors_preflight(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    with_cors(&state, &headers, StatusCode::NO_CONTENT.into_response())
+async fn cors_preflight() -> Response {
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn sync(
@@ -443,7 +450,7 @@ async fn sync(
         .await
         .map_err(|error| ServeError::Internal(error.to_string()))?;
 
-    Ok(with_cors(&state, &headers, Json(result).into_response()))
+    Ok(Json(result).into_response())
 }
 
 async fn sync_events(
@@ -471,6 +478,7 @@ async fn sync_events(
         .map_err(|error| ServeError::Internal(format!("database error: {}", error)))?;
     let (session_id, ephemeral, initial_ephemeral) =
         if let Some(runtime) = state.database.ephemeral() {
+            let capability = new_ephemeral_capability()?;
             let contract = state
                 .manifest
                 .ephemeral
@@ -486,6 +494,7 @@ async fn sync_events(
                     .map_err(runtime_serve_error)?;
                 let id = joined.participant.connection_id().to_string();
                 let transport = EphemeralTransport {
+                    capability,
                     participant: Some(joined.participant),
                     subscription: Arc::new(StdMutex::new(joined.subscription)),
                 };
@@ -499,6 +508,7 @@ async fn sync_events(
                     .map_err(runtime_serve_error)?;
                 let id = subscribed.subscription.connection_id().to_string();
                 let transport = EphemeralTransport {
+                    capability,
                     participant: None,
                     subscription: Arc::new(StdMutex::new(subscribed.subscription)),
                 };
@@ -521,7 +531,7 @@ async fn sync_events(
             },
         );
 
-    let connected = json!({
+    let mut connected = json!({
         "type": "connected",
         "sessionId": session_id,
         "connectionId": session_id,
@@ -529,6 +539,12 @@ async fn sync_events(
         "databaseEpoch": database_epoch,
         "ephemeralEpoch": state.database.ephemeral().map(DatabaseRuntime::epoch),
     });
+    if let (Some(transport), Some(object)) = (ephemeral.as_ref(), connected.as_object_mut()) {
+        object.insert(
+            "ephemeralCapability".to_string(),
+            JsonValue::String(URL_SAFE_NO_PAD.encode(transport.capability)),
+        );
+    }
     let cleanup = ConnectionCleanup {
         state: Arc::clone(&state),
         session_id: session_id.clone(),
@@ -571,7 +587,7 @@ async fn sync_events(
     let response = Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response();
-    Ok(with_cors(&state, &headers, response))
+    Ok(response)
 }
 
 async fn patch_connection(
@@ -581,10 +597,11 @@ async fn patch_connection(
 ) -> Response {
     let sequence = body.client_request_sequence;
     let result = (|| {
-        let authenticated = authenticated_session_from_request(&state, &headers)?;
         let runtime = ephemeral_runtime(&state)?;
         validate_ephemeral_identity(&state, runtime, &body)?;
-        let participant = participant_for_request(&state, &body.connection_id)?;
+        let participant =
+            participant_for_request(&state, &body.connection_id, &body.ephemeral_capability)?;
+        let authenticated = authenticated_session_from_request(&state, &headers)?;
         let patch = body
             .patch
             .as_ref()
@@ -599,7 +616,7 @@ async fn patch_connection(
             .unwrap_or_else(|| runtime.revision().map_err(runtime_serve_error))?;
         Ok(("connectionPatch", revision, None))
     })();
-    ephemeral_response(&state, &headers, sequence, result)
+    ephemeral_response(&state, sequence, result)
 }
 
 async fn patch_shared(
@@ -609,10 +626,11 @@ async fn patch_shared(
 ) -> Response {
     let sequence = body.client_request_sequence;
     let result = (|| {
-        let authenticated = authenticated_session_from_request(&state, &headers)?;
         let runtime = ephemeral_runtime(&state)?;
         validate_ephemeral_identity(&state, runtime, &body)?;
-        let transport = transport_for_request(&state, &body.connection_id)?;
+        let transport =
+            transport_for_request(&state, &body.connection_id, &body.ephemeral_capability)?;
+        let authenticated = authenticated_session_from_request(&state, &headers)?;
         let patch = body
             .patch
             .as_ref()
@@ -635,7 +653,7 @@ async fn patch_shared(
             .unwrap_or_else(|| runtime.revision().map_err(runtime_serve_error))?;
         Ok(("sharedPatch", revision, None))
     })();
-    ephemeral_response(&state, &headers, sequence, result)
+    ephemeral_response(&state, sequence, result)
 }
 
 async fn refresh_lease(
@@ -644,48 +662,8 @@ async fn refresh_lease(
     Json(body): Json<EphemeralRequest>,
 ) -> Response {
     let sequence = body.client_request_sequence;
-    let result = (|| {
-        let authenticated = authenticated_session_from_request(&state, &headers)?;
-        let runtime = ephemeral_runtime(&state)?;
-        validate_ephemeral_identity(&state, runtime, &body)?;
-        let transport = transport_for_request(&state, &body.connection_id)?;
-        let (revision, lease) = if let Some(participant) = transport.participant {
-            let (change, lease) = runtime
-                .refresh_and_renew(
-                    &participant,
-                    &authenticated.owner_id,
-                    authenticated.session.json(),
-                )
-                .map_err(runtime_serve_error)?;
-            let revision = change
-                .as_ref()
-                .map(|change| change.revision)
-                .map(Ok)
-                .unwrap_or_else(|| runtime.revision().map_err(runtime_serve_error))?;
-            (revision, lease)
-        } else {
-            let subscription = transport
-                .subscription
-                .lock()
-                .map_err(|_| ServeError::Internal("subscription lock is poisoned".to_string()))?
-                .clone();
-            let lease = runtime
-                .renew_subscription(&subscription, &authenticated.owner_id)
-                .map_err(runtime_serve_error)?;
-            (runtime.revision().map_err(runtime_serve_error)?, lease)
-        };
-        update_connection_session(
-            &state,
-            &body.connection_id,
-            authenticated.session.logical().clone(),
-        )?;
-        Ok((
-            "leaseRefresh",
-            revision,
-            Some(json!({ "leaseDeadlineMillis": lease.deadline_millis })),
-        ))
-    })();
-    ephemeral_response(&state, &headers, sequence, result)
+    let result = refresh_lease_result(&state, &headers, &body);
+    ephemeral_response(&state, sequence, result)
 }
 
 async fn resnapshot(
@@ -695,23 +673,21 @@ async fn resnapshot(
 ) -> Response {
     let sequence = body.client_request_sequence;
     let result = (|| {
-        let authenticated = authenticated_session_from_request(&state, &headers)?;
         let runtime = ephemeral_runtime(&state)?;
         validate_ephemeral_identity(&state, runtime, &body)?;
-        let transport = transport_for_request(&state, &body.connection_id)?;
-        let current = transport
+        let transport =
+            transport_for_request(&state, &body.connection_id, &body.ephemeral_capability)?;
+        let authenticated = authenticated_session_from_request(&state, &headers)?;
+        // Keep teardown from observing the old generation after the runtime has
+        // installed its replacement subscription.
+        let mut current = transport
             .subscription
             .lock()
-            .map_err(|_| ServeError::Internal("subscription lock is poisoned".to_string()))?
-            .clone();
+            .map_err(|_| ServeError::Internal("subscription lock is poisoned".to_string()))?;
         let refreshed = runtime
             .resubscribe(&current, &authenticated.owner_id)
             .map_err(runtime_serve_error)?;
-        *transport
-            .subscription
-            .lock()
-            .map_err(|_| ServeError::Internal("subscription lock is poisoned".to_string()))? =
-            refreshed.subscription;
+        *current = refreshed.subscription;
         let revision = refreshed.snapshot.revision;
         Ok((
             "resnapshot",
@@ -719,7 +695,72 @@ async fn resnapshot(
             Some(json!({ "ephemeralSnapshot": refreshed.snapshot })),
         ))
     })();
-    ephemeral_response(&state, &headers, sequence, result)
+    ephemeral_response(&state, sequence, result)
+}
+
+fn refresh_lease_result(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &EphemeralRequest,
+) -> Result<(&'static str, u64, Option<JsonValue>), ServeError> {
+    let runtime = ephemeral_runtime(state)?;
+    validate_ephemeral_identity(state, runtime, body)?;
+    // Possession is checked before authentication so an unrelated request can never
+    // revoke a connection merely by naming its public ID.
+    let transport = transport_for_request(state, &body.connection_id, &body.ephemeral_capability)?;
+    let authenticated = match authenticated_session_from_request(state, headers) {
+        Ok(authenticated) => authenticated,
+        Err(error) => {
+            if matches!(
+                &error,
+                ServeError::Unauthorized(_) | ServeError::Forbidden(_)
+            ) {
+                terminate_for_authorization_loss(state, runtime, &body.connection_id, &transport);
+            }
+            return Err(error);
+        }
+    };
+
+    let renewed = if let Some(participant) = transport.participant.as_ref() {
+        runtime
+            .refresh_and_renew(
+                participant,
+                &authenticated.owner_id,
+                authenticated.session.json(),
+            )
+            .map(|(change, lease)| (change.map(|change| change.revision), lease))
+    } else {
+        let subscription = transport
+            .subscription
+            .lock()
+            .map_err(|_| ServeError::Internal("subscription lock is poisoned".to_string()))?
+            .clone();
+        runtime
+            .renew_subscription(&subscription, &authenticated.owner_id)
+            .map(|lease| (None, lease))
+    };
+    let (changed_revision, lease) = match renewed {
+        Ok(renewed) => renewed,
+        Err(error) => {
+            if is_authorization_failure(&error) {
+                terminate_for_authorization_loss(state, runtime, &body.connection_id, &transport);
+            }
+            return Err(runtime_serve_error(error));
+        }
+    };
+    let revision = changed_revision
+        .map(Ok)
+        .unwrap_or_else(|| runtime.revision().map_err(runtime_serve_error))?;
+    update_connection_session(
+        state,
+        &body.connection_id,
+        authenticated.session.logical().clone(),
+    )?;
+    Ok((
+        "leaseRefresh",
+        revision,
+        Some(json!({ "leaseDeadlineMillis": lease.deadline_millis })),
+    ))
 }
 
 fn ephemeral_runtime(state: &AppState) -> Result<&DatabaseRuntime<libsql::Database>, ServeError> {
@@ -745,23 +786,52 @@ fn validate_ephemeral_identity(
 fn transport_for_request(
     state: &AppState,
     connection_id: &str,
+    capability: &str,
 ) -> Result<EphemeralTransport, ServeError> {
-    state
+    let transport = state
         .connections
         .lock()
         .map_err(|_| ServeError::Internal("connection map is poisoned".to_string()))?
         .get(connection_id)
         .and_then(|connection| connection.ephemeral.clone())
-        .ok_or_else(|| ServeError::Conflict("connection is not active".to_string()))
+        .ok_or_else(invalid_ephemeral_capability)?;
+    if !capability_matches(&transport.capability, capability) {
+        return Err(invalid_ephemeral_capability());
+    }
+    Ok(transport)
 }
 
 fn participant_for_request(
     state: &AppState,
     connection_id: &str,
+    capability: &str,
 ) -> Result<Participant, ServeError> {
-    transport_for_request(state, connection_id)?
+    transport_for_request(state, connection_id, capability)?
         .participant
         .ok_or_else(|| ServeError::Forbidden("subscription is read-only".to_string()))
+}
+
+fn invalid_ephemeral_capability() -> ServeError {
+    ServeError::Forbidden("invalid ephemeral participation capability".to_string())
+}
+
+fn capability_matches(expected: &[u8; 32], supplied: &str) -> bool {
+    let Ok(supplied) = URL_SAFE_NO_PAD.decode(supplied) else {
+        return false;
+    };
+    if supplied.len() != expected.len() {
+        return false;
+    }
+    let Ok(mut expected_mac) = HmacSha256::new_from_slice(expected) else {
+        return false;
+    };
+    expected_mac.update(b"pyre ephemeral participation capability");
+    let expected_tag = expected_mac.finalize().into_bytes();
+    let Ok(mut supplied_mac) = HmacSha256::new_from_slice(&supplied) else {
+        return false;
+    };
+    supplied_mac.update(b"pyre ephemeral participation capability");
+    supplied_mac.verify_slice(&expected_tag).is_ok()
 }
 
 fn update_connection_session(
@@ -782,7 +852,6 @@ fn update_connection_session(
 
 fn ephemeral_response(
     state: &AppState,
-    headers: &HeaderMap,
     sequence: u64,
     result: Result<(&'static str, u64, Option<JsonValue>), ServeError>,
 ) -> Response {
@@ -812,7 +881,7 @@ fn ephemeral_response(
         )
             .into_response(),
     };
-    with_cors(state, headers, response)
+    response
 }
 
 async fn run_query(
@@ -874,11 +943,7 @@ async fn run_query(
         send_messages(&state, messages).await;
     }
 
-    Ok(with_cors(
-        &state,
-        &headers,
-        Json(result.response).into_response(),
-    ))
+    Ok(Json(result.response).into_response())
 }
 
 fn connected_sessions(state: &AppState) -> Result<ConnectedSessions, ServeError> {
@@ -964,6 +1029,65 @@ fn cleanup_ephemeral_transport(
     }
 }
 
+fn terminate_for_authorization_loss(
+    state: &AppState,
+    runtime: &DatabaseRuntime<libsql::Database>,
+    connection_id: &str,
+    transport: &EphemeralTransport,
+) {
+    let removed = state
+        .connections
+        .lock()
+        .ok()
+        .and_then(|mut connections| connections.remove(connection_id));
+    if removed.is_none() {
+        return;
+    }
+    if let Some(participant) = transport.participant.as_ref() {
+        let _ = runtime.authorization_lost(participant);
+    } else if let Ok(subscription) = transport.subscription.lock() {
+        let _ = runtime.unsubscribe(&subscription);
+    }
+}
+
+fn is_authorization_failure(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::OwnerMismatch | RuntimeError::EmptyOwnerId
+    )
+}
+
+fn expire_leases_and_transports(state: &AppState) -> Result<(), RuntimeError> {
+    let Some(runtime) = state.database.ephemeral() else {
+        return Ok(());
+    };
+    // Runtime expiry completes before the host transport map is locked.
+    let expired = runtime.expire_leases_detailed()?;
+    if expired.connection_ids.is_empty() && expired.subscription_ids.is_empty() {
+        return Ok(());
+    }
+    let mut connections = state
+        .connections
+        .lock()
+        .map_err(|_| RuntimeError::StatePoisoned)?;
+    remove_expired_transport_entries(
+        &mut connections,
+        &expired.connection_ids,
+        &expired.subscription_ids,
+    );
+    Ok(())
+}
+
+fn remove_expired_transport_entries(
+    connections: &mut HashMap<String, Connection>,
+    connection_ids: &[String],
+    subscription_ids: &[String],
+) {
+    for id in connection_ids.iter().chain(subscription_ids) {
+        connections.remove(id);
+    }
+}
+
 fn authenticated_session_from_request(
     state: &AppState,
     headers: &HeaderMap,
@@ -1030,9 +1154,8 @@ fn runtime_serve_error(error: RuntimeError) -> ServeError {
         | RuntimeError::StaleSubscription
         | RuntimeError::LeaseExpired
         | RuntimeError::Closed => ServeError::Conflict(error.to_string()),
-        RuntimeError::PayloadTooLarge | RuntimeError::Capacity => {
-            ServeError::PayloadTooLarge(error.to_string())
-        }
+        RuntimeError::PayloadTooLarge => ServeError::PayloadTooLarge(error.to_string()),
+        RuntimeError::Capacity => ServeError::Unavailable(error.to_string()),
         _ => ServeError::Internal(error.to_string()),
     }
 }
@@ -1119,15 +1242,24 @@ fn new_connection_id() -> String {
     format!("conn_{}", id)
 }
 
-fn allowed_cors_origin<'a>(state: &'a AppState, headers: &HeaderMap) -> Option<&'a str> {
-    allowed_cors_origin_for(&state.cors_origins, headers)
+fn new_ephemeral_capability() -> Result<[u8; 32], ServeError> {
+    let mut capability = [0_u8; 32];
+    getrandom::getrandom(&mut capability).map_err(|error| {
+        ServeError::Internal(format!(
+            "failed to generate participation capability: {error}"
+        ))
+    })?;
+    Ok(capability)
 }
 
-fn allowed_cors_origin_for<'a>(cors_origins: &'a [String], headers: &HeaderMap) -> Option<&'a str> {
+fn allowed_cors_origin_for<'a>(
+    cors_origins: &'a [String],
+    request_origin: Option<&HeaderValue>,
+) -> Option<&'a str> {
     if cors_origins.is_empty() {
         return None;
     }
-    let request_origin = headers.get(header::ORIGIN)?.to_str().ok()?;
+    let request_origin = request_origin?.to_str().ok()?;
 
     cors_origins
         .iter()
@@ -1135,34 +1267,76 @@ fn allowed_cors_origin_for<'a>(cors_origins: &'a [String], headers: &HeaderMap) 
         .map(String::as_str)
 }
 
-fn with_cors(state: &AppState, request_headers: &HeaderMap, mut response: Response) -> Response {
-    let Some(origin) = allowed_cors_origin(state, request_headers) else {
-        return response;
-    };
-
-    let headers = response.headers_mut();
-    if let Ok(value) = HeaderValue::from_str(&origin) {
-        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
-    }
-    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, PATCH, OPTIONS"),
-    );
+async fn apply_cors<B>(
+    State(state): State<Arc<AppState>>,
+    request: Request<B>,
+    next: Next<B>,
+) -> Response {
+    let request_origin = request.headers().get(header::ORIGIN).cloned();
     let session_header = match &state.session_source {
         SessionSource::Header { name, .. } => name.as_str(),
         _ => DEFAULT_SESSION_HEADER,
     };
-    if let Ok(value) = HeaderValue::from_str(&format!("content-type, {session_header}")) {
-        headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
-    }
+    let mut response = next.run(request).await;
+    apply_cors_headers(
+        &state.cors_origins,
+        session_header,
+        request_origin.as_ref(),
+        response.headers_mut(),
+    );
     response
+}
+
+fn apply_cors_headers(
+    cors_origins: &[String],
+    session_header: &str,
+    request_origin: Option<&HeaderValue>,
+    response_headers: &mut HeaderMap,
+) {
+    response_headers.remove(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+    response_headers.remove(header::ACCESS_CONTROL_ALLOW_CREDENTIALS);
+    response_headers.remove(header::ACCESS_CONTROL_ALLOW_METHODS);
+    response_headers.remove(header::ACCESS_CONTROL_ALLOW_HEADERS);
+    append_vary_origin(response_headers);
+    let Some(origin) = allowed_cors_origin_for(cors_origins, request_origin) else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(origin) {
+        response_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    }
+    response_headers.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        HeaderValue::from_static("true"),
+    );
+    response_headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, PATCH, OPTIONS"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("content-type, {session_header}")) {
+        response_headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
+    }
+}
+
+fn append_vary_origin(headers: &mut HeaderMap) {
+    let contains_origin = headers.get_all(header::VARY).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .any(|value| value.trim().eq_ignore_ascii_case("origin"))
+        })
+    });
+    if contains_origin {
+        return;
+    }
+    headers.append(header::VARY, HeaderValue::from_static("Origin"));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
     use pyre::server::manifest::FieldSchema;
+    use tower::ServiceExt;
 
     #[test]
     fn sync_request_accepts_public_client_cursor_envelope() {
@@ -1214,6 +1388,62 @@ mod tests {
 
     fn empty_auth() -> Option<String> {
         None
+    }
+
+    async fn test_router(cors_origins: &[&str]) -> Router {
+        let database = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        pyre::server::schema::ensure_database(
+            &connection,
+            "CorsTest",
+            "record Note {\n id Id.Uuid @id\n @public\n}",
+        )
+        .await
+        .unwrap();
+        let loaded_schema = load_schema_from_database(&connection).await.unwrap();
+        drop(connection);
+        let state = Arc::new(AppState {
+            database: DatabaseOwner::Durable(database),
+            manifest: manifest_with_session(),
+            loaded_schema,
+            database_id: "default".to_string(),
+            session_source: SessionSource::Header {
+                name: DEFAULT_SESSION_HEADER.to_string(),
+                secret: None,
+            },
+            page_size: 1000,
+            connections: StdMutex::new(HashMap::new()),
+            cors_origins: cors_origins
+                .iter()
+                .map(|origin| (*origin).to_string())
+                .collect(),
+        });
+        serve_router(state)
+    }
+
+    async fn router_response(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        origin: &str,
+        body: &'static str,
+    ) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::ORIGIN, origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     fn serve_options<'a>(
@@ -1288,6 +1518,7 @@ mod tests {
                 "databaseId": "db",
                 "ephemeralEpoch": "epoch",
                 "connectionId": "connection",
+                "ephemeralCapability": "capability",
                 "clientRequestSequence": sequence,
             }))
         };
@@ -1331,6 +1562,75 @@ mod tests {
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn expiration_removes_connection_and_subscription_transports_immediately() {
+        let connection = |id: &str| {
+            let (sender, receiver) = mpsc::channel(1);
+            (
+                id.to_string(),
+                Connection {
+                    session: HashMap::new(),
+                    sender,
+                    ephemeral: None,
+                },
+                receiver,
+            )
+        };
+        let (participant_id, participant, mut participant_receiver) = connection("participant");
+        let (subscription_id, subscription, mut subscription_receiver) = connection("subscription");
+        let (active_id, active, mut active_receiver) = connection("active");
+        let mut connections = HashMap::from([
+            (participant_id, participant),
+            (subscription_id, subscription),
+            (active_id, active),
+        ]);
+
+        remove_expired_transport_entries(
+            &mut connections,
+            &["participant".to_string()],
+            &["subscription".to_string()],
+        );
+
+        assert_eq!(connections.len(), 1);
+        assert!(connections.contains_key("active"));
+        assert!(matches!(
+            participant_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            subscription_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            active_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn capabilities_are_independent_and_required_exactly() {
+        let first = new_ephemeral_capability().unwrap();
+        let second = new_ephemeral_capability().unwrap();
+        let encoded = URL_SAFE_NO_PAD.encode(first);
+
+        assert_ne!(first, second);
+        assert!(capability_matches(&first, &encoded));
+        assert!(!capability_matches(&second, &encoded));
+        assert!(!capability_matches(&first, "not-base64!"));
+    }
+
+    #[test]
+    fn participant_capacity_is_service_unavailable_but_payload_is_too_large() {
+        assert_eq!(
+            runtime_serve_error(RuntimeError::Capacity).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            runtime_serve_error(RuntimeError::PayloadTooLarge).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[test]
@@ -1388,8 +1688,28 @@ mod tests {
         );
 
         assert_eq!(
-            allowed_cors_origin_for(&cors_origins, &headers),
+            allowed_cors_origin_for(&cors_origins, headers.get(header::ORIGIN)),
             Some("http://localhost:5173")
+        );
+
+        let mut response_headers = HeaderMap::new();
+        apply_cors_headers(
+            &cors_origins,
+            DEFAULT_SESSION_HEADER,
+            headers.get(header::ORIGIN),
+            &mut response_headers,
+        );
+        assert_eq!(
+            response_headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("http://localhost:5173"))
+        );
+        assert_eq!(
+            response_headers.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            Some(&HeaderValue::from_static("true"))
+        );
+        assert_eq!(
+            response_headers.get(header::VARY),
+            Some(&HeaderValue::from_static("Origin"))
         );
     }
 
@@ -1402,6 +1722,111 @@ mod tests {
             HeaderValue::from_static("http://evil.example"),
         );
 
-        assert_eq!(allowed_cors_origin_for(&cors_origins, &headers), None);
+        assert_eq!(
+            allowed_cors_origin_for(&cors_origins, headers.get(header::ORIGIN)),
+            None
+        );
+        let mut response_headers = HeaderMap::new();
+        apply_cors_headers(
+            &cors_origins,
+            DEFAULT_SESSION_HEADER,
+            headers.get(header::ORIGIN),
+            &mut response_headers,
+        );
+        assert!(!response_headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        assert!(!response_headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+        assert_eq!(
+            response_headers.get(header::VARY),
+            Some(&HeaderValue::from_static("Origin"))
+        );
+    }
+
+    #[test]
+    fn cors_varies_on_origin_when_request_origin_is_absent() {
+        let mut response_headers = HeaderMap::new();
+        apply_cors_headers(
+            &["http://localhost:5173".to_string()],
+            DEFAULT_SESSION_HEADER,
+            None,
+            &mut response_headers,
+        );
+
+        assert_eq!(
+            response_headers.get(header::VARY),
+            Some(&HeaderValue::from_static("Origin"))
+        );
+        assert!(!response_headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    #[tokio::test]
+    async fn cors_covers_handler_extractor_and_router_errors() {
+        const ALLOWED: &str = "http://localhost:5173";
+        let router = test_router(&[ALLOWED]).await;
+        let cases = [
+            (
+                "POST",
+                "/sync",
+                r#"{"databaseId":"default","syncCursor":{"tables":{}}}"#,
+                StatusCode::UNAUTHORIZED,
+            ),
+            ("POST", "/sync", "{", StatusCode::BAD_REQUEST),
+            ("POST", "/missing", "{}", StatusCode::NOT_FOUND),
+            ("GET", "/sync", "", StatusCode::METHOD_NOT_ALLOWED),
+        ];
+
+        for (method, uri, body, expected_status) in cases {
+            let response = router_response(&router, method, uri, ALLOWED, body).await;
+            assert_eq!(response.status(), expected_status, "{method} {uri}");
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static(ALLOWED))
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+                Some(&HeaderValue::from_static("true"))
+            );
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_METHODS),
+                Some(&HeaderValue::from_static("GET, POST, PATCH, OPTIONS"))
+            );
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS),
+                Some(&HeaderValue::from_static("content-type, x-pyre-session"))
+            );
+            assert_eq!(
+                response.headers().get(header::VARY),
+                Some(&HeaderValue::from_static("Origin"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_rejects_unlisted_origin_on_handler_and_extractor_errors() {
+        let router = test_router(&["http://localhost:5173"]).await;
+        let cases = [
+            (
+                r#"{"databaseId":"default","syncCursor":{"tables":{}}}"#,
+                StatusCode::UNAUTHORIZED,
+            ),
+            ("{", StatusCode::BAD_REQUEST),
+        ];
+
+        for (body, expected_status) in cases {
+            let response =
+                router_response(&router, "POST", "/sync", "http://evil.example", body).await;
+            assert_eq!(response.status(), expected_status);
+            assert!(!response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+            assert!(!response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+            assert_eq!(
+                response.headers().get(header::VARY),
+                Some(&HeaderValue::from_static("Origin"))
+            );
+        }
     }
 }

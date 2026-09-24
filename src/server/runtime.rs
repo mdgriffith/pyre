@@ -468,7 +468,7 @@ impl<H> DatabaseRuntime<H> {
             None
         };
         let epoch = environment_id(config.environment.as_ref())?;
-        Ok(Self {
+        let runtime = Self {
             database_id,
             database,
             contract,
@@ -483,7 +483,9 @@ impl<H> DatabaseRuntime<H> {
                 outboxes: BTreeMap::new(),
                 closed: false,
             }),
-        })
+        };
+        runtime.snapshot()?;
+        Ok(runtime)
     }
 
     pub fn database_id(&self) -> &str {
@@ -520,7 +522,7 @@ impl<H> DatabaseRuntime<H> {
         ensure_open(&state)?;
         self.require_state("Shared")?;
         require_owner_id(trusted_owner_id)?;
-        if state.outboxes.len() >= self.config.max_participants {
+        if participation_count(&state) >= self.config.max_participants {
             return Err(RuntimeError::Capacity);
         }
         let snapshot = self.snapshot_locked(&state)?;
@@ -553,7 +555,7 @@ impl<H> DatabaseRuntime<H> {
         let mut state = self.lock_state()?;
         ensure_open(&state)?;
         self.require_state("Connection")?;
-        if state.connections.len() >= self.config.max_participants {
+        if participation_count(&state) >= self.config.max_participants {
             return Err(RuntimeError::Capacity);
         }
         require_owner_id(&evidence.owner_id)?;
@@ -566,7 +568,9 @@ impl<H> DatabaseRuntime<H> {
         now.monotonic_millis
             .checked_add(duration_millis(self.config.downstream_delivery_cadence)?)
             .ok_or(RuntimeError::ClockOverflow)?;
-        if state.connections.contains_key(&connection_id) {
+        if state.connections.contains_key(&connection_id)
+            || state.outboxes.contains_key(&connection_id)
+        {
             return Err(RuntimeError::IdCollision);
         }
         let generation = state
@@ -589,6 +593,10 @@ impl<H> DatabaseRuntime<H> {
         self.ensure_delivery_size(&Delivery::Snapshot {
             snapshot: snapshot.clone(),
         })?;
+        let change = self.connection_change(revision, connection_id.clone(), value.clone());
+        self.ensure_delivery_size(&Delivery::Changes {
+            change: change.clone(),
+        })?;
         state.revision = revision;
         state.generation = generation;
         state.subscription_generation = subscription_generation;
@@ -609,7 +617,6 @@ impl<H> DatabaseRuntime<H> {
                 lease_deadline: deadline,
             },
         );
-        let change = self.connection_change(revision, connection_id, value);
         self.publish_locked(&mut state, &change);
         let subscription = self.insert_outbox_locked(
             &mut state,
@@ -770,14 +777,19 @@ impl<H> DatabaseRuntime<H> {
         if !patched.changed {
             return Ok(None);
         }
-        let revision = advance(&mut state)?;
+        let revision = next_revision(&state)?;
+        let change = self.connection_change(
+            revision,
+            participant.connection_id.clone(),
+            patched.value.clone(),
+        );
+        self.ensure_state_change_size(&state, &change)?;
+        advance(&mut state)?;
         state
             .connections
             .get_mut(&participant.connection_id)
             .expect("validated connection")
             .value = patched.value.clone();
-        let change =
-            self.connection_change(revision, participant.connection_id.clone(), patched.value);
         self.publish_locked(&mut state, &change);
         Ok(Some(change))
     }
@@ -802,14 +814,19 @@ impl<H> DatabaseRuntime<H> {
         if !refreshed.changed {
             return Ok(None);
         }
-        let revision = advance(&mut state)?;
+        let revision = next_revision(&state)?;
+        let change = self.connection_change(
+            revision,
+            participant.connection_id.clone(),
+            refreshed.value.clone(),
+        );
+        self.ensure_state_change_size(&state, &change)?;
+        advance(&mut state)?;
         state
             .connections
             .get_mut(&participant.connection_id)
             .expect("validated connection")
             .value = refreshed.value.clone();
-        let change =
-            self.connection_change(revision, participant.connection_id.clone(), refreshed.value);
         self.publish_locked(&mut state, &change);
         Ok(Some(change))
     }
@@ -834,18 +851,20 @@ impl<H> DatabaseRuntime<H> {
                 .refresh_connection(current, trusted_session, now.unix_seconds)?;
         let deadline = self.deadline(now)?;
         let change = if refreshed.changed {
-            let revision = advance(&mut state)?;
+            let revision = next_revision(&state)?;
+            let change = self.connection_change(
+                revision,
+                participant.connection_id.clone(),
+                refreshed.value.clone(),
+            );
+            self.ensure_state_change_size(&state, &change)?;
+            advance(&mut state)?;
             let connection = state
                 .connections
                 .get_mut(&participant.connection_id)
                 .expect("validated connection");
             connection.value = refreshed.value.clone();
             connection.lease_deadline = deadline;
-            let change = self.connection_change(
-                revision,
-                participant.connection_id.clone(),
-                refreshed.value,
-            );
             self.publish_locked(&mut state, &change);
             Some(change)
         } else {
@@ -995,10 +1014,14 @@ impl<H> DatabaseRuntime<H> {
     }
 
     /// Removes a subscription that has no associated Connection value.
+    /// Joined subscriptions return `UnknownConnection` and must be retired with `leave`.
     pub fn unsubscribe(&self, subscription: &Subscription) -> Result<(), RuntimeError> {
         let mut state = self.lock_state()?;
         ensure_open(&state)?;
         self.validate_subscription(&state, subscription)?;
+        if state.connections.contains_key(&subscription.connection_id) {
+            return Err(RuntimeError::UnknownConnection);
+        }
         state.outboxes.remove(&subscription.connection_id);
         Ok(())
     }
@@ -1100,16 +1123,18 @@ impl<H> DatabaseRuntime<H> {
         if !patched.changed {
             return Ok(None);
         }
-        let revision = advance(state)?;
-        state.shared = Some(patched.value.clone());
+        let revision = next_revision(state)?;
         let change = Change {
             database_id: self.database_id.clone(),
             epoch: self.epoch.clone(),
             revision,
-            shared: Some(patched.value),
+            shared: Some(patched.value.clone()),
             connections: BTreeMap::new(),
             removed_connections: Vec::new(),
         };
+        self.ensure_state_change_size(state, &change)?;
+        advance(state)?;
+        state.shared = Some(patched.value.clone());
         self.publish_locked(state, &change);
         Ok(Some(change))
     }
@@ -1298,6 +1323,22 @@ impl<H> DatabaseRuntime<H> {
         }
     }
 
+    fn ensure_state_change_size(&self, state: &State, change: &Change) -> Result<(), RuntimeError> {
+        self.ensure_delivery_size(&Delivery::Changes {
+            change: change.clone(),
+        })?;
+        let mut snapshot = self.snapshot_value(state);
+        snapshot.revision = change.revision;
+        if let Some(shared) = &change.shared {
+            snapshot.shared = Some(shared.clone());
+        }
+        snapshot.connections.extend(change.connections.clone());
+        for id in &change.removed_connections {
+            snapshot.connections.remove(id);
+        }
+        self.ensure_delivery_size(&Delivery::Snapshot { snapshot })
+    }
+
     fn connection_change(&self, revision: u64, id: String, value: Value) -> Change {
         Change {
             database_id: self.database_id.clone(),
@@ -1375,12 +1416,25 @@ fn require_owner_id(owner_id: &str) -> Result<(), RuntimeError> {
     }
 }
 
+fn participation_count(state: &State) -> usize {
+    state.connections.len()
+        + state
+            .outboxes
+            .keys()
+            .filter(|id| !state.connections.contains_key(*id))
+            .count()
+}
+
 fn advance(state: &mut State) -> Result<u64, RuntimeError> {
-    state.revision = state
+    state.revision = next_revision(state)?;
+    Ok(state.revision)
+}
+
+fn next_revision(state: &State) -> Result<u64, RuntimeError> {
+    state
         .revision
         .checked_add(1)
-        .ok_or(RuntimeError::RevisionExhausted)?;
-    Ok(state.revision)
+        .ok_or(RuntimeError::RevisionExhausted)
 }
 
 fn duration_millis(duration: Duration) -> Result<u64, RuntimeError> {

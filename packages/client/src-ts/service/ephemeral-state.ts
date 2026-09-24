@@ -99,6 +99,7 @@ interface Channel {
   queuedCompletions: Completion[];
   timer: ReturnType<typeof setTimeout> | null;
   lastSentAt: number | null;
+  inFlightGeneration: number | null;
 }
 
 interface InFlight {
@@ -120,8 +121,10 @@ export interface EphemeralStateServiceConfig {
   ephemeralWrite?: boolean;
   maxUpdateCadenceMs?: number;
   leaseCadenceMs?: number;
+  requestTimeoutMs?: number;
   credentials?: RequestCredentials;
   resolveHeaders?: () => Promise<Record<string, string>>;
+  requestTransportReconnect?: () => void;
   fetch?: typeof fetch;
   now?: () => number;
   setTimeout?: typeof setTimeout;
@@ -139,7 +142,7 @@ export class EphemeralStateService<
   SharedPatch extends object = Partial<Shared>,
 > {
   private readonly config: Required<Pick<EphemeralStateServiceConfig,
-    'ephemeralWrite' | 'maxUpdateCadenceMs' | 'leaseCadenceMs' | 'credentials'>>
+    'ephemeralWrite' | 'maxUpdateCadenceMs' | 'leaseCadenceMs' | 'requestTimeoutMs' | 'credentials'>>
     & EphemeralStateServiceConfig;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
@@ -165,6 +168,9 @@ export class EphemeralStateService<
   private sequence = 0;
   private leaseTimer: ReturnType<typeof setTimeout> | null = null;
   private resnapshotInFlight = false;
+  private pendingRecoveryRevision: number | null = null;
+  private bufferedChanges: EphemeralChangesMessage[] = [];
+  private ephemeralCapability: string | null = null;
   private disposed = false;
 
   constructor(config: EphemeralStateServiceConfig) {
@@ -174,6 +180,7 @@ export class EphemeralStateService<
       ephemeralWrite: config.ephemeralWrite ?? true,
       maxUpdateCadenceMs: config.maxUpdateCadenceMs ?? 50,
       leaseCadenceMs: config.leaseCadenceMs ?? 10_000,
+      requestTimeoutMs: config.requestTimeoutMs ?? 8_000,
       credentials: config.credentials ?? 'same-origin',
     };
     const fetchImpl = config.fetch ?? globalThis.fetch;
@@ -190,12 +197,13 @@ export class EphemeralStateService<
     return {
       authoritative: {
         ...this.authority,
-        connections: { ...this.authority.connections },
+        shared: cloneJsonValue(this.authority.shared) as Shared | null,
+        connections: cloneJsonValue(this.authority.connections) as Record<string, Connection>,
         freshness: { ...this.authority.freshness },
       },
       desired: {
-        connection: captureJsonValue(this.channels.connection.desired, 'Ephemeral desired state', new Set()) as ConnectionPatch,
-        shared: captureJsonValue(this.channels.shared.desired, 'Ephemeral desired state', new Set()) as SharedPatch,
+        connection: cloneJsonValue(this.channels.connection.desired) as ConnectionPatch,
+        shared: cloneJsonValue(this.channels.shared.desired) as SharedPatch,
       },
       latestOutcome: this.latestOutcome ? { ...this.latestOutcome } : null,
     };
@@ -258,7 +266,7 @@ export class EphemeralStateService<
   private newChannel(): Channel {
     return {
       desired: emptyRecord(), fieldVersions: emptyRecord(), queued: emptyRecord(), queuedFieldVersions: emptyRecord(),
-      queuedCompletions: [], timer: null, lastSentAt: null,
+      queuedCompletions: [], timer: null, lastSentAt: null, inFlightGeneration: null,
     };
   }
 
@@ -309,9 +317,12 @@ export class EphemeralStateService<
   private handleConnected(message: Record<string, unknown>): void {
     if (message.databaseId !== this.config.databaseId
       || typeof message.connectionId !== 'string'
+      || typeof message.ephemeralCapability !== 'string'
+      || message.ephemeralCapability.length === 0
       || typeof message.ephemeralEpoch !== 'string') return;
 
     this.endGeneration('Ephemeral connection identity changed');
+    this.ephemeralCapability = message.ephemeralCapability;
     this.authority = {
       shared: null,
       connections: {},
@@ -327,15 +338,41 @@ export class EphemeralStateService<
     if (!this.matchesCurrentIdentity(snapshot)
       || (!recovery && this.authority.freshness.status !== 'connecting')
       || (recovery && this.authority.freshness.status !== 'resyncing')) return;
+    const bufferedChanges = recovery
+      ? this.bufferedChanges.sort((left, right) => left.revision - right.revision)
+      : [];
+    this.bufferedChanges = [];
     this.authority = {
       shared: (snapshot.shared ?? null) as Shared | null,
       connections: { ...snapshot.connections } as Record<string, Connection>,
       epoch: snapshot.epoch,
       revision: snapshot.revision,
       connectionId: this.authority.connectionId,
-      freshness: { status: 'live', stale: false },
+      freshness: recovery
+        ? { status: 'resyncing', stale: true }
+        : { status: 'live', stale: false },
     };
     this.resnapshotInFlight = false;
+    for (const changes of bufferedChanges) {
+      if (changes.revision <= this.authority.revision!) continue;
+      if (this.removesOwnConnection(changes)) {
+        this.failLive('Ephemeral connection was removed by the server');
+        return;
+      }
+      this.applyChanges(changes);
+    }
+
+    if (recovery && this.pendingRecoveryRevision !== null
+      && this.pendingRecoveryRevision > this.authority.revision!) {
+      this.emit();
+      this.startResnapshot();
+      return;
+    }
+    this.pendingRecoveryRevision = null;
+    this.authority = {
+      ...this.authority,
+      freshness: { status: 'live', stale: false },
+    };
     this.scheduleLease();
     this.emit();
 
@@ -350,9 +387,22 @@ export class EphemeralStateService<
   private installChanges(changes: EphemeralChangesMessage): void {
     if (!this.matchesCurrentIdentity(changes)
       || this.authority.revision === null
-      || changes.revision <= this.authority.revision
-      || this.authority.freshness.status === 'resyncing') return;
+      || changes.revision <= this.authority.revision) return;
 
+    if (this.removesOwnConnection(changes)) {
+      this.failLive('Ephemeral connection was removed by the server');
+      return;
+    }
+    if (this.authority.freshness.status === 'resyncing') {
+      this.bufferedChanges.push(changes);
+      return;
+    }
+
+    this.applyChanges(changes);
+    this.emit();
+  }
+
+  private applyChanges(changes: EphemeralChangesMessage): void {
     const connections = { ...this.authority.connections } as Record<string, Connection>;
     for (const [connectionId, value] of Object.entries(changes.connections ?? {})) {
       connections[connectionId] = value as Connection;
@@ -368,7 +418,11 @@ export class EphemeralStateService<
       connections,
       revision: changes.revision,
     };
-    this.emit();
+  }
+
+  private removesOwnConnection(changes: EphemeralChangesMessage): boolean {
+    return this.authority.connectionId !== null
+      && (changes.removedConnections ?? []).includes(this.authority.connectionId);
   }
 
   private handleResyncRequired(value: unknown): void {
@@ -377,11 +431,18 @@ export class EphemeralStateService<
       || value.epoch !== this.authority.epoch
       || !isSafeRevision(value.revision)
       || this.authority.revision === null
-      || value.revision <= this.authority.revision
-      || this.resnapshotInFlight) return;
+      || value.revision <= this.authority.revision) return;
 
+    this.pendingRecoveryRevision = Math.max(this.pendingRecoveryRevision ?? 0, value.revision);
+    this.startResnapshot();
+  }
+
+  private startResnapshot(): void {
+    if (this.resnapshotInFlight) return;
     this.resnapshotInFlight = true;
-    this.setFreshness({ status: 'resyncing', stale: true });
+    if (this.authority.freshness.status !== 'resyncing') {
+      this.setFreshness({ status: 'resyncing', stale: true });
+    }
     void this.requestResnapshot();
   }
 
@@ -403,7 +464,8 @@ export class EphemeralStateService<
 
   private schedule(channelName: ChannelName): void {
     const channel = this.channels[channelName];
-    if (channel.timer || Object.keys(channel.queued).length === 0 || !this.isLive()) return;
+    if (channel.timer || channel.inFlightGeneration !== null
+      || Object.keys(channel.queued).length === 0 || !this.isLive()) return;
     const elapsed = channel.lastSentAt === null ? Infinity : this.now() - channel.lastSentAt;
     const delay = Math.max(0, this.config.maxUpdateCadenceMs - elapsed);
     channel.timer = this.setTimer(() => {
@@ -423,8 +485,10 @@ export class EphemeralStateService<
     channel.queuedCompletions = [];
     channel.lastSentAt = this.now();
     const generation = this.generation;
+    channel.inFlightGeneration = generation;
     const endpoint = channelName === 'connection' ? this.config.endpoints.connection : this.config.endpoints.shared;
     const result = await this.request(`${channelName}Patch`, endpoint, patch, generation, completions);
+    if (channel.inFlightGeneration === generation) channel.inFlightGeneration = null;
     if (generation !== this.generation || this.disposed) return;
     if (result.status === 'accepted') {
       completions.forEach(({ resolve }) => resolve(result.accepted));
@@ -453,14 +517,29 @@ export class EphemeralStateService<
     const controller = new AbortController();
     const tracked: InFlight = { controller, completions, generation, sequence };
     this.inFlight.add(tracked);
+    let rejectInterrupted: ((error: Error) => void) | null = null;
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      rejectInterrupted = reject;
+    });
+    const timeout = this.setTimer(() => {
+      const error = new Error(`${operation} timed out after ${this.config.requestTimeoutMs}ms`);
+      rejectInterrupted?.(error);
+      controller.abort();
+    }, this.config.requestTimeoutMs);
+    controller.signal.addEventListener('abort', () => {
+      rejectInterrupted?.(new Error(`${operation} was aborted`));
+    }, { once: true });
     try {
-      const resolvedHeaders = await this.config.resolveHeaders?.() ?? {};
+      const resolvedHeaders = await Promise.race([
+        this.config.resolveHeaders?.() ?? Promise.resolve({}),
+        interrupted,
+      ]);
       if (generation !== this.generation || this.disposed) {
         return { status: 'failed', outcome: this.unknown(sequence, `${operation} outcome is unknown after connection change`) };
       }
       const headers = new Headers(resolvedHeaders);
       headers.set('content-type', 'application/json');
-      const response = await this.fetchImpl(resolveUrl(this.config.baseUrl, path), {
+      const response = await Promise.race([this.fetchImpl(resolveUrl(this.config.baseUrl, path), {
         method: patch === undefined ? 'POST' : 'PATCH',
         headers,
         credentials: this.config.credentials,
@@ -469,14 +548,16 @@ export class EphemeralStateService<
           databaseId: this.config.databaseId,
           ephemeralEpoch: identity.epoch,
           connectionId: identity.connectionId,
+          ephemeralCapability: identity.capability,
           clientRequestSequence: sequence,
           ...(patch === undefined ? {} : { patch }),
         }),
-      });
+      }), interrupted]);
       let raw: unknown;
       try {
-        raw = await response.json();
+        raw = await Promise.race([response.json(), interrupted]);
       } catch (error) {
+        if (controller.signal.aborted) throw error;
         return {
           status: 'failed',
           outcome: this.unknown(sequence, `${operation} returned a non-JSON response (HTTP ${response.status}): ${errorMessage(error)}`),
@@ -510,6 +591,7 @@ export class EphemeralStateService<
     } catch (error) {
       return { status: 'failed', outcome: this.unknown(sequence, `${operation} outcome is unknown: ${errorMessage(error)}`) };
     } finally {
+      this.clearTimer(timeout);
       this.inFlight.delete(tracked);
     }
   }
@@ -544,6 +626,7 @@ export class EphemeralStateService<
       freshness: { status: 'error', stale: true, error },
     };
     this.emit();
+    if (!this.disposed) this.config.requestTransportReconnect?.();
   }
 
   private endGeneration(reason: string): void {
@@ -551,6 +634,9 @@ export class EphemeralStateService<
     if (this.leaseTimer) this.clearTimer(this.leaseTimer);
     this.leaseTimer = null;
     this.resnapshotInFlight = false;
+    this.pendingRecoveryRevision = null;
+    this.bufferedChanges = [];
+    this.ephemeralCapability = null;
     let hadPending = false;
     for (const channel of Object.values(this.channels)) {
       if (channel.timer) this.clearTimer(channel.timer);
@@ -562,6 +648,7 @@ export class EphemeralStateService<
       channel.queuedCompletions.forEach(({ reject }) => reject(new EphemeralUpdateError(outcome)));
       channel.queuedCompletions = [];
       channel.lastSentAt = null;
+      channel.inFlightGeneration = null;
     }
     for (const request of this.inFlight) {
       request.controller.abort();
@@ -579,9 +666,13 @@ export class EphemeralStateService<
       && this.authority.connectionId !== null;
   }
 
-  private identity(): { epoch: string; connectionId: string } | null {
-    return this.authority.epoch && this.authority.connectionId
-      ? { epoch: this.authority.epoch, connectionId: this.authority.connectionId }
+  private identity(): { epoch: string; connectionId: string; capability: string } | null {
+    return this.authority.epoch && this.authority.connectionId && this.ephemeralCapability
+      ? {
+        epoch: this.authority.epoch,
+        connectionId: this.authority.connectionId,
+        capability: this.ephemeralCapability,
+      }
       : null;
   }
 
@@ -624,15 +715,18 @@ export class EphemeralStateService<
 
   private emit(): void {
     if (this.callbacks.size === 0) return;
-    const snapshot = this.getSnapshot();
-    this.callbacks.forEach((callback) => callback(snapshot));
+    this.callbacks.forEach((callback) => callback(this.getSnapshot()));
   }
 }
 
 function parseSnapshot(value: unknown): EphemeralSnapshotMessage | null {
   if (!isRecord(value) || typeof value.databaseId !== 'string' || typeof value.epoch !== 'string'
     || !isSafeRevision(value.revision) || !isRecord(value.connections)) return null;
-  return value as unknown as EphemeralSnapshotMessage;
+  try {
+    return cloneJsonValue(value) as unknown as EphemeralSnapshotMessage;
+  } catch {
+    return null;
+  }
 }
 
 function parseChanges(value: unknown): EphemeralChangesMessage | null {
@@ -641,7 +735,11 @@ function parseChanges(value: unknown): EphemeralChangesMessage | null {
     || (value.connections !== undefined && !isRecord(value.connections))
     || (value.removedConnections !== undefined
       && (!Array.isArray(value.removedConnections) || value.removedConnections.some((id) => typeof id !== 'string')))) return null;
-  return value as unknown as EphemeralChangesMessage;
+  try {
+    return cloneJsonValue(value) as unknown as EphemeralChangesMessage;
+  } catch {
+    return null;
+  }
 }
 
 function isSafeRevision(value: unknown): value is number {
@@ -683,6 +781,7 @@ function validateConfig(config: EphemeralStateServiceConfig): void {
   }
   validateCadence(config.maxUpdateCadenceMs, 'maxUpdateCadenceMs', true);
   validateCadence(config.leaseCadenceMs, 'leaseCadenceMs', false);
+  validateCadence(config.requestTimeoutMs, 'requestTimeoutMs', false);
 }
 
 function validateCadence(value: number | undefined, name: string, allowZero: boolean): void {
@@ -707,12 +806,12 @@ function captureJsonValue(value: unknown, path: string, seen: Set<object>): unkn
   }
   if (typeof value === 'bigint') {
     const normalized = Number(value);
-    if (!Number.isFinite(normalized)) throw new TypeError(`${path} must contain only JSON-safe values`);
+    if (!Number.isSafeInteger(normalized)) throw new TypeError(`${path} must contain only JSON-safe values`);
     return normalized;
   }
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) throw new TypeError(`${path} contains an invalid Date`);
-    return value.toISOString();
+    return Math.floor(value.getTime() / 1000);
   }
   if (ArrayBuffer.isView(value)) {
     return Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
@@ -742,6 +841,10 @@ function captureJsonValue(value: unknown, path: string, seen: Set<object>): unkn
   } finally {
     seen.delete(value);
   }
+}
+
+function cloneJsonValue(value: unknown): unknown {
+  return captureJsonValue(value, 'Ephemeral state', new Set());
 }
 
 function emptyRecord<T = unknown>(): Record<string, T> {

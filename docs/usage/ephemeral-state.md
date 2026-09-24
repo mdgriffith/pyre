@@ -49,6 +49,10 @@ value atomically and rejects unknown, derived, or invalid fields without changin
 state.
 
 State fields support Pyre scalar, collection, `Json<T>`, and tagged-union types.
+Ephemeral `DateTime` values use whole Unix epoch seconds in generated Rust and
+TypeScript state types and on the wire. Trusted application sessions may use the
+ordinary accepted DateTime inputs; the server canonicalizes them before deriving
+Connection fields.
 State is not relational: links, indexes, table directives, queries, and record
 permissions do not apply. Run `pyre check` and `pyre generate` after changing a
 declaration. Generated artifacts include:
@@ -119,8 +123,8 @@ server: {
 
 A read-only client receives snapshots, changes, and removals but its public update
 methods reject before HTTP. Write intent alone does not grant Shared authority;
-the server policy, authenticated owner, current epoch, connection identity, and
-lease must all match.
+the server policy, authenticated owner, current epoch, private participation
+capability, connection identity, and lease must all match.
 
 ## Cadence And Limits
 
@@ -128,7 +132,8 @@ Client patches are coalesced independently for Connection and Shared. The defaul
 minimum interval is 50 ms per channel and can be set with
 `ephemeralMaxUpdateCadenceMs`. Lease renewal is independent of application writes;
 `ephemeralLeaseCadenceMs` defaults to 10 seconds. Do not use application activity
-as a heartbeat.
+as a heartbeat. Ephemeral HTTP work times out after 8 seconds by default; configure
+`ephemeralRequestTimeoutMs` when deployment latency requires a different bound.
 
 The server sends complete changed entries and explicit Connection removals.
 Downstream cadence coalesces intermediate values while guaranteeing a trailing
@@ -173,7 +178,10 @@ Signed production sessions have payload shape
 `{ session, exp, sessionKey }`. When a schema declares ephemeral state,
 `sessionKey` is required and must remain stable across token refresh. It is the
 server-authenticated owner identity and is stored only as a hash. A Connection ID
-is routing state, not a credential. Static development sessions use one stable
+is routing state, not a credential. `pyre serve` sends a separate high-entropy
+participation capability only in that connection's `connected` message and requires
+it on every ephemeral HTTP request; snapshots and peer changes never contain it.
+Static development sessions use one stable
 process-local owner; unsigned trusted session JSON cannot preserve ownership when
 the complete credential changes.
 
@@ -183,9 +191,10 @@ Custom TypeScript servers use `createDatabaseRuntime` from
 generated `state.rs` value/patch types at application boundaries. Trusted server
 code can call the runtime's server-owned Shared patch API even when participant
 writes are disabled. Transport adapters must authenticate joins and every patch,
-poll bounded deliveries, renew/expire leases, process transport closure, and close
-the runtime. See [Custom Ephemeral Runtime](./ephemeral-runtime.md) for the focused
-ownership API.
+retain an independent participation capability rather than resolving private
+handles from connection IDs, poll bounded deliveries, renew/expire leases, process
+transport closure, and close the runtime. See
+[Custom Ephemeral Runtime](./ephemeral-runtime.md) for the focused ownership API.
 
 The native runtime deliberately accepts `serde_json::Value` at its contract
 boundary; generated Rust types provide the typed application boundary:

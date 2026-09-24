@@ -123,22 +123,26 @@ export class DatabaseRuntimeError extends Error {
   }
 }
 
+declare const participationHandleBrand: unique symbol;
+/** Server-private opaque authority for one runtime participation. */
+export type ParticipationHandle = string & { readonly [participationHandleBrand]: true };
+
 type BridgeResponse<T> = { ok: true; value: T } | { ok: false; error: RuntimeErrorValue };
 
 export interface DatabaseRuntimeBridge {
   join(ownerId: string, trustedSession: unknown, writable: boolean): unknown;
   subscribe(ownerId: string, writable: boolean): unknown;
-  patch_connection(connectionId: string, ownerId: string, patch: unknown): unknown;
+  patch_connection(handle: string, ownerId: string, patch: unknown): unknown;
   patch_shared(patch: unknown): unknown;
-  patch_shared_from_participant(connectionId: string, ownerId: string, patch: unknown): unknown;
-  patch_shared_from_subscription(connectionId: string, ownerId: string, patch: unknown): unknown;
-  refresh_and_renew(connectionId: string, ownerId: string, trustedSession: unknown): unknown;
-  renew(connectionId: string, ownerId: string): unknown;
-  renew_subscription(connectionId: string, ownerId: string): unknown;
-  resubscribe(connectionId: string, ownerId: string): unknown;
-  poll(connectionId: string): unknown;
-  leave(connectionId: string): unknown;
-  unsubscribe(connectionId: string): unknown;
+  patch_shared_from_participant(handle: string, ownerId: string, patch: unknown): unknown;
+  patch_shared_from_subscription(handle: string, ownerId: string, patch: unknown): unknown;
+  refresh_and_renew(handle: string, ownerId: string, trustedSession: unknown): unknown;
+  renew(handle: string, ownerId: string): unknown;
+  renew_subscription(handle: string, ownerId: string): unknown;
+  resubscribe(handle: string, ownerId: string): unknown;
+  poll(handle: string): unknown;
+  leave(handle: string): unknown;
+  unsubscribe(handle: string): unknown;
   expire(): unknown;
   snapshot(): unknown;
   close(): unknown;
@@ -159,6 +163,7 @@ export interface CreateDatabaseRuntimeOptions<Database> {
 
 export interface Connected<Connection, Shared> {
   connectionId: string;
+  handle: ParticipationHandle;
   snapshot: EphemeralSnapshot<Connection, Shared>;
 }
 
@@ -182,17 +187,17 @@ export interface DatabaseRuntime<Database, Types extends EphemeralStateTypes> {
   readonly database: Database;
   join(input: { ownerId: string; trustedSession: unknown; writable?: boolean }): Connected<Types["connection"], Types["shared"]>;
   subscribe(input: { ownerId: string; writable?: boolean }): Connected<Types["connection"], Types["shared"]>;
-  patchConnection(connectionId: string, ownerId: string, patch: Types["connectionPatch"]): EphemeralChange<Types["connection"], Types["shared"]> | null;
+  patchConnection(handle: ParticipationHandle, ownerId: string, patch: Types["connectionPatch"]): EphemeralChange<Types["connection"], Types["shared"]> | null;
   patchShared(patch: Types["sharedPatch"]): EphemeralChange<Types["connection"], Types["shared"]> | null;
-  patchSharedFromParticipant(connectionId: string, ownerId: string, patch: Types["sharedPatch"]): EphemeralChange<Types["connection"], Types["shared"]> | null;
-  patchSharedFromSubscription(connectionId: string, ownerId: string, patch: Types["sharedPatch"]): EphemeralChange<Types["connection"], Types["shared"]> | null;
-  refreshAndRenew(connectionId: string, ownerId: string, trustedSession: unknown): RefreshResult<Types["connection"], Types["shared"]>;
-  renew(connectionId: string, ownerId: string): Lease;
-  renewSubscription(connectionId: string, ownerId: string): Lease;
-  resubscribe(connectionId: string, ownerId: string): Connected<Types["connection"], Types["shared"]>;
-  poll(connectionId: string): EphemeralDelivery<Types["connection"], Types["shared"]> | null;
-  leave(connectionId: string): EphemeralChange<Types["connection"], Types["shared"]> | null;
-  unsubscribe(connectionId: string): void;
+  patchSharedFromParticipant(handle: ParticipationHandle, ownerId: string, patch: Types["sharedPatch"]): EphemeralChange<Types["connection"], Types["shared"]> | null;
+  patchSharedFromSubscription(handle: ParticipationHandle, ownerId: string, patch: Types["sharedPatch"]): EphemeralChange<Types["connection"], Types["shared"]> | null;
+  refreshAndRenew(handle: ParticipationHandle, ownerId: string, trustedSession: unknown): RefreshResult<Types["connection"], Types["shared"]>;
+  renew(handle: ParticipationHandle, ownerId: string): Lease;
+  renewSubscription(handle: ParticipationHandle, ownerId: string): Lease;
+  resubscribe(handle: ParticipationHandle, ownerId: string): Connected<Types["connection"], Types["shared"]>;
+  poll(handle: ParticipationHandle): EphemeralDelivery<Types["connection"], Types["shared"]> | null;
+  leave(handle: ParticipationHandle): EphemeralChange<Types["connection"], Types["shared"]> | null;
+  unsubscribe(handle: ParticipationHandle): void;
   expire(): ExpirationResult<Types["connection"], Types["shared"]>;
   snapshot(): EphemeralSnapshot<Types["connection"], Types["shared"]>;
   close(): EphemeralChange<Types["connection"], Types["shared"]> | null;

@@ -345,3 +345,55 @@ fn rejects_duplicate_and_unknown_typed_state_fields() {
         pyre::error::ErrorType::UnknownType { found, .. } if found == "Missing"
     )));
 }
+
+#[test]
+fn rejects_custom_types_that_collide_with_generated_state_declarations() {
+    for name in [
+        "Connection",
+        "ConnectionPatch",
+        "Shared",
+        "SharedPatch",
+        "StateTypes",
+        "StateName",
+        "PatchField",
+        "StateMetadata",
+    ] {
+        let source =
+            format!("type {name}\n   = Value\n\nstate Shared {{\n    value Int @default(0)\n}}\n");
+        assert!(
+            messages(&source).iter().any(|message| message
+                .contains(&format!("Type '{name}' emits the generated identifier"))),
+            "expected a generated declaration collision for {name}"
+        );
+    }
+
+    for name in ["Connection_Patch", "Patch_Field", "State_Metadata"] {
+        let source =
+            format!("type {name}\n   = Value\n\nstate Shared {{\n    value Int @default(0)\n}}\n");
+        assert!(
+            messages(&source)
+                .iter()
+                .any(|message| message.contains("conflicts with an ephemeral state declaration")),
+            "expected normalized generated declaration collision for {name}"
+        );
+    }
+
+    let collapsed = messages(
+        r#"type User_Profile
+   = First
+
+type User__Profile
+   = Second
+
+state Shared {
+    value Int @default(0)
+}
+"#,
+    );
+    assert!(collapsed.iter().any(|message| message.contains(
+        "Types 'User_Profile' and 'User__Profile' both emit the generated Rust identifier 'UserProfile'"
+    )));
+
+    check("type StateTypes\n   = Value\n")
+        .expect("reserved state names remain legal without state generation");
+}

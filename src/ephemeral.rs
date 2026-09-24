@@ -1,7 +1,7 @@
 //! Canonical executable contract for complete ephemeral values and top-level patches.
 
 use crate::{ast, error::DefInfo, typecheck};
-use chrono::{DateTime, NaiveDate};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::collections::BTreeMap;
@@ -533,7 +533,7 @@ fn normalize_value(
             .map(Value::Number)
             .ok_or_else(invalid),
         ValueType::Bool => value.as_bool().map(Value::Bool).ok_or_else(invalid),
-        ValueType::DateTime => datetime_seconds(value).map(Value::from).ok_or_else(invalid),
+        ValueType::DateTime => value.as_i64().map(Value::from).ok_or_else(invalid),
         ValueType::Date => value
             .as_str()
             .filter(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok())
@@ -665,19 +665,6 @@ fn normalize_custom(
     } else {
         Err(errors)
     }
-}
-
-fn datetime_seconds(value: &Value) -> Option<i64> {
-    if let Some(seconds) = value.as_i64() {
-        return Some(seconds);
-    }
-    let raw = value.as_str()?.trim();
-    if let Ok(seconds) = raw.parse::<i64>() {
-        return Some(seconds);
-    }
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|datetime| datetime.timestamp())
 }
 
 fn type_name(type_: &ValueType) -> String {

@@ -18,7 +18,7 @@ import {
 } from './service/entity-stream';
 import { QueryClientService, resolveLocalQuerySource } from './service/query-client';
 import { QueryManagerService, type MutationResult } from './service/query-manager';
-import { SSEManager, type LiveSyncMessage } from './service/sse';
+import { redactEphemeralCapability, SSEManager, type LiveSyncMessage } from './service/sse';
 import {
   EphemeralStateService,
   type BoundEphemeralStateSnapshot,
@@ -504,8 +504,16 @@ class SingleDatabasePyreClient {
       ephemeralWrite: config.server.ephemeralWrite,
       maxUpdateCadenceMs: config.server.ephemeralMaxUpdateCadenceMs,
       leaseCadenceMs: config.server.ephemeralLeaseCadenceMs,
+      requestTimeoutMs: config.server.ephemeralRequestTimeoutMs,
       credentials: getServerCredentials(config.server),
       resolveHeaders: () => resolveServerHeaders(config.server),
+      requestTransportReconnect: () => {
+        if (liveSyncTransport === 'sse') {
+          this.sseManager.connect();
+        } else {
+          this.webSocketManager.connect();
+        }
+      },
     });
     this.queryManager = new QueryManagerService(this.logDebug);
     this.queryClient = new QueryClientService((payload) => {
@@ -527,9 +535,11 @@ class SingleDatabasePyreClient {
       }
     };
     if (liveSyncTransport === 'sse') {
+      this.sseManager.setOnEphemeralMessage((message) => this.ephemeralState.handleMessage(message));
       this.sseManager.setOnMessage(this.handleLiveSyncMessage);
       this.sseManager.setOnStateChange(handleTransportState);
     } else {
+      this.webSocketManager.setOnEphemeralMessage((message) => this.ephemeralState.handleMessage(message));
       this.webSocketManager.setOnMessage(this.handleLiveSyncMessage);
       this.webSocketManager.setOnStateChange(handleTransportState);
     }
@@ -866,11 +876,11 @@ class SingleDatabasePyreClient {
   }
 
   private handleLiveSyncMessage = (message: LiveSyncMessage): void => {
-    this.emitDevtoolsEvent(`sync:${message.type}`, message);
-    this.ephemeralState.handleMessage(message);
+    const publicMessage = redactEphemeralCapability(message);
+    this.emitDevtoolsEvent(`sync:${publicMessage.type}`, publicMessage);
 
-    if (message.type === 'connected') {
-      const connectionId = message.connectionId;
+    if (publicMessage.type === 'connected') {
+      const connectionId = publicMessage.connectionId;
       if (connectionId) {
         this.connectionId = connectionId;
         this.connectionCallbacks.forEach((callback) => {
@@ -2433,6 +2443,7 @@ function validateServerConfig(server: ServerConfig): void {
   }
   validateServerCadence(server.ephemeralMaxUpdateCadenceMs, 'ephemeralMaxUpdateCadenceMs', true);
   validateServerCadence(server.ephemeralLeaseCadenceMs, 'ephemeralLeaseCadenceMs', false);
+  validateServerCadence(server.ephemeralRequestTimeoutMs, 'ephemeralRequestTimeoutMs', false);
 }
 
 function validateServerCadence(value: number | undefined, name: string, allowZero: boolean): void {

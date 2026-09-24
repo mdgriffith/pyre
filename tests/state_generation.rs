@@ -113,7 +113,7 @@ const replaceCursor: ConnectionPatch = {
 };
 const shared: Shared = {
   count: 0,
-  started: new Date(),
+  started: 1_797_024_003,
   root: { _type: "Text", value: "root" },
   selection: null,
 };
@@ -130,8 +130,10 @@ const invalidNull: SharedPatch = { count: null };
 // @ts-expect-error Nested values are complete replacements, not recursive partials.
 const partialNestedPatch: SharedPatch = { root: { _type: "Text" } };
 // @ts-expect-error Complete readable state requires every top-level field.
-const incompleteShared: Shared = { count: 0, started: new Date(), root: { _type: "Text", value: "root" } };
-void [derivedPatch, invalidNull, partialNestedPatch, incompleteShared];
+const incompleteShared: Shared = { count: 0, started: 1_797_024_003, root: { _type: "Text", value: "root" } };
+// @ts-expect-error State DateTime values are canonical Unix seconds, not Date objects.
+const invalidDateTime: SharedPatch = { started: new Date() };
+void [derivedPatch, invalidNull, partialNestedPatch, incompleteShared, invalidDateTime];
 "#,
     )
     .unwrap();
@@ -168,6 +170,8 @@ fn generated_rust_state_surface_compiles_and_preserves_patch_null_semantics() {
         .find(|file| file.path == Path::new("rust/state.rs"))
         .expect("generated Rust state module");
     assert!(state.contents.contains("pub user_id: i64"));
+    assert!(state.contents.contains("pub started: i64"));
+    assert!(!state.contents.contains("pub enum DateTime"));
     assert!(state.contents.contains("pub cursor: PatchField<Option<"));
     let connection_patch = state
         .contents
@@ -209,6 +213,14 @@ fn main() {
         user_id: 7,
     };
     assert_eq!(serde_json::to_value(connection).unwrap()["userId"], 7);
+
+    let shared = state::Shared {
+        count: 0,
+        root: state::Node::Text { value: "root".to_string() },
+        selection: None,
+        started: 1_797_024_003,
+    };
+    assert_eq!(serde_json::to_value(shared).unwrap()["started"], 1_797_024_003_i64);
 
     let omitted = state::ConnectionPatch::default();
     assert_eq!(serde_json::to_value(omitted).unwrap(), serde_json::json!({}));

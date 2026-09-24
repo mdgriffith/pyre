@@ -1712,7 +1712,12 @@ record Note {
     assert_eq!(first_connected["type"], "connected");
     assert_eq!(first_snapshot["type"], "ephemeralSnapshot");
     let first_id = first_connected["connectionId"].as_str().unwrap();
+    let first_capability = first_connected["ephemeralCapability"].as_str().unwrap();
     let epoch = first_connected["ephemeralEpoch"].as_str().unwrap();
+    assert_eq!(
+        first_snapshot["ephemeralSnapshot"]["ephemeralCapability"],
+        serde_json::Value::Null
+    );
     assert_eq!(
         first_snapshot["ephemeralSnapshot"]["connections"][first_id]["userId"],
         1
@@ -1722,7 +1727,9 @@ record Note {
     let second_connected = next_sse_event(&mut second);
     let second_snapshot = next_sse_event(&mut second);
     let second_id = second_connected["connectionId"].as_str().unwrap();
+    let second_capability = second_connected["ephemeralCapability"].as_str().unwrap();
     assert_ne!(first_id, second_id);
+    assert_ne!(first_capability, second_capability);
     assert!(second_snapshot["ephemeralSnapshot"]["connections"]
         .as_object()
         .unwrap()
@@ -1734,11 +1741,12 @@ record Note {
             .contains_key(second_id)
     );
 
-    let request = |connection_id: &str, sequence, patch: serde_json::Value| {
+    let request = |connection_id: &str, capability: &str, sequence, patch: serde_json::Value| {
         serde_json::json!({
             "databaseId": "default",
             "ephemeralEpoch": epoch,
             "connectionId": connection_id,
+            "ephemeralCapability": capability,
             "clientRequestSequence": sequence,
             "patch": patch,
         })
@@ -1750,6 +1758,7 @@ record Note {
         "/ephemeral/connection",
         Some(&request(
             first_id,
+            first_capability,
             10,
             serde_json::json!({"cursor": "left"}),
         )),
@@ -1766,6 +1775,23 @@ record Note {
         );
     }
 
+    // A same-owner peer knows the broadcast ID but cannot borrow this stream's
+    // private capability.
+    let (status, body) = http_request_with_headers(
+        port,
+        "PATCH",
+        "/ephemeral/connection",
+        Some(&request(
+            first_id,
+            second_capability,
+            101,
+            serde_json::json!({"cursor": "cross-connection"}),
+        )),
+        &owner,
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("participation capability"), "{body}");
+
     let forged = auth(2, "member", Some("different-session"));
     let (status, body) = http_request_with_headers(
         port,
@@ -1773,6 +1799,7 @@ record Note {
         "/ephemeral/connection",
         Some(&request(
             first_id,
+            first_capability,
             11,
             serde_json::json!({"cursor": "forged"}),
         )),
@@ -1790,6 +1817,7 @@ record Note {
         "/ephemeral/connection",
         Some(&request(
             first_id,
+            first_capability,
             112,
             serde_json::json!({"cursor": "missing-key"}),
         )),
@@ -1801,6 +1829,7 @@ record Note {
         "databaseId": "default",
         "ephemeralEpoch": "forged",
         "connectionId": first_id,
+        "ephemeralCapability": first_capability,
         "clientRequestSequence": 111,
         "patch": {"cursor": "forged"},
     })
@@ -1813,7 +1842,12 @@ record Note {
         port,
         "PATCH",
         "/ephemeral/shared",
-        Some(&request(first_id, 12, serde_json::json!({"count": 7}))),
+        Some(&request(
+            first_id,
+            first_capability,
+            12,
+            serde_json::json!({"count": 7}),
+        )),
         &owner,
     );
     assert_eq!(status, 200, "{body}");
@@ -1823,6 +1857,7 @@ record Note {
             "databaseId": "default",
             "ephemeralEpoch": epoch,
             "connectionId": first_id,
+            "ephemeralCapability": first_capability,
             "clientRequestSequence": sequence,
         })
         .to_string()
@@ -1891,7 +1926,12 @@ record Note {
         port,
         "PATCH",
         "/ephemeral/shared",
-        Some(&request(first_id, 15, serde_json::json!({"count": 8}))),
+        Some(&request(
+            first_id,
+            first_capability,
+            15,
+            serde_json::json!({"count": 8}),
+        )),
         &refreshed_owner,
     );
     assert_eq!(status, 200, "{body}");
@@ -1909,6 +1949,74 @@ record Note {
         removed,
         "transport close did not publish Connection removal"
     );
+
+    // Invalid callers cannot turn lease authentication into a revocation oracle.
+    let invalid_lease = serde_json::json!({
+        "databaseId": "default",
+        "ephemeralEpoch": epoch,
+        "connectionId": first_id,
+        "ephemeralCapability": second_capability,
+        "clientRequestSequence": 16,
+    })
+    .to_string();
+    let (status, body) = http_request_with_headers(
+        port,
+        "POST",
+        "/ephemeral/lease",
+        Some(&invalid_lease),
+        &forged,
+    );
+    assert_eq!(status, 403, "{body}");
+    let (status, body) = http_request_with_headers(
+        port,
+        "PATCH",
+        "/ephemeral/shared",
+        Some(&request(
+            first_id,
+            first_capability,
+            17,
+            serde_json::json!({"count": 9}),
+        )),
+        &refreshed_owner,
+    );
+    assert_eq!(status, 200, "{body}");
+
+    // A valid capability plus failed owner authentication revokes immediately.
+    let lost_lease = identity_request(18);
+    let (status, body) =
+        http_request_with_headers(port, "POST", "/ephemeral/lease", Some(&lost_lease), &forged);
+    assert_eq!(status, 403, "{body}");
+    let mut authorization_lost = false;
+    for _ in 0..6 {
+        let event = next_sse_event(&mut reconnected);
+        authorization_lost = event["ephemeralChanges"]["removedConnections"]
+            .as_array()
+            .is_some_and(|connections| connections.iter().any(|id| id == first_id));
+        if authorization_lost {
+            break;
+        }
+    }
+    assert!(
+        authorization_lost,
+        "authorization loss did not publish removal"
+    );
+    let mut stream_closed = false;
+    for _ in 0..64 {
+        let mut line = String::new();
+        match first.read_line(&mut line) {
+            Ok(0) => {
+                stream_closed = true;
+                break;
+            }
+            Ok(_) if line.trim() == "0" => {
+                stream_closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => panic!("revoked stream did not close promptly: {error}"),
+        }
+    }
+    assert!(stream_closed, "revoked stream remained open");
 }
 
 #[test]
@@ -1954,17 +2062,20 @@ record Dummy {
     let writer_connected = next_sse_event(&mut writer);
     assert_eq!(next_sse_event(&mut writer)["type"], "ephemeralSnapshot");
     let writer_id = writer_connected["connectionId"].as_str().unwrap();
+    let writer_capability = writer_connected["ephemeralCapability"].as_str().unwrap();
     let epoch = writer_connected["ephemeralEpoch"].as_str().unwrap();
 
     let mut reader = open_sse_with_query(port, "databaseId=default&ephemeralWrite=false", "");
     let reader_connected = next_sse_event(&mut reader);
     assert_eq!(next_sse_event(&mut reader)["type"], "ephemeralSnapshot");
     let reader_id = reader_connected["connectionId"].as_str().unwrap();
-    let request = |connection_id: &str, sequence: u64, count: i64| {
+    let reader_capability = reader_connected["ephemeralCapability"].as_str().unwrap();
+    let request = |connection_id: &str, capability: &str, sequence: u64, count: i64| {
         serde_json::json!({
             "databaseId": "default",
             "ephemeralEpoch": epoch,
             "connectionId": connection_id,
+            "ephemeralCapability": capability,
             "clientRequestSequence": sequence,
             "patch": {"count": count},
         })
@@ -1975,7 +2086,7 @@ record Dummy {
         port,
         "PATCH",
         "/ephemeral/shared",
-        Some(&request(writer_id, 1, 7)),
+        Some(&request(writer_id, writer_capability, 1, 7)),
     );
     assert_eq!(status, 200, "{body}");
     let change = next_sse_event(&mut reader);
@@ -1985,12 +2096,21 @@ record Dummy {
         port,
         "PATCH",
         "/ephemeral/shared",
-        Some(&request(reader_id, 2, 8)),
+        Some(&request(reader_id, reader_capability, 2, 8)),
     );
     assert_eq!(status, 403, "{body}");
     let rejected: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(rejected["type"], "ephemeralRejected");
     assert!(rejected["error"].as_str().unwrap().contains("read-only"));
+
+    let (status, body) = http_request(
+        port,
+        "PATCH",
+        "/ephemeral/shared",
+        Some(&request(writer_id, reader_capability, 3, 9)),
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("participation capability"), "{body}");
 }
 
 #[test]

@@ -106,6 +106,7 @@ test('PyreClient validates server URLs, endpoints, and ephemeral cadence before 
   await expect(PyreClient.create({ ...base, server: { ...server, endpoints: { events: '' } } })).rejects.toThrow('server.endpoints.events');
   await expect(PyreClient.create({ ...base, server: { ...server, ephemeralMaxUpdateCadenceMs: -1 } })).rejects.toThrow('finite non-negative');
   await expect(PyreClient.create({ ...base, server: { ...server, ephemeralLeaseCadenceMs: 0 } })).rejects.toThrow('finite positive');
+  await expect(PyreClient.create({ ...base, server: { ...server, ephemeralRequestTimeoutMs: 0 } })).rejects.toThrow('finite positive');
 });
 
 test('ephemeral APIs delegate to the existing database internal client', async () => {
