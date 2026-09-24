@@ -968,6 +968,47 @@ fn test_generate_command() {
 }
 
 #[test]
+fn test_generate_command_emits_ephemeral_state_type_modules() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n    userId Int\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"type Presence
+   = Online
+   | Away { since DateTime }
+
+state Connection {
+    userId Int = Session.userId
+    presence Presence?
+}
+
+state Shared {
+    count Int @default(0)
+}
+"#,
+    )
+    .unwrap();
+
+    ctx.run_command("generate").assert().success();
+
+    let typescript = std::fs::read_to_string(
+        ctx.workspace_path
+            .join("pyre/generated/typescript/core/state.ts"),
+    )
+    .unwrap();
+    let rust =
+        std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/rust/state.rs")).unwrap();
+    assert!(typescript.contains("export interface Connection"));
+    assert!(typescript.contains("export interface SharedPatch"));
+    assert!(rust.contains("pub struct Connection"));
+    assert!(rust.contains("pub struct SharedPatch"));
+}
+
+#[test]
 fn test_generate_preserves_namespaced_session_id_storage_types() {
     let ctx = TestContext::new();
     std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Main")).unwrap();

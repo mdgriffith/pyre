@@ -632,7 +632,7 @@ fn unique_name(name: &str, used: &mut HashSet<String>) -> String {
     candidate
 }
 
-fn to_pascal_name(name: &str) -> String {
+pub(crate) fn to_pascal_name(name: &str) -> String {
     let mut result = String::new();
     let mut capitalize_next = true;
 
@@ -689,7 +689,7 @@ fn to_constant_name(name: &str) -> String {
     snake.to_ascii_uppercase()
 }
 
-fn to_field_name(name: &str) -> String {
+pub(crate) fn to_field_name(name: &str) -> String {
     raw_identifier(&to_snake_name(&string::decapitalize(name)).trim_start_matches("r#"))
 }
 
