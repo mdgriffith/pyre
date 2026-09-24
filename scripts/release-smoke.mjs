@@ -50,6 +50,7 @@ writeFileSync(
       },
       overrides: {
         "@pyre/core": `file:${coreTarball}`,
+        "@pyre/client": `file:${clientTarball}`,
       },
     },
     null,
