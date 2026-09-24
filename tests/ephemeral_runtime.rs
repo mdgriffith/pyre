@@ -260,7 +260,12 @@ fn leave_transport_close_expiry_and_renewal_publish_removals() {
         runtime.renew(&expiring.participant, "expiring"),
         Err(RuntimeError::LeaseExpired)
     );
-    let expired = runtime.expire_leases().unwrap().unwrap();
+    let expiration = runtime.expire_leases_detailed().unwrap();
+    assert_eq!(
+        expiration.connection_ids,
+        [expiring.participant.connection_id()]
+    );
+    let expired = expiration.change.unwrap();
     assert_eq!(
         expired.removed_connections,
         [expiring.participant.connection_id()]
@@ -493,7 +498,15 @@ fn shared_only_subscribers_enforce_write_intent_owner_policy_and_lease() {
         ),
         Err(RuntimeError::LeaseExpired)
     );
-    assert!(runtime.expire_leases().unwrap().is_none());
+    let expiration = runtime.expire_leases_detailed().unwrap();
+    assert!(expiration.change.is_none());
+    assert_eq!(
+        expiration.subscription_ids,
+        [
+            refreshed.subscription.connection_id(),
+            writer.subscription.connection_id()
+        ]
+    );
     assert_eq!(
         runtime.poll(&refreshed.subscription),
         Err(RuntimeError::UnknownSubscription)

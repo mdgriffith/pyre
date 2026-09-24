@@ -98,6 +98,12 @@ impl fmt::Debug for RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
+        Self::with_environment(Arc::new(SystemEnvironment::default()))
+    }
+}
+
+impl RuntimeConfig {
+    pub fn with_environment(environment: Arc<dyn RuntimeEnvironment>) -> Self {
         Self {
             shared_write_policy: SharedWritePolicy::ServerOnly,
             max_participants: 1_024,
@@ -106,7 +112,7 @@ impl Default for RuntimeConfig {
             max_pending_entries: 1_024,
             max_pending_controls: 1,
             max_delivery_bytes: 1024 * 1024,
-            environment: Arc::new(SystemEnvironment::default()),
+            environment,
         }
     }
 }
@@ -246,6 +252,13 @@ pub struct Lease {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Expiration {
+    pub change: Option<Change>,
+    pub connection_ids: Vec<String>,
+    pub subscription_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeError {
     EmptyDatabaseId,
     EmptyOwnerId,
@@ -323,6 +336,39 @@ impl fmt::Display for RuntimeError {
 }
 
 impl Error for RuntimeError {}
+
+impl RuntimeError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::EmptyDatabaseId => "empty_database_id",
+            Self::EmptyOwnerId => "empty_owner_id",
+            Self::InvalidParticipantBound => "invalid_participant_bound",
+            Self::InvalidLeaseDuration => "invalid_lease_duration",
+            Self::InvalidTransportBounds => "invalid_transport_bounds",
+            Self::ClockOverflow => "clock_overflow",
+            Self::IdGeneration(_) => "id_generation",
+            Self::IdCollision => "id_collision",
+            Self::Capacity => "capacity",
+            Self::Closed => "closed",
+            Self::WrongDatabase => "wrong_database",
+            Self::StaleEpoch => "stale_epoch",
+            Self::UnknownConnection => "unknown_connection",
+            Self::StaleParticipant => "stale_participant",
+            Self::UnknownSubscription => "unknown_subscription",
+            Self::StaleSubscription => "stale_subscription",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::ReadOnly => "read_only",
+            Self::SharedServerOnly => "shared_server_only",
+            Self::LeaseExpired => "lease_expired",
+            Self::RevisionExhausted => "revision_exhausted",
+            Self::GenerationExhausted => "generation_exhausted",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::StateNotDeclared(_) => "state_not_declared",
+            Self::StatePoisoned => "state_poisoned",
+            Self::Validation(_) => "validation",
+        }
+    }
+}
 
 impl From<Vec<ValidationError>> for RuntimeError {
     fn from(errors: Vec<ValidationError>) -> Self {
@@ -974,6 +1020,11 @@ impl<H> DatabaseRuntime<H> {
     }
 
     pub fn expire_leases(&self) -> Result<Option<Change>, RuntimeError> {
+        Ok(self.expire_leases_detailed()?.change)
+    }
+
+    /// Expires leases and reports the opaque IDs whose host-side handles can be discarded.
+    pub fn expire_leases_detailed(&self) -> Result<Expiration, RuntimeError> {
         let now = self.config.environment.now();
         let mut state = self.lock_state()?;
         ensure_open(&state)?;
@@ -993,20 +1044,28 @@ impl<H> DatabaseRuntime<H> {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        for id in expired_subscriptions {
-            state.outboxes.remove(&id);
+        for id in &expired_subscriptions {
+            state.outboxes.remove(id);
         }
         if removed.is_empty() {
-            return Ok(None);
+            return Ok(Expiration {
+                change: None,
+                connection_ids: removed,
+                subscription_ids: expired_subscriptions,
+            });
         }
         let revision = advance(&mut state)?;
         for id in &removed {
             state.connections.remove(id);
             state.outboxes.remove(id);
         }
-        let change = self.removal_change(revision, removed);
+        let change = self.removal_change(revision, removed.clone());
         self.publish_locked(&mut state, &change);
-        Ok(Some(change))
+        Ok(Expiration {
+            change: Some(change),
+            connection_ids: removed,
+            subscription_ids: expired_subscriptions,
+        })
     }
 
     /// Fences all future work and discards Shared and Connection state.

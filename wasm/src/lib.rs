@@ -3,6 +3,7 @@ use js_sys;
 use log::Level;
 use wasm_bindgen::prelude::*;
 mod cache;
+mod database_runtime;
 mod ephemeral;
 mod migrate;
 mod query;

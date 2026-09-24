@@ -21,6 +21,10 @@
       "types": "./context.ts",
       "default": "./context.ts"
     },
+    "./ephemeral": {
+      "types": "./ephemeral.ts",
+      "default": "./ephemeral.ts"
+    },
     ".": {
       "types": "./index.ts",
       "default": "./index.ts"
@@ -71,6 +75,7 @@
     "operations.ts",
     "init.ts",
     "database-id.ts",
+    "ephemeral.ts",
     "query-sync.ts",
     "query.ts",
     "runtime",
