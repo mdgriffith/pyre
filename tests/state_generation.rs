@@ -99,7 +99,7 @@ fn generated_typescript_state_surface_enforces_complete_values_and_writable_patc
     std::fs::write(temp_dir.path().join("state.ts"), &state.contents).unwrap();
     std::fs::write(
         temp_dir.path().join("verify.ts"),
-        r#"import type { Connection, ConnectionPatch, Shared, SharedPatch } from "./state";
+        r#"import type { Connection, ConnectionPatch, Shared, SharedPatch, StateTypes } from "./state";
 
 const connection: Connection = {
   userId: 7,
@@ -119,6 +119,9 @@ const shared: Shared = {
 };
 const clearSelection: SharedPatch = { selection: null };
 void [connection, emptyConnectionPatch, clearCursor, replaceCursor, shared, clearSelection];
+const connectionFromBundle: StateTypes["connection"] = connection;
+const sharedPatchFromBundle: StateTypes["sharedPatch"] = clearSelection;
+void [connectionFromBundle, sharedPatchFromBundle];
 
 // @ts-expect-error Derived Connection fields are readable but never writable.
 const derivedPatch: ConnectionPatch = { userId: 8 };

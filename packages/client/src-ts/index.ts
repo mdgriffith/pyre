@@ -19,6 +19,12 @@ import {
 import { QueryClientService, resolveLocalQuerySource } from './service/query-client';
 import { QueryManagerService, type MutationResult } from './service/query-manager';
 import { SSEManager, type LiveSyncMessage } from './service/sse';
+import {
+  EphemeralStateService,
+  type BoundEphemeralStateSnapshot,
+  type EphemeralAccepted,
+  type EphemeralStateTypeBundle,
+} from './service/ephemeral-state';
 import { WebSocketManager } from './service/websocket';
 import {
   deriveIndexedDbName,
@@ -61,6 +67,18 @@ export type {
   TableSyncStatus,
 } from './types';
 export type { MutationResult } from './service/query-manager';
+export {
+  EphemeralUpdateError,
+  type BoundEphemeralStateSnapshot,
+  type EphemeralAccepted,
+  type EphemeralAuthority,
+  type EphemeralFreshness,
+  type EphemeralRejected,
+  type EphemeralStateSnapshot,
+  type EphemeralStateTypeBundle,
+  type EphemeralUnknown,
+  type EphemeralUpdateOutcome,
+} from './service/ephemeral-state';
 export type {
   EntityChange,
   EntityChangeBatch,
@@ -328,7 +346,8 @@ interface SingleDatabasePyreClientCreateConfig {
   elm?: PyreElmConfig;
 }
 
-export type PyreInternalClient = Pick<SingleDatabasePyreClient, 'run' | 'disconnect' | 'getDevtoolsSnapshot' | 'inspectDevtoolsTablePage' | 'startSync' | 'onSyncState' | 'onEntityChanges' | 'onDevtoolsEvent'>;
+export type PyreInternalClient = Pick<SingleDatabasePyreClient, 'run' | 'disconnect' | 'getDevtoolsSnapshot' | 'inspectDevtoolsTablePage' | 'startSync' | 'onSyncState' | 'onEntityChanges' | 'onDevtoolsEvent'> &
+  Partial<Pick<SingleDatabasePyreClient, 'getEphemeralState' | 'subscribeEphemeralState' | 'updateEphemeralConnection' | 'updateEphemeralShared'>>;
 
 type PyreInternalClientFactory = (config: SingleDatabasePyreClientCreateConfig & {
   databaseId: DatabaseId;
@@ -381,10 +400,11 @@ class SingleDatabasePyreClient {
   private queryManager: QueryManagerService;
   private queryClient: QueryClientService;
   private entityStream: EntityStreamService;
+  private ephemeralState: EphemeralStateService;
   private bridgeCleanup: (() => void) | null = null;
   private debug: boolean;
   private server: ServerConfig;
-  private endpoints: ServerEndpoints;
+  private endpoints: Required<ServerEndpoints>;
   private queryCounter = 0;
   private mutationCounter = 0;
   private schema: SchemaMetadata;
@@ -409,6 +429,10 @@ class SingleDatabasePyreClient {
       catchup: '/sync',
       events: '/sync/events',
       query: '/db',
+      ephemeralConnection: '/ephemeral/connection',
+      ephemeralShared: '/ephemeral/shared',
+      ephemeralLease: '/ephemeral/lease',
+      ephemeralResnapshot: '/ephemeral/resnapshot',
       ...config.server.endpoints,
     };
     this.lastSyncState = createInitialSyncState(config.schema);
@@ -460,12 +484,29 @@ class SingleDatabasePyreClient {
       credentials: config.server.credentials,
       withCredentials: config.server.withCredentials,
       databaseId: config.databaseId,
+      ephemeralWrite: config.server.ephemeralWrite ?? true,
     }, undefined, this.logDebug);
     this.webSocketManager = new WebSocketManager({
       baseUrl: config.server.baseUrl,
       eventsPath: this.endpoints.events,
       databaseId: config.databaseId,
+      ephemeralWrite: config.server.ephemeralWrite ?? true,
     }, undefined, this.logDebug);
+    this.ephemeralState = new EphemeralStateService({
+      databaseId: config.databaseId ?? 'default',
+      baseUrl: config.server.baseUrl,
+      endpoints: {
+        connection: this.endpoints.ephemeralConnection,
+        shared: this.endpoints.ephemeralShared,
+        lease: this.endpoints.ephemeralLease,
+        resnapshot: this.endpoints.ephemeralResnapshot,
+      },
+      ephemeralWrite: config.server.ephemeralWrite,
+      maxUpdateCadenceMs: config.server.ephemeralMaxUpdateCadenceMs,
+      leaseCadenceMs: config.server.ephemeralLeaseCadenceMs,
+      credentials: getServerCredentials(config.server),
+      resolveHeaders: () => resolveServerHeaders(config.server),
+    });
     this.queryManager = new QueryManagerService(this.logDebug);
     this.queryClient = new QueryClientService((payload) => {
       if (config.onError) {
@@ -478,8 +519,20 @@ class SingleDatabasePyreClient {
     this.queryClient.setOnQueryUnregister(this.handleQueryUnregister);
 
     this.indexedDbService.attachPorts(this.elmApp);
-    this.sseManager.setOnMessage(this.handleLiveSyncMessage);
-    this.webSocketManager.setOnMessage(this.handleLiveSyncMessage);
+    const handleTransportState = (state: 'connecting' | 'disconnected') => {
+      if (state === 'connecting') {
+        this.ephemeralState.transportConnecting();
+      } else {
+        this.ephemeralState.transportDisconnected();
+      }
+    };
+    if (liveSyncTransport === 'sse') {
+      this.sseManager.setOnMessage(this.handleLiveSyncMessage);
+      this.sseManager.setOnStateChange(handleTransportState);
+    } else {
+      this.webSocketManager.setOnMessage(this.handleLiveSyncMessage);
+      this.webSocketManager.setOnStateChange(handleTransportState);
+    }
     this.sseManager.attachPorts(this.elmApp);
     this.webSocketManager.attachPorts(this.elmApp);
     this.queryManager.attachPorts(this.elmApp);
@@ -585,6 +638,28 @@ class SingleDatabasePyreClient {
     return () => {
       this.connectionCallbacks.delete(callback);
     };
+  }
+
+  getEphemeralState<Types extends EphemeralStateTypeBundle>(): BoundEphemeralStateSnapshot<Types> {
+    return this.ephemeralState.getSnapshot() as BoundEphemeralStateSnapshot<Types>;
+  }
+
+  subscribeEphemeralState<Types extends EphemeralStateTypeBundle>(
+    callback: (snapshot: BoundEphemeralStateSnapshot<Types>) => void,
+  ): () => void {
+    return this.ephemeralState.subscribe((snapshot) => callback(snapshot as BoundEphemeralStateSnapshot<Types>));
+  }
+
+  updateEphemeralConnection<Types extends EphemeralStateTypeBundle>(
+    patch: Types['connectionPatch'],
+  ): Promise<EphemeralAccepted> {
+    return this.ephemeralState.updateConnection(patch);
+  }
+
+  updateEphemeralShared<Types extends EphemeralStateTypeBundle>(
+    patch: Types['sharedPatch'],
+  ): Promise<EphemeralAccepted> {
+    return this.ephemeralState.updateShared(patch);
   }
 
   async onEntityChanges(subscription: EntitySubscription, callback: (batch: EntityChangeBatch) => void): Promise<() => void> {
@@ -776,6 +851,7 @@ class SingleDatabasePyreClient {
     this.bridgeCleanup = null;
     this.sseManager.disconnect();
     this.webSocketManager.disconnect();
+    this.ephemeralState.dispose();
     this.connectionId = null;
     this.pendingLiveState = null;
     this.pendingLiveQueries.clear();
@@ -791,6 +867,7 @@ class SingleDatabasePyreClient {
 
   private handleLiveSyncMessage = (message: LiveSyncMessage): void => {
     this.emitDevtoolsEvent(`sync:${message.type}`, message);
+    this.ephemeralState.handleMessage(message);
 
     if (message.type === 'connected') {
       const connectionId = message.connectionId;
@@ -1349,11 +1426,19 @@ export class PyreClient {
     const generation = (this.clientGenerations.get(targetDatabaseId) ?? 0) + 1;
     this.clientGenerations.set(targetDatabaseId, generation);
 
-    const created = this.config.createInternalClient(this.internalClientConfig(targetDatabaseId));
+    const created = Promise.resolve()
+      .then(() => this.config.createInternalClient(this.internalClientConfig(targetDatabaseId)))
+      .then((client) => {
+        this.watchInternalClient(targetDatabaseId, generation, client);
+        return client;
+      })
+      .catch((error) => {
+        if (this.clients.get(targetDatabaseId) === created) {
+          this.clients.delete(targetDatabaseId);
+        }
+        throw error;
+      });
     this.clients.set(targetDatabaseId, created);
-    void created.then((client) => {
-      this.watchInternalClient(targetDatabaseId, generation, client);
-    });
     return created;
   }
 
@@ -1401,10 +1486,12 @@ export class PyreClient {
   }
 
   getInternalIndexedDbName(databaseId: DatabaseId): string {
+    const targetDatabaseId = requireDatabaseId(databaseId);
+    this.markKnownDatabase(targetDatabaseId);
     return deriveIndexedDbName(
       this.config.indexedDbName ?? 'pyre-client',
       this.config.cacheNamespace,
-      databaseId
+      targetDatabaseId
     );
   }
 
@@ -1453,6 +1540,37 @@ export class PyreClient {
     return client.onEntityChanges(subscription, callback);
   }
 
+  async getEphemeralState<Types extends EphemeralStateTypeBundle>(
+    databaseId: DatabaseId,
+  ): Promise<BoundEphemeralStateSnapshot<Types>> {
+    const client = await this.getOrCreateClient(databaseId);
+    return requireEphemeralMethod(client, 'getEphemeralState')<Types>();
+  }
+
+  async subscribeEphemeralState<Types extends EphemeralStateTypeBundle>(
+    databaseId: DatabaseId,
+    callback: (snapshot: BoundEphemeralStateSnapshot<Types>) => void,
+  ): Promise<() => void> {
+    const client = await this.getOrCreateClient(databaseId);
+    return requireEphemeralMethod(client, 'subscribeEphemeralState')<Types>(callback);
+  }
+
+  async updateEphemeralConnection<Types extends EphemeralStateTypeBundle>(
+    databaseId: DatabaseId,
+    patch: Types['connectionPatch'],
+  ): Promise<EphemeralAccepted> {
+    const client = await this.getOrCreateClient(databaseId);
+    return requireEphemeralMethod(client, 'updateEphemeralConnection')<Types>(patch);
+  }
+
+  async updateEphemeralShared<Types extends EphemeralStateTypeBundle>(
+    databaseId: DatabaseId,
+    patch: Types['sharedPatch'],
+  ): Promise<EphemeralAccepted> {
+    const client = await this.getOrCreateClient(databaseId);
+    return requireEphemeralMethod(client, 'updateEphemeralShared')<Types>(patch);
+  }
+
   async getDevtoolsSnapshot(): Promise<PyreDevtoolsSnapshot> {
     const selectedDatabaseId = this.knownDatabaseIds[0];
     const firstClient = selectedDatabaseId ? await this.clients.get(selectedDatabaseId) : undefined;
@@ -1473,6 +1591,10 @@ export class PyreClient {
       catchup: '/sync',
       events: '/sync/events',
       query: '/db',
+      ephemeralConnection: '/ephemeral/connection',
+      ephemeralShared: '/ephemeral/shared',
+      ephemeralLease: '/ephemeral/lease',
+      ephemeralResnapshot: '/ephemeral/resnapshot',
       ...this.config.server.endpoints,
     };
 
@@ -2030,6 +2152,10 @@ export class PyreClient {
       catchup: '/sync',
       events: '/sync/events',
       query: '/db',
+      ephemeralConnection: '/ephemeral/connection',
+      ephemeralShared: '/ephemeral/shared',
+      ephemeralLease: '/ephemeral/lease',
+      ephemeralResnapshot: '/ephemeral/resnapshot',
       ...this.config.server.endpoints,
     };
     return {
@@ -2070,6 +2196,20 @@ export class PyreClient {
       error: errorState?.error,
     };
   }
+}
+
+type EphemeralMethodName = 'getEphemeralState' | 'subscribeEphemeralState'
+  | 'updateEphemeralConnection' | 'updateEphemeralShared';
+
+function requireEphemeralMethod<Name extends EphemeralMethodName>(
+  client: PyreInternalClient,
+  name: Name,
+): NonNullable<PyreInternalClient[Name]> {
+  const method = client[name];
+  if (!method) {
+    throw new Error(`Custom Pyre internal client does not implement ${name}`);
+  }
+  return method.bind(client) as NonNullable<PyreInternalClient[Name]>;
 }
 
 function dedupeDatabaseIds(databaseIds: DatabaseId[]): DatabaseId[] {
@@ -2220,6 +2360,7 @@ async function resolveCreateConfig(config: SingleDatabasePyreClientCreateConfig)
   if (!server) {
     throw new Error('SingleDatabasePyreClient.create requires server or connect');
   }
+  validateServerConfig(server);
 
   const databaseId = connected?.databaseId ?? config.databaseId;
   const cacheNamespace = connected?.cacheNamespace ?? config.cacheNamespace;
@@ -2249,6 +2390,7 @@ async function resolveMultiCreateConfig(config: PyreClientConfig): Promise<Resol
   if (!server) {
     throw new Error('PyreClient.create requires server or connect');
   }
+  validateServerConfig(server);
 
   const cacheNamespace = connected?.cacheNamespace ?? config.cacheNamespace;
   if (!cacheNamespace) {
@@ -2265,6 +2407,39 @@ async function resolveMultiCreateConfig(config: PyreClientConfig): Promise<Resol
     createInternalClient: config.createInternalClient ?? ((internalConfig) => SingleDatabasePyreClient.create(internalConfig)),
     elm: config.elm,
   };
+}
+
+function validateServerConfig(server: ServerConfig): void {
+  let base: URL;
+  try {
+    base = new URL(server.baseUrl);
+  } catch {
+    throw new Error('server.baseUrl must be a valid absolute HTTP(S) URL');
+  }
+  if ((base.protocol !== 'http:' && base.protocol !== 'https:') || !base.host) {
+    throw new Error('server.baseUrl must be a valid absolute HTTP(S) URL');
+  }
+  const endpoints = server.endpoints ?? {};
+  for (const [name, endpoint] of Object.entries(endpoints)) {
+    if (typeof endpoint !== 'string' || endpoint.trim() === '') {
+      throw new Error(`server.endpoints.${name} must be a non-empty HTTP(S) path or URL`);
+    }
+    try {
+      const resolved = new URL(endpoint.replace(/^\//, ''), `${base.toString().replace(/\/?$/, '/')}`);
+      if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') throw new Error();
+    } catch {
+      throw new Error(`server.endpoints.${name} must be a valid HTTP(S) path or URL`);
+    }
+  }
+  validateServerCadence(server.ephemeralMaxUpdateCadenceMs, 'ephemeralMaxUpdateCadenceMs', true);
+  validateServerCadence(server.ephemeralLeaseCadenceMs, 'ephemeralLeaseCadenceMs', false);
+}
+
+function validateServerCadence(value: number | undefined, name: string, allowZero: boolean): void {
+  if (value === undefined) return;
+  if (!Number.isFinite(value) || (allowZero ? value < 0 : value <= 0)) {
+    throw new Error(`server.${name} must be a finite ${allowZero ? 'non-negative' : 'positive'} number`);
+  }
 }
 
 function reportElmBridgeError(

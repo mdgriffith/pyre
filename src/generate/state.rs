@@ -39,6 +39,22 @@ fn typescript_state(contract: &Contract) -> String {
         result.push_str(&typescript_state_types("Shared", state));
     }
 
+    result.push_str("export interface StateTypes {\n");
+    if contract.connection.is_some() {
+        result.push_str("  connection: Connection;\n  connectionPatch: ConnectionPatch;\n");
+    } else {
+        result.push_str(
+            "  connection: Record<string, never>;\n  connectionPatch: Record<string, never>;\n",
+        );
+    }
+    if contract.shared.is_some() {
+        result.push_str("  shared: Shared;\n  sharedPatch: SharedPatch;\n");
+    } else {
+        result
+            .push_str("  shared: Record<string, never>;\n  sharedPatch: Record<string, never>;\n");
+    }
+    result.push_str("}\n\n");
+
     result.push_str("export const stateMetadata = {\n");
     if let Some(state) = &contract.connection {
         result.push_str(&typescript_metadata("Connection", state));

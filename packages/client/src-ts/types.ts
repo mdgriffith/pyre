@@ -18,6 +18,10 @@ export interface ServerEndpoints {
   catchup: string;
   events: string;
   query: string;
+  ephemeralConnection?: string;
+  ephemeralShared?: string;
+  ephemeralLease?: string;
+  ephemeralResnapshot?: string;
 }
 
 export type ServerHeaders = Record<string, string> | (() => Record<string, string> | Promise<Record<string, string>>);
@@ -29,6 +33,12 @@ export interface ServerConfig {
   credentials?: RequestCredentials;
   withCredentials?: boolean;
   liveSyncTransport?: LiveSyncTransport;
+  /** Advertise write intent to the ephemeral live subscription. Defaults to true. */
+  ephemeralWrite?: boolean;
+  /** Minimum time between requests for each ephemeral patch kind. Defaults to 50ms. */
+  ephemeralMaxUpdateCadenceMs?: number;
+  /** Time between independent ephemeral lease renewals. Defaults to 10 seconds. */
+  ephemeralLeaseCadenceMs?: number;
 }
 
 export interface SyncProgress {

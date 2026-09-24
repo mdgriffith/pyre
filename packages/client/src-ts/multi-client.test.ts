@@ -100,6 +100,102 @@ test('PyreClient requires cacheNamespace', async () => {
   })).rejects.toThrow('PyreClient.create requires cacheNamespace');
 });
 
+test('PyreClient validates server URLs, endpoints, and ephemeral cadence before creating clients', async () => {
+  const base = { schema, cacheNamespace: 'config-validation' };
+  await expect(PyreClient.create({ ...base, server: { baseUrl: '/relative' } })).rejects.toThrow('server.baseUrl');
+  await expect(PyreClient.create({ ...base, server: { ...server, endpoints: { events: '' } } })).rejects.toThrow('server.endpoints.events');
+  await expect(PyreClient.create({ ...base, server: { ...server, ephemeralMaxUpdateCadenceMs: -1 } })).rejects.toThrow('finite non-negative');
+  await expect(PyreClient.create({ ...base, server: { ...server, ephemeralLeaseCadenceMs: 0 } })).rejects.toThrow('finite positive');
+});
+
+test('ephemeral APIs delegate to the existing database internal client', async () => {
+  const calls = [];
+  const snapshot = {
+    authoritative: { shared: null, connections: {}, epoch: null, revision: null, connectionId: null, freshness: { status: 'disconnected', stale: true } },
+    desired: { connection: {}, shared: {} },
+    latestOutcome: null,
+  };
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'ephemeral-delegation',
+    createInternalClient: async (config) => ({
+      ...fakeInternalClient([], config.databaseId),
+      getEphemeralState() {
+        calls.push(['get', config.databaseId]);
+        return snapshot;
+      },
+      subscribeEphemeralState(callback) {
+        calls.push(['subscribe', config.databaseId]);
+        callback(snapshot);
+        return () => calls.push(['unsubscribe', config.databaseId]);
+      },
+      updateEphemeralConnection(patch) {
+        calls.push(['connection', config.databaseId, patch]);
+        return Promise.resolve({ status: 'accepted' });
+      },
+      updateEphemeralShared(patch) {
+        calls.push(['shared', config.databaseId, patch]);
+        return Promise.resolve({ status: 'accepted' });
+      },
+    }),
+  });
+
+  expect(await client.getEphemeralState('alpha')).toBe(snapshot);
+  const observed = [];
+  const unsubscribe = await client.subscribeEphemeralState('alpha', value => observed.push(value));
+  await client.updateEphemeralConnection('alpha', { cursor: 1 });
+  await client.updateEphemeralShared('alpha', { count: 2 });
+  unsubscribe();
+  expect(observed).toEqual([snapshot]);
+  expect(calls).toEqual([
+    ['get', 'alpha'], ['subscribe', 'alpha'],
+    ['connection', 'alpha', { cursor: 1 }], ['shared', 'alpha', { count: 2 }],
+    ['unsubscribe', 'alpha'],
+  ]);
+  client.disconnect();
+});
+
+test('ephemeral APIs report custom internal clients that omit the optional methods', async () => {
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'ephemeral-custom-error',
+    createInternalClient: async (config) => fakeInternalClient([], config.databaseId),
+  });
+  await expect(client.getEphemeralState('alpha')).rejects.toThrow(
+    'Custom Pyre internal client does not implement getEphemeralState',
+  );
+  client.disconnect();
+});
+
+test('ephemeral APIs validate and mark database IDs before custom factory errors', async () => {
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'ephemeral-id-validation',
+    createInternalClient: async (config) => fakeInternalClient([], config.databaseId),
+  });
+  await expect(client.getEphemeralState(' ')).rejects.toThrow('databaseId is required');
+  expect(client.getKnownDatabaseIds()).toEqual([]);
+  await expect(client.updateEphemeralShared('alpha', { count: 1 })).rejects.toThrow(
+    'Custom Pyre internal client does not implement updateEphemeralShared',
+  );
+  expect(client.getKnownDatabaseIds()).toEqual(['alpha']);
+  client.disconnect();
+});
+
+test('custom internal factory failures stay clear and can be retried', async () => {
+  let attempts = 0;
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'factory-failure',
+    createInternalClient: async (config) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error(`factory unavailable for ${config.databaseId}`);
+      return fakeInternalClient([], config.databaseId);
+    },
+  });
+  await expect(client.getOrCreateClient('alpha')).rejects.toThrow('factory unavailable for alpha');
+  expect(client.getInternalDatabaseIds()).toEqual([]);
+  await expect(client.getOrCreateClient('alpha')).resolves.toBeDefined();
+  expect(attempts).toBe(2);
+  client.disconnect();
+});
+
 test('explicit submission snapshots pure operations and forwards one ordered batch through run', async () => {
   const runs = [];
   let created = 0;
