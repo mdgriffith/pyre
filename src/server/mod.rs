@@ -5,6 +5,8 @@ pub mod database_id;
 pub mod manifest;
 #[cfg(feature = "database")]
 pub mod query;
+#[cfg(feature = "json")]
+pub mod runtime;
 #[cfg(feature = "database")]
 pub mod schema;
 #[cfg(feature = "database")]

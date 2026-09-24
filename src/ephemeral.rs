@@ -237,6 +237,32 @@ impl Contract {
         })
     }
 
+    /// Recomputes trusted derived fields while retaining every writable field.
+    pub fn refresh_connection(
+        &self,
+        current: &Value,
+        trusted_session: &Value,
+        now_seconds: i64,
+    ) -> Result<PatchResult, Vec<ValidationError>> {
+        let state = self.state("Connection")?;
+        let normalized_current = normalize_state(self, state, current)?;
+        let mut value = self.initialize_connection(trusted_session, now_seconds)?;
+        let (Value::Object(current), Value::Object(ref mut refreshed)) =
+            (&normalized_current, &mut value)
+        else {
+            unreachable!("normalized states are objects")
+        };
+        for (name, field) in &state.fields {
+            if field.writable {
+                refreshed.insert(name.clone(), current[name].clone());
+            }
+        }
+        Ok(PatchResult {
+            changed: value != normalized_current,
+            value,
+        })
+    }
+
     fn state(&self, name: &str) -> Result<&StateContract, Vec<ValidationError>> {
         let state = match name {
             "Connection" => self.connection.as_ref(),
