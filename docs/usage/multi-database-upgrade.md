@@ -132,11 +132,13 @@ connectSSEClient({ databaseId, sessionId, session, stream })
 
 Queries and mutations must use the database-specific connection group:
 
+For a composed request, validate that the `$batch` body is an array and pass it as the operation argument instead of the literal route ID:
+
 ```ts
 const result = await Sync.run(
   db,
   queries,
-  queryId,
+  queryId === '$batch' ? args : queryId,
   args,
   session,
   connectionsForDatabase(databaseId),
@@ -149,6 +151,8 @@ await result.sync((sessionId, message) => {
 ```
 
 For Rust mutation deltas, pass the same `databaseId` to delta calculation:
+
+Execute synced mutations with `query::run_sync` so revisions are allocated inside the transaction. Include a server-created logical origin carrying the authenticated request session in the recipient map even without SSE; never use an untrusted connection ID to suppress a peer. See [Rust Server](./rust-server.md#live-deltas-after-mutations) for the complete sequence.
 
 ```rust
 let messages = sync_server.calculate_deltas(
@@ -174,7 +178,11 @@ Choose one cache policy during the upgrade:
 
 Do not assume existing local caches will be reused automatically after changing the naming scheme.
 
-Removing browser sessions does not clean up cached rows when permissions contract. Permission-contraction cache cleanup remains separate work, not a guarantee of this upgrade.
+IndexedDB v4 separately rebuilds incompatible legacy caches on upgrade; matching names do not preserve pre-v4 rows. See [Identity And Client Migration](./migrations.md#upgrading-synced-identities-and-clients).
+
+Connected permission-changing writes deliver incremental removals. Removal recovery across delivery gaps remains separate work; changing auth state or deselecting a database does not automatically erase cached rows. See [Reconnect And Recovery](./sync.md#reconnect-and-recovery-boundaries).
+
+Composed submissions use namespace-bearing targets such as `database('Campaign', campaignDatabaseId)` and cannot span instances. Generated Elm query storage and receipts are also instance-scoped: preserve `databaseId` when forwarding messages, use `Pyre.getResult databaseId queryId queries`, and handle `QueryUpdated databaseId queryId`.
 
 ## Command Plane And Tenant Schemas
 

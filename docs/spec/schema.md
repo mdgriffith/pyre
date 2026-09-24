@@ -4,6 +4,8 @@
 
 Pyre schema files define database structure using records (tables), types (tagged unions), and sessions. Schema files use the `.pyre` extension and are typically named `schema.pyre` or organized in a `schema/` directory.
 
+Namespaces are syncable by default. Every synced record must have exactly one non-null `Id.Uuid @id` field; custom primary-key names are supported. Integer/plain-string identity examples in this language reference apply only to namespaces declared with `@syncable(false)`. Use [Schema Guide](../usage/schema.md) for copyable application examples and [Migration Guide](../usage/migrations.md#upgrading-synced-identities-and-clients) for existing databases.
+
 ## Syntax Rules
 
 - **Indentation**: Top-level definitions (`record`, `type`, `session`) must start at column 1 (beginning of line). Indentation is not allowed.
@@ -112,11 +114,13 @@ tags Json<List<String?>>
 **ID Types:**
 Branded type-safe identifiers that prevent mixing IDs from different tables:
 ```pyre
-id Id.Int @id         -- Integer primary key (branded as TableId)
+id Id.Int @id         -- Integer primary key, query-only namespaces
 externalId Id.Uuid    -- UUID identifier (branded as Uuid Table)
 ```
 
 ID types are stored in the database using their underlying representation (`INTEGER` for `Id.Int`, `TEXT` for `Id.Uuid`), but the generated client code uses branded types to prevent accidental misuse. For example, a `UserId` cannot be passed where a `PostId` is expected.
+
+Generated UUID create builders capture canonical lowercase UUIDv7 once and omit the primary key from application input. Named commands and trusted imports can accept explicit UUIDs of other versions. See [Generated CRUD And Composed Operations](../usage/query.md#generated-crud-and-composed-operations) for the distinct execution contracts.
 
 **Foreign Key Field References:**
 Reference the ID field of another table to get the correct branded type:

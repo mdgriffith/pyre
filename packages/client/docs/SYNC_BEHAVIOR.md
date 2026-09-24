@@ -1,15 +1,17 @@
 # Sync Behavior
 
+For application setup and examples, use [Sync Setup](../../../docs/usage/sync.md). This document describes the worker implementation behind that public API.
+
 ## Startup sequence
 
 1. **Elm init (`Main.elm`)**
    - `Main.init` starts the headless worker with flags (`schema`, `server`).
-   - It immediately sends `IndexedDb.requestInitialData` (via `Data.IndexedDb`).
+   - With auto-start enabled it sends `IndexedDb.requestInitialData`; otherwise explicit sync selection starts initialization.
 
 2. **IndexedDB bootstrap (`Data.IndexedDb` + `Db`)**
    - The TS IndexedDB service returns `InitialDataReceived`.
    - `Main.handleIndexedDbIncoming` updates the in-memory `Db` and re-runs all registered queries.
-   - `Data.Catchup` receives `InitialDataLoaded` and computes the initial sync cursor from the in-memory DB.
+   - The worker restores authoritative rows, per-row revision stamps (including tombstones), the revision floor, and the epoch. `Data.Catchup` resumes the persisted server cursor rather than advancing it from live-only rows.
 
 3. **Catchup loop (`Data.Catchup`)**
     - Once initial data is loaded, `Data.Catchup` requests `/sync`.
@@ -56,18 +58,18 @@ flowchart TD
 ## Key ordering guarantees
 
 - Catchup starts immediately after `InitialDataLoaded`.
-- SSE does not connect until catchup finishes.
+- SSE connects after catchup finishes, or after a catchup error so live recovery signals can still arrive.
 - Query re-execution happens:
    - after IndexedDB bootstraps, and
    - after each catchup page, and
    - after each SSE delta.
 - Authoritative catchup/live deltas are applied before local optimistic mutations are replayed.
-- Live sync deltas with `serverRevision <= lastAppliedServerRevision` are stale and are skipped.
+- HTTP, live, and catchup authority pass through per-row revision fences. An older message for a different row can still be accepted; the global maximum revision is not proof that all earlier rows arrived. Exceptional recovery additionally establishes a whole-cache revision floor.
 - Revision ordering applies only within the same `databaseEpoch`.
 - The client persists `lastAppliedServerRevision` in IndexedDB metadata and restores it at startup.
 - The client persists the server-issued `databaseEpoch` alongside the revision watermark.
-- Live `syncRequired` / `catchupRequired` messages with stale `serverRevision` values are ignored.
-- Catchup responses include the current `serverRevision` when the server has allocated one, so reconnect catchup advances the same revision watermark as live sync.
+- `syncRequired` / `catchupRequired` hints are not deduplicated against the global maximum revision: omitted rows may still be missing.
+- Catchup pages carry a consistent snapshot revision and use the same per-row authority path. Ordinary same-epoch `connected` handshakes preserve readers and pending writes; they do not initiate a destructive reload. Missed deletions/permission removals across a delivery gap remain deferred (MEC-157), including the initial catchup/subscription gap.
 
 ## Database replacement
 
@@ -83,12 +85,16 @@ Pyre treats mutation request order, response order, and live-sync arrival order 
 - The server response acknowledges that `requestId` and returns the normal mutation result.
 - The client keeps in-flight optimistic mutations in request order until the server response accepts or rejects them.
 - Authoritative live/catchup data is applied to the local DB first, then unsettled optimistic mutations are replayed over it.
-- Live sync events carry `serverRevision`; clients apply only revisions newer than their last applied revision.
+- Live sync events carry `serverRevision`; clients fence each row against its own last accepted revision.
 - The server may avoid echoing live sync events to the origin connection, but clients must not rely on that suppression for correctness.
 
-The protocol authority is the server-assigned monotonic revision on sync events. The server stores that counter in Pyre internal metadata (`_pyre_sync`) so revisions survive process restarts. Mutation responses should also include this revision when authoritative mutation results are added to the response envelope.
+The server allocates the monotonic `_pyre_sync` revision inside the write transaction, so delayed publication cannot stamp older values as newer. HTTP responses include normal operation results and permission-filtered incremental authority. Batches expose indexed results while authority contains final row values/removals, not intermediate grants.
 
-Server integrations must await the `result.sync(...)` returned from `runWithSync` after successful mutations. That call allocates the `_pyre_sync` revision, sends live messages with `serverRevision`, and returns `{ serverRevision }` for integrations that want to include protocol metadata in their mutation response envelope.
+Server integrations must await `result.sync(...)` after successful synced mutations, even without active subscribers. It uses the committed revision, sends live messages, and prepares `result.response` as `{ databaseEpoch, serverRevision, sync, result }` for affected-row operations. Serialize the response afterward.
+
+One worker replays ordered optimistic intent over authoritative rows and publishes the resulting visible state to query and entity readers. Entity streams project worker snapshots; they do not independently apply HTTP, live, or IndexedDB authority. Rejection removes intent and replays later submissions. Supported complete scalar creates and existing-row updates/deletes can be predicted; omitted defaults/managed values keep creates server-only.
+
+Pending edits are memory-only. Unknown transport/commit outcomes use exceptional fenced authority recovery without replaying writes. Explicit invalidation and epoch changes also reset readers and fence pre-reset responses. These paths are distinct from ordinary reconnect. IndexedDB v4 rebuilds legacy caches; accepted removals and their per-row stamps are persisted atomically so old responses cannot resurrect delivered tombstones.
 
 ## Public sync state
 

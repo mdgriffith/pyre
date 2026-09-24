@@ -58,7 +58,7 @@ record User {
     accounts @link(Account.userId)
     posts    @link(Post.authorUserId)
 
-    id        Int      @id
+    id        Id.Uuid  @id
     name      String?
     status    Status
     createdAt DateTime @default(now)
@@ -66,8 +66,8 @@ record User {
 }
 
 record Account {
-    id     Int    @id
-    userId Int
+    id     Id.Uuid @id
+    userId User.id
     name   String
     status String
     user   @link(userId, User.id)
@@ -75,9 +75,9 @@ record Account {
 }
 
 record Post {
-    id           Int      @id
+    id           Id.Uuid  @id
     createdAt    DateTime @default(now)
-    authorUserId Int
+    authorUserId User.id
     title        String
     content      String
     status       Status
@@ -99,6 +99,8 @@ This defines:
 - reusable domain types like `Status`
 
 For a deeper language reference, see [Schema Guide](./schema.md).
+
+Namespaces sync by default, so these records use non-null UUID primary keys. Use `@syncable(false)` at namespace scope for a query-only database that needs integer or plain-string keys. Generated create builders allocate UUIDv7 identities; see [Generated CRUD And Composed Operations](./query.md#generated-crud-and-composed-operations).
 
 CLI shortcut: `pyre docs schema`
 
@@ -125,7 +127,7 @@ CLI shortcut: `pyre docs migrations`
 Create a query file under `pyre/`. Any non-schema `.pyre` file in that tree is treated as a query file. A common convention is `pyre/query.pyre`.
 
 ```pyre
-query GetUser($id: Int) {
+query GetUser($id: User.id) {
     user {
         @where { id == $id }
         id
@@ -139,21 +141,22 @@ query GetUser($id: Int) {
     }
 }
 
-insert CreateUser($name: String, $status: Status) {
+insert CreateUser($id: User.id, $name: String, $status: Status) {
     user {
+        id = $id
         name = $name
         status = $status
     }
 }
 
-update UpdatePostStatus($postId: Int, $status: Status) {
+update UpdatePostStatus($postId: Post.id, $status: Status) {
     post {
         @where { id == $postId }
         status = $status
     }
 }
 
-delete DeleteAccount($accountId: Int) {
+delete DeleteAccount($accountId: Account.id) {
     account {
         @where { id == $accountId }
     }
@@ -161,6 +164,8 @@ delete DeleteAccount($accountId: Int) {
 ```
 
 For a deeper language reference, see [Query Guide](./query.md).
+
+The handwritten `CreateUser` command above takes an explicit UUID. Generated `User.create` builders instead capture UUIDv7 automatically; these are distinct input contracts.
 
 CLI shortcut: `pyre docs query`
 
@@ -195,11 +200,11 @@ pyre/generated/
 
 High-level purpose:
 
-- `typescript/core/`: shared schema/query metadata
+- `typescript/core/`: shared schema/query metadata and pure typed CRUD builders in `edits.ts`
 - `typescript/run.ts`: typed query functions for direct execution
 - `typescript/seed.ts`: schema-bound fixture and import helper
 - `typescript/server.ts`: query metadata used by `@pyre/server/query` and `@pyre/server/sync`
-- `client/elm/`: generated Elm surfaces for sync-enabled clients
+- `client/elm/`: generated Elm queries plus `Db.Edit` submission/receipts and `Db.Edit.<Record>` builders
 
 ## Step 5: Choose An Integration Style
 
@@ -207,18 +212,20 @@ After generation, you have a few reasonable ways to use Pyre.
 
 ### Install TypeScript Dependencies
 
-Pyre's TypeScript packages are distributed as versioned GitHub Release artifacts rather than through npm. Install all Pyre packages from the same release:
+Pyre's TypeScript packages are distributed as versioned GitHub Release artifacts rather than through npm. Install all Pyre packages from the release matching the compiler used to generate your code. In this template, replace every `VERSION` with that release's version number; composed builders require a release containing the composed-operation APIs (or matching workspace packages when developing from source).
 
 ```json
 {
   "dependencies": {
     "@libsql/client": "^0.14.0",
-    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-core-0.1.5.tgz",
-    "@pyre/server": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-server-0.1.5.tgz",
+    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-VERSION/pyre-core-VERSION.tgz",
+    "@pyre/server": "https://github.com/mdgriffith/pyre/releases/download/version-VERSION/pyre-server-VERSION.tgz",
+    "@pyre/client": "https://github.com/mdgriffith/pyre/releases/download/version-VERSION/pyre-client-VERSION.tgz",
     "zod": "^4.1.12"
   },
   "overrides": {
-    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-core-0.1.5.tgz"
+    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-VERSION/pyre-core-VERSION.tgz",
+    "@pyre/client": "https://github.com/mdgriffith/pyre/releases/download/version-VERSION/pyre-client-VERSION.tgz"
   }
 }
 ```
@@ -252,14 +259,16 @@ const db = createClient({
     authToken: undefined,
 });
 
-const result = await GetUser(db, { id: 1 });
+const result = await GetUser(db, { id: "01900000-0000-7000-8000-000000000001" });
 
 console.log(result.user);
 ```
 
-Generated functions accept an existing libSQL client and return the decoded, typed query result. For session-aware queries, pass the session before the input: `GetUser(db, session, { id: 1 })`.
+Generated functions accept an existing libSQL client and return the decoded, typed query result. For session-aware queries, pass the session before the input: `GetUser(db, session, { id: userId })`.
 
 This is the most flexible path when your app already has its own HTTP server and auth model. If the server dispatches generated client requests dynamically, use the `queries` map from `typescript/server.ts` with `@pyre/server/query` or `@pyre/server/sync` instead.
+
+For ordered atomic writes, use generated builders with `executeOperations` under an explicit server session. This works without a browser worker or live subscription; see [Seeding And Server-Owned Writes](./seeding.md). Rust integrations use the existing manifest executor described in [Rust Server](./rust-server.md).
 
 ### Option 3: Use Live Sync With `@pyre/client`
 

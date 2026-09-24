@@ -223,20 +223,41 @@ let sync_result = sync_server
 
 Return `sync_result` as JSON. It includes `databaseId` so the browser runtime can route the catchup page to the matching local cache.
 
+## Composed Operations
+
+The existing manifest executor accepts ordered descriptors. The application supplies the authorized connection and authenticated `PyreSession`; clients supply compiled query IDs and inputs, never SQL or permission metadata.
+
+```rust
+use pyre::server::query::{self, OperationDescriptor};
+
+let operations: Vec<OperationDescriptor> = serde_json::from_value(request_body)?;
+let mut result = query::run_operations(
+    &conn, &manifest, &operations, &session, true, // sync mode
+).await?;
+```
+
+Alternatively pass `"$batch"` and the descriptor-array JSON to `query::run_sync`; use `query::run` for normal request/response mode. Operations target one namespace/database, execute in order in one transaction, and return indexed `{ index, queryId, result }` entries. Generated writes enforce exactly-one-row cardinality and generated UUID creates require canonical UUIDv7. Named commands retain their existing matching/empty-result behavior.
+
+Execution failures roll back; `query::Error::OutcomeUnknown` means commit could have succeeded and must not be treated as a definite rejection or automatically retried. Map it to an HTTP server error for browser recovery. In sync mode, run delta calculation before returning the response as below.
+
 ## Live Deltas After Mutations
 
 After running a mutation:
 
 ```rust
-let result = query::run(&conn, &manifest, query_id, input, &session).await?;
-let mut result = result;
+let mut result = query::run_sync(&conn, &manifest, query_id, input, &session).await?;
+
+// Server-generated logical origin, independent of any client connectionId.
+let origin_session_id = new_server_origin_id();
+let mut recipients = connected_sessions.clone();
+recipients.insert(origin_session_id.clone(), session.logical().clone());
 
 let messages = sync_server.calculate_deltas(
     &conn,
     &mut result,
-    &connected_sessions,
+    &recipients,
     &database_id,
-    Some(origin_session_id),
+    Some(&origin_session_id),
 ).await?;
 ```
 
@@ -247,6 +268,10 @@ for item in messages {
     send_to_session(item.session_id, item.message);
 }
 ```
+
+`new_server_origin_id` is application-owned and must return an ID unique among recipients. The synthetic origin supplies HTTP authority even without SSE; it is excluded from live fanout. Real live connections, including the caller's, keep their own permission-filtered messages. Do not derive origin permissions or suppress a peer using an untrusted `connectionId`. The built-in server uses this synthetic-origin approach. The worker fences duplicate HTTP/SSE authority by revision.
+
+`run_sync` allocates the revision inside the write transaction. Delta calculation uses that committed revision and the original/final visibility of each affected row; it does not expose intermediate permission grants. Delivered removals carry identity-only tombstones. Return the wrapped `result.response` **after** calculating deltas, even with no live subscribers. Post-commit publication failure is not a rollback. For delivery-gap and exceptional recovery limits, see [Sync Setup](./sync.md#reconnect-and-recovery-boundaries).
 
 `item.message` serializes as:
 
@@ -298,9 +323,9 @@ Do not reimplement these in the app server.
 4. Build `PyreSession` from the authenticated app session.
 5. Include `pyre/generated/rust/server.rs` when the app has server-owned workflows.
 6. Use generated `query_ids` and typed inputs/outputs for server-owned workflows.
-7. Use direct `query::run` with dynamic JSON for generic client-driven queries and mutations.
-8. Return `result.response` to query/mutation callers.
-9. After mutations, pass the database connection, mutable `QueryResult`, connected sessions, database id, and origin session id to `SyncServer::calculate_deltas` and send live messages. This allocates the persisted `_pyre_sync` revision, stamps every live message with `serverRevision`, suppresses fanout to the origin session, and wraps `result.response` as `{ serverRevision, sync, result }` for the origin.
+7. Use `query::run` for request/response execution, or `query::run_sync` for synced operations (including `$batch`).
+8. For synced writes, call `SyncServer::calculate_deltas` with the mutable result, database-scoped recipients and authenticated logical origin; then publish live messages using the revision already allocated in the write transaction.
+9. Return `result.response` after publication/envelope preparation. Synced affected-row responses include `{ databaseEpoch, serverRevision, sync, result }` for the origin.
 10. Use `SyncServer::catchup` for `/sync` catchup requests.
 
 ## Current Coverage

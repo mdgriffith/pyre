@@ -2,6 +2,8 @@
 
 This document describes how Pyre persists named tagged unions, `Json<T>` values, and raw `JSON` values.
 
+The integer-key examples below illustrate storage in a query-only namespace (`@syncable(false)`). Synced schemas instead require non-null UUID primary keys. Generated edits replace an entire logical JSON/union value; these storage layouts do not imply nested-patch or concurrent field-merge semantics. See the [Query Guide](../usage/query.md#generated-crud-and-composed-operations).
+
 ## Scope
 
 This spec covers:

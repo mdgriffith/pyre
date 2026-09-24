@@ -4,6 +4,8 @@
 
 Pyre generates SQL that directly produces the final JSON response shape, similar to GraphQL with automatically written resolvers. The SQL itself composes the final JSON structure, eliminating the need for post-processing in application code.
 
+Integer-key schema examples in this specification assume a query-only namespace declared with `@syncable(false)`; synced records require UUID primary keys. Client composition reuses these precompiled operations in an ordered transaction, with generated-write cardinality checked before commit. See the [Query Guide](../usage/query.md#generated-crud-and-composed-operations) for public operation semantics and [Generated Operation Builders](./composed-operation-builders.md) for execution/conformance details.
+
 ## Queries
 
 ### Core Principle

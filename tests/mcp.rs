@@ -434,7 +434,7 @@ fn docs_are_exposed_as_resources() {
     assert!(query_docs["content"]
         .as_str()
         .unwrap()
-        .contains("generated update inputs omit them"));
+        .contains("updates omit protected fields"));
 
     let migration_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "migrations" }));
     assert!(migration_docs["content"]
@@ -519,12 +519,35 @@ fn sync_and_optional_guides_are_discoverable_and_retrievable() {
                 "The accessible-list check is UI behavior, not authorization",
                 "query.md#local-queries-and-session",
                 "one client per schema family",
+                "client.submit(target, edits)",
+                "not yet recovered",
             ],
         ),
         (
             "elm-sync",
             "Elm + Sync Runtime Setup",
-            vec!["Db.Database.fromString", "elm:", "setSyncedDatabases"],
+            vec![
+                "Db.Database.fromString",
+                "elm:",
+                "setSyncedDatabases",
+                "Db.Edit.submit",
+                "Db.Edit.receive",
+                "Pyre.getResult databaseId",
+            ],
+        ),
+        (
+            "seeding",
+            "Seeding And Server-Owned Writes",
+            vec![
+                "executeOperations",
+                "mode: 'normal'",
+                "bypasses query permissions",
+            ],
+        ),
+        (
+            "rust-server",
+            "Rust Server Integration",
+            vec!["query::run_operations", "query::run_sync", "OutcomeUnknown"],
         ),
         (
             "multi-database-upgrade",

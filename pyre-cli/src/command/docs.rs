@@ -28,7 +28,7 @@ pub const DOC_RESOURCES: &[DocResource] = &[
         uri: "pyre://guides/query",
         name: "Query Guide",
         description:
-            "How to write Pyre queries and mutations: selects, inserts, updates, deletes, transactions, params.",
+            "Queries, named commands, generated CRUD, composed-operation semantics, and typed results.",
         content: include_str!("../../../docs/usage/query.md"),
     },
     DocResource {
@@ -42,14 +42,14 @@ pub const DOC_RESOURCES: &[DocResource] = &[
         topic: "sync",
         uri: "pyre://guides/sync",
         name: "Pyre Sync Setup",
-        description: "Primary client/server sync workflow: authentication, database selection, and local queries.",
+        description: "Client/server sync: authentication, local reads, TypeScript composed writes, and recovery limits.",
         content: include_str!("../../../docs/usage/sync.md"),
     },
     DocResource {
         topic: "elm-sync",
         uri: "pyre://guides/elm-sync",
         name: "Elm + Sync Runtime Setup",
-        description: "Optional Elm integration: typed database IDs, generated queries, and the port bridge.",
+        description: "Elm integration: database-scoped queries, opaque edit builders, typed receipts, and ports.",
         content: include_str!("../../../docs/usage/elm-sync.md"),
     },
     DocResource {
@@ -65,6 +65,20 @@ pub const DOC_RESOURCES: &[DocResource] = &[
         name: "Server Contexts Guide",
         description: "Optional server-only session-resolution caching API for TypeScript/Rust, TTL, and invalidation.",
         content: include_str!("../../../docs/usage/server-contexts.md"),
+    },
+    DocResource {
+        topic: "seeding",
+        uri: "pyre://guides/seeding",
+        name: "Seeding And Server-Owned Writes",
+        description: "Explicit-session composed execution versus the trusted import-oriented seed helper.",
+        content: include_str!("../../../docs/usage/seeding.md"),
+    },
+    DocResource {
+        topic: "rust-server",
+        uri: "pyre://guides/rust-server",
+        name: "Rust Server Integration",
+        description: "Manifest execution, composed operations, authenticated origins, and incremental sync in Rust.",
+        content: include_str!("../../../docs/usage/rust-server.md"),
     },
     DocResource {
         topic: "migrations",
