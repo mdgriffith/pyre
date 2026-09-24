@@ -1,0 +1,53 @@
+==================
+Ephemeral state declarations
+==================
+
+state Connection {
+  userId Int = Session.userId
+  cursor String?
+  label String @default("online")
+}
+
+state Shared {
+  count Int @default(0)
+}
+
+---
+
+(source_file
+  (state_declaration
+    name: (type_identifier)
+    (block
+      (field_declaration
+        name: (identifier)
+        type: (type_expression
+          (type_identifier))
+        derived_value: (expression
+          (qualified_identifier
+            (type_identifier)
+            (identifier))))
+      (field_declaration
+        name: (identifier)
+        type: (type_expression
+          (type_identifier)))
+      (field_declaration
+        name: (identifier)
+        type: (type_expression
+          (type_identifier))
+        (directive
+          name: (directive_name)
+          (argument_list
+            (expression
+              (string)))))))
+  (state_declaration
+    name: (type_identifier)
+    (block
+      (field_declaration
+        name: (identifier)
+        type: (type_expression
+          (type_identifier))
+        (directive
+          name: (directive_name)
+          (argument_list
+            (expression
+              (number))))))))

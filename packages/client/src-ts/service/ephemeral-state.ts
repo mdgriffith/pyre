@@ -176,10 +176,14 @@ export class EphemeralStateService<
       leaseCadenceMs: config.leaseCadenceMs ?? 10_000,
       credentials: config.credentials ?? 'same-origin',
     };
-    this.fetchImpl = config.fetch ?? fetch;
+    const fetchImpl = config.fetch ?? globalThis.fetch;
+    this.fetchImpl = (...args) => fetchImpl(...args);
     this.now = config.now ?? Date.now;
-    this.setTimer = config.setTimeout ?? setTimeout;
-    this.clearTimer = config.clearTimeout ?? clearTimeout;
+    const setTimer = config.setTimeout ?? globalThis.setTimeout;
+    const clearTimer = config.clearTimeout ?? globalThis.clearTimeout;
+    // Browser timer functions require a valid host call boundary in Chromium.
+    this.setTimer = setTimer.bind(globalThis);
+    this.clearTimer = clearTimer.bind(globalThis);
   }
 
   getSnapshot(): EphemeralStateSnapshot<Connection, ConnectionPatch, Shared, SharedPatch> {

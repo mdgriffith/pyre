@@ -331,6 +331,16 @@
     "type": "field_declaration",
     "named": true,
     "fields": {
+      "derived_value": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "expression",
+            "named": true
+          }
+        ]
+      },
       "name": {
         "multiple": false,
         "required": true,
@@ -654,7 +664,37 @@
           "named": true
         },
         {
+          "type": "state_declaration",
+          "named": true
+        },
+        {
           "type": "type_declaration",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "state_declaration",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type_identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "block",
           "named": true
         }
       ]
@@ -890,6 +930,10 @@
   },
   {
     "type": "session",
+    "named": false
+  },
+  {
+    "type": "state",
     "named": false
   },
   {

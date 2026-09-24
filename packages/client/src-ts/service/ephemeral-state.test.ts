@@ -95,6 +95,27 @@ function harness(options = {}) {
 
 const tick = () => Promise.resolve().then(() => Promise.resolve());
 
+test('invokes configured host timers with a valid global receiver instead of the service', () => {
+  const receivers = [];
+  const service = new EphemeralStateService({
+    databaseId: 'alpha',
+    baseUrl: 'https://api.example.test',
+    endpoints: {
+      connection: '/ephemeral/connection', shared: '/ephemeral/shared',
+      lease: '/ephemeral/lease', resnapshot: '/ephemeral/resnapshot',
+    },
+    setTimeout: function () { receivers.push(this); return 1; },
+    clearTimeout: function () { receivers.push(this); },
+  });
+  service.handleMessage({ type: 'connected', databaseId: 'alpha', connectionId: 'one', ephemeralEpoch: 'epoch' });
+  service.handleMessage({
+    type: 'ephemeralSnapshot',
+    ephemeralSnapshot: { databaseId: 'alpha', epoch: 'epoch', revision: 1, shared: {}, connections: {} },
+  });
+  service.dispose();
+  expect(receivers).toEqual([globalThis, globalThis]);
+});
+
 test('snapshot and ordered changes replace complete entries and process removals', () => {
   const { service, connect } = harness();
   connect('mine', 'epoch-1', 4, { connections: { mine: { nested: { x: 1 }, old: true }, peer: { value: 1 } } });

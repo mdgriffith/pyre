@@ -70,5 +70,10 @@ jobs:
         working-directory: packages/client
         run: bun scripts/field-edit-proof.ts
 
+      - name: Real pyre serve ephemeral browser proof
+        run: |
+          cargo build --locked --bin pyre
+          bun packages/client/scripts/ephemeral-serve-proof.ts
+
       - name: Run tests
         run: cargo test --locked

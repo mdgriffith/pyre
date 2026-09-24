@@ -2,12 +2,11 @@
 
 ## Status
 
-This document defines the proposed contract for
+This document records the implemented contract for
 [MEC-158](https://linear.app/mechanical-elephant/issue/MEC-158/add-typed-ephemeral-state-scoped-to-a-database-runtime).
-The schema, validation, runtime, transport, and client work must use the existing
+The schema, validation, runtime, transport, and client implementation uses the existing
 Pyre type, authorization, database-routing, and live-connection paths. The
-database-runtime ownership decision below must be approved before runtime code is
-implemented.
+database-runtime ownership decision below is the implemented V1 boundary.
 
 ## Scope
 
@@ -214,27 +213,36 @@ not a parallel public client or cache. Ephemeral values never enter IndexedDB. E
 worker and generated Elm regression coverage remains required, but V1 does not add
 a separate public Elm state API unless product scope changes.
 
-## Delivery order
+## Executable evidence
 
-1. Add schema syntax, generated types, one resolved Rust value contract, and native/WASM conformance fixtures.
-2. Add the authoritative database-runtime state engine, authorization integration, explicit retirement, and lifecycle tests.
-3. Add snapshot ordering, revisions, removals, cadence, bounded coalescing, leases, and explicit overflow recovery.
-4. Integrate Rust and TypeScript APIs, `pyre serve`, reconnect behavior, documentation, and two-client browser conformance.
+Run the complete Rust integration set with `cargo test --locked`; run TypeScript
+client/server coverage with `bun test packages/client/src-ts` and
+`bun test packages/server`; run the real browser proof after building the client
+worker with `bun packages/client/scripts/ephemeral-serve-proof.ts` from the
+repository root (or `bun scripts/ephemeral-serve-proof.ts` from
+`packages/client`). CI executes it after the existing field-edit proof.
 
-Each slice must extend existing ownership paths. If implementation requires a
-second database registry, connection map, state validator, transport, or client
-cache, work stops for architectural review.
+| Contract | Executable evidence |
+| --- | --- |
+| Parser, formatter, reserved names, defaults, derivations, and invalid declarations | `tests/state_schema.rs` (`parses_state_as_distinct_ast_with_writable_and_derived_fields`, `formats_state_declarations_and_derivations_idempotently`, `valid_state_types_defaults_and_derivations_typecheck_without_tables`, and rejection tests) |
+| Generated TypeScript/Rust complete and patch types | `tests/state_generation.rs` (`generated_typescript_state_surface_enforces_complete_values_and_writable_patches`, `generated_rust_state_surface_compiles_and_preserves_patch_null_semantics`); `packages/client/src-ts/ephemeral-state.typecheck.ts` |
+| Defaults, nullability, nested/custom validation, normalization, and atomic patch rejection | `tests/ephemeral.rs` (`initializes_defaults_nulls_and_trusted_derivations_canonically`, `validates_recursive_custom_list_dict_and_typed_json_values_strictly`, `patches_are_atomic_top_level_replacements_and_reject_derived_or_unknown_fields`) |
+| Contract serialization and Rust/WASM boundary behavior | `tests/ephemeral.rs::serialized_contract_has_the_same_results_as_the_native_contract`; `wasm/src/database_runtime.rs` private-handle, stable-error, and expiry tests; `packages/server/ephemeral.test.ts` |
+| Database isolation, same-owner connections, read-only policy, trusted owner checks, refresh, revocation, expiry, close, fresh epoch/defaults | `tests/ephemeral_runtime.rs` tests from `runtimes_isolate_databases_and_same_owner_connections` through `authorization_loss_removes_the_connection`, including `close_fences_handles_and_reopen_has_new_epoch_and_defaults` |
+| Snapshot ordering, coalescing, removals, bounds, overflow/resnapshot, reconnect identity | `tests/ephemeral_runtime.rs::subscription_snapshot_has_no_concurrent_update_gap`, `coalesces_complete_entries_and_delivers_on_trailing_cadence`, `removals_dominate_older_values_and_a_later_rejoin_wins`, `entry_overflow_requests_immediate_resync_and_suppresses_deltas`, `payload_and_transport_bounds_fail_explicitly`, `reconnect_has_a_fresh_identity_snapshot_and_no_replay` |
+| `pyre serve` route authorization, fencing, read-only subscription, signed-session requirements | `tests/commands.rs::test_serve_ephemeral_http_sse_lifecycle_and_fencing` and adjacent serve tests; run `cargo test --locked --test commands test_serve_ephemeral` |
+| Client desired/authoritative separation, stale replies, observable failures, reconnect Connection republish without Shared replay | `packages/client/src-ts/service/ephemeral-state.test.ts`; run `bun test packages/client/src-ts/service/ephemeral-state.test.ts` |
+| Real public-client Chromium lifecycle over actual `pyre serve`, including two same-user identities, propagation, rejection, removals, disconnect/reconnect, restart, durable database survival, and SQLite/IndexedDB non-persistence scans | `packages/client/scripts/ephemeral-serve-proof.ts` and `packages/client/scripts/ephemeral-serve-browser.ts`; run `bun scripts/ephemeral-serve-proof.ts` from `packages/client` |
+| Documentation CLI/MCP discovery | `tests/commands.rs::docs_lists_topics`, `tests/commands.rs::docs_prints_requested_topic`, `tests/mcp.rs::docs_are_exposed_as_resources`, `tests/mcp.rs::sync_and_optional_guides_are_discoverable_and_retrievable` |
 
-## Acceptance
+## Remaining limitations
 
-Executable coverage must establish:
-
-- parser, formatter, and typechecker behavior for both reserved declarations;
-- defaults, nullability, nested/custom values, derived fields, and atomic rejection;
-- matching native Rust and WASM state transitions;
-- database isolation, same-user multiple connections, read-only participation,
-  trusted ownership, refresh, revocation, lease expiry, and runtime reset;
-- race-free snapshot/update/removal ordering and bounded coalescing recovery;
-- stale-response protection and reconnect without historical or `Shared` replay;
-- a real two-client HTTP/SSE browser lifecycle through `pyre serve`;
-- no state values in SQL, sync metadata, durable outboxes, or IndexedDB.
+- V1 requires one authoritative serving process per concrete database. It has no
+  distributed owner election, replication, or cross-process convergence.
+- There is no separate public Elm ephemeral API. The browser TypeScript client is
+  the application-facing surface; generated Elm output remains unchanged.
+- Custom servers must supply their own authenticated HTTP/WebSocket/SSE adapter,
+  runtime registry, polling, lease scheduling, and retirement. The helper does not
+  install routes or infer database residency.
+- Delivery is latest-value convergence, not an event log. Intermediate values may
+  be coalesced and state cannot be recovered after runtime replacement.

@@ -134,6 +134,11 @@ token refreshes; it is hashed and never exposed. Durable-only serving remains
 compatible with older signed payloads that omit it. Unsigned session JSON changes
 cannot preserve ephemeral ownership when the credential itself changes.
 
+Use the public client and generated state types rather than constructing these
+request envelopes directly. The [Ephemeral State guide](./ephemeral-state.md)
+covers application APIs, authoritative versus desired state, reconnect behavior,
+runtime lifetime, non-persistence, and the one-owner deployment requirement.
+
 ## Options
 
 ```text

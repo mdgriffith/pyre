@@ -1,5 +1,9 @@
 # Custom Ephemeral Runtime
 
+This guide covers custom server ownership and transport adaptation. For schema
+syntax, generated application types, public browser APIs, reconnect semantics, and
+deployment constraints, start with [Ephemeral State](./ephemeral-state.md).
+
 Use `createDatabaseRuntime` when the application owns its database routing and
 transport. The helper keeps the application database handle and a per-instance
 Rust/WASM `DatabaseRuntime` together, but does not create a registry, timers, or

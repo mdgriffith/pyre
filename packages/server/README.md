@@ -28,6 +28,12 @@ For the normal client/server integration, start with the [sync guide](../../docs
 
 ## Ephemeral Database Runtime
 
+See the [Ephemeral State guide](../../docs/usage/ephemeral-state.md) for the
+application-facing schema, generated types, client semantics, lifetime, and
+deployment model. This section and the
+[custom runtime guide](../../docs/usage/ephemeral-runtime.md) focus on custom
+server ownership.
+
 `createDatabaseRuntime` from `@pyre/server/ephemeral` pairs an application-owned
 database handle with one isolated Rust/WASM ephemeral runtime. Initialize WASM,
 then pass the canonical `ephemeral` contract from the generated `manifest.json`:

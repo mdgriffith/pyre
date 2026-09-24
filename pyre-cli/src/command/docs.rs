@@ -46,6 +46,13 @@ pub const DOC_RESOURCES: &[DocResource] = &[
         content: include_str!("../../../docs/usage/sync.md"),
     },
     DocResource {
+        topic: "ephemeral-state",
+        uri: "pyre://guides/ephemeral-state",
+        name: "Ephemeral State",
+        description: "Typed transient Connection and Shared state across schema, client, server, and deployment APIs.",
+        content: include_str!("../../../docs/usage/ephemeral-state.md"),
+    },
+    DocResource {
         topic: "elm-sync",
         uri: "pyre://guides/elm-sync",
         name: "Elm + Sync Runtime Setup",

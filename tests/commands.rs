@@ -89,6 +89,7 @@ fn docs_lists_topics() {
         .assert()
         .success()
         .stdout(predicate::str::contains("getting-started"))
+        .stdout(predicate::str::contains("ephemeral-state"))
         .stdout(predicate::str::contains("serve"));
 }
 
@@ -101,6 +102,18 @@ fn docs_prints_requested_topic() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Pyre Schema Guide"));
+}
+
+#[test]
+fn docs_prints_ephemeral_state_topic() {
+    let ctx = TestContext::new();
+
+    ctx.run_command("docs")
+        .arg("ephemeral-state")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Ephemeral State"))
+        .stdout(predicate::str::contains("updateEphemeralConnection"));
 }
 
 #[test]

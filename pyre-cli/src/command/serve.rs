@@ -120,7 +120,12 @@ struct SyncRequest {
     #[serde(rename = "databaseEpoch")]
     database_epoch: Option<String>,
     #[serde(rename = "syncCursor")]
-    sync_cursor: SyncCursor,
+    sync_cursor: ClientSyncCursor,
+}
+
+#[derive(Deserialize)]
+struct ClientSyncCursor {
+    tables: SyncCursor,
 }
 
 #[derive(Deserialize)]
@@ -429,7 +434,7 @@ async fn sync(
     let result = server
         .catchup_protocol(
             &conn,
-            &body.sync_cursor,
+            &body.sync_cursor.tables,
             authenticated.session.logical(),
             state.page_size,
             &state.database_id,
@@ -1158,6 +1163,18 @@ fn with_cors(state: &AppState, request_headers: &HeaderMap, mut response: Respon
 mod tests {
     use super::*;
     use pyre::server::manifest::FieldSchema;
+
+    #[test]
+    fn sync_request_accepts_public_client_cursor_envelope() {
+        let request: SyncRequest = serde_json::from_value(json!({
+            "databaseId": "proof",
+            "syncCursor": { "tables": {} }
+        }))
+        .unwrap();
+
+        assert_eq!(request.database_id.as_deref(), Some("proof"));
+        assert!(request.sync_cursor.tables.is_empty());
+    }
 
     #[tokio::test]
     async fn unknown_commit_outcome_is_not_an_http_rejection() {
