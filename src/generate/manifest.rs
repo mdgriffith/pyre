@@ -1,64 +1,10 @@
 use crate::ast;
 use crate::filesystem;
 use crate::generate::sql;
+use crate::server::manifest::{FieldSchema, GeneratedEdit, Manifest, QueryManifest, SqlInfo};
 use crate::typecheck;
-use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-
-#[derive(Serialize)]
-struct Manifest {
-    version: u32,
-    session_schema: BTreeMap<String, FieldSchema>,
-    queries: BTreeMap<String, QueryManifest>,
-}
-
-#[derive(Serialize)]
-struct QueryManifest {
-    id: String,
-    operation: String,
-    primary_db: String,
-    attached_dbs: Vec<String>,
-    input_schema: BTreeMap<String, FieldSchema>,
-    session_args: Vec<String>,
-    optional_input_args: Vec<String>,
-    json_input_args: Vec<String>,
-    sql: Vec<SqlInfo>,
-    #[serde(rename = "syncSql", skip_serializing_if = "Option::is_none")]
-    sync_sql: Option<Vec<SqlInfo>>,
-    #[serde(rename = "generatedEdit", skip_serializing_if = "Option::is_none")]
-    generated_edit: Option<GeneratedEdit>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GeneratedEdit {
-    write_statement: usize,
-    sync_write_statement: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    create_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct FieldSchema {
-    #[serde(rename = "type")]
-    type_: String,
-    is_enum: bool,
-    enum_variants: Vec<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    tagged_union_variants: BTreeMap<String, BTreeMap<String, FieldSchema>>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    tagged_union_types: BTreeMap<String, BTreeMap<String, BTreeMap<String, FieldSchema>>>,
-    nullable: bool,
-    omittable: bool,
-}
-
-#[derive(Serialize)]
-struct SqlInfo {
-    include: bool,
-    params: Vec<String>,
-    sql: String,
-}
 
 pub fn generate_schema(
     context: &typecheck::Context,
@@ -99,8 +45,20 @@ fn write_manifest(
             .into_iter()
             .map(|query| (query.id.clone(), query))
             .collect(),
+        ephemeral: if context.states.is_empty() {
+            None
+        } else {
+            Some(
+                crate::ephemeral::Contract::from_context(context)
+                    .expect("typechecked ephemeral state should resolve"),
+            )
+        },
     };
-    let content = serde_json::to_string_pretty(&manifest).expect("manifest should serialize");
+    // Serializing through Value keeps generated output stable even though runtime maps are HashMaps.
+    let content = serde_json::to_string_pretty(
+        &serde_json::to_value(manifest).expect("manifest should serialize"),
+    )
+    .expect("manifest should serialize");
 
     files.retain(|file| file.path != Path::new("manifest.json"));
     files.push(filesystem::generate_text_file("manifest.json", content));
@@ -167,7 +125,7 @@ fn sorted_strings(values: &std::collections::HashSet<String>) -> Vec<String> {
     result
 }
 
-fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<String, FieldSchema> {
+fn input_schema(context: &typecheck::Context, query: &ast::Query) -> HashMap<String, FieldSchema> {
     query
         .args
         .iter()
@@ -183,8 +141,8 @@ fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<St
                 FieldSchema {
                     is_enum: !enum_variants.is_empty(),
                     enum_variants,
-                    tagged_union_variants: BTreeMap::new(),
-                    tagged_union_types: BTreeMap::new(),
+                    tagged_union_variants: HashMap::new(),
+                    tagged_union_types: HashMap::new(),
                     type_,
                     nullable: arg.nullable,
                     omittable: arg.omittable,
@@ -194,7 +152,7 @@ fn input_schema(context: &typecheck::Context, query: &ast::Query) -> BTreeMap<St
         .collect()
 }
 
-fn session_schema(context: &typecheck::Context) -> BTreeMap<String, FieldSchema> {
+fn session_schema(context: &typecheck::Context) -> HashMap<String, FieldSchema> {
     context
         .session
         .as_ref()
@@ -283,7 +241,7 @@ fn session_field_schema_inner(
         is_enum: !enum_variants.is_empty(),
         enum_variants,
         tagged_union_variants,
-        tagged_union_types: BTreeMap::new(),
+        tagged_union_types: HashMap::new(),
         type_,
         nullable: column.nullable,
         omittable: false,
@@ -294,7 +252,7 @@ fn collect_session_tagged_union_types(
     context: &typecheck::Context,
     type_: &ast::ColumnType,
     visited: &mut HashSet<String>,
-    definitions: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, FieldSchema>>>,
+    definitions: &mut HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
 ) {
     let Some(type_name) = type_.get_custom_type_name() else {
         return;
@@ -358,8 +316,8 @@ fn session_field_schema_reference(
     FieldSchema {
         is_enum: !enum_variants.is_empty(),
         enum_variants,
-        tagged_union_variants: BTreeMap::new(),
-        tagged_union_types: BTreeMap::new(),
+        tagged_union_variants: HashMap::new(),
+        tagged_union_types: HashMap::new(),
         type_,
         nullable: column.nullable,
         omittable: false,

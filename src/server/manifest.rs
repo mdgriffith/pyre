@@ -1,4 +1,4 @@
-use crate::sync;
+use crate::{ephemeral, sync};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -20,6 +20,8 @@ pub struct Manifest {
     pub version: u32,
     pub session_schema: HashMap<String, FieldSchema>,
     pub queries: HashMap<String, QueryManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<ephemeral::Contract>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,9 +37,13 @@ pub struct QueryManifest {
     pub optional_input_args: Vec<String>,
     pub json_input_args: Vec<String>,
     pub sql: Vec<SqlInfo>,
-    #[serde(default, rename = "syncSql")]
+    #[serde(default, rename = "syncSql", skip_serializing_if = "Option::is_none")]
     pub sync_sql: Option<Vec<SqlInfo>>,
-    #[serde(default, rename = "generatedEdit")]
+    #[serde(
+        default,
+        rename = "generatedEdit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub generated_edit: Option<GeneratedEdit>,
 }
 
@@ -46,6 +52,7 @@ pub struct QueryManifest {
 pub struct GeneratedEdit {
     pub write_statement: usize,
     pub sync_write_statement: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_id: Option<String>,
 }
 

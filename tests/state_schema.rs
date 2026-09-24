@@ -206,6 +206,17 @@ state Shared {
         error.error_type,
         pyre::error::ErrorType::InvalidColumnDefault { .. }
     )));
+
+    let invalid_date = errors(
+        r#"state Shared {
+    day Date @default("24/09/2026")
+}
+"#,
+    );
+    assert!(invalid_date.iter().any(|error| matches!(
+        error.error_type,
+        pyre::error::ErrorType::InvalidColumnDefault { .. }
+    )));
 }
 
 #[test]

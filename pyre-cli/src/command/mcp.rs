@@ -887,6 +887,11 @@ fn dynamic_manifest(
         version: 1,
         session_schema: session_schema(context),
         queries,
+        ephemeral: if context.states.is_empty() {
+            None
+        } else {
+            Some(pyre::ephemeral::Contract::from_context(context).map_err(|error| error.message)?)
+        },
     })
 }
 

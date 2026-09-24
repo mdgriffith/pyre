@@ -634,6 +634,7 @@ mod tests {
                 },
             )]),
             queries: HashMap::new(),
+            ephemeral: None,
         }
     }
 

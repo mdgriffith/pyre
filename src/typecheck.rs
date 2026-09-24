@@ -288,6 +288,8 @@ pub struct Context {
 
     pub types: HashMap<String, (DefInfo, Type)>,
     pub tables: HashMap<String, Table>,
+    /// Typechecked ephemeral state declarations, kept separate from SQL tables.
+    pub states: HashMap<String, State>,
 
     // All variants by type name + variant name.
     // Used to check if there are multiple variants with the same name in a type.
@@ -303,6 +305,14 @@ pub struct Table {
     /// Tables in cycles get the same layer number.
     pub sync_layer: usize,
     /// Filepath of the schema file where this record is defined
+    pub filepath: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct State {
+    pub name: String,
+    pub schema: String,
+    pub fields: Vec<ast::StateField>,
     pub filepath: String,
 }
 
@@ -331,6 +341,7 @@ pub fn empty_context() -> Context {
         funcs: fns,
         types: HashMap::new(),
         tables: HashMap::new(),
+        states: HashMap::new(),
         variants: HashMap::new(),
     };
     context
@@ -464,18 +475,79 @@ fn default_value_matches_type(
     allow_structured: bool,
 ) -> bool {
     match type_ {
-        ast::ColumnType::String | ast::ColumnType::Date | ast::ColumnType::IdUuid { .. } => {
-            matches!(value, ast::QueryValue::String(_))
-        }
+        ast::ColumnType::String => matches!(value, ast::QueryValue::String(_)),
+        ast::ColumnType::Date => match value {
+            ast::QueryValue::String((_, value)) if allow_structured => {
+                chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+            }
+            ast::QueryValue::String(_) => true,
+            _ => false,
+        },
         ast::ColumnType::Int | ast::ColumnType::DateTime => {
             matches!(value, ast::QueryValue::Int(_))
+        }
+        ast::ColumnType::IdInt { .. } if allow_structured => {
+            matches!(value, ast::QueryValue::Int(_))
+        }
+        ast::ColumnType::IdUuid { .. } if allow_structured => {
+            matches!(value, ast::QueryValue::String(_))
         }
         ast::ColumnType::Float => {
             matches!(value, ast::QueryValue::Int(_) | ast::QueryValue::Float(_))
         }
         ast::ColumnType::Bool => matches!(value, ast::QueryValue::Bool(_)),
-        ast::ColumnType::ForeignKey { .. } => {
-            matches!(value, ast::QueryValue::String(_) | ast::QueryValue::Int(_))
+        ast::ColumnType::ForeignKey {
+            schema,
+            table,
+            field,
+            serialization_type,
+        } => {
+            if !allow_structured {
+                return matches!(value, ast::QueryValue::String(_) | ast::QueryValue::Int(_));
+            }
+            if let Some(target) = context.tables.values().find_map(|candidate| {
+                (candidate.record.name == *table
+                    && schema
+                        .as_ref()
+                        .map(|schema| candidate.schema == *schema)
+                        .unwrap_or(true))
+                .then(|| {
+                    candidate
+                        .record
+                        .fields
+                        .iter()
+                        .find_map(|field_| match field_ {
+                            ast::Field::Column(column) if column.name == *field => Some(column),
+                            _ => None,
+                        })
+                })
+                .flatten()
+            }) {
+                return default_value_matches_type(context, &target.type_, value, allow_structured);
+            }
+            match serialization_type {
+                Some(
+                    ast::ConcreteSerializationType::Text | ast::ConcreteSerializationType::IdUuid,
+                ) => matches!(value, ast::QueryValue::String(_)),
+                Some(
+                    ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt,
+                ) => matches!(value, ast::QueryValue::Int(_)),
+                Some(ast::ConcreteSerializationType::Real) => {
+                    matches!(value, ast::QueryValue::Int(_) | ast::QueryValue::Float(_))
+                }
+                Some(ast::ConcreteSerializationType::Date) => {
+                    matches!(value, ast::QueryValue::String(_))
+                }
+                Some(ast::ConcreteSerializationType::DateTime) => {
+                    matches!(value, ast::QueryValue::Int(_))
+                }
+                Some(
+                    ast::ConcreteSerializationType::Blob
+                    | ast::ConcreteSerializationType::JsonB
+                    | ast::ConcreteSerializationType::VectorBlob { .. },
+                )
+                | None => false,
+            }
         }
         ast::ColumnType::Nullable(inner) => {
             matches!(value, ast::QueryValue::Null(_))
@@ -524,7 +596,8 @@ fn default_value_matches_type(
         | ast::ColumnType::List(_)
         | ast::ColumnType::Dict(_)
         | ast::ColumnType::Custom(_)
-        | ast::ColumnType::IdInt { .. } => false,
+        | ast::ColumnType::IdInt { .. }
+        | ast::ColumnType::IdUuid { .. } => false,
     }
 }
 
@@ -677,6 +750,117 @@ fn validate_type_expr(
 
             seen_types.remove(name);
         }
+    }
+}
+
+fn validate_state_foreign_keys(
+    context: &Context,
+    current_schema: &str,
+    filepath: &str,
+    contexts: Vec<Range>,
+    primary: Vec<Range>,
+    type_: &ast::ColumnType,
+    errors: &mut Vec<Error>,
+) {
+    validate_state_foreign_keys_inner(
+        context,
+        current_schema,
+        filepath,
+        contexts,
+        primary,
+        type_,
+        &mut HashSet::new(),
+        errors,
+    );
+}
+
+fn validate_state_foreign_keys_inner(
+    context: &Context,
+    current_schema: &str,
+    filepath: &str,
+    contexts: Vec<Range>,
+    primary: Vec<Range>,
+    type_: &ast::ColumnType,
+    visiting: &mut HashSet<String>,
+    errors: &mut Vec<Error>,
+) {
+    match type_ {
+        ast::ColumnType::ForeignKey {
+            schema,
+            table,
+            field,
+            ..
+        } => {
+            let target_schema = schema.as_deref().unwrap_or(current_schema);
+            let target = context
+                .tables
+                .values()
+                .find(|candidate| {
+                    candidate.schema == target_schema && candidate.record.name == *table
+                })
+                .and_then(|table| {
+                    table
+                        .record
+                        .fields
+                        .iter()
+                        .find_map(|candidate| match candidate {
+                            ast::Field::Column(column) if column.name == *field => Some(column),
+                            _ => None,
+                        })
+                });
+            if !target.is_some_and(|column| column.type_.is_id_type()) {
+                errors.push(invalid_type_usage_error(
+                    filepath,
+                    format!(
+                        "State foreign key '{}.{}' must reference an existing ID field.",
+                        table, field
+                    ),
+                    contexts,
+                    primary,
+                ));
+            }
+        }
+        ast::ColumnType::JsonTyped(inner)
+        | ast::ColumnType::List(inner)
+        | ast::ColumnType::Dict(inner)
+        | ast::ColumnType::Nullable(inner) => validate_state_foreign_keys_inner(
+            context,
+            current_schema,
+            filepath,
+            contexts,
+            primary,
+            inner,
+            visiting,
+            errors,
+        ),
+        ast::ColumnType::Custom(name) => {
+            if !visiting.insert(name.clone()) {
+                return;
+            }
+            if let Some((_, Type::OneOf { variants })) = context.types.get(name) {
+                for variant in variants {
+                    for column in variant
+                        .fields
+                        .as_ref()
+                        .map(ast::collect_columns)
+                        .unwrap_or_default()
+                    {
+                        validate_state_foreign_keys_inner(
+                            context,
+                            current_schema,
+                            filepath,
+                            contexts.clone(),
+                            primary.clone(),
+                            &column.type_,
+                            visiting,
+                            errors,
+                        );
+                    }
+                }
+            }
+            visiting.remove(name);
+        }
+        _ => {}
     }
 }
 
@@ -1125,6 +1309,14 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
         for file in &schema.files {
             for definition in &file.definitions {
                 match definition {
+                    ast::Definition::State { name, fields, .. } => {
+                        context.states.entry(name.clone()).or_insert_with(|| State {
+                            name: name.clone(),
+                            schema: schema.namespace.clone(),
+                            fields: fields.clone(),
+                            filepath: file.path.clone(),
+                        });
+                    }
                     ast::Definition::Record {
                         name,
                         fields,
@@ -1898,6 +2090,18 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
         }
     }
 
+    for state in context.states.values_mut() {
+        for field in &mut state.fields {
+            let column = match field {
+                ast::StateField::Writable(column) | ast::StateField::Derived { column, .. } => {
+                    column
+                }
+                _ => continue,
+            };
+            resolve_type(&mut column.type_, Some(&state.schema), &foreign_key_types);
+        }
+    }
+
     for (_, type_) in context.types.values_mut() {
         let Type::OneOf { variants } = type_ else {
             continue;
@@ -2057,8 +2261,17 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                                 state_context.clone(),
                                 to_range(&column.start_typename, &column.end_typename),
                                 &column.type_,
-                                false,
+                                true,
                                 &mut HashSet::new(),
+                                errors,
+                            );
+                            validate_state_foreign_keys(
+                                context,
+                                &schema.namespace,
+                                &file.path,
+                                state_context.clone(),
+                                to_range(&column.start_typename, &column.end_typename),
+                                &column.type_,
                                 errors,
                             );
 
