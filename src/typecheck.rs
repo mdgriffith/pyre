@@ -339,6 +339,10 @@ pub fn empty_context() -> Context {
     context
         .types
         .insert("Int".to_string(), (DefInfo::Builtin, Type::Integer));
+    context.types.insert(
+        "Sequence.Int".to_string(),
+        (DefInfo::Builtin, Type::Integer),
+    );
     context
         .types
         .insert("Float".to_string(), (DefInfo::Builtin, Type::Float));
@@ -428,7 +432,9 @@ fn allowed_defaults_for_column_type(column: &ast::Column) -> Vec<String> {
             };
             allowed_defaults_for_column_type(&nested)
         }
-        ast::ColumnType::IdInt { .. } | ast::ColumnType::IdUuid { .. } => vec![],
+        ast::ColumnType::SequenceInt
+        | ast::ColumnType::IdInt { .. }
+        | ast::ColumnType::IdUuid { .. } => vec![],
         ast::ColumnType::ForeignKey { .. } => vec!["an integer or string literal".to_string()],
         ast::ColumnType::Custom(_) => vec!["a literal value matching the field type".to_string()],
     };
@@ -529,6 +535,13 @@ fn validate_type_expr(
     errors: &mut Vec<Error>,
 ) {
     match type_ {
+        ast::ColumnType::SequenceInt => {
+            if inside_json {
+                errors.push(invalid_type_usage_error(filepath,
+                    "Sequence.Int can only be used as a non-nullable record field, not inside a structured type or container. Use Int for stored sequence values.".to_string(),
+                    contexts, primary));
+            }
+        }
         ast::ColumnType::String
         | ast::ColumnType::Int
         | ast::ColumnType::Float
@@ -1015,6 +1028,7 @@ pub fn resolve_query_param_column_type(
     type_: &ast::ColumnType,
 ) -> ast::ColumnType {
     match type_ {
+        ast::ColumnType::SequenceInt => return ast::ColumnType::Int,
         ast::ColumnType::JsonTyped(inner) => {
             return ast::ColumnType::JsonTyped(Box::new(resolve_query_param_column_type(
                 context, inner,
@@ -1066,6 +1080,7 @@ pub fn resolve_query_param_column_type(
                     ast::Field::Column(column) if column.name == *field => {
                         let mut type_ = column.type_.clone();
                         match &mut type_ {
+                            ast::ColumnType::SequenceInt => type_ = ast::ColumnType::Int,
                             ast::ColumnType::IdInt { table }
                             | ast::ColumnType::IdUuid { table }
                                 if table.is_empty() =>
@@ -1971,6 +1986,12 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                         }
 
                         for column in ast::collect_columns(&session.fields) {
+                            if column.type_.contains_sequence() {
+                                errors.push(invalid_type_usage_error(&file.path,
+                                    "Sequence.Int cannot be used in session fields. Use Int instead.".to_string(),
+                                    to_range(&session.start, &session.end),
+                                    to_range(&column.start_typename, &column.end_typename)));
+                            }
                             validate_reference_type(
                                 context,
                                 &file.path,
@@ -2005,6 +2026,39 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                     } => {
                         let mut field_names: HashMap<String, Option<Range>> = HashMap::new();
                         let fields = ast::with_timestamps_fields(fields);
+                        let sequence_columns: Vec<_> = fields
+                            .iter()
+                            .filter_map(|field| match field {
+                                ast::Field::Column(column) if column.type_.contains_sequence() => {
+                                    Some(column)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        for sequence in &sequence_columns {
+                            let valid_identity = fields.iter().any(|field| matches!(field,
+                                ast::Field::Column(column) if ast::is_primary_key(column)
+                                    && matches!(column.type_, ast::ColumnType::IdUuid { .. }) && !column.nullable));
+                            let invalid_directive = sequence.directives.iter().any(|directive| {
+                                matches!(
+                                    directive,
+                                    ast::ColumnDirective::PrimaryKey
+                                        | ast::ColumnDirective::Default { .. }
+                                        | ast::ColumnDirective::CreatedAt
+                                        | ast::ColumnDirective::UpdatedAt
+                                )
+                            });
+                            if sequence_columns.len() != 1
+                                || !valid_identity
+                                || sequence.nullable
+                                || !ast::is_sequence(sequence)
+                                || invalid_directive
+                            {
+                                errors.push(invalid_type_usage_error(&file.path,
+                                    "Sequence.Int requires a non-nullable Id.Uuid @id in the same record. Declare at most one non-nullable Sequence.Int field, without @id, @default, @createdAt, or @updatedAt.".to_string(),
+                                    to_range(start, end), to_range(&sequence.start, &sequence.end)));
+                            }
+                        }
                         for column in ast::collect_columns(&fields) {
                             validate_type_expr(
                                 context,
@@ -2293,6 +2347,11 @@ pub fn check_query(context: &Context, errors: &mut Vec<Error>, query: &ast::Quer
             }
 
             Some(type_) => {
+                if ast::ColumnType::from_str(type_).contains_sequence() {
+                    errors.push(invalid_type_usage_error(&context.current_filepath,
+                        "Sequence.Int is server-managed and cannot be a query parameter type. Use Int to filter or compare sequence values.".to_string(),
+                        vec![], to_range(&param_def.start_type, &param_def.end_type)));
+                }
                 validate_reference_type(
                     context,
                     &context.current_filepath,
@@ -2571,6 +2630,7 @@ fn is_known_query_param_type(context: &Context, type_: &str) -> bool {
 
     match ast::ColumnType::from_str(type_) {
         ast::ColumnType::String
+        | ast::ColumnType::SequenceInt
         | ast::ColumnType::Int
         | ast::ColumnType::Float
         | ast::ColumnType::Bool
@@ -3460,6 +3520,18 @@ fn check_record_permissions(
     filepath: &String,
     errors: &mut Vec<Error>,
 ) {
+    fn sequence_reference<'a>(
+        record: &ast::RecordDetails,
+        expression: &'a ast::WhereArg,
+    ) -> Option<&'a ast::Range> {
+        match expression {
+            ast::WhereArg::Column(false, path, _, _, range)
+                if record.fields.iter().any(|field| matches!(field,
+                    ast::Field::Column(column) if column.name == path.root() && ast::is_sequence(column))) => Some(range),
+            ast::WhereArg::And(items) | ast::WhereArg::Or(items) => items.iter().find_map(|item| sequence_reference(record, item)),
+            _ => None,
+        }
+    }
     let synced = context
         .tables
         .values()
@@ -3516,6 +3588,11 @@ fn check_record_permissions(
             _ => vec![],
         };
         for expression in expressions {
+            if let Some(range) = sequence_reference(record, expression) {
+                errors.push(invalid_type_usage_error(filepath,
+                    "Insert permissions cannot depend on Sequence.Int: its value is assigned by SQLite during insertion. Authorize inserts using caller-supplied fields or Session instead.".to_string(),
+                    vec![], vec![convert_range(range)]));
+            }
             if let Some(range) = first_exists_range(expression) {
                 errors.push(Error {
                     filepath: filepath.clone(),
@@ -4465,6 +4542,15 @@ fn check_table_query(
 
             if let Some(link) = through_link {
                 for field in &link.foreign.fields {
+                    if ast::collect_columns(&table.record.fields)
+                        .iter()
+                        .any(|column| column.name == *field && ast::is_sequence(column))
+                    {
+                        errors.push(invalid_type_usage_error(&context.current_filepath,
+                            format!("Nested inserts cannot supply server-managed sequence {} through a relationship. Link through the UUID identity instead.", field),
+                            vec![], to_range(&query.start, &query.end)));
+                        return;
+                    }
                     if queried_fields.contains_key(field) {
                         errors.push(Error {
                             filepath: context.current_filepath.clone(),
@@ -4483,6 +4569,7 @@ fn check_table_query(
 
             for col in ast::collect_columns(&table.record.fields) {
                 if ast::is_integer_primary_key(&col)
+                    || ast::is_sequence(&col)
                     || ast::has_default_value(&col)
                     || ast::is_managed_timestamp(&col)
                     || through_link.map_or(false, |link| link.foreign.fields.contains(&col.name))
@@ -4563,7 +4650,7 @@ fn check_field(
             if matches!(
                 operation,
                 ast::QueryOperation::Insert | ast::QueryOperation::Update
-            ) && ast::is_managed_timestamp(column)
+            ) && (ast::is_managed_timestamp(column) || ast::is_sequence(column))
             {
                 errors.push(Error {
                     filepath: context.current_filepath.clone(),

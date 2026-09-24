@@ -439,9 +439,10 @@ pub fn linked_to_unique_field_with_record(
                 Field::Column(column) => {
                     if column.name == *field_name {
                         // Check if this column has UNIQUE or PRIMARY KEY constraint
-                        return column.directives.iter().any(|d| {
-                            matches!(d, ColumnDirective::Unique | ColumnDirective::PrimaryKey)
-                        });
+                        return is_sequence(column)
+                            || column.directives.iter().any(|d| {
+                                matches!(d, ColumnDirective::Unique | ColumnDirective::PrimaryKey)
+                            });
                     }
                 }
                 _ => {}
@@ -462,9 +463,10 @@ pub fn field_is_unique(field_name: &str, record: &RecordDetails) -> bool {
             Field::Column(column) => {
                 if column.name == field_name {
                     // Check if this column has UNIQUE or PRIMARY KEY constraint
-                    return column.directives.iter().any(|d| {
-                        matches!(d, ColumnDirective::Unique | ColumnDirective::PrimaryKey)
-                    });
+                    return is_sequence(column)
+                        || column.directives.iter().any(|d| {
+                            matches!(d, ColumnDirective::Unique | ColumnDirective::PrimaryKey)
+                        });
                 }
             }
             _ => {}
@@ -621,6 +623,8 @@ pub enum ColumnType {
     // Primitive types
     String,
     Int,
+    /// Server-assigned insertion order; the physical SQLite INTEGER PRIMARY KEY.
+    SequenceInt,
     Float,
     Bool,
     DateTime,
@@ -657,6 +661,7 @@ impl ColumnType {
         match self {
             ColumnType::String => "String".to_string(),
             ColumnType::Int => "Int".to_string(),
+            ColumnType::SequenceInt => "Sequence.Int".to_string(),
             ColumnType::Float => "Float".to_string(),
             ColumnType::Bool => "Bool".to_string(),
             ColumnType::DateTime => "DateTime".to_string(),
@@ -697,7 +702,9 @@ impl ColumnType {
     pub fn to_serialization_type(&self) -> SerializationType {
         match self {
             ColumnType::String => SerializationType::Concrete(ConcreteSerializationType::Text),
-            ColumnType::Int => SerializationType::Concrete(ConcreteSerializationType::Integer),
+            ColumnType::Int | ColumnType::SequenceInt => {
+                SerializationType::Concrete(ConcreteSerializationType::Integer)
+            }
             ColumnType::Float => SerializationType::Concrete(ConcreteSerializationType::Real),
             ColumnType::Bool => SerializationType::Concrete(ConcreteSerializationType::Integer),
             ColumnType::DateTime => {
@@ -733,6 +740,7 @@ impl ColumnType {
     /// Returns the concrete query type for a resolved foreign key.
     pub fn query_type_string(&self) -> String {
         match self {
+            ColumnType::SequenceInt => "Int".to_string(),
             ColumnType::JsonTyped(inner) => format!("Json<{}>", inner.query_type_string()),
             ColumnType::List(inner) => format!("List<{}>", inner.query_type_string()),
             ColumnType::Dict(inner) => format!("Dict<{}>", inner.query_type_string()),
@@ -786,6 +794,17 @@ impl ColumnType {
     /// Check if this is an ID type
     pub fn is_id_type(&self) -> bool {
         matches!(self, ColumnType::IdInt { .. } | ColumnType::IdUuid { .. })
+    }
+
+    pub fn contains_sequence(&self) -> bool {
+        match self {
+            ColumnType::SequenceInt => true,
+            ColumnType::JsonTyped(inner)
+            | ColumnType::List(inner)
+            | ColumnType::Dict(inner)
+            | ColumnType::Nullable(inner) => inner.contains_sequence(),
+            _ => false,
+        }
     }
 
     /// Get the table name for ID types or foreign keys
@@ -894,6 +913,7 @@ impl ColumnType {
         match type_str {
             "String" => ColumnType::String,
             "Int" => ColumnType::Int,
+            "Sequence.Int" => ColumnType::SequenceInt,
             "Float" => ColumnType::Float,
             "Bool" => ColumnType::Bool,
             "DateTime" => ColumnType::DateTime,
@@ -965,6 +985,7 @@ impl std::fmt::Display for ColumnType {
         match self {
             ColumnType::String => write!(f, "String"),
             ColumnType::Int => write!(f, "Int"),
+            ColumnType::SequenceInt => write!(f, "Sequence.Int"),
             ColumnType::Float => write!(f, "Float"),
             ColumnType::Bool => write!(f, "Bool"),
             ColumnType::DateTime => write!(f, "DateTime"),
@@ -1080,6 +1101,10 @@ pub fn is_updated_at(col: &Column) -> bool {
 
 pub fn is_managed_timestamp(col: &Column) -> bool {
     is_created_at(col) || is_updated_at(col)
+}
+
+pub fn is_sequence(col: &Column) -> bool {
+    matches!(col.type_, ColumnType::SequenceInt)
 }
 
 pub fn is_integer_primary_key(col: &Column) -> bool {

@@ -157,6 +157,22 @@ pub(crate) fn migrate_dynamic_for_schema(
     // Generate the SQL from the diff
     let db_diff = db_diff::diff(&new_context, &new_schema_clone, &introspection);
 
+    let primary_key_errors: Vec<_> = db_diff.modified_records.iter().flat_map(|record| {
+        record.changes.iter().filter_map(move |change| match change {
+            db_diff::RecordChange::ModifiedField { name, changes } if changes.primary_key_changed.is_some() => Some(error::Error {
+                error_type: error::ErrorType::InvalidTypeUsage {
+                    message: format!("The physical primary key of {}.{} differs from the schema. Changing SQLite primary keys requires an explicit table-rebuild migration; preserve the UUID identity and existing sequence values.", record.name, name),
+                },
+                filepath: schema_filepath.to_string(),
+                locations: vec![],
+            }),
+            _ => None,
+        })
+    }).collect();
+    if !primary_key_errors.is_empty() {
+        return Err(primary_key_errors);
+    }
+
     if db_diff::is_empty(&db_diff) {
         return Ok(MigrationSql {
             sql: vec![],

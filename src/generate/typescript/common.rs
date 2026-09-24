@@ -130,7 +130,9 @@ pub fn sort_types_by_dependency(database: &ast::Database) -> Vec<(String, Vec<as
 pub fn column_type_to_ts_type(type_: &ast::ColumnType, qualify_custom: bool) -> String {
     match type_ {
         ast::ColumnType::String => "string".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float => "number".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt | ast::ColumnType::Float => {
+            "number".to_string()
+        }
         ast::ColumnType::Bool => "boolean".to_string(),
         ast::ColumnType::DateTime => "Date".to_string(),
         ast::ColumnType::Date => "string".to_string(),
@@ -168,7 +170,9 @@ pub fn column_type_to_ts_type(type_: &ast::ColumnType, qualify_custom: bool) -> 
 fn column_type_to_ts_input_type(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "string".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float => "number".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt | ast::ColumnType::Float => {
+            "number".to_string()
+        }
         ast::ColumnType::Bool => "boolean | number".to_string(),
         ast::ColumnType::DateTime => "number | string | Date".to_string(),
         ast::ColumnType::Date => "string".to_string(),
@@ -196,7 +200,7 @@ fn column_type_to_ts_input_type(type_: &ast::ColumnType) -> String {
 pub fn column_type_to_zod_validator(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
-        ast::ColumnType::Int => "z.number().int()".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt => "z.number().int()".to_string(),
         ast::ColumnType::Float => "z.number()".to_string(),
         ast::ColumnType::Bool => "CoercedBool".to_string(),
         ast::ColumnType::DateTime => "CoercedDate".to_string(),

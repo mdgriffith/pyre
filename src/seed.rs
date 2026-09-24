@@ -126,7 +126,7 @@ pub fn seed_database(
 
         // Collect non-foreign-key columns first
         for col in &columns {
-            if !foreign_key_column_names.contains(&col.name) {
+            if !ast::is_sequence(col) && !foreign_key_column_names.contains(&col.name) {
                 column_names.push(col.name.clone());
             }
         }
@@ -195,7 +195,7 @@ pub fn seed_database(
 
             // Generate non-foreign-key column values
             for col in &columns {
-                if !foreign_key_column_names.contains(&col.name) {
+                if !ast::is_sequence(col) && !foreign_key_column_names.contains(&col.name) {
                     let value = generate_column_value(
                         col,
                         row_idx,

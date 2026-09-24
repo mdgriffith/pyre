@@ -384,9 +384,10 @@ pub fn to_env(context: &typecheck::Context, database: &ast::Database) -> Option<
 fn session_validator(context: &typecheck::Context, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String | ast::ColumnType::Date => "z.string()".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
-            "z.number()".to_string()
-        }
+        ast::ColumnType::Int
+        | ast::ColumnType::SequenceInt
+        | ast::ColumnType::Float
+        | ast::ColumnType::IdInt { .. } => "z.number()".to_string(),
         ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type: Some(serialization_type),

@@ -153,9 +153,10 @@ fn to_seed_validators(context: &typecheck::Context) -> String {
 fn seed_column_validator(type_: &ast::ColumnType, context: &typecheck::Context) -> String {
     match type_ {
         ast::ColumnType::String | ast::ColumnType::Date => "z.string()".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
-            "z.number()".to_string()
-        }
+        ast::ColumnType::Int
+        | ast::ColumnType::SequenceInt
+        | ast::ColumnType::Float
+        | ast::ColumnType::IdInt { .. } => "z.number()".to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type: Some(ast::ConcreteSerializationType::IdUuid),
             ..
@@ -212,6 +213,9 @@ fn to_seed_types(context: &typecheck::Context) -> String {
         result.push_str(&format!("export type {} = {{\n", type_name));
 
         for column in ast::collect_columns(&table.record.fields) {
+            if ast::is_sequence(&column) {
+                continue;
+            }
             let ts_type = seed_column_type(&column);
             result.push_str(&format!(
                 "  {}?: {};\n",

@@ -82,7 +82,9 @@ pub fn add_builtin(fns: &mut HashMap<String, FuncDefinition>) {
 pub fn to_serialization_type(type_: &str) -> ast::SerializationType {
     match type_ {
         "String" => ast::SerializationType::Concrete(ast::ConcreteSerializationType::Text),
-        "Int" => ast::SerializationType::Concrete(ast::ConcreteSerializationType::Integer),
+        "Int" | "Sequence.Int" => {
+            ast::SerializationType::Concrete(ast::ConcreteSerializationType::Integer)
+        }
         "Float" => ast::SerializationType::Concrete(ast::ConcreteSerializationType::Real),
         "Bool" => ast::SerializationType::Concrete(ast::ConcreteSerializationType::Integer),
         "DateTime" => ast::SerializationType::Concrete(ast::ConcreteSerializationType::Integer),

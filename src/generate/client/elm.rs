@@ -635,7 +635,7 @@ fn entity_stream_encoder(database: &ast::Database, type_: &ast::ColumnType) -> O
         ast::ColumnType::JsonTyped(inner) | ast::ColumnType::Nullable(inner) => {
             entity_stream_encoder(database, inner)
         }
-        ast::ColumnType::Int => Some("Encode.int".to_string()),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt => Some("Encode.int".to_string()),
         ast::ColumnType::String => Some("Encode.string".to_string()),
         _ => None,
     }
@@ -745,7 +745,9 @@ fn entity_stream_id_type(fields: &Vec<ast::Field>) -> Option<(String, &'static s
                         "Db.Id.encodeUuid"
                     },
                 )),
-                ast::ColumnType::Int => Some(("Int".to_string(), "Encode.int")),
+                ast::ColumnType::Int | ast::ColumnType::SequenceInt => {
+                    Some(("Int".to_string(), "Encode.int"))
+                }
                 ast::ColumnType::String => Some(("String".to_string(), "Encode.string")),
                 _ => None,
             };
@@ -1144,7 +1146,7 @@ fn column_to_elm_type(column: &ast::Column) -> String {
 fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) -> String {
     match type_ {
         ast::ColumnType::String => "String".to_string(),
-        ast::ColumnType::Int => "Int".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt => "Int".to_string(),
         ast::ColumnType::Float => "Float".to_string(),
         ast::ColumnType::Bool => "Bool".to_string(),
         ast::ColumnType::DateTime => "Time.Posix".to_string(),
@@ -1422,7 +1424,7 @@ fn id_kind_for_brand(database: &ast::Database, brand: &str) -> Option<IdKind> {
 fn to_json_type_decoder(database: &ast::Database, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "Decode.string".to_string(),
-        ast::ColumnType::Int => "Decode.int".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt => "Decode.int".to_string(),
         ast::ColumnType::Float => "Decode.float".to_string(),
         ast::ColumnType::Bool => "bool".to_string(),
         ast::ColumnType::DateTime => "dateTime".to_string(),
@@ -1565,7 +1567,7 @@ fn to_field_encoder(database: &ast::Database, indent: usize, field: &ast::Field)
 fn to_type_encoder(database: &ast::Database, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "Encode.string".to_string(),
-        ast::ColumnType::Int => "Encode.int".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt => "Encode.int".to_string(),
         ast::ColumnType::Float => "Encode.float".to_string(),
         ast::ColumnType::Bool => "Encode.bool".to_string(),
         ast::ColumnType::DateTime => "dateTime".to_string(),
@@ -1603,7 +1605,7 @@ fn to_type_encoder_str(lookup: &ElmLookup, type_: &str) -> String {
 fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "Encode.string".to_string(),
-        ast::ColumnType::Int => "Encode.int".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt => "Encode.int".to_string(),
         ast::ColumnType::Float => "Encode.float".to_string(),
         ast::ColumnType::Bool => "Encode.bool".to_string(),
         ast::ColumnType::DateTime => "Db.Encode.dateTime".to_string(),
@@ -2450,7 +2452,7 @@ fn to_elm_typename(lookup: &ElmLookup, type_: &str, is_link: bool) -> String {
 fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "String".to_string(),
-        ast::ColumnType::Int => "Int".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt => "Int".to_string(),
         ast::ColumnType::Float => "Float".to_string(),
         ast::ColumnType::Bool => "Bool".to_string(),
         ast::ColumnType::DateTime => "Time.Posix".to_string(),
@@ -2497,7 +2499,7 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
 fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "Decode.string".to_string(),
-        ast::ColumnType::Int => "Decode.int".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt => "Decode.int".to_string(),
         ast::ColumnType::Float => "Decode.float".to_string(),
         ast::ColumnType::DateTime => "Db.Decode.dateTime".to_string(),
         ast::ColumnType::Date => "Decode.string".to_string(),

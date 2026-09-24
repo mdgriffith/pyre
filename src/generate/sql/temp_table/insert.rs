@@ -733,7 +733,7 @@ fn to_table_fieldname(
     match table_field {
         ast::Field::Column(col) => {
             // Integer @id fields are auto-generated and shouldn't be in INSERT.
-            if ast::is_integer_primary_key(col) {
+            if ast::is_integer_primary_key(col) || ast::is_sequence(col) {
                 return vec![];
             }
 
@@ -811,7 +811,7 @@ fn to_field_insert_values(
 
         // Skip integer primary keys - they're auto-generated and shouldn't be in INSERT values
         if let Some(ast::Field::Column(col)) = table_field {
-            if ast::is_integer_primary_key(col) {
+            if ast::is_integer_primary_key(col) || ast::is_sequence(col) {
                 continue;
             }
         }

@@ -4,6 +4,21 @@ use crate::ast::{
 use crate::db::introspect::{ColumnInfo, Introspection};
 
 pub fn to_schema(introspection: &Introspection) -> SchemaFile {
+    // Managed databases retain the canonical Pyre schema. SQLite's physical PK
+    // alone cannot recover logical UUID identity when a Sequence.Int owns rowid
+    // (nor can storage types recover tagged unions and other semantic types).
+    if let crate::db::introspect::SchemaResult::Success { schema, .. } = &introspection.schema {
+        if !schema.files.is_empty() {
+            return SchemaFile {
+                path: String::from("schema.sql"),
+                definitions: schema
+                    .files
+                    .iter()
+                    .flat_map(|file| file.definitions.clone())
+                    .collect(),
+            };
+        }
+    }
     let mut definitions = Vec::new();
 
     for table in &introspection.tables {

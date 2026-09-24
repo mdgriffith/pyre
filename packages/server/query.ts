@@ -825,6 +825,9 @@ async function insertScalarRows(
                 if (!knownColumns.has(columnName)) {
                     throw new SeedInputError(`unknown seed column '${path}.${columnName}' on table '${table.name}'`);
                 }
+                if (table.columns?.some(column => column.name === columnName && column.type === "Sequence.Int")) {
+                    throw new SeedInputError(`seed field '${path}.${columnName}' is a server-managed sequence and cannot be supplied`);
+                }
             }
 
             const normalizedValues = await normalizeSeedValues(context, table, scalarValues);

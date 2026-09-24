@@ -225,9 +225,10 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
         if let ast::Field::Column(col) = field {
             let ts_type = match &col.type_ {
                 ast::ColumnType::String => "string".to_string(),
-                ast::ColumnType::Int | ast::ColumnType::Float | ast::ColumnType::IdInt { .. } => {
-                    "number".to_string()
-                }
+                ast::ColumnType::Int
+                | ast::ColumnType::SequenceInt
+                | ast::ColumnType::Float
+                | ast::ColumnType::IdInt { .. } => "number".to_string(),
                 ast::ColumnType::IdUuid { .. }
                 | ast::ColumnType::ForeignKey {
                     serialization_type:
@@ -267,9 +268,9 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
             let validator = match &col.type_ {
                 ast::ColumnType::Custom(name) => session_custom_validator(context, name),
                 ast::ColumnType::String => "z.string()".to_string(),
-                ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => {
-                    "z.number().int()".to_string()
-                }
+                ast::ColumnType::Int
+                | ast::ColumnType::SequenceInt
+                | ast::ColumnType::IdInt { .. } => "z.number().int()".to_string(),
                 ast::ColumnType::Float => "z.number()".to_string(),
                 ast::ColumnType::IdUuid { .. }
                 | ast::ColumnType::ForeignKey {
@@ -1276,10 +1277,11 @@ fn to_schema_metadata(context: &typecheck::Context) -> String {
                 is_first_column = false;
 
                 let is_primary = ast::is_primary_key(column);
-                let is_unique = column
-                    .directives
-                    .iter()
-                    .any(|d| matches!(d, ast::ColumnDirective::Unique));
+                let is_unique = ast::is_sequence(column)
+                    || column
+                        .directives
+                        .iter()
+                        .any(|d| matches!(d, ast::ColumnDirective::Unique));
                 let is_indexed = column
                     .directives
                     .iter()
@@ -1412,10 +1414,11 @@ fn to_schema_metadata(context: &typecheck::Context) -> String {
         for field in &table.record.fields {
             if let ast::Field::Column(column) = field {
                 let is_primary = ast::is_primary_key(column);
-                let is_unique = column
-                    .directives
-                    .iter()
-                    .any(|d| matches!(d, ast::ColumnDirective::Unique));
+                let is_unique = ast::is_sequence(column)
+                    || column
+                        .directives
+                        .iter()
+                        .any(|d| matches!(d, ast::ColumnDirective::Unique));
                 let is_index = column
                     .directives
                     .iter()
@@ -1498,7 +1501,9 @@ fn to_input_decoder_zod_type(type_: &str) -> String {
 fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float => "z.number()".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt | ast::ColumnType::Float => {
+            "z.number()".to_string()
+        }
         ast::ColumnType::Bool => "z.boolean()".to_string(),
         ast::ColumnType::DateTime => "z.union([z.date(), z.string(), z.number()])".to_string(),
         ast::ColumnType::Date => "z.string()".to_string(),
@@ -1547,7 +1552,9 @@ fn input_decoder_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
 fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::Float => "z.number()".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt | ast::ColumnType::Float => {
+            "z.number()".to_string()
+        }
         ast::ColumnType::Bool => "CoercedBool".to_string(),
         ast::ColumnType::DateTime => "CoercedDate".to_string(),
         ast::ColumnType::Date => "z.string()".to_string(),

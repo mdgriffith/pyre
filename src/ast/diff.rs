@@ -33,6 +33,15 @@ pub fn to_errors(diff: SchemaDiff) -> Vec<Error> {
     for record_diff in &diff.modified_records {
         for change in &record_diff.changes {
             match change {
+                RecordChange::AddedField(field) if ast::is_sequence(field) => {
+                    errors.push(Error {
+                        error_type: ErrorType::InvalidTypeUsage {
+                            message: format!("Adding Sequence.Int to existing record {} requires a table-rebuild migration: make {} the INTEGER PRIMARY KEY AUTOINCREMENT, keep the UUID identity NOT NULL UNIQUE, and explicitly choose the sequence values for existing rows. Automatic migration cannot infer historical event order.", record_diff.name, field.name),
+                        },
+                        filepath: String::new(),
+                        locations: vec![],
+                    });
+                }
                 RecordChange::RemovedField(field) => {
                     errors.push(Error {
                         error_type: ErrorType::MigrationColumnDropped {

@@ -33,6 +33,8 @@ pub enum RecordChange {
 pub struct ColumnDiff {
     pub type_changed: Option<(String, String)>, // (old_type, new_type)
     pub nullable_changed: Option<(bool, bool)>, // (old_nullable, new_nullable)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_key_changed: Option<(bool, bool)>,
 }
 
 pub fn diff(
@@ -463,6 +465,29 @@ fn create_table_from_fields(
         .map(|idx| materialized_index_to_index_info(&table_name, idx))
         .collect();
 
+    // @id remains the logical identity. A sequence owns SQLite's rowid while
+    // UUID identity is enforced by a unique index, also usable by foreign keys.
+    if let Some(sequence) = fields.iter().find_map(|field| match field {
+        crate::ast::Field::Column(column) if crate::ast::is_sequence(column) => Some(column),
+        _ => None,
+    }) {
+        for column in &mut columns {
+            if column.pk {
+                indexes.push(crate::db::introspect::IndexInfo {
+                    name: format!("uniq_{}_{}", table_name, column.name),
+                    unique: true,
+                    columns: vec![crate::db::introspect::IndexedColumnInfo {
+                        name: column.name.clone(),
+                        desc: false,
+                        expression: false,
+                    }],
+                    where_clause: None,
+                });
+            }
+            column.pk = column.name == sequence.name;
+        }
+    }
+
     if syncable
         && fields
             .iter()
@@ -697,12 +722,18 @@ fn compare_record(
                     None
                 };
 
-                if type_changed.is_some() || nullable_changed.is_some() {
+                let primary_key_changed =
+                    (schema_col.pk != intro_col.pk).then_some((intro_col.pk, schema_col.pk));
+                if type_changed.is_some()
+                    || nullable_changed.is_some()
+                    || primary_key_changed.is_some()
+                {
                     changes.push(RecordChange::ModifiedField {
                         name: name.to_string(),
                         changes: ColumnDiff {
                             type_changed,
                             nullable_changed,
+                            primary_key_changed,
                         },
                     });
                 }

@@ -121,6 +121,9 @@ fn to_seed_scope(context: &typecheck::Context, tables: &[&typecheck::Table]) -> 
         result.push_str("#[derive(Clone, Debug, Default, serde::Serialize)]\n");
         result.push_str(&format!("pub struct {} {{\n", seed_row_name(&table_name)));
         for column in ast::collect_columns(&table.record.fields) {
+            if ast::is_sequence(&column) {
+                continue;
+            }
             let field_name = to_field_name(&column.name);
             result.push_str(&format!("    #[serde(rename = {:?}", column.name));
             if column.nullable || matches!(column.type_, ast::ColumnType::Nullable(_)) {
@@ -203,7 +206,9 @@ fn seed_rust_type(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String | ast::ColumnType::Date => "String".to_string(),
         ast::ColumnType::DateTime => "DateTime".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => "i64".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt | ast::ColumnType::IdInt { .. } => {
+            "i64".to_string()
+        }
         ast::ColumnType::IdUuid { .. } => "String".to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type, ..
@@ -542,7 +547,9 @@ fn rust_type_for_column(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String | ast::ColumnType::Date => "String".to_string(),
         ast::ColumnType::DateTime => "DateTime".to_string(),
-        ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => "i64".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt | ast::ColumnType::IdInt { .. } => {
+            "i64".to_string()
+        }
         ast::ColumnType::ForeignKey {
             serialization_type, ..
         } => concrete_rust_type(

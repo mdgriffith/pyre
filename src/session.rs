@@ -144,7 +144,7 @@ fn scalar_session_value(type_: &ast::ColumnType, value: &JsonValue) -> Option<Se
         ast::ColumnType::String | ast::ColumnType::IdUuid { .. } => value
             .as_str()
             .map(|value| SessionValue::Text(value.to_string())),
-        ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => {
+        ast::ColumnType::Int | ast::ColumnType::SequenceInt | ast::ColumnType::IdInt { .. } => {
             value.as_i64().map(SessionValue::Integer)
         }
         ast::ColumnType::Float => value.as_f64().map(SessionValue::Real),

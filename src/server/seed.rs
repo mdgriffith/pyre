@@ -108,6 +108,15 @@ fn insert_row<'a>(
         let links = ast::collect_links(&table.record.fields);
 
         for key in input.keys() {
+            if columns
+                .iter()
+                .any(|column| column.name == *key && ast::is_sequence(column))
+            {
+                return Err(Error::InvalidInput(format!(
+                    "{}.{} is a server-managed sequence and cannot be supplied",
+                    path, key
+                )));
+            }
             if !columns.iter().any(|column| column.name == *key)
                 && !links.iter().any(|link| link.link_name == *key)
             {
@@ -267,6 +276,12 @@ fn serialize_column(
     path: &str,
     output: &mut Vec<(String, libsql::Value)>,
 ) -> Result<(), Error> {
+    if ast::is_sequence(column) {
+        return Err(Error::InvalidInput(format!(
+            "{} is a server-managed sequence and cannot be supplied",
+            path
+        )));
+    }
     if value.is_null() {
         if !column.nullable && !matches!(column.type_, ast::ColumnType::Nullable(_)) {
             return Err(Error::InvalidInput(format!("{} cannot be null", path)));
@@ -306,11 +321,13 @@ fn serialize_value(
             datetime_to_epoch(value)
                 .ok_or_else(|| invalid_type(path, "RFC3339 or Unix seconds"))?,
         ),
-        ColumnType::Int | ColumnType::IdInt { .. } => libsql::Value::Integer(
-            value
-                .as_i64()
-                .ok_or_else(|| invalid_type(path, "an integer"))?,
-        ),
+        ColumnType::Int | ColumnType::SequenceInt | ColumnType::IdInt { .. } => {
+            libsql::Value::Integer(
+                value
+                    .as_i64()
+                    .ok_or_else(|| invalid_type(path, "an integer"))?,
+            )
+        }
         ColumnType::ForeignKey {
             serialization_type, ..
         } => serialize_concrete(

@@ -24,6 +24,47 @@ Generated CRUD builders allocate a canonical lowercase UUIDv7 for creates; appli
 
 For server-only/request-response databases with integer or plain-string primary keys, put `@syncable(false)` at namespace scope. Such records cannot be synchronized by the UUID-based browser worker. All records still require a primary key. See [Namespacing](./namespacing.md#sync-policy) and [Migration Guide](./migrations.md#upgrading-synced-identities-and-clients).
 
+### Insertion Sequences
+
+Use `Sequence.Int` for a server-assigned insertion order independent of UUID identity:
+
+```pyre
+record GameEvent {
+    @public
+    id       Id.Uuid @id
+    sequence Sequence.Int
+    payload  String
+}
+```
+
+Each table in each database has an independent sequence. SQLite assigns it on insert;
+generated create/update inputs and seed inputs omit it. Queries can select, sort, and
+filter it as an integer. Use `Int` (or `GameEvent.sequence`) for a query parameter.
+Generated result types use Rust `i64`, TypeScript `number`, and Elm `Int`.
+
+The UUID remains the identity used by relationships, CRUD, and synchronization. Physically,
+Pyre makes the sequence `INTEGER PRIMARY KEY AUTOINCREMENT` and enforces `NOT NULL` and
+uniqueness on the UUID. Allocation participates in the insert transaction, including
+nested and batched writes. Deleted committed sequence numbers are not reused; gaps are
+allowed. Rolled-back allocations need not be retained.
+
+Only one `Sequence.Int` field is allowed per record, alongside a non-null `Id.Uuid @id`.
+The sequence must be non-nullable, cannot have `@id`, a default, or timestamp directives,
+and cannot appear in sessions or structured payloads. It is immutable through Pyre write
+APIs. Insert permissions cannot depend on the not-yet-assigned sequence; query, update,
+and delete permissions can use the stored value. Direct SQL and explicit migrations can
+still supply or change sequence values.
+
+The authoritative database assigns sequences. Synced clients receive those values; they
+do not allocate their own. Generated creates for these records have no optimistic row
+prediction and become visible when the server responds.
+
+Creating new sequence-enabled tables is supported by automatic migrations. Adding a
+sequence to an existing table requires an explicit table-rebuild migration and a chosen
+backfill order. Pyre reports this rather than guessing historical event order. Stored Pyre
+schema metadata preserves the distinction between UUID identity and the physical primary
+key when the database is reopened.
+
 ## Links
 
 Links describe relationships between records.
