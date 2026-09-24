@@ -35,6 +35,12 @@ if (!coreTarball || !serverTarball || !clientTarball) {
 rmSync(smokeDir, { recursive: true, force: true });
 mkdirSync(smokeDir, { recursive: true });
 
+const localPackages = {
+  "@pyre/core": `file:${coreTarball}`,
+  "@pyre/server": `file:${serverTarball}`,
+  "@pyre/client": `file:${clientTarball}`,
+};
+
 writeFileSync(
   join(smokeDir, "package.json"),
   JSON.stringify(
@@ -43,15 +49,11 @@ writeFileSync(
       private: true,
       type: "module",
       dependencies: {
-        "@pyre/core": `file:${coreTarball}`,
-        "@pyre/server": `file:${serverTarball}`,
-        "@pyre/client": `file:${clientTarball}`,
+        ...localPackages,
         zod: "^4.1.12",
       },
-      overrides: {
-        "@pyre/core": `file:${coreTarball}`,
-        "@pyre/client": `file:${clientTarball}`,
-      },
+      // Transitive dependencies must also use the unpublished local tarballs.
+      overrides: localPackages,
     },
     null,
     2
