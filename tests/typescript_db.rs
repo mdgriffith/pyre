@@ -11,8 +11,75 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 }
 
 #[test]
+fn generated_crud_builders_reuse_typed_modules_and_checked_execution() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+record Document {
+    @public
+    id Id.Uuid @id
+    title String
+    owner String @immutable
+    summary String?
+    tags Json<List<String>>
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap();
+    let mut queries = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = vec![];
+    core::generate_queries(
+        &context,
+        &info,
+        &queries,
+        Path::new("typescript/core"),
+        &mut files,
+    );
+    let file = |suffix: &str| {
+        &files
+            .iter()
+            .find(|file| path_ends_with(&file.path, suffix))
+            .unwrap()
+            .contents
+    };
+    let builders = file("edits.ts");
+    assert!(builders.contains(
+        "documentCreate(input: Omit<BindIds<DocumentCreate.Input, DocumentIds>, \"id\">)"
+    ));
+    assert!(builders.contains("[\"id\"]: createId()"));
+    assert!(builders.contains("patch: Omit<BindIds<DocumentUpdate.Input, DocumentIds>, \"id\">"));
+    assert!(builders.contains("documentDelete(id: DocumentId)"));
+    assert!(file("metadata/documentCreate.ts")
+        .contains("generatedEdit: { writeStatement: 0, syncWriteStatement: 0, createId: \"id\" }"));
+    let update = file("metadata/documentUpdate.ts");
+    assert!(update.contains("generatedEdit: { writeStatement: 0, syncWriteStatement: 1 }"));
+    assert!(update.contains("summary: z.string().nullable().optional()"));
+    assert!(!update
+        .split("export type Input")
+        .next()
+        .unwrap()
+        .contains("owner:"));
+
+    // A command that merely claims a reserved name is not compiler-owned.
+    let ast::QueryDef::Query(mut impostor) = queries.queries[0].clone() else {
+        panic!()
+    };
+    impostor.args.clear();
+    assert!(pyre::generated_queries::generated_crud_table(&context, &impostor).is_none());
+}
+
+#[test]
 fn typescript_schema_and_decoders_render_typed_json_containers() {
     let schema_source = r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -242,6 +309,7 @@ record Document {
 #[test]
 fn typescript_session_validator_uses_custom_type_decoder() {
     let schema_source = r#"
+@syncable(false)
 type Role
     = Admin
     | Member
@@ -301,6 +369,7 @@ record User {
 #[test]
 fn core_session_validator_composes_named_type_decoders() {
     let schema_source = r#"
+@syncable(false)
 type ParticipantStatus
     = Storyteller
     | Player
@@ -470,6 +539,7 @@ if (SessionValidator.safeParse({ campaignRole: { _type: "Member", campaignId: "c
 #[test]
 fn typescript_session_references_preserve_id_storage_types() {
     let schema_source = r#"
+@syncable(false)
 session {
     uuidRecordId UuidRecord.id?
     intRecordId  IntRecord.id?
@@ -555,6 +625,7 @@ if (SessionValidator.safeParse({ intRecordId: 7.5 }).success) {
 #[test]
 fn typescript_metadata_serializes_payload_union_parameters_but_not_unit_enums() {
     let schema_source = r#"
+@syncable(false)
 type Content
    = Folder
    | Markdown {

@@ -618,7 +618,7 @@ test('Elm destructively resets persisted state before retrying a changed databas
         app.ports.receiveIndexedDbMessage.send({
           type: 'initialData',
           data: {
-            tables: { maps: [{ id: 1, updatedAt: 9 }] },
+            tables: { maps: [{ id: '00000000-0000-7000-8000-000000000001', updatedAt: 9 }] },
             cursor: { tables: { maps: { last_seen_updated_at: 9, permission_hash: 'old' } } },
             lastAppliedServerRevision: 20,
             databaseEpoch: 'old-epoch',
@@ -651,7 +651,7 @@ test('Elm destructively resets persisted state before retrying a changed databas
         databaseEpoch: 'old-epoch',
         syncCursor: {
           tables: {
-            maps: { last_seen_updated_at: 9, last_seen_primary_key: 1, permission_hash: 'old' },
+            maps: { last_seen_updated_at: 9, last_seen_primary_key: '00000000-0000-7000-8000-000000000001', permission_hash: 'old' },
           },
         },
       },

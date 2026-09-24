@@ -5,6 +5,182 @@ import { z } from "zod";
 import { run, seed } from "./query";
 import { toRunner } from "./runtime/runner";
 import { buildArgs, toSqlStatements } from "./runtime/sql";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+test("composed operations commit once, retain indexed results, and publish only final row authority", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pyre-batch-"));
+  const db = createClient({ url: `file:${join(directory, "test.db")}` });
+  try {
+    await db.batch([
+      "create table notes (id integer primary key, owner integer, body text unique)",
+      "insert into notes values (1, 7, 'original')",
+      "create table _pyre_sync (id integer primary key, database_epoch text, server_revision integer)",
+      "insert into _pyre_sync values (1, 'epoch', 0)",
+    ]);
+    const sql = [
+      { include: false, params: ["id", "body", "session_userId"], sql: "update notes set body = $body where id = $id and owner = $session_userId" },
+      { include: true, params: ["id"], sql: "select json_object('id', id, 'body', body) as note from notes where id = $id" },
+      { include: true, params: ["id"], sql: "select json_array(json_object('table_name', 'notes', 'headers', json_array('id', 'body'), 'rows', json_array(json_array(id, body)))) as _affectedRows from notes where id = $id" },
+    ];
+    const queries = { edit: {
+      id: "edit", operation: "update", primary_db: "Main", sql, syncSql: sql,
+      syncEffects: { sql: true, syncSql: true },
+      generatedEdit: { writeStatement: 0 },
+      session_args: ["userId"], optional_input_args: [], json_input_args: [],
+      InputValidator: z.object({ id: z.number(), body: z.string() }).strict(),
+      SessionValidator: z.object({ userId: z.number() }),
+    } };
+    const publish = mock(async (groups: any[], _sessions: any, _send: any, _origin: any, revision: any) => {
+      expect((await db.execute("select body from notes")).rows[0].body).toBe("last");
+      expect(groups).toEqual([{ table_name: "notes", headers: ["id", "body"], rows: [[1, "last"]] }]);
+      return revision;
+    });
+    const execute = (operations: any, session = { userId: 7 }) => run(db, queries, operations, undefined, session, new Map(), publish, undefined, { mode: "sync", allocateSyncRevision: true });
+    const success = await execute([
+      { queryId: "edit", input: { id: 1, body: "first" } },
+      { queryId: "edit", input: { id: 1, body: "last" } },
+    ]);
+    expect(success.kind).toBe("success");
+    expect(success.response).toEqual([
+      { index: 0, queryId: "edit", result: { note: [{ id: 1, body: "first" }] } },
+      { index: 1, queryId: "edit", result: { note: [{ id: 1, body: "last" }] } },
+    ]);
+    expect(publish).not.toHaveBeenCalled();
+    expect(await success.sync(() => {})).toEqual({ databaseEpoch: "epoch", serverRevision: 1 });
+    await success.sync(() => {});
+    expect(publish).toHaveBeenCalledTimes(1);
+
+    const rejected = await execute([
+      { queryId: "edit", input: { id: 1, body: "must roll back" } },
+      { queryId: "edit", input: { id: 2, body: "missing" } },
+      // This later successful write and revision allocation execute before the
+      // application checks counts. Neither may survive the rejected middle edit.
+      { queryId: "edit", input: { id: 1, body: "also must roll back" } },
+    ]);
+    expect(rejected.error).toMatchObject({ errorType: "TransactionFailed", operationIndex: 1 });
+    await rejected.sync(() => {});
+    expect((await db.execute("select body from notes")).rows).toEqual([{ body: "last" }]);
+    expect((await db.execute("select server_revision from _pyre_sync")).rows).toEqual([{ server_revision: 1 }]);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect((await execute([{ queryId: "edit", input: { id: 1, body: "denied" } }], { userId: 9 })).kind).toBe("error");
+    expect((await execute([{ queryId: "edit", input: { id: 1, body: 12 } }])).error?.errorType).toBe("InvalidInput");
+    expect((await execute([{ queryId: "toString", input: {} }])).error?.errorType).toBe("UnknownQuery");
+    expect((await execute([])).response).toEqual([]);
+
+    await db.execute("insert into notes values (2, 7, 'taken')");
+    const constraint = await execute([
+      { queryId: "edit", input: { id: 1, body: "temporary" } },
+      { queryId: "edit", input: { id: 2, body: "temporary" } },
+    ]);
+    // The adapter's batch SQL error does not identify its failing statement.
+    expect(constraint.error).toMatchObject({ errorType: "TransactionFailed" });
+    expect(constraint.error?.operationIndex).toBeUndefined();
+    expect((await db.execute("select body from notes order by id")).rows).toEqual([{ body: "last" }, { body: "taken" }]);
+
+    const broad = { ...queries.edit, sql: [{ include: false, params: [], sql: "update notes set owner = 8" }], syncSql: undefined };
+    const overbroad = await run(db, { broad }, [{ queryId: "broad", input: { id: 1, body: "x" } }], undefined, { userId: 7 });
+    expect(overbroad.kind).toBe("error");
+    expect((await db.execute("select distinct owner from notes")).rows).toEqual([{ owner: 7 }]);
+    const named = await run(db, { broad: { ...broad, generatedEdit: undefined } }, [{ queryId: "broad", input: { id: 1, body: "x" } }], undefined, { userId: 7 });
+    expect(named.kind).toBe("success");
+    expect((await db.execute("select distinct owner from notes")).rows).toEqual([{ owner: 8 }]);
+    await db.execute("update notes set owner = 7");
+
+    await db.execute("delete from _pyre_sync");
+    const missingRevision = await execute([{ queryId: "edit", input: { id: 1, body: "must not commit" } }]);
+    expect(missingRevision.kind).toBe("error");
+    expect((await db.execute("select body from notes where id = 1")).rows[0].body).toBe("last");
+  } finally {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("revision allocation follows active compiler effects, not SQL literals", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pyre-effects-"));
+  const db = createClient({ url: `file:${join(directory, "test.db")}` });
+  try {
+    await db.batch([
+      "create table _pyre_sync (id integer primary key, database_epoch text, server_revision integer)",
+      "insert into _pyre_sync values (1, 'epoch', 0)",
+      "create table notes (body text)",
+    ]);
+    const base = {
+      id: "query", session_args: [], optional_input_args: [], json_input_args: [],
+      InputValidator: z.object({}), SessionValidator: z.object({}),
+    };
+    const read = { ...base, sql: [{ include: true, params: [], sql: "select json_quote('_affectedRows') as literal" }], syncEffects: { sql: false, syncSql: false } };
+    const write = {
+      ...base,
+      sql: [{ include: false, params: [], sql: "insert into notes values ('normal')" }],
+      syncSql: [{ include: false, params: [], sql: "insert into notes values ('sync')" }],
+      syncEffects: { sql: false, syncSql: true },
+    };
+    const revision = async () => Number((await db.execute("select server_revision from _pyre_sync")).rows[0].server_revision);
+    for (const composed of [false, true]) {
+      const execute = (query: typeof read | typeof write, mode: "sync" | "normal") => run(
+        db, { query }, composed ? [{ queryId: "query", input: {} }] : "query", {}, {},
+        undefined, undefined, undefined, { mode, allocateSyncRevision: true },
+      );
+      const before = await revision();
+      expect((await execute(read, "sync")).kind).toBe("success");
+      expect(await revision()).toBe(before);
+      expect((await execute(write, "normal")).kind).toBe("success");
+      expect(await revision()).toBe(before);
+      expect((await execute(write, "sync")).kind).toBe("success");
+      expect(await revision()).toBe(before + 1);
+      // A sync request can fall back to the normal SQL variant.
+      expect((await execute({ ...read, sql: write.syncSql, syncEffects: { sql: true, syncSql: false } }, "sync")).kind).toBe("success");
+      expect(await revision()).toBe(before + 2);
+    }
+  } finally {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("composed execution rejects mismatched namespaces before opening a transaction", async () => {
+  const operation = {
+    id: "query", sql: [], session_args: [], optional_input_args: [], json_input_args: [],
+    InputValidator: z.object({}), SessionValidator: z.object({}),
+  };
+  const db = { transaction: mock(() => { throw new Error("must not execute"); }) };
+  const result = await run(db as any, { a: { ...operation, primary_db: "A" }, b: { ...operation, primary_db: "B" } },
+    [{ queryId: "a", input: {} }, { queryId: "b", input: {} }], undefined, {});
+  expect(result.error).toMatchObject({ errorType: "InvalidInput", operationIndex: 1 });
+  expect(db.transaction).not.toHaveBeenCalled();
+  expect((await run(db as any, {}, [], undefined, {})).response).toEqual([]);
+  expect(db.transaction).not.toHaveBeenCalled();
+});
+
+test("generated UUID creates reject noncanonical identity before execution", async () => {
+  const db = { transaction: mock(() => { throw new Error('must not execute'); }) };
+  const query = {
+    id: 'create', sql: [], session_args: [], optional_input_args: [], json_input_args: [],
+    generatedEdit: { writeStatement: 0, createId: 'id' },
+    InputValidator: z.object({ id: z.string() }).strict(), SessionValidator: z.object({}),
+  };
+  for (const id of [undefined, '01900000-0000-4000-8000-000000000000', '019ABCDE-0000-7000-8000-000000000000', '01900000-0000-7000-0000-000000000000']) {
+    const result = await run(db as any, { create: query }, 'create', { id }, {});
+    expect(result.error?.errorType).toBe('InvalidInput');
+  }
+  expect(db.transaction).not.toHaveBeenCalled();
+});
+
+test("failed commit reports unknown outcome rather than a safe-to-retry rejection", async () => {
+  const tx = {
+    batch: async () => [],
+    commit: async () => { throw new Error("connection lost"); },
+    rollback: async () => {}, close() {}, closed: false,
+  };
+  const result = await run({ transaction: async () => tx } as any, { command: {
+    id: "command", sql: [], session_args: [], optional_input_args: [], json_input_args: [],
+    InputValidator: z.object({}), SessionValidator: z.object({}),
+  } }, [{ queryId: "command", input: {} }], undefined, {});
+  expect(result.error?.errorType).toBe("OutcomeUnknown");
+});
 
 test("transaction runner executes every step in exactly one ordered batch", async () => {
   const db = {

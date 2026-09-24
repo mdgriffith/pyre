@@ -77,6 +77,10 @@ pub enum ErrorType {
     NoPrimaryKey {
         record: String,
     },
+    InvalidSyncedPrimaryKey {
+        record: String,
+        field: String,
+    },
     MultiplePrimaryKeys {
         record: String,
         field: String,
@@ -1075,6 +1079,11 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
             result
         }
 
+        ErrorType::InvalidSyncedPrimaryKey { record, field } => format!(
+            "Synced record {} must have exactly one non-null Id.Uuid primary key. Change {} to Id.Uuid @id, or declare @syncable(false) for a query-only/server-owned namespace.",
+            cyan_if(in_color, record),
+            cyan_if(in_color, field),
+        ),
         ErrorType::MultiplePrimaryKeys { record, .. } => {
             let mut result = "".to_string();
 
@@ -1640,6 +1649,7 @@ pub fn to_error_title(error_type: &ErrorType) -> String {
         ErrorType::InvalidTypeUsage { .. } => "Invalid Type Usage",
         ErrorType::NoPrimaryKey { .. } => "No Primary Key",
         ErrorType::MultiplePrimaryKeys { .. } => "Multiple Primary Keys",
+        ErrorType::InvalidSyncedPrimaryKey { .. } => "Invalid Synced Primary Key",
         ErrorType::MultipleTableNames { .. } => "Multiple table names",
         ErrorType::MultiplePermissions { .. } => "Multiple Permissions",
         ErrorType::MissingPermissions { .. } => "Missing Permissions",

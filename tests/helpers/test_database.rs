@@ -506,13 +506,14 @@ impl TestDatabase {
         let mut all_param_names = param_names.clone();
         all_param_names.extend(session_param_names.clone());
 
-        // Collect parameter values in the order they appear in SQL
-        // We need to find the order parameters appear in each SQL statement
-        let mut param_values: Vec<libsql::Value> = Vec::new();
+        let conn = self.db.connect().map_err(TestError::Database)?;
+        let mut results = Vec::new();
 
-        // For each SQL statement, collect parameters in the order they appear
-        for (_, sql_stmt) in &sql_statements {
-            if let SqlAndParams::Sql(sql) = sql_stmt {
+        // Bind each statement independently: preimages and writes can use
+        // different parameters and different orders in the same transaction.
+        for (include, sql_stmt) in sql_statements {
+            let mut param_values: Vec<libsql::Value> = Vec::new();
+            if let SqlAndParams::Sql(sql) = &sql_stmt {
                 // Find parameters in the order they appear in this SQL
                 let mut seen_in_this_sql = std::collections::HashSet::new();
                 let mut chars = sql.chars().peekable();
@@ -539,13 +540,6 @@ impl TestDatabase {
                     }
                 }
             }
-        }
-
-        let conn = self.db.connect().map_err(TestError::Database)?;
-        let mut results = Vec::new();
-
-        // Execute statements sequentially
-        for (include, sql_stmt) in sql_statements {
             match sql_stmt {
                 SqlAndParams::Sql(sql) => {
                     let sql_with_params = if all_param_names.is_empty() {

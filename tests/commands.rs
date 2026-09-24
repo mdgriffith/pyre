@@ -45,6 +45,7 @@ fn write_basic_schema(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id   Int    @id
     name String
@@ -133,9 +134,19 @@ fn free_loopback_port() -> u16 {
 }
 
 fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    http_request_with_headers(port, method, path, body, "")
+}
+
+fn http_request_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    extra_headers: &str,
+) -> (u16, String) {
     let body = body.unwrap_or("");
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
         body.as_bytes().len()
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -182,6 +193,7 @@ fn write_multi_namespace_schemas(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/App/schema.pyre"),
         r#"
+@syncable(false)
 record Project {
     id    Int    @id
     name  String
@@ -194,6 +206,7 @@ record Project {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Auth/schema.pyre"),
         r#"
+@syncable(false)
 record Account {
     id       Int    @id
     email    String
@@ -223,6 +236,7 @@ fn write_ai_session_schema_and_query(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 type AiSessionRole
    = Root
    | Worker
@@ -273,6 +287,7 @@ fn write_union_payload_schema_and_query(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 type AiSessionStatus
    = Active
    | Idle
@@ -422,6 +437,7 @@ fn write_json_schema_and_query(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record Event {
     @public
     id      Id.Int @id
@@ -455,6 +471,7 @@ fn write_typed_json_schema_and_query(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -718,6 +735,10 @@ fn write_elm_build_files(ctx: &TestContext) {
 }
 
 fn run_elm_make_check(ctx: &TestContext) {
+    // These tests have separate output directories but share Elm's package cache.
+    // Concurrent cold builds can race while compiling dependency artifacts.
+    static ELM_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _build = ELM_BUILD.lock().unwrap();
     let elm_root = ctx.workspace_path.join("pyre/generated/client/elm");
     let output = StdCommand::new("elm")
         .arg("make")
@@ -974,6 +995,7 @@ record UuidRecord {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Other/schema.pyre"),
         r#"
+@syncable(false)
 record IntRecord {
     id Id.Int @id
     @public
@@ -1007,12 +1029,12 @@ fn test_generate_embeds_namespaced_database_initializers() {
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
-        "record User {\n    id Id.Int @id\n    @public\n}\n",
+        "record User {\n    id Id.Uuid @id\n    @public\n}\n",
     )
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Campaign/schema.pyre"),
-        "record Encounter {\n    id Id.Int @id\n    userId Main.User.id\n    user @link(userId, Main.User.id)\n    @public\n}\n",
+        "record Encounter {\n    id Id.Uuid @id\n    userId Main.User.id\n    user @link(userId, Main.User.id)\n    @public\n}\n",
     )
     .unwrap();
 
@@ -1062,12 +1084,12 @@ fn test_generate_embeds_shared_session_type_in_each_standalone_schema() {
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Main/schema.pyre"),
-        "type MemberRole\n   = Admin\n   | Player\n\nrecord Member {\n    @public\n    id Id.Int @id\n    role MemberRole\n}\n",
+        "type MemberRole\n   = Admin\n   | Player\n\nrecord Member {\n    @public\n    id Id.Uuid @id\n    role MemberRole\n}\n",
     )
     .unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/schema/Child/schema.pyre"),
-        "record Document {\n    @allow(query) { Or(Session.role == Admin, Session.role == Player) }\n    @allow(insert, update, delete) { False }\n    id Id.Int @id\n}\n",
+        "record Document {\n    @allow(query) { Or(Session.role == Admin, Session.role == Player) }\n    @allow(insert, update, delete) { False }\n    id Id.Uuid @id\n}\n",
     )
     .unwrap();
 
@@ -1092,6 +1114,7 @@ fn test_generated_seed_artifacts_include_typed_inputs() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id Id.Int @id
     name String
@@ -1260,7 +1283,7 @@ session {
         r#"
 
 record User {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     name String
     settings Json?
@@ -1371,6 +1394,142 @@ query GetUsers {
     assert_eq!(query_status, 200, "query body: {}", query_body);
     let result: serde_json::Value = serde_json::from_str(&query_body).unwrap();
     assert_eq!(result["user"], serde_json::json!([]));
+}
+
+#[test]
+fn test_serve_http_authority_without_sse_and_untrusted_connection_id() {
+    use base64::Engine;
+    use std::io::{BufRead, BufReader};
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n    userId Int\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+record Note {
+    @allow(query) { owner == Session.userId }
+    @allow(insert, update, delete) { True }
+    key Id.Uuid @id
+    owner Int
+    title String
+}
+"#,
+    )
+    .unwrap();
+    let db_path = ctx.workspace_path.join("db/app.db");
+    ctx.run_command("migrate")
+        .arg(&db_path)
+        .arg("--push")
+        .assert()
+        .success();
+    ctx.run_command("generate").assert().success();
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let create = manifest["queries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|q| q["operation"] == "insert")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let port = free_loopback_port();
+    let child = StdCommand::new(assert_cmd::cargo::cargo_bin("pyre"))
+        .current_dir(&ctx.workspace_path)
+        .arg("serve")
+        .arg(&db_path)
+        .args([
+            "--port",
+            &port.to_string(),
+            "--session-header",
+            "x-pyre-session",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server = ServerGuard { child };
+    wait_for_health(port);
+    let auth = |id| {
+        format!(
+            "x-pyre-session: {}\r\n",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(format!(r#"{{"userId":{id}}}"#))
+        )
+    };
+    let mutate = |key: &str, owner, connection: &str| {
+        let input = serde_json::json!({"key":key,"owner":owner,"title":"private"}).to_string();
+        let (status, body) = http_request_with_headers(
+            port,
+            "POST",
+            &format!("/db/{create}?sync=true{connection}"),
+            Some(&input),
+            &auth(1),
+        );
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()
+    };
+    // The first write has no SSE connections at all, but must settle from HTTP authority.
+    let first = mutate("01900000-0000-7000-8000-000000000001", 1, "");
+    assert_eq!(first["sync"]["type"], "delta", "{first}");
+    assert!(
+        first["sync"]["data"][0]["rows"][0]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("private")),
+        "{first}"
+    );
+    assert!(first["sync"]["serverRevision"].as_i64().unwrap() > 0);
+    assert!(first["sync"]["databaseEpoch"].is_string());
+
+    // Connect a different reader, then maliciously name its connection as the origin.
+    let mut peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    peer.write_all(
+        format!(
+            "GET /sync/events HTTP/1.1\r\nHost: localhost\r\n{}\r\n",
+            auth(2)
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut peer = BufReader::new(peer);
+    let mut event = || loop {
+        let mut line = String::new();
+        assert!(peer.read_line(&mut line).unwrap() > 0);
+        if let Some(data) = line.strip_prefix("data:") {
+            break serde_json::from_str::<serde_json::Value>(data.trim()).unwrap();
+        }
+    };
+    let connected = event();
+    let forged = format!(
+        "&connectionId={}",
+        connected["connectionId"].as_str().unwrap()
+    );
+    let second = mutate("01900000-0000-7000-8000-000000000002", 2, &forged);
+    assert_eq!(second["sync"]["type"], "delta", "{second}");
+    assert_eq!(
+        second["sync"]["data"],
+        serde_json::json!([]),
+        "HTTP cannot borrow peer authority: {second}"
+    );
+    let broadcast = event();
+    assert!(
+        broadcast["data"][0]["rows"][0]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("private")),
+        "peer broadcast was suppressed: {broadcast}"
+    );
+    assert_eq!(
+        broadcast["serverRevision"],
+        second["sync"]["serverRevision"]
+    );
 }
 
 #[test]
@@ -1588,7 +1747,7 @@ type TaskStatus
 
 record Task {
     @public
-    id     Int        @id
+    id     Id.Uuid    @id
     title  String
     status TaskStatus
 }
@@ -1650,7 +1809,7 @@ async fn test_migrate_push_reports_stored_schema_parse_errors() {
     let ctx = TestContext::new();
     write_clocktower_schema(
         &ctx,
-        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
     ctx.run_command("migrate")
@@ -1682,7 +1841,7 @@ async fn test_migrate_push_reports_stored_schema_typecheck_errors() {
     let ctx = TestContext::new();
     write_clocktower_schema(
         &ctx,
-        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
     ctx.run_command("migrate")
@@ -1694,7 +1853,7 @@ async fn test_migrate_push_reports_stored_schema_typecheck_errors() {
         .success();
     replace_stored_schema(
         &ctx,
-        "record Note {\n    id Int @id\n    missing MissingType\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    missing MissingType\n    @public\n}\n",
     )
     .await;
 
@@ -1748,7 +1907,7 @@ fn test_migrate_push_with_valid_stored_schema_still_succeeds() {
         .join("pyre/schema/Clocktower/schema.pyre");
     write_clocktower_schema(
         &ctx,
-        "record Note {\n    id Int @id\n    body String\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
     ctx.run_command("migrate")
@@ -1760,7 +1919,7 @@ fn test_migrate_push_with_valid_stored_schema_still_succeeds() {
         .success();
     std::fs::write(
         schema_path,
-        "record Note {\n    id Int @id\n    body String\n    summary String?\n    @public\n}\n",
+        "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    summary String?\n    @public\n}\n",
     )
     .unwrap();
 
@@ -1779,7 +1938,7 @@ async fn test_migrate_push_records_immutable_only_schema_change() {
     let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
     std::fs::write(
         &schema_path,
-        "record Document {\n    id Int @id\n    ownerId Int\n    title String\n    @public\n}\n",
+        "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int\n    title String\n    @public\n}\n",
     )
     .unwrap();
 
@@ -1790,7 +1949,7 @@ async fn test_migrate_push_records_immutable_only_schema_change() {
         .success();
     std::fs::write(
         &schema_path,
-        "record Document {\n    id Int @id\n    ownerId Int @immutable\n    title String\n    @public\n}\n",
+        "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int @immutable\n    title String\n    @public\n}\n",
     )
     .unwrap();
     ctx.run_command("migrate")
@@ -1857,7 +2016,7 @@ async fn test_migrate_push_applies_physical_and_immutable_changes_together() {
     let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
     std::fs::write(
         &schema_path,
-        "record Document {\n    id Int @id\n    ownerId Int\n    @public\n}\n",
+        "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int\n    @public\n}\n",
     )
     .unwrap();
     ctx.run_command("migrate")
@@ -1868,7 +2027,7 @@ async fn test_migrate_push_applies_physical_and_immutable_changes_together() {
 
     std::fs::write(
         &schema_path,
-        "record Document {\n    id Int @id\n    ownerId Int @immutable\n    summary String?\n    @public\n}\n",
+        "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int @immutable\n    summary String?\n    @public\n}\n",
     )
     .unwrap();
     ctx.run_command("migrate")
@@ -1948,7 +2107,7 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
     std::fs::write(
         ctx.workspace_path
             .join("pyre/schema/Clocktower/schema.pyre"),
-        "record Game {\n    @allow(query) { Or(Session.memberRole == GM, Session.memberRole == GamePlayer) }\n    @allow(insert, update, delete) { False }\n    id       Id.Int @id\n    memberId Main.Member.id\n}\n",
+        "record Game {\n    @allow(query) { Or(Session.memberRole == GM, Session.memberRole == GamePlayer) }\n    @allow(insert, update, delete) { False }\n    id       Id.Uuid @id\n    memberId Main.Member.id\n}\n",
     )
     .unwrap();
 
@@ -2072,6 +2231,7 @@ fn test_migrate_refuses_automatic_destructive_reconciliation() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id Int @id
     @public
@@ -2187,6 +2347,7 @@ fn test_generate_schema_with_relationships() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     @public
     id   Int    @id
@@ -2538,6 +2699,7 @@ async fn test_generated_seed_data_decodes_through_generated_query() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record Token {
     id Id.Int @id
     name String

@@ -137,6 +137,21 @@ pyre migrate db/app.db --namespace Billing
 pyre migrate db/app.db --namespace Billing --push
 ```
 
+## Upgrading Synced Identities And Clients
+
+Synced namespaces require exactly one non-null `Id.Uuid @id` field per record. To keep integer or plain-string keys in a server-only database, declare `@syncable(false)` at namespace scope. That is a query-only execution choice, not compatibility with the UUID-based sync worker.
+
+For an existing synced database:
+
+1. Plan an explicit old-to-new UUID mapping for primary keys and migrate foreign-key values together. Update external references and stored session IDs that refer to those records.
+2. Review and apply the data migration; changing the schema type or running `--push` alone does not construct this mapping or preserve relationships automatically.
+3. Regenerate TypeScript, Elm, and server manifests with the matching compiler. Deploy schema, server/runtime packages, and generated clients together; old protocols and generated artifacts are not a supported mixed-version upgrade.
+4. Reload server schema caches. IndexedDB v4 atomically discards legacy browser caches and their cursors/revisions; the next initialization loads server authority. Pending optimistic edits are memory-only and do not survive reload.
+
+Generated create builders allocate UUIDv7 once. Existing/imported UUIDs may use other versions; do not regenerate valid identities merely to make them v7. Custom primary-key names are supported throughout the client.
+
+For application integration changes, update Elm calls to `Pyre.getResult databaseId queryId queries`, handle `QueryUpdated databaseId queryId`, and retain `databaseId` in bridge messages. Entity consumers must handle `op: 'remove'` as well as `op: 'row'`. See [Elm + Sync](./elm-sync.md) and [Sync Setup](./sync.md).
+
 ## Common Mistakes
 
 - Generating a migration and then running `pyre migrate --push`.

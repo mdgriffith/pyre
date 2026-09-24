@@ -5,6 +5,7 @@ use std::collections::HashMap;
 /// Schema with permissions for testing
 fn permissions_schema() -> String {
     r#"
+@syncable(false)
 session {
     userId Int
     role String
@@ -132,6 +133,7 @@ async fn test_select_permissions_filter_by_author() -> Result<(), TestError> {
 #[tokio::test]
 async fn test_select_permissions_with_session_membership() -> Result<(), TestError> {
     let schema = r#"
+@syncable(false)
 session {
     activeClocktowerGameIds Json<List<String>>
 }
@@ -376,6 +378,7 @@ async fn test_insert_permissions() -> Result<(), TestError> {
 async fn false_insert_permission_writes_no_row() -> Result<(), TestError> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record AuditLog {
     id Int @id
     message String
@@ -419,6 +422,7 @@ insert CreateAuditLog($message: String) {
 async fn insert_permission_uses_the_final_generated_integer_id() -> Result<(), TestError> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Gate {
     id Int @id
     value String
@@ -467,6 +471,7 @@ insert CreateFirstOnly($value: String) {
 async fn insert_permission_uses_omitted_column_defaults() -> Result<(), TestError> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -514,6 +519,7 @@ insert CreateNote($body: String) {
 async fn nested_insert_permission_is_enforced() -> Result<(), TestError> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Project {
     id Int @id
     name String
@@ -572,6 +578,7 @@ insert CreateProject($name: String, $title: String) {
 async fn denied_parent_insert_cannot_attach_children_to_an_existing_row() -> Result<(), TestError> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Project {
     id Int @id
     name String
@@ -951,6 +958,7 @@ query GetDocuments {
 #[tokio::test]
 async fn test_nested_link_permission_uses_cte_table_alias() -> Result<(), TestError> {
     let schema = r#"
+@syncable(false)
 session {
     userId Int
     isAdmin Bool

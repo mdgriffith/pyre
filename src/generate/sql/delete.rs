@@ -38,7 +38,7 @@ pub fn delete_to_string(
     ));
     if include_affected_rows {
         sql.push_str(&format!(
-            ", json_array({}) as _affectedRows",
+            ", json_array(json_insert({}, '$.headers[#]', '_pyre_removed', '$.rows[0][#]', json('true'))) as _affectedRows",
             returning::affected_rows_expression(context, table)
         ));
     }

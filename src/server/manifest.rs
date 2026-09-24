@@ -37,6 +37,16 @@ pub struct QueryManifest {
     pub sql: Vec<SqlInfo>,
     #[serde(default, rename = "syncSql")]
     pub sync_sql: Option<Vec<SqlInfo>>,
+    #[serde(default, rename = "generatedEdit")]
+    pub generated_edit: Option<GeneratedEdit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedEdit {
+    pub write_statement: usize,
+    pub sync_write_statement: usize,
+    pub create_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

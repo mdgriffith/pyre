@@ -1,5 +1,6 @@
 {
   "lockfileVersion": 1,
+  "configVersion": 0,
   "workspaces": {
     "": {
       "name": "pyre-monorepo",
@@ -43,6 +44,7 @@
       "version": "0.1.19",
       "dependencies": {
         "@libsql/client": "^0.14.0",
+        "@pyre/client": "0.1.19",
         "@pyre/core": "0.1.19",
       },
       "devDependencies": {

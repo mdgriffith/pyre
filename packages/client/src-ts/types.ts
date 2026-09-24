@@ -52,6 +52,9 @@ export interface SyncState {
 export type LiveSyncTransport = 'sse' | 'websocket';
 
 export interface ElmPorts {
+  visibleStateOut?: {
+    subscribe: (callback: (message: { source: import('./service/entity-stream').EntityChangeBatchSource; data: import('./service/entity-stream').ServerTableGroup[]; snapshot: import('./service/entity-stream').ServerTableGroup[] }) => void) => void;
+  };
   indexedDbOut?: {
     subscribe: (callback: (message: unknown) => void) => void;
   };

@@ -37,11 +37,105 @@ pub fn generate_queries(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let formatter = to_metadata_formatter();
+    let mut edits = String::from("// Generated browser-independent CRUD builders.\nimport { operation, createId, type Operation } from '@pyre/client/operations';\nexport { batch, database } from '@pyre/client/operations';\n\ndeclare const identity: unique symbol;\ntype Id<Namespace, Record, Value> = Value & { readonly [identity]: readonly [Namespace, Record] };\ntype BindIds<Value, Ids> = { [Key in keyof Value]: Key extends keyof Ids ? Ids[Key] | Extract<Value[Key], null | undefined> : Value[Key] };\ntype BindRows<Value, Ids> = { [Key in keyof Value]: Value[Key] extends (infer Row)[] ? BindIds<Row, Ids>[] : Value[Key] };\n\n");
+    let mut identity_tables: Vec<_> = context.tables.values().collect();
+    identity_tables.sort_by(|a, b| a.record.name.cmp(&b.record.name));
+    for table in identity_tables {
+        let name = &table.record.name;
+        let columns = ast::collect_columns(&table.record.fields);
+        let key = columns
+            .iter()
+            .find(|column| ast::is_primary_key(column))
+            .unwrap();
+        let uuid = matches!(key.type_, ast::ColumnType::IdUuid { .. });
+        let text = uuid || matches!(key.type_, ast::ColumnType::String);
+        let base = if text { "string" } else { "number" };
+        edits.push_str(&format!(
+            "export type {name}Id = Id<{}, {}, {base}>;\n",
+            string::quote(&table.schema),
+            string::quote(name)
+        ));
+        let validation = if uuid {
+            "typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)"
+        } else if text {
+            "typeof value !== 'string'"
+        } else {
+            "!Number.isSafeInteger(value)"
+        };
+        edits.push_str(&format!("export function {}Id(value: {base}): {name}Id {{ if ({validation}) throw new Error('Invalid {name} identity'); return value as {name}Id; }}\n", string::decapitalize(name)));
+        let mut ids = Vec::new();
+        for column in columns {
+            let target = if ast::is_primary_key(&column) {
+                Some(name.as_str())
+            } else {
+                match &column.type_ {
+                    ast::ColumnType::ForeignKey { table, field, .. } => context
+                        .tables
+                        .get(&string::decapitalize(table))
+                        .filter(|target| {
+                            ast::collect_columns(&target.record.fields)
+                                .iter()
+                                .any(|key| key.name == *field && ast::is_primary_key(key))
+                        })
+                        .map(|_| table.as_str()),
+                    _ => None,
+                }
+            };
+            if let Some(target) = target {
+                ids.push(format!("{}: {target}Id", string::quote(&column.name)));
+            }
+        }
+        edits.push_str(&format!("type {name}Ids = {{ {} }};\n\n", ids.join("; ")));
+    }
 
     for operation in &query_list.queries {
         match operation {
             ast::QueryDef::Query(q) => {
                 let query_info = all_query_info.get(&q.name);
+                if let (Some(table), Some(info)) = (
+                    crate::generated_queries::generated_crud_table(context, q),
+                    query_info,
+                ) {
+                    let primary_key = ast::collect_columns(&table.record.fields)
+                        .into_iter()
+                        .find(|column| ast::is_primary_key(column))
+                        .expect("CRUD primary key");
+                    let module = &q.name;
+                    edits.push_str(&format!(
+                        "import * as {module} from './queries/metadata/{}';\n",
+                        string::decapitalize(module)
+                    ));
+                    let namespace = string::quote(&info.primary_db);
+                    let record = &table.record.name;
+                    let key = string::quote(&primary_key.name);
+                    let (input_type, input) = match q.operation {
+                        ast::QueryOperation::Insert
+                            if matches!(primary_key.type_, ast::ColumnType::IdUuid { .. }) =>
+                        {
+                            (
+                                format!("input: Omit<BindIds<{module}.Input, {record}Ids>, {key}>"),
+                                format!("{{ ...input, [{}]: createId() }}", key),
+                            )
+                        }
+                        ast::QueryOperation::Insert => {
+                            (format!("input: BindIds<{module}.Input, {record}Ids>"), "input".into())
+                        }
+                        ast::QueryOperation::Update => (
+                            format!(
+                                "id: {record}Id, patch: Omit<BindIds<{module}.Input, {record}Ids>, {key}>"
+                            ),
+                            format!("{{ ...patch, [{key}]: id }}"),
+                        ),
+                        _ => (
+                            format!("id: {record}Id"),
+                            format!("{{ [{key}]: id }}"),
+                        ),
+                    };
+                    edits.push_str(&format!(
+                        "export function {}({input_type}): Operation<{namespace}, BindRows<{module}.Result, {record}Ids>> {{\n  return operation({module}.meta, {input}) as Operation<{namespace}, BindRows<{module}.Result, {record}Ids>>;\n}}\n\n",
+                        string::decapitalize(module)
+                    ));
+                }
                 files.push(generate_text_file(
                     base_out_dir
                         .join("queries/metadata")
@@ -63,6 +157,16 @@ pub fn generate_queries(
             _ => continue,
         }
     }
+    let mut records: Vec<_> = context.tables.values().collect();
+    records.sort_by(|a, b| a.record.name.cmp(&b.record.name));
+    for table in records {
+        let name = &table.record.name;
+        let has_all = ["Create", "Update", "Delete"].iter().all(|suffix| query_list.queries.iter().any(|definition| matches!(definition, ast::QueryDef::Query(query) if query.name == format!("{name}{suffix}") && crate::generated_queries::generated_crud_table(context, query).is_some())));
+        if has_all {
+            edits.push_str(&format!("export const {name} = {{ create: {}Create, update: {}Update, delete: {}Delete }} as const;\n", string::decapitalize(name), string::decapitalize(name), string::decapitalize(name)));
+        }
+    }
+    files.push(generate_text_file(base_out_dir.join("edits.ts"), edits));
 }
 
 fn sql_types_file() -> String {
@@ -413,9 +517,13 @@ fn to_query_metadata_file(
     }
     imports.push_str("import * as Decode from '../../decode';\n");
 
-    let input_block = to_param_type_alias(context, &query.args)
-        .trim_end()
-        .to_string();
+    let input_block = to_param_type_alias(
+        context,
+        &query.args,
+        crate::generated_queries::generated_crud_table(context, query).is_some(),
+    )
+    .trim_end()
+    .to_string();
 
     let query_shape_block = if query.operation == ast::QueryOperation::Query {
         Some(to_query_shape(context, query).trim_end().to_string())
@@ -490,11 +598,45 @@ fn to_query_metadata_file(
     meta_block.push_str("  InputValidator,\n");
     meta_block.push_str("  SessionValidator: Decode.SessionValidator,\n");
     meta_block.push_str("  ReturnData,\n");
+    // Normal SQL omits affected rows; sync SQL tracks each mutation field,
+    // including writes inside heterogeneous transactions.
+    let has_sync_effect = query.fields.iter().any(|field| match field {
+        ast::TopLevelQueryField::Field(field) => matches!(
+            ast::query_field_operation(query, field),
+            ast::QueryOperation::Insert | ast::QueryOperation::Update | ast::QueryOperation::Delete
+        ),
+        _ => false,
+    });
+    meta_block.push_str(&format!(
+        "  syncEffects: {{ sql: false, syncSql: {} }},\n",
+        bool_to_ts_bool(has_sync_effect)
+    ));
+    if let Some(table) = crate::generated_queries::generated_crud_table(context, query) {
+        if let Some(info) = query_info {
+            // Generated CRUD is one scalar write after any ATTACH statements.
+            let create_id = ast::collect_columns(&table.record.fields)
+                .into_iter()
+                .find(|column| ast::is_primary_key(column))
+                .filter(|column| {
+                    query.operation == ast::QueryOperation::Insert
+                        && matches!(column.type_, ast::ColumnType::IdUuid { .. })
+                })
+                .map(|column| format!(", createId: {}", string::quote(&column.name)))
+                .unwrap_or_default();
+            meta_block.push_str(&format!(
+                "  generatedEdit: {{ writeStatement: {}, syncWriteStatement: {}{} }},\n",
+                sql::to_sql::format_attach(info).len(),
+                sql::to_sql::format_attach(info).len()
+                    + usize::from(query.operation == ast::QueryOperation::Update),
+                create_id
+            ));
+        }
+    }
     if query.operation == ast::QueryOperation::Query {
         meta_block.push_str("  queryShape,\n");
         meta_block.push_str("  toQueryShape: (_input: Input) => queryShape,\n");
     }
-    if let Some(optimistic) = to_optimistic_update_metadata(query) {
+    if let Some(optimistic) = to_optimistic_update_metadata(context, query) {
         meta_block.push_str(&format!("  optimistic: {},\n", optimistic));
     }
     meta_block.push_str("};\n");
@@ -700,8 +842,40 @@ struct OptimisticUpdateMetadata {
     set_fields: Vec<(String, String)>,
 }
 
-fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMetadata> {
-    if query.operation != ast::QueryOperation::Update {
+fn optimistic_update_metadata(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> Option<OptimisticUpdateMetadata> {
+    if query.operation == ast::QueryOperation::Insert {
+        let table = crate::generated_queries::generated_crud_table(context, query)?;
+        let key = ast::collect_columns(&table.record.fields)
+            .into_iter()
+            .find(|column| ast::is_primary_key(column))?;
+        let [ast::TopLevelQueryField::Field(root)] = query.fields.as_slice() else {
+            return None;
+        };
+        let set_fields = ast::collect_query_fields(&root.fields)
+            .iter()
+            .map(|field| match &field.set {
+                Some(ast::QueryValue::Variable((_, variable)))
+                    if variable.session_field.is_none() =>
+                {
+                    Some((field.name.clone(), variable.name.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let (_, id_input) = set_fields.iter().find(|(field, _)| field == &key.name)?;
+        return Some(OptimisticUpdateMetadata {
+            query_field: root.name.clone(),
+            where_field: key.name.clone(),
+            where_input: id_input.clone(),
+            set_fields,
+        });
+    }
+    if query.operation != ast::QueryOperation::Update
+        && query.operation != ast::QueryOperation::Delete
+    {
         return None;
     }
 
@@ -742,7 +916,7 @@ fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMeta
         })
         .collect();
 
-    if set_fields.is_empty() {
+    if set_fields.is_empty() && query.operation != ast::QueryOperation::Delete {
         return None;
     }
 
@@ -754,8 +928,14 @@ fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMeta
     })
 }
 
-fn to_optimistic_update_metadata(query: &ast::Query) -> Option<String> {
-    let metadata = optimistic_update_metadata(query)?;
+fn to_optimistic_update_metadata(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> Option<String> {
+    if query.operation == ast::QueryOperation::Insert {
+        crate::generated_queries::generated_crud_table(context, query)?;
+    }
+    let metadata = optimistic_update_metadata(context, query)?;
     let set_fields = metadata
         .set_fields
         .iter()
@@ -770,11 +950,18 @@ fn to_optimistic_update_metadata(query: &ast::Query) -> Option<String> {
         .join(", ");
 
     Some(format!(
-        "{{ queryField: {}, where: {{ field: {}, input: {} }}, set: [{}] }}",
+        "{{ queryField: {}, where: {{ field: {}, input: {} }}, set: [{}], kind: {} }}",
         string::quote(&metadata.query_field),
         string::quote(&metadata.where_field),
         string::quote(&metadata.where_input),
-        set_fields
+        set_fields,
+        string::quote(if query.operation == ast::QueryOperation::Insert {
+            "create"
+        } else if query.operation == ast::QueryOperation::Delete {
+            "delete"
+        } else {
+            "update"
+        })
     ))
 }
 
@@ -1439,6 +1626,7 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
 fn to_param_type_alias(
     context: &typecheck::Context,
     args: &Vec<ast::QueryParamDefinition>,
+    strict: bool,
 ) -> String {
     let mut result = "const RawInputValidator = z.object({".to_string();
     let mut is_first = true;
@@ -1462,7 +1650,11 @@ fn to_param_type_alias(
             result.push_str(&format!(",\n  {}: {}", arg.name, type_string));
         }
     }
-    result.push_str("\n});\n");
+    result.push_str(if strict {
+        "\n}).strict();\n"
+    } else {
+        "\n});\n"
+    });
 
     result.push_str("const InputValidator = z.object({");
     let mut is_first = true;
@@ -1486,7 +1678,11 @@ fn to_param_type_alias(
             result.push_str(&format!(",\n  {}: {}", arg.name, type_string));
         }
     }
-    result.push_str("\n});\n");
+    result.push_str(if strict {
+        "\n}).strict();\n"
+    } else {
+        "\n});\n"
+    });
 
     result.push_str("export type Input = z.infer<typeof RawInputValidator>;");
     result

@@ -52,7 +52,7 @@ Internally, this is a Dict from IndexKey (foreign key value) to a list of RowIds
 
 -}
 type Index
-    = Index (Dict String (List Int))
+    = Index (Dict String (List String))
 
 
 {-| The foreign key value (e.g., "1", "2" for user\_id values).
@@ -61,10 +61,10 @@ type alias IndexKey =
     String
 
 
-{-| Row identifier (corresponds to SQLite rowid).
+{-| UUID primary key of a synchronized row (not SQLite's internal rowid).
 -}
 type alias RowId =
-    Int
+    String
 
 
 {-| Create an empty index.
@@ -172,7 +172,7 @@ lookup key (Index dict) =
 This scans all rows in the table and builds an index on the specified column.
 
 -}
-rebuildFromTable : Dict Int (Dict String Value) -> String -> Index
+rebuildFromTable : Dict String (Dict String Value) -> String -> Index
 rebuildFromTable tableData columnName =
     Dict.foldl
         (\rowId row acc ->
@@ -224,7 +224,7 @@ for schema-declared indices.
 Returns a Dict keyed by (tableName, columnName).
 
 -}
-buildIndicesFromSchema : SchemaMetadata -> Dict String (Dict Int (Dict String Value)) -> Dict ( String, String ) Index
+buildIndicesFromSchema : SchemaMetadata -> Dict String (Dict String (Dict String Value)) -> Dict ( String, String ) Index
 buildIndicesFromSchema schema tables =
     Dict.foldl
         (\tableName tableMeta acc ->
@@ -247,7 +247,7 @@ buildIndicesFromSchema schema tables =
                                             Dict.insert indexKey index innerAcc
 
                                         Nothing ->
-                                            innerAcc
+                                            Dict.insert ( linkInfo.to.table, linkInfo.to.column ) empty innerAcc
 
                                 _ ->
                                     -- ManyToOne and OneToOne use primary key lookups (already O(1))
@@ -271,7 +271,7 @@ buildIndicesFromSchema schema tables =
                                     Dict.insert indexKey index innerAcc
 
                                 Nothing ->
-                                    innerAcc
+                                    Dict.insert ( tableName, indexInfo.field ) empty innerAcc
                         )
                         accWithLinks
                         tableMeta.indices

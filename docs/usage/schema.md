@@ -8,7 +8,7 @@ Records become database tables.
 
 ```pyre
 record User {
-    id   Int    @id
+    id   Id.Uuid @id
     name String
     @public
 }
@@ -16,14 +16,22 @@ record User {
 
 Common scalar types are `Int`, `Float`, `String`, `Bool`, `DateTime`, `Date`, and `JSON`. Add `?` for nullable fields, for example `deletedAt DateTime?`.
 
+### Identity And Syncability
+
+Namespaces are syncable by default. Every record in a synced namespace requires exactly one non-null `Id.Uuid @id` field. Its name can be `id`, `documentKey`, or another field name; the runtime uses the schema primary key, not a hardcoded `id` column. Reference identities through field types such as `User.id` so foreign keys and query parameters follow the schema.
+
+Generated CRUD builders allocate a canonical lowercase UUIDv7 for creates; application code omits the primary key. Trusted imports and named commands can use explicit UUIDs of other versions. UUID ordering improves index locality; it is not business ordering.
+
+For server-only/request-response databases with integer or plain-string primary keys, put `@syncable(false)` at namespace scope. Such records cannot be synchronized by the UUID-based browser worker. All records still require a primary key. See [Namespacing](./namespacing.md#sync-policy) and [Migration Guide](./migrations.md#upgrading-synced-identities-and-clients).
+
 ## Links
 
 Links describe relationships between records.
 
 ```pyre
 record Post {
-    id       Int @id
-    authorId Int
+    id       Id.Uuid @id
+    authorId User.id
     author   @link(authorId, User.id)
     @public
 }
@@ -41,7 +49,7 @@ Use directives to describe table behavior and constraints.
 
 ```pyre
 record Membership {
-    id        Int @id
+    id        Id.Uuid @id
     orgId     Int
     userId    Int
     deletedAt DateTime?
@@ -60,7 +68,7 @@ Use `@immutable` for a record field that may be assigned when a row is inserted 
 
 ```pyre
 record Document {
-    id      Int @id
+    id      Id.Uuid @id
     ownerId Int @immutable
     title   String
     @public
@@ -126,7 +134,7 @@ Session definitions describe trusted values supplied by the server from its auth
 
 ```pyre
 session {
-    userId Int
+    userId User.id
 }
 ```
 
@@ -147,7 +155,7 @@ record Post {
     }
     @allow(insert, update, delete) { authorId == Session.userId }
 
-    id Post.id @id
+    id Id.Uuid @id
     authorId User.id
     published Bool
 }
@@ -187,7 +195,7 @@ record Document {
     }
     @allow(insert, update, delete) { False }
 
-    id Document.id @id
+    id Id.Uuid @id
     workspaceId Workspace.id
     workspace @link(workspaceId, Workspace.id)
 }
@@ -197,7 +205,7 @@ record Document {
 `Workspace` to `WorkspaceMember`. An `exists` expression inside another
 `exists` block is not currently supported.
 
-Current relational-permission boundaries:
+Put the relational-permission example in a namespace declared with `@syncable(false)` and provide the referenced `Workspace`/membership records. Current relational-permission boundaries:
 
 - relational query permissions require a query-only namespace (`@syncable(false)`)
 - relational insert permissions are not supported

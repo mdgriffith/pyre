@@ -7,6 +7,7 @@ Use this guide when you want:
 - a Pyre-backed server
 - live sync on the client
 - local query subscriptions over synced data
+- explicit composed writes with optimistic feedback through the same local read model
 
 If your main goal is Elm port wiring, also see [Elm + Sync Runtime Setup](./elm-sync.md).
 
@@ -20,18 +21,20 @@ The shortest sync path looks like this:
 4. Start a Pyre-backed server that exposes `/sync`, `/sync/events`, and `/db`.
 5. Create a `PyreClient` in your browser app.
 6. Select databases from the application's accessible IDs and register local queries.
+7. Construct generated edits and submit them explicitly when the user saves.
 
 The rest of this guide walks through those steps.
 
-For browser sync, add `@pyre/client` from the same GitHub Release used for `@pyre/core` and `@pyre/server` in [Getting Started](./getting-started.md):
+For browser sync, use `@pyre/client` from the same GitHub Release used for the compiler, `@pyre/core`, and `@pyre/server` in [Getting Started](./getting-started.md). Replace every `VERSION` in this template with that release's version; use matching workspace packages for unreleased development code.
 
 ```json
 {
   "dependencies": {
-    "@pyre/client": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-client-0.1.5.tgz"
+    "@pyre/client": "https://github.com/mdgriffith/pyre/releases/download/version-VERSION/pyre-client-VERSION.tgz"
   },
   "overrides": {
-    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-0.1.5/pyre-core-0.1.5.tgz"
+    "@pyre/core": "https://github.com/mdgriffith/pyre/releases/download/version-VERSION/pyre-core-VERSION.tgz",
+    "@pyre/client": "https://github.com/mdgriffith/pyre/releases/download/version-VERSION/pyre-client-VERSION.tgz"
   }
 }
 ```
@@ -50,9 +53,9 @@ Define records and permissions in `pyre/schema.pyre`:
 
 ```pyre
 record User {
-    @allow(query) { ownerId == Session.userId }
+    @allow(query, insert, update, delete) { ownerId == Session.userId }
 
-    id Int @id
+    id Id.Uuid @id
     ownerId Int
     name String
 }
@@ -61,7 +64,7 @@ record User {
 Define the local query in `pyre/query.pyre`:
 
 ```pyre
-query GetUser($id: Int) {
+query GetUser($id: User.id) {
     user {
         @where { id == $id }
 
@@ -72,6 +75,8 @@ query GetUser($id: Int) {
 ```
 
 The server validates its authenticated session against the schema and enforces the schema permissions when selecting data to sync. `GetUser` remains a normal local query: its only explicit filter uses the ordinary `$id` input, and its only `Session` dependency is in server-side schema permissions.
+
+Synced records require one non-null UUID primary key. `ownerId` here is an ordinary integer from the external authentication system, not this record's primary key. Generated `User.create` allocates the row's UUIDv7; updates and queries use that UUID. See [Schema Identity](./schema.md#identity-and-syncability).
 
 For explicit `Session` filters and their ordinary-input alternative, see [Local Queries And Session](./query.md#local-queries-and-session).
 
@@ -111,6 +116,7 @@ pyre/generated/
 The important pieces for sync are:
 
 - `typescript/core/`: schema metadata and query metadata
+- `typescript/core/edits.ts`: typed CRUD builders, branded IDs, `batch`, and namespace-bearing `database` targets
 - `client/elm/`: generated Elm sync/query surface
 - `typescript/server.ts`: query metadata consumed by the server sync runtime
 
@@ -155,13 +161,16 @@ await Sync.loadSchemaFromDatabase(db);
 // These values normally come from the authenticated request and route.
 const queryId = request.params.queryId;
 const args = await request.json();
+if (queryId === '$batch' && !Array.isArray(args)) {
+  return Response.json({ errorType: 'InvalidInput', message: 'Expected an operation array' }, { status: 400 });
+}
 const session = { userId: authenticatedUser.id };
 const databaseId = 'main';
 
 const result = await Sync.run(
   db,
   queries,
-  queryId,
+  queryId === '$batch' ? args : queryId,
   args,
   session,
   connectionsForDatabase(databaseId),
@@ -169,17 +178,25 @@ const result = await Sync.run(
 );
 
 if (result.kind === 'error') {
-  throw new Error(result.error?.message ?? 'Query execution failed');
+  return Response.json(result.error, {
+    status: result.error?.errorType === 'OutcomeUnknown' ? 500 : 400,
+  });
 }
 
 await result.sync((sessionId, message) => {
   sendPyreSyncMessage(databaseId, sessionId, message);
 });
 
-return result.response;
+return Response.json(result.response);
 ```
 
 `queryId` is the generated interface ID sent by the client, not a source-level name such as `GetUser`. A custom server must authenticate each request, construct the Pyre session, authorize the requested `databaseId`, and map it to the correct database connection. Keep live-sync connections partitioned by database; never broadcast deltas across database IDs. See [Multi-Database Server Requirements](./multi-database-upgrade.md#server-requirements) for route wiring.
+
+`$batch` is the composed-operation route ID. Its body is an array of `{ queryId, input }` descriptors; pass that array as the third argument to `Sync.run`. Passing the literal string `'$batch'` to the TypeScript executor would look up a named query instead. The built-in Rust server handles this route itself.
+
+Call `result.sync` before serializing a successful sync response, even when no live clients are connected. It publishes final permission-filtered rows/removals and wraps the result as `{ databaseEpoch, serverRevision, sync, result }` when there are affected rows. Revisions are allocated inside the write transaction, not during later publication. HTTP origin authority uses the executing session without requiring an SSE connection. Omit the optional origin connection ID unless your server has authenticated its ownership; never trust a caller-supplied ID to select permissions or suppress another client's delivery. Post-commit publication failures must not be reported as definite rollbacks.
+
+Local TypeScript composed writes and catchup use interactive transactions and require file-backed libSQL. They reject private in-memory databases before opening the transaction.
 
 After applying schema changes, reload the server schema cache before serving sync. [Server Contexts](./server-contexts.md) is an optional session-resolution cache for custom servers, not a requirement for authentication or sync.
 
@@ -191,6 +208,7 @@ After applying schema changes, reload the server schema cache before serving syn
 - catchup sync
 - live sync transport
 - query registration and refresh
+- ordered optimistic intent, rejection replay, and authoritative reconciliation in one worker
 
 Create one client per schema family in the browser app. Multiple database IDs can share that client when they use the same generated schema; independently generated schema families need separate clients and server runtime wiring.
 
@@ -278,12 +296,12 @@ import { meta as getUser } from './pyre/generated/typescript/core/queries/metada
 const subscription = await client.run(
   bootstrap.mainDatabaseId,
   getUser,
-  { id: 1 },
+  { id: '01900000-0000-7000-8000-000000000001' },
   (result) => console.log('Current user result:', result),
 );
 
 // When the UI selects a different user:
-subscription?.update({ id: 2 });
+subscription?.update({ id: '01900000-0000-7000-8000-000000000002' });
 
 // When the UI no longer needs this query:
 subscription?.unsubscribe();
@@ -295,16 +313,65 @@ Generated query shapes preserve `@where`, `@sort`, and `@limit`. For the `Sessio
 
 Elm apps can use the same runtime through the optional [Elm + Sync Runtime Setup](./elm-sync.md) continuation, which covers generated APIs, typed database IDs, and ports.
 
-## 7. Mental Model
+## 7. Submit Composed Writes
+
+For the `User` schema above, use the generated builders:
+
+```typescript
+import { User, batch, database, userId } from './pyre/generated/typescript/core/edits';
+
+// Schema namespace first, concrete database instance second.
+const target = database('_default', bootstrap.mainDatabaseId);
+const id = userId('01900000-0000-7000-8000-000000000001');
+const edits = batch([
+  User.update(id, { name: 'Updated name' }),
+  User.create({ ownerId: bootstrap.userId, name: 'Another user' }),
+]);
+
+try {
+  const receipt = await client.submit(target, edits);
+  if (!receipt.ok) {
+    console.error('Write did not complete successfully:', receipt.error);
+    return;
+  }
+  const created = receipt.value[1].result.user[0];
+  console.log('Committed UUID:', created.id);
+} catch (error) {
+  // Dispatch or result-decoding failure; do not assume the server rolled back.
+  console.error(error);
+}
+```
+
+`batch` is an optional pure ordered-composition helper; `client.submit(target, [edit])` works for one edit. Construction copies inputs and allocates UUID creates once. Only submission sends a request and installs supported optimistic intent. Use the generated ID conversion function for external IDs; IDs returned by typed CRUD results are already branded. For named namespaces use their actual name instead of `_default`.
+
+One submission is one atomic server transaction. Generated writes reject if they do not affect exactly one row. Consume typed indexed results rather than assuming success means a row remains visible under query permissions. For input omission/null semantics and named-command composition, see [Query Guide](./query.md#generated-crud-and-composed-operations).
+
+### Shared Visible State And Outcomes
+
+Local query subscriptions and entity streams observe the same worker state. Do not maintain a second optimistic application cache. Existing-row updates/deletes and complete scalar creates can be predicted. Creates that omit defaults or depend on server-managed values remain server-only. Rejection removes that submission's intent and replays later pending intent; confirmation installs server-normalized values with per-row revision fencing.
+
+Entity consumers must handle both `op: 'row'` and `op: 'remove'`. A removal's `change.id` is the identity, and `change.row` contains the schema's actual primary-key field. This also covers rows leaving an entity subscription's filter. Query subscribers receive the corresponding visible query changes.
+
+Pending edits are memory-only, not a durable offline outbox. Handle both `ok: false` completions and rejected promises. A lost response or unknown commit outcome is not proof of rejection: the worker uses exceptional fenced authority recovery and never automatically replays the write. Publication or decoding errors can happen after commit.
+
+### Reconnect And Recovery Boundaries
+
+Ordinary same-epoch live handshakes preserve cached rows, query/entity readers, and pending requests. Connected writes deliver incremental final rows and permission-filtered removals; intermediate permission grants within a batch do not expose rows. Delivered removals and per-row revision stamps persist together, preventing stale responses from restoring removed data after reload.
+
+Deletions or permission removals missed during a delivery gap, including the initial catchup/subscription gap, are **not yet recovered** by ordinary reconnect. Incremental catchup cannot infer removal from an omitted row, and the server has no durable removal replay log. This limitation is tracked in MEC-157; do not describe reconnect as full removal recovery or add a destructive reload to every handshake.
+
+Explicit invalidation, database-epoch changes, and genuinely unknown write outcomes use exceptional reset/recovery. These paths can clear readers temporarily and invalidate pre-reset responses. Permission-evaluation failures or oversized removal delivery can also require invalidation. Authentication changes remain an application-owned cache-isolation concern.
+
+## 8. Mental Model
 
 Information moves through the system in four main paths:
 
 - Sync selection: after the app selects databases, `PyreClient` restores their cached state and schedules server catchup. Creating the client or receiving accessible IDs alone does not start sync.
 - Live sync: the server pushes deltas over `/sync/events`, and `PyreClient` applies and persists them.
 - Local reads: registered queries evaluate local data and refresh as inputs or synced rows change; they do not send server query requests.
-- Server operations: mutations and explicitly server-executed queries use the authenticated query endpoint. Mutation deltas update the local read model through sync.
+- Server operations: explicit composed submissions and named mutations use the authenticated query endpoint. One worker combines pending intent with authoritative incremental rows/removals. Explicit server queries remain available without local subscription or optimism.
 
-## 8. Sync Data Flow
+## 9. Sync Data Flow
 
 ```mermaid
 flowchart TD

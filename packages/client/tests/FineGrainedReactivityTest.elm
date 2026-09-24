@@ -10,6 +10,7 @@ import Dict exposing (Dict)
 import Expect
 import Set exposing (Set)
 import Test exposing (..)
+import Uuid
 
 
 suite : Test
@@ -151,14 +152,14 @@ doesChangeAffectWhereClauseTests =
 
                     oldRow =
                         Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "role", Data.Value.StringValue "user" )
                             , ( "email", Data.Value.StringValue "old@example.com" )
                             ]
 
                     newRow =
                         Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "role", Data.Value.StringValue "admin" )
                             , ( "email", Data.Value.StringValue "old@example.com" )
                             ]
@@ -177,14 +178,14 @@ doesChangeAffectWhereClauseTests =
 
                     oldRow =
                         Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "role", Data.Value.StringValue "admin" )
                             , ( "email", Data.Value.StringValue "old@example.com" )
                             ]
 
                     newRow =
                         Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "role", Data.Value.StringValue "admin" )
                             , ( "email", Data.Value.StringValue "new@example.com" )
                             ]
@@ -204,7 +205,7 @@ doesChangeAffectWhereClauseTests =
 
                     oldRow =
                         Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "role", Data.Value.StringValue "admin" )
                             , ( "status", Data.Value.StringValue "active" )
                             , ( "email", Data.Value.StringValue "old@example.com" )
@@ -212,7 +213,7 @@ doesChangeAffectWhereClauseTests =
 
                     newRow =
                         Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "role", Data.Value.StringValue "admin" )
                             , ( "status", Data.Value.StringValue "active" )
                             , ( "email", Data.Value.StringValue "new@example.com" )
@@ -233,14 +234,14 @@ doesChangeAffectWhereClauseTests =
 
                     oldRow =
                         Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "role", Data.Value.StringValue "admin" )
                             , ( "status", Data.Value.StringValue "active" )
                             ]
 
                     newRow =
                         Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "role", Data.Value.StringValue "admin" )
                             , ( "status", Data.Value.StringValue "inactive" )
                             ]
@@ -267,18 +268,18 @@ extractChangedRowIdsTests =
                             [ { tableName = "users"
                               , headers = [ "id", "name" ]
                               , rows =
-                                    [ [ Data.Value.IntValue 1, Data.Value.StringValue "Alice" ]
-                                    , [ Data.Value.IntValue 2, Data.Value.StringValue "Bob" ]
+                                    [ [ Uuid.value 1, Data.Value.StringValue "Alice" ]
+                                    , [ Uuid.value 2, Data.Value.StringValue "Bob" ]
                                     ]
                               }
                             ]
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds { tables = Dict.empty, queryFieldToTable = Dict.empty } delta
                 in
                 Expect.equal
-                    (Dict.fromList [ ( "users", Set.fromList [ 1, 2 ] ) ])
+                    (Dict.fromList [ ( "users", Uuid.set [ 1, 2 ] ) ])
                     result
         , test "extracts row IDs from multiple tables" <|
             \_ ->
@@ -287,25 +288,25 @@ extractChangedRowIdsTests =
                         { tableGroups =
                             [ { tableName = "users"
                               , headers = [ "id", "name" ]
-                              , rows = [ [ Data.Value.IntValue 1, Data.Value.StringValue "Alice" ] ]
+                              , rows = [ [ Uuid.value 1, Data.Value.StringValue "Alice" ] ]
                               }
                             , { tableName = "posts"
                               , headers = [ "id", "title" ]
                               , rows =
-                                    [ [ Data.Value.IntValue 10, Data.Value.StringValue "Post 1" ]
-                                    , [ Data.Value.IntValue 11, Data.Value.StringValue "Post 2" ]
+                                    [ [ Uuid.value 10, Data.Value.StringValue "Post 1" ]
+                                    , [ Uuid.value 11, Data.Value.StringValue "Post 2" ]
                                     ]
                               }
                             ]
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds { tables = Dict.empty, queryFieldToTable = Dict.empty } delta
                 in
                 Expect.equal
                     (Dict.fromList
-                        [ ( "users", Set.fromList [ 1 ] )
-                        , ( "posts", Set.fromList [ 10, 11 ] )
+                        [ ( "users", Uuid.set [ 1 ] )
+                        , ( "posts", Uuid.set [ 10, 11 ] )
                         ]
                     )
                     result
@@ -316,7 +317,7 @@ extractChangedRowIdsTests =
                         { tableGroups = [] }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds { tables = Dict.empty, queryFieldToTable = Dict.empty } delta
                 in
                 Expect.equal Dict.empty result
         , test "skips rows without valid ID" <|
@@ -327,19 +328,19 @@ extractChangedRowIdsTests =
                             [ { tableName = "users"
                               , headers = [ "id", "name" ]
                               , rows =
-                                    [ [ Data.Value.IntValue 1, Data.Value.StringValue "Alice" ]
+                                    [ [ Uuid.value 1, Data.Value.StringValue "Alice" ]
                                     , [ Data.Value.StringValue "invalid", Data.Value.StringValue "Bob" ]
-                                    , [ Data.Value.IntValue 3, Data.Value.StringValue "Charlie" ]
+                                    , [ Uuid.value 3, Data.Value.StringValue "Charlie" ]
                                     ]
                               }
                             ]
                         }
 
                     result =
-                        Data.QueryManager.extractChangedRowIds delta
+                        Data.QueryManager.extractChangedRowIds { tables = Dict.empty, queryFieldToTable = Dict.empty } delta
                 in
                 Expect.equal
-                    (Dict.fromList [ ( "users", Set.fromList [ 1, 3 ] ) ])
+                    (Dict.fromList [ ( "users", Uuid.set [ 1, 3 ] ) ])
                     result
         ]
 
@@ -373,7 +374,7 @@ shouldReExecuteQueryTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2, 3 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", Uuid.set [ 1, 2, 3 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -382,13 +383,13 @@ shouldReExecuteQueryTests =
                         { tableGroups =
                             [ { tableName = "posts"
                               , headers = [ "id", "title" ]
-                              , rows = [ [ Data.Value.IntValue 10, Data.Value.StringValue "Post" ] ]
+                              , rows = [ [ Uuid.value 10, Data.Value.StringValue "Post" ] ]
                               }
                             ]
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -416,7 +417,7 @@ shouldReExecuteQueryTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2, 3 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", Uuid.set [ 1, 2, 3 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -425,13 +426,13 @@ shouldReExecuteQueryTests =
                         { tableGroups =
                             [ { tableName = "users"
                               , headers = [ "id", "name" ]
-                              , rows = [ [ Data.Value.IntValue 999, Data.Value.StringValue "Charlie" ] ]
+                              , rows = [ [ Uuid.value 999, Data.Value.StringValue "Charlie" ] ]
                               }
                             ]
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -497,7 +498,7 @@ shouldReExecuteQueryTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "game", Set.fromList [ 1 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "game", Uuid.set [ 1 ] ) ]
                         , revision = 1
                         , lastResult = Nothing
                         }
@@ -506,13 +507,13 @@ shouldReExecuteQueryTests =
                         { tableGroups =
                             [ { tableName = "game_members"
                               , headers = [ "id", "gameId", "userId" ]
-                              , rows = [ [ Data.Value.IntValue 10, Data.Value.IntValue 1, Data.Value.IntValue 2 ] ]
+                              , rows = [ [ Uuid.value 10, Uuid.value 1, Uuid.value 2 ] ]
                               }
                             ]
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -545,7 +546,7 @@ shouldReExecuteQueryTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2, 3 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", Uuid.set [ 1, 2, 3 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -555,14 +556,14 @@ shouldReExecuteQueryTests =
                             [ { tableName = "users"
                               , headers = [ "id", "name", "role" ]
                               , rows =
-                                    [ [ Data.Value.IntValue 999, Data.Value.StringValue "New User", Data.Value.StringValue "admin" ]
+                                    [ [ Uuid.value 999, Data.Value.StringValue "New User", Data.Value.StringValue "admin" ]
                                     ]
                               }
                             ]
                         }
 
                     db =
-                        { tables = Dict.empty, indices = Dict.empty }
+                        Db.init
 
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
@@ -578,7 +579,7 @@ shouldReExecuteQueryTests =
 integrationTests : Test
 integrationTests =
     describe "Integration: Full query reactivity flow"
-        [ test "query with WHERE clause skips re-execution when non-filtered field changes" <|
+        [ test "query with WHERE clause updates selected values when non-filtered field changes" <|
             \_ ->
                 let
                     -- Schema setup
@@ -607,7 +608,7 @@ integrationTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", Uuid.set [ 1, 2 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -618,16 +619,16 @@ integrationTests =
                             Dict.fromList
                                 [ ( "users"
                                   , Dict.fromList
-                                        [ ( 1
+                                        [ ( Uuid.id 1
                                           , Dict.fromList
-                                                [ ( "id", Data.Value.IntValue 1 )
+                                                [ ( "id", Uuid.value 1 )
                                                 , ( "role", Data.Value.StringValue "admin" )
                                                 , ( "email", Data.Value.StringValue "admin1@example.com" )
                                                 ]
                                           )
-                                        , ( 2
+                                        , ( Uuid.id 2
                                           , Dict.fromList
-                                                [ ( "id", Data.Value.IntValue 2 )
+                                                [ ( "id", Uuid.value 2 )
                                                 , ( "role", Data.Value.StringValue "admin" )
                                                 , ( "email", Data.Value.StringValue "admin2@example.com" )
                                                 ]
@@ -636,6 +637,7 @@ integrationTests =
                                   )
                                 ]
                         , indices = Dict.empty
+                        , primaryKeys = Dict.empty
                         }
 
                     -- Delta: user 1 changes email (NOT role)
@@ -644,7 +646,7 @@ integrationTests =
                             [ { tableName = "users"
                               , headers = [ "id", "role", "email" ]
                               , rows =
-                                    [ [ Data.Value.IntValue 1
+                                    [ [ Uuid.value 1
                                       , Data.Value.StringValue "admin"
                                       , Data.Value.StringValue "newemail@example.com"
                                       ]
@@ -656,8 +658,8 @@ integrationTests =
                     result =
                         Data.QueryManager.shouldReExecuteQuery schema db subscription delta
                 in
-                -- Should NOT re-execute because 'role' didn't change
-                Expect.equal Data.QueryManager.NoReExecute result
+                -- The selected email changed even though membership did not.
+                Expect.equal Data.QueryManager.ReExecuteFull result
         , test "query with WHERE clause triggers re-execution when filtered field changes" <|
             \_ ->
                 let
@@ -685,7 +687,7 @@ integrationTests =
                                 ]
                         , input = Data.Value.NullValue |> Data.Value.encodeValue
                         , callbackPort = "port1"
-                        , resultRowIds = Dict.fromList [ ( "users", Set.fromList [ 1, 2 ] ) ]
+                        , resultRowIds = Dict.fromList [ ( "users", Uuid.set [ 1, 2 ] ) ]
                         , revision = 0
                         , lastResult = Nothing
                         }
@@ -695,9 +697,9 @@ integrationTests =
                             Dict.fromList
                                 [ ( "users"
                                   , Dict.fromList
-                                        [ ( 1
+                                        [ ( Uuid.id 1
                                           , Dict.fromList
-                                                [ ( "id", Data.Value.IntValue 1 )
+                                                [ ( "id", Uuid.value 1 )
                                                 , ( "role", Data.Value.StringValue "admin" )
                                                 ]
                                           )
@@ -705,6 +707,7 @@ integrationTests =
                                   )
                                 ]
                         , indices = Dict.empty
+                        , primaryKeys = Dict.empty
                         }
 
                     -- Delta: user 1 changes role from admin to user
@@ -713,7 +716,7 @@ integrationTests =
                             [ { tableName = "users"
                               , headers = [ "id", "role" ]
                               , rows =
-                                    [ [ Data.Value.IntValue 1
+                                    [ [ Uuid.value 1
                                       , Data.Value.StringValue "user"
                                       ]
                                     ]

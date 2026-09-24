@@ -1,6 +1,7 @@
 port module Data.QueryManager exposing (Incoming(..), Model, Msg(..), OptimisticMutation, OptimisticSetField, OptimisticWhere, QueryClientIncoming(..), QueryDeltaOp(..), QuerySubscription, ReExecuteDecision(..), decodeIncoming, decodeQueryClientIncoming, doesChangeAffectWhereClause, extractChangedRowIds, extractWhereClauseFields, init, mutationResult, notifyTablesChanged, queryClientDelta, queryClientFull, receiveIncoming, receiveQueryClientIncoming, shouldReExecuteQuery, update)
 
 import Data.Delta
+import Data.RowId
 import Data.Schema
 import Data.Value exposing (Value)
 import Db
@@ -25,7 +26,7 @@ type alias QuerySubscription =
     , query : Db.Query.Query
     , input : Encode.Value
     , callbackPort : String
-    , resultRowIds : Dict String (Set Int)
+    , resultRowIds : Dict String (Set String)
     , revision : Int
     , lastResult : Maybe (Dict String (List (Dict String Value)))
     }
@@ -40,13 +41,14 @@ type Msg
 
 
 type Incoming
-    = SendMutation String String String (List ( String, String )) String Bool Encode.Value (Maybe OptimisticMutation) -- requestId, mutationId, baseUrl, headers, credentials, withCredentials, input, optimistic metadata
+    = SendMutation String String String (List ( String, String )) String Bool Encode.Value (List ( OptimisticMutation, Encode.Value )) -- requestId, mutationId, baseUrl, headers, credentials, withCredentials, input, captured optimistic operations
 
 
 type alias OptimisticMutation =
     { queryField : String
     , where_ : OptimisticWhere
     , set : List OptimisticSetField
+    , kind : String
     }
 
 
@@ -139,7 +141,7 @@ notifyTablesChanged schema db model delta =
                         deltaOutcome =
                             case subscription.lastResult of
                                 Just previousResult ->
-                                    buildDeltaOps previousResult executionResult.results
+                                    buildDeltaOps schema subscription.query previousResult executionResult.results
 
                                 Nothing ->
                                     Err "Missing previous result"
@@ -282,8 +284,8 @@ type Id
     | IdString String
 
 
-buildDeltaOps : Dict String (List (Dict String Value)) -> Dict String (List (Dict String Value)) -> Result String (List QueryDeltaOp)
-buildDeltaOps previousResult nextResult =
+buildDeltaOps : Data.Schema.SchemaMetadata -> Db.Query.Query -> Dict String (List (Dict String Value)) -> Dict String (List (Dict String Value)) -> Result String (List QueryDeltaOp)
+buildDeltaOps schema query previousResult nextResult =
     let
         allFields =
             List.foldl
@@ -304,7 +306,7 @@ buildDeltaOps previousResult nextResult =
                     acc
 
                 Ok opsSoFar ->
-                    case diffField field previousResult nextResult of
+                    case diffField (projectedPrimaryKey schema query field) field previousResult nextResult of
                         Ok fieldOps ->
                             Ok (opsSoFar ++ fieldOps)
 
@@ -315,8 +317,43 @@ buildDeltaOps previousResult nextResult =
         allFields
 
 
-diffField : String -> Dict String (List (Dict String Value)) -> Dict String (List (Dict String Value)) -> Result String (List QueryDeltaOp)
-diffField fieldName previousResult nextResult =
+projectedPrimaryKey : Data.Schema.SchemaMetadata -> Db.Query.Query -> String -> Maybe String
+projectedPrimaryKey schema query fieldName =
+    Dict.get fieldName schema.queryFieldToTable
+        |> Maybe.andThen
+            (\tableName ->
+                Dict.get fieldName query
+                    |> Maybe.andThen
+                        (\field ->
+                            let
+                                key =
+                                    Data.Schema.primaryKey schema tableName
+                            in
+                            if Dict.isEmpty field.selections then
+                                Just key
+
+                            else
+                                Dict.toList field.selections
+                                    |> List.filterMap
+                                        (\( alias, selection ) ->
+                                            case selection of
+                                                Db.Query.SelectField source ->
+                                                    if Maybe.withDefault alias source == key then
+                                                        Just alias
+
+                                                    else
+                                                        Nothing
+
+                                                _ ->
+                                                    Nothing
+                                        )
+                                    |> List.head
+                        )
+            )
+
+
+diffField : Maybe String -> String -> Dict String (List (Dict String Value)) -> Dict String (List (Dict String Value)) -> Result String (List QueryDeltaOp)
+diffField key fieldName previousResult nextResult =
     let
         oldRows =
             Dict.get fieldName previousResult |> Maybe.withDefault []
@@ -324,7 +361,7 @@ diffField fieldName previousResult nextResult =
         newRows =
             Dict.get fieldName nextResult |> Maybe.withDefault []
     in
-    case ( listRowIds oldRows, listRowIds newRows ) of
+    case ( Maybe.andThen (\name -> listRowIds name oldRows) key, Maybe.andThen (\name -> listRowIds name newRows) key ) of
         ( Just oldIds, Just newIds ) ->
             let
                 listOps =
@@ -480,16 +517,16 @@ listValueEquals left right =
         List.all identity (List.map2 valueEquals left right)
 
 
-listRowIds : List (Dict String Value) -> Maybe (List Id)
-listRowIds rows =
+listRowIds : String -> List (Dict String Value) -> Maybe (List Id)
+listRowIds key rows =
     rows
-        |> List.map extractRowId
+        |> List.map (extractRowId key)
         |> sequenceMaybe
 
 
-extractRowId : Dict String Value -> Maybe Id
-extractRowId row =
-    case Dict.get "id" row of
+extractRowId : String -> Dict String Value -> Maybe Id
+extractRowId key row =
+    case Dict.get key row of
         Just (Data.Value.IntValue id) ->
             Just (IdInt id)
 
@@ -618,21 +655,18 @@ sequenceMaybe values =
 
 {-| Extract row IDs that changed from a delta, grouped by table name.
 -}
-extractChangedRowIds : Data.Delta.Delta -> Dict String (Set Int)
-extractChangedRowIds delta =
+extractChangedRowIds : Data.Schema.SchemaMetadata -> Data.Delta.Delta -> Dict String (Set String)
+extractChangedRowIds schema delta =
     List.foldl
         (\tableGroup acc ->
             let
                 changedIds =
                     List.filterMap
                         (\row ->
-                            -- Row is a list of values, first one should be id
-                            case row of
-                                (Data.Value.IntValue id) :: _ ->
-                                    Just id
-
-                                _ ->
-                                    Nothing
+                            List.map2 Tuple.pair tableGroup.headers row
+                                |> Dict.fromList
+                                |> Dict.get (Data.Schema.primaryKey schema tableGroup.tableName)
+                                |> Maybe.andThen Data.RowId.fromValue
                         )
                         tableGroup.rows
                         |> Set.fromList
@@ -738,7 +772,7 @@ shouldReExecuteQuery schema db subscription delta =
 
         -- Get changed row IDs grouped by table
         changedRowIds =
-            extractChangedRowIds delta
+            extractChangedRowIds schema delta
 
         -- Check each table used by the query
         hasRelevantChanges =
@@ -756,8 +790,10 @@ shouldReExecuteQuery schema db subscription delta =
                                     not (Set.isEmpty (Set.diff deltaIds resultIds))
                             in
                             if not (Set.isEmpty overlappingIds) then
-                                -- Rows in result set changed - need to check WHERE clause
-                                analyzeOverlappingChanges schema db subscription tableName overlappingIds delta
+                                -- The database already contains the new visible state.
+                                -- Any result row may have changed a selected value or
+                                -- left the query; result diffing suppresses true no-ops.
+                                True
 
                             else if hasNewRows then
                                 -- New rows that aren't in result set - only re-execute if they match WHERE
@@ -793,7 +829,7 @@ fields are referenced in that clause.
 Also handles LIMIT/SORT edge cases.
 
 -}
-analyzeOverlappingChanges : Data.Schema.SchemaMetadata -> Db.Db -> QuerySubscription -> String -> Set Int -> Data.Delta.Delta -> Bool
+analyzeOverlappingChanges : Data.Schema.SchemaMetadata -> Db.Db -> QuerySubscription -> String -> Set String -> Data.Delta.Delta -> Bool
 analyzeOverlappingChanges schema db subscription tableName overlappingIds delta =
     let
         -- Get the field query for this table
@@ -861,7 +897,7 @@ analyzeOverlappingChanges schema db subscription tableName overlappingIds delta 
             True
 
 
-checkIfNewRowsMatchWhere : Data.Schema.SchemaMetadata -> Db.Db -> String -> Set Int -> QuerySubscription -> Data.Delta.Delta -> Bool
+checkIfNewRowsMatchWhere : Data.Schema.SchemaMetadata -> Db.Db -> String -> Set String -> QuerySubscription -> Data.Delta.Delta -> Bool
 checkIfNewRowsMatchWhere schema db tableName newRowIds subscription delta =
     if Set.isEmpty newRowIds then
         False
@@ -904,8 +940,8 @@ checkIfNewRowsMatchWhere schema db tableName newRowIds subscription delta =
                     Just _ ->
                         List.any
                             (\newRowArray ->
-                                case newRowArray of
-                                    (Data.Value.IntValue rowId) :: _ ->
+                                case rowArrayToDict tableGroup.headers newRowArray |> Dict.get (Db.primaryKey db tableName) |> Maybe.andThen Data.RowId.fromValue of
+                                    Just rowId ->
                                         if Set.member rowId newRowIds then
                                             let
                                                 newRow =
@@ -934,7 +970,7 @@ Gets old row values from DB, new row values from delta, and compares
 fields referenced in the WHERE clause.
 
 -}
-checkIfFilteredFieldsChanged : Db.Db -> String -> Set Int -> Db.Query.WhereClause -> Data.Delta.Delta -> Bool
+checkIfFilteredFieldsChanged : Db.Db -> String -> Set String -> Db.Query.WhereClause -> Data.Delta.Delta -> Bool
 checkIfFilteredFieldsChanged db tableName overlappingIds whereClause delta =
     let
         -- Get the table data from DB (old values)
@@ -953,8 +989,8 @@ checkIfFilteredFieldsChanged db tableName overlappingIds whereClause delta =
                 Just tableGroup ->
                     List.any
                         (\newRowArray ->
-                            case newRowArray of
-                                (Data.Value.IntValue rowId) :: _ ->
+                            case rowArrayToDict tableGroup.headers newRowArray |> Dict.get (Db.primaryKey db tableName) |> Maybe.andThen Data.RowId.fromValue of
+                                Just rowId ->
                                     if Set.member rowId overlappingIds then
                                         -- This row is in both delta and result set
                                         case Dict.get rowId oldTableData of
@@ -997,7 +1033,7 @@ rowArrayToDict headers values =
 Used for SORT field change detection.
 
 -}
-checkIfSpecificFieldsChanged : Db.Db -> String -> Set Int -> Set String -> Data.Delta.Delta -> Bool
+checkIfSpecificFieldsChanged : Db.Db -> String -> Set String -> Set String -> Data.Delta.Delta -> Bool
 checkIfSpecificFieldsChanged db tableName overlappingIds fieldsToCheck delta =
     let
         -- Get the table data from DB (old values)
@@ -1016,8 +1052,8 @@ checkIfSpecificFieldsChanged db tableName overlappingIds fieldsToCheck delta =
                 Just tableGroup ->
                     List.any
                         (\newRowArray ->
-                            case newRowArray of
-                                (Data.Value.IntValue rowId) :: _ ->
+                            case rowArrayToDict tableGroup.headers newRowArray |> Dict.get (Db.primaryKey db tableName) |> Maybe.andThen Data.RowId.fromValue of
+                                Just rowId ->
                                     if Set.member rowId overlappingIds then
                                         -- This row is in both delta and result set
                                         case Dict.get rowId oldTableData of
@@ -1159,7 +1195,20 @@ decodeIncoming =
                                 ]
                             )
                             (Decode.field "input" Decode.value)
-                            (Decode.maybe (Decode.field "optimistic" decodeOptimisticMutation))
+                            (Decode.oneOf
+                                [ Decode.field "optimistic"
+                                    (Decode.list
+                                        (Decode.map2 Tuple.pair
+                                            (Decode.field "optimistic" decodeOptimisticMutation)
+                                            (Decode.field "input" Decode.value)
+                                        )
+                                    )
+                                , Decode.map2 (\metadata input -> [ ( metadata, input ) ])
+                                    (Decode.field "optimistic" decodeOptimisticMutation)
+                                    (Decode.field "input" Decode.value)
+                                , Decode.succeed []
+                                ]
+                            )
 
                     _ ->
                         Decode.fail ("Unknown QueryManager incoming type: " ++ type_)
@@ -1168,10 +1217,11 @@ decodeIncoming =
 
 decodeOptimisticMutation : Decode.Decoder OptimisticMutation
 decodeOptimisticMutation =
-    Decode.map3 OptimisticMutation
+    Decode.map4 OptimisticMutation
         (Decode.field "queryField" Decode.string)
         (Decode.field "where" decodeOptimisticWhere)
         (Decode.field "set" (Decode.list decodeOptimisticSetField))
+        (Decode.oneOf [ Decode.field "kind" Decode.string, Decode.succeed "update" ])
 
 
 decodeOptimisticWhere : Decode.Decoder OptimisticWhere

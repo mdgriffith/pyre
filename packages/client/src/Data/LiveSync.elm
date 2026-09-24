@@ -47,6 +47,7 @@ type Incoming
     | LiveSyncError String
     | SyncCompleteReceived (Maybe String)
     | SyncRequiredReceived (Maybe String) (Maybe String) (Maybe Int)
+    | InvalidateReceived (Maybe String) String Int
 
 
 port sseOut : Encode.Value -> Cmd msg
@@ -103,6 +104,12 @@ decodeIncoming =
         |> Decode.andThen
             (\type_ ->
                 case type_ of
+                    "invalidate" ->
+                        Decode.map3 InvalidateReceived
+                            (Decode.maybe (Decode.field "databaseId" Decode.string))
+                            (Decode.field "databaseEpoch" Decode.string)
+                            (Decode.field "serverRevision" Decode.int)
+
                     "delta" ->
                         Decode.map4 DeltaReceived
                             (Decode.maybe (Decode.field "databaseId" Decode.string))

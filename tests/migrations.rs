@@ -173,7 +173,7 @@ async fn create_migration_diff(
 async fn migration_creates_single_pyre_sync_revision_row() -> Result<(), TestError> {
     let db = MigrationDatabase::new(
         r#"record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     @public
 }"#,
@@ -238,7 +238,7 @@ async fn migration_creates_single_pyre_sync_revision_row() -> Result<(), TestErr
 #[tokio::test]
 async fn test_introspection_captures_index_metadata() -> Result<(), TestError> {
     let schema = r#"record Membership {
-    id        Int @id
+    id        Id.Uuid @id
     orgId     Int
     userId    Int
     createdAt DateTime
@@ -357,7 +357,7 @@ record Event {
 async fn explicit_composite_cursor_index_is_not_duplicated() -> Result<(), TestError> {
     let db = MigrationDatabase::new(
         r#"record Event {
-    id        Int @id
+    id        Id.Uuid @id
     updatedAt DateTime
     @index(updatedAt, id)
     @public
@@ -393,13 +393,13 @@ async fn explicit_composite_cursor_index_is_not_duplicated() -> Result<(), TestE
 #[tokio::test]
 async fn sync_mode_migrations_add_and_remove_composite_cursor_indexes() -> Result<(), TestError> {
     let synced = r#"record Event {
-    id Int @id
+    id Id.Uuid @id
     @public
 }"#;
     let query_only = r#"@syncable(false)
 
 record Event {
-    id Int @id
+    id Id.Uuid @id
     @public
 }"#;
 
@@ -424,7 +424,7 @@ record Event {
 async fn migration_replaces_legacy_timestamp_index_with_composite_cursor_index(
 ) -> Result<(), TestError> {
     let schema_source = r#"record Note {
-    id Int @id
+    id Id.Uuid @id
     @public
 }"#;
     let db = MigrationDatabase::new(schema_source).await?;
@@ -472,7 +472,8 @@ create index "idx_notes_updatedAt" on "notes" ("updatedAt");
 #[tokio::test]
 async fn singleton_record_rejects_a_second_row_and_is_introspected() -> Result<(), TestError> {
     let db = MigrationDatabase::new(
-        r#"record ApplicationSettings {
+        r#"@syncable(false)
+record ApplicationSettings {
     @singleton
     @public
 
@@ -523,12 +524,12 @@ async fn singleton_record_rejects_a_second_row_and_is_introspected() -> Result<(
 async fn singleton_migrations_add_and_remove_the_constant_unique_index() -> Result<(), TestError> {
     let regular = r#"record ApplicationSettings {
     @public
-    id Int @id
+    id Id.Uuid @id
 }"#;
     let singleton = r#"record ApplicationSettings {
     @singleton
     @public
-    id Int @id
+    id Id.Uuid @id
 }"#;
 
     let add_sql = diff::to_sql::to_sql(&create_migration_diff(regular, singleton).await?);
@@ -558,12 +559,12 @@ async fn singleton_migrations_add_and_remove_the_constant_unique_index() -> Resu
 #[tokio::test]
 async fn immutable_changes_produce_no_sql_migration() -> Result<(), TestError> {
     let mutable = r#"record Document {
-    id      Int @id
+    id      Id.Uuid @id
     ownerId Int
     @public
 }"#;
     let immutable = r#"record Document {
-    id      Int @id
+    id      Id.Uuid @id
     ownerId Int @immutable
     @public
 }"#;
@@ -580,12 +581,12 @@ async fn immutable_changes_produce_no_sql_migration() -> Result<(), TestError> {
 #[tokio::test]
 async fn immutable_and_physical_changes_produce_only_physical_sql() -> Result<(), TestError> {
     let old = r#"record Document {
-    id      Int @id
+    id      Id.Uuid @id
     ownerId Int
     @public
 }"#;
     let new = r#"record Document {
-    id      Int @id
+    id      Id.Uuid @id
     ownerId Int @immutable
     summary String?
     @public
@@ -607,22 +608,22 @@ async fn immutable_and_physical_changes_produce_only_physical_sql() -> Result<()
 #[tokio::test]
 async fn test_migration_add_table() -> Result<(), TestError> {
     let old_schema = r#"record User {
-    id   Int    @id
+    id   Id.Uuid @id
     name String
     @public
 }"#;
 
     let new_schema = r#"record User {
-    id   Int    @id
+    id   Id.Uuid @id
     name String
     @public
 }
 
 record Post {
-    id        Int    @id
+    id        Id.Uuid @id
     title     String
     content   String
-    authorId  Int
+    authorId  User.id
     author    @link(authorId, User.id)
     @public
 }"#;
@@ -649,13 +650,13 @@ record Post {
 #[tokio::test]
 async fn test_migration_add_column() -> Result<(), TestError> {
     let old_schema = r#"record User {
-    id   Int    @id
+    id   Id.Uuid @id
     name String
     @public
 }"#;
 
     let new_schema = r#"record User {
-    id    Int    @id
+    id    Id.Uuid @id
     name  String
     email String
     @public
@@ -687,7 +688,7 @@ async fn test_migration_add_column() -> Result<(), TestError> {
 #[tokio::test]
 async fn test_migration_adds_composite_unique_and_partial_ordered_index() -> Result<(), TestError> {
     let old_schema = r#"record Membership {
-    id        Int @id
+    id        Id.Uuid @id
     orgId     Int
     userId    Int
     createdAt DateTime
@@ -696,7 +697,7 @@ async fn test_migration_adds_composite_unique_and_partial_ordered_index() -> Res
 }"#;
 
     let new_schema = r#"record Membership {
-    id        Int @id
+    id        Id.Uuid @id
     orgId     Int
     userId    Int
     createdAt DateTime
@@ -745,14 +746,14 @@ async fn test_migration_adds_composite_unique_and_partial_ordered_index() -> Res
 #[tokio::test]
 async fn test_migration_remove_column() -> Result<(), TestError> {
     let old_schema = r#"record User {
-    id    Int    @id
+    id    Id.Uuid @id
     name  String
     email String
     @public
 }"#;
 
     let new_schema = r#"record User {
-    id   Int    @id
+    id   Id.Uuid @id
     name String
     @public
 }"#;
@@ -782,13 +783,13 @@ async fn test_migration_remove_column() -> Result<(), TestError> {
 #[tokio::test]
 async fn test_migration_change_column_type() -> Result<(), TestError> {
     let old_schema = r#"record User {
-    id   Int    @id
+    id   Id.Uuid @id
     age  Int
     @public
 }"#;
 
     let new_schema = r#"record User {
-    id   Int     @id
+    id   Id.Uuid @id
     age  String
     @public
 }"#;

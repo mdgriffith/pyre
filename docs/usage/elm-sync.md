@@ -11,6 +11,7 @@ There are three layers:
    - Owns concrete database ID construction, such as `"main"` or `"campaign:123"`.
    - Registers/unregisters queries.
    - Receives query results/deltas.
+   - Constructs opaque edits, explicitly submits them, and handles typed receipts.
 
 2. **TypeScript bridge**
    - Hosts `PyreClient` from `@pyre/client`.
@@ -22,7 +23,7 @@ There are three layers:
    - `@pyre/server/sync` routes (`/sync`, `/sync/events`, query route).
    - Computes catchup and live deltas.
 
-Elm should not reimplement sync transport details. Keep transport/stateful runtime concerns in the TS bridge.
+The bridge connects the app to one worker engine that owns authoritative rows, optimistic intent, and reconciliation. Query and entity readers share its visible state. Elm should not reimplement transport or maintain a separate optimistic cache.
 
 ## Client runtime setup
 
@@ -163,6 +164,7 @@ Elm → TS:
 - `update-input`
 - `unregister`
 - `mutate`
+- `submit`
 
 Generated `Pyre` returns effects as data:
 
@@ -170,12 +172,65 @@ Generated `Pyre` returns effects as data:
 type Effect
     = NoEffect
     | Send Encode.Value
+    | QueryUpdated String QueryId
     | LogError Encode.Value
 ```
 
-The host app should map `Send`/`LogError` to its own outgoing ports.
+The host app should send `Send` through `pyreStoreOut`, handle `LogError`, and react to `QueryUpdated databaseId queryId` when needed. Generated query storage is keyed by database instance and query ID. Read it with `Pyre.getResult databaseId queryId model.<queryField>`; custom bridges must preserve `databaseId` on incoming results. Equal query IDs in different database instances are independent.
 
-For standard writes, prefer the generated mutation modules in `Query.*`.
+## Composed Writes And Typed Receipts
+
+For standard CRUD, prefer `Db.Edit.<Record>` builders. For example, given a writable `Document` record with `id Id.Uuid @id`, `title String`, and `summary String?`:
+
+```elm
+import Db.Edit
+import Db.Edit.Document as Document
+
+
+save databaseId requestId documentId =
+    Db.Edit.submit databaseId requestId
+        [ Document.update documentId
+            [ Document.title "New title"
+            , Document.summary Nothing
+            ]
+        ]
+
+
+create databaseId requestId =
+    Db.Edit.submit databaseId requestId
+        [ Document.create
+            { title = "New document" }
+            [ Document.withSummary (Just "Summary") ]
+        ]
+```
+
+Send the returned value with `pyreStoreOut (save databaseId requestId documentId)` from the app's update function. Keep a unique request ID for each in-flight submission and retain its expected database ID and operation order in your model. Use the schema-derived `Db.Id` value for `documentId` (for an external UUID, `Db.Id.uuid uuidString`). Do not invent raw wire descriptors.
+
+Builders are pure and record-specific. Required create inputs are a record; optional create fields use `withField` builders. For nullable updates, omission leaves a field unchanged, `Nothing` clears it, and `Just value` sets it. `Patch` and `CreateOption` constructors are opaque; generated names may gain underscore suffixes to avoid collisions, so consult the generated module. JSON/union fields replace whole logical values.
+
+All edits in one `Db.Edit.submit` execute in order in one server transaction, targeting one typed namespace and concrete database. The bridge captures a UUIDv7 for each create once before worker dispatch; do not provide a UUID primary key in create input. There are no intra-batch generated-ID references. Use a successful create result for a later dependent submission.
+
+Subscribe to the mutation-result port and decode a completion against the database and request retained in your model:
+
+```elm
+-- In a port module:
+port pyre_receiveMutationResult : (Decode.Value -> msg) -> Sub msg
+
+
+decodeSave databaseId requestId wire =
+    Db.Edit.receive databaseId requestId wire
+        |> Result.andThen (Document.updateResult 0)
+```
+
+Import `Json.Decode as Decode` for the port type. Wire the subscription to an application message (for example `pyre_receiveMutationResult Received`). In its update branch, handle `Ok returnData` and `Err message`; a mismatched database/request is a decode error, not another request's completion. For a create use `Document.createResult index`; for a delete use `Document.deleteResult index`. Accessors check the operation index and compiled query identity, and decode its generated return type.
+
+Submission installs supported prediction in the existing worker; ordinary query publications update the UI. Do not apply the receipt as a second cache patch. Handle bridge dispatch errors through the configured `elm.onError` callback as well as mutation-result failures. Pending edits are memory-only, and unknown outcomes must not be automatically retried. See [Sync Outcomes And Recovery](./sync.md#shared-visible-state-and-outcomes).
+
+The repository's `tests/fixtures/ComposedExample.elm` demonstrates the complete model/effect/port path and database-scoped query storage; its generated-browser lifecycle is exercised by `cargo test --test crud_builders`.
+
+## Named Mutation Compatibility
+
+Generated mutation modules in `Query.*` remain available for individual commands and existing integrations.
 
 Pyre generates default CRUD mutations for writable tables:
 
@@ -183,11 +238,11 @@ Pyre generates default CRUD mutations for writable tables:
 - `{Table}Update`
 - `{Table}Delete`
 
-That means Elm app code can usually initiate writes through generated modules like `Query.DocumentCreate`, `Query.DocumentUpdate`, and `Query.DocumentDelete` without authoring custom mutation queries first.
+These are the compiled operations used by the CRUD builders. Existing code can still call `Query.DocumentCreate`, `Query.DocumentUpdate`, and `Query.DocumentDelete` directly; unlike the builder path, direct create inputs must include any required identity, and generated UUID creates require canonical UUIDv7.
 
 Reach for a handwritten mutation query only when the write is not simple CRUD, such as nested inserts or other custom write behavior.
 
-Generated update mutation modules use `Db.Updates` for nullable update fields so Elm can distinguish:
+The lower-level generated `Query.*` update inputs use `Db.Updates` for omittable fields so Elm can distinguish:
 
 - set a value
 - leave the field unchanged
@@ -229,14 +284,14 @@ This is what allows single-column updates from Elm without conflating `null` and
 
 Notes:
 
-- Use generated `Pyre.elm` and `Query.*` modules as the Elm API surface.
+- Use generated `Pyre.elm`, `Db.Edit`, `Db.Edit.<Record>`, and `Query.*` modules as the Elm API surface. Do not import `Db.Internal.Edit` in application code.
 - Let `PyreClient` handle the bridge protocol; app code should not construct register or mutate payloads by hand.
 - Generated query shapes preserve filters, sorting, and limits automatically.
 
 TS → Elm:
 
 - Forward incoming query data to the generated `Pyre.decodeIncomingDelta` path.
-- Forward incoming mutation results to the generated mutation module decoders.
+- Decode composed completions through `Db.Edit.receive` and record-specific result accessors; use generated mutation module decoders for individual `Query.*` commands.
 
 Generated mutation modules expose `mutationRequest databaseId requestId input` and `decodeMutationResult`, so Elm can initiate mutations and handle results without needing to know the bridge payload format.
 

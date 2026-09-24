@@ -2,6 +2,13 @@
 
 ## Overview
 
+The examples below describe the schema-derived field expansion. Current compiled
+CRUD uses flat per-field input parameters (not a nested `$input` object), and the
+actual schema primary-key name rather than assuming `id`. Generated edit builders
+omit UUID create IDs and allocate UUIDv7 once; synced namespaces require UUID keys.
+See [operation builders](composed-operation-builders.md) for the current public
+TypeScript/Elm APIs, execution contract and runnable examples.
+
 Pyre can generate built-in CRUD mutations for writable tables so applications do not need to author low-value single-table mutation queries by hand.
 
 These generated mutations are part of the compiled query surface even though they do not come from a user-authored `.pyre` file.

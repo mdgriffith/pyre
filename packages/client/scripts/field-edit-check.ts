@@ -1,0 +1,127 @@
+import assert from 'node:assert/strict';
+import { realpathSync } from 'node:fs';
+import { dirname } from 'node:path';
+
+// Use the installed Playwright rather than adding another browser dependency.
+const { chromium } = await import(`${dirname(realpathSync(Bun.which('playwright')!))}/index.mjs`);
+const url = process.argv[2].replace(/\/$/, '');
+const browser = await chromium.launch({ headless: true });
+try {
+  const context = await browser.newContext();
+  const a = await context.newPage();
+  const bContext = await browser.newContext();
+  const b = await bContext.newPage();
+  for (const [page, name] of [[a, 'a'], [b, 'b']] as const) {
+    page.on('pageerror', console.error);
+    const wait = page.waitForFunction.bind(page);
+    page.waitForFunction = async (...args) => {
+      try { return await wait(...args); }
+      catch (error) {
+        console.error('Wait failed', name, String(args[0]), await page.evaluate('window.proof && { rows: proof.rows, connected: proof.connected, results: proof.results }'));
+        throw error;
+      }
+    };
+    await page.goto(`${url}/${name}`);
+    try {
+      await page.waitForFunction('window.proof?.rows?.length === 2 && proof.connected');
+    } catch (error) {
+      console.error('Initial state', name, await page.evaluate('window.proof && { rows: proof.rows, connected: proof.connected, batches: proof.batches }'));
+      throw error;
+    }
+  }
+  await a.waitForFunction("async () => (await (await fetch('/stats')).json()).connections.length === 2");
+  const migration = await a.evaluate('proof.verifyIdentityMigration()');
+  assert.deepEqual(migration.before, { rows: {}, revision: null, stamps: [], cursor: { tables: {} } });
+  assert.deepEqual(migration.rows, [{ id: '00000000-0000-7000-8000-000000000001', title: 'Current' }]);
+  assert.deepEqual(migration.stamps, [['notes', '00000000-0000-7000-8000-000000000001', 2]]);
+  assert.deepEqual(await a.evaluate('proof.verifyRemovalPersistence()'), { rows: [], stamps: [['notes', '00000000-0000-7000-8000-000000000003', 3]] });
+  const initial = await (await a.request.get(`${url}/stats`)).json();
+  await a.evaluate("proof.edit('normalized')");
+  await a.waitForFunction("proof.rows[0].title === 'NORMALIZED'");
+  await b.waitForFunction("proof.rows[0].title === 'NORMALIZED'");
+  assert(await a.evaluate("proof.batches.some(b => b.source === 'optimistic' && b.changes.some(c => c.row.title === 'normalized'))"));
+  assert(await a.evaluate("proof.batches.some(b => b.source === 'mutation-response' && b.changes.some(c => c.row.title === 'NORMALIZED'))"));
+  assert(await b.evaluate("proof.batches.some(b => b.source === 'live' && b.changes.some(c => c.row.title === 'NORMALIZED'))"));
+  const stats = await (await a.request.get(`${url}/stats`)).json();
+  assert.equal(stats.catchup, initial.catchup);
+  assert.equal(stats.delta, initial.delta + 1);
+  assert.deepEqual(await a.evaluate('proof.rows'), await b.evaluate('proof.rows'));
+  await a.waitForFunction("async () => (await proof.persisted())[0].title === 'NORMALIZED'");
+
+  await a.evaluate("proof.edit('reject')");
+  await a.waitForFunction("proof.results.length === 2 && proof.rows[0].title === 'NORMALIZED'");
+  assert(await a.evaluate("proof.results.at(-1).ok === false"));
+  assert(await a.evaluate("proof.batches.at(-1).changes[0].row.title === 'NORMALIZED'"));
+
+  const beforeBatch = await (await a.request.get(`${url}/stats`)).json();
+  const optimisticBefore = await a.evaluate("proof.batches.filter(b => b.source === 'optimistic').length");
+  const batch = await a.evaluate("proof.batch([{ id: '00000000-0000-7000-8000-000000000001', title: 'intermediate' }, { id: '00000000-0000-7000-8000-000000000002', title: 'second' }, { id: '00000000-0000-7000-8000-000000000001', title: 'final' }])");
+  assert.equal(batch.ok, true);
+  assert.deepEqual(batch.value.map((entry: any) => entry.index), [0, 1, 2]);
+  await b.waitForFunction("proof.rows[0].title === 'FINAL' && proof.rows[1].title === 'SECOND'");
+  assert.deepEqual(await a.evaluate('proof.rows'), await b.evaluate('proof.rows'));
+  assert.equal(await a.evaluate("proof.batches.filter(b => b.source === 'optimistic').length"), optimisticBefore + 1);
+  const afterBatch = await (await a.request.get(`${url}/stats`)).json();
+  assert.equal(afterBatch.mutations, beforeBatch.mutations + 1);
+  assert.equal(afterBatch.delta, beforeBatch.delta + 1);
+  assert.equal(afterBatch.catchup, beforeBatch.catchup);
+  const rejected = await a.evaluate("proof.batch([{ id: '00000000-0000-7000-8000-000000000001', title: 'rollback' }, { id: '00000000-0000-7000-8000-000000000999', title: 'missing' }])");
+  assert.equal(rejected.ok, false);
+  assert.deepEqual(await a.evaluate('proof.rows'), await b.evaluate('proof.rows'));
+  await a.waitForFunction("async () => (await proof.persisted())[0].title === 'FINAL'");
+
+  // Keep the committed HTTP response held across an incremental permission loss.
+  const beforeRemoval = await (await a.request.get(`${url}/stats`)).json();
+  await b.evaluate("proof.edit('hold')");
+  await b.waitForFunction("proof.rows[0].title === 'hold'");
+  await a.waitForFunction("proof.rows[0].title === 'HOLD'");
+  assert.equal(await b.evaluate("(async () => (await proof.late())[0].changes[0].row.title)()"), 'hold');
+  await a.evaluate("proof.edit('hidden')");
+  await a.waitForFunction("proof.rows[0].title === 'HIDDEN'");
+  await b.waitForFunction("proof.rows.length === 1 && proof.rows[0].noteKey === '00000000-0000-7000-8000-000000000002'");
+  await b.waitForFunction("async () => (await proof.persisted()).length === 1");
+  assert(await b.evaluate("proof.batches.some(b => b.changes.some(c => c.id === '00000000-0000-7000-8000-000000000001' && c.op === 'remove'))"));
+  await b.request.get(`${url}/release`);
+  await b.waitForFunction('proof.results.length === 1');
+  // The write committed successfully; its older authority cannot undo removal.
+  assert.equal(await b.evaluate('proof.results[0].ok'), true);
+  assert.equal(await b.evaluate('proof.rows[0].noteKey'), '00000000-0000-7000-8000-000000000002');
+  assert.equal(await b.evaluate('proof.rows[0].id'), 'ordinary');
+  assert.deepEqual(await b.evaluate('(async () => (await proof.persisted()).map(r => r.noteKey))()'), ['00000000-0000-7000-8000-000000000002']);
+  const afterRemoval = await (await a.request.get(`${url}/stats`)).json();
+  assert.equal(afterRemoval.catchup, beforeRemoval.catchup);
+  assert.equal(afterRemoval.invalidation, beforeRemoval.invalidation);
+
+  await b.reload();
+  await b.waitForFunction('window.proof?.connected && proof.rows?.length === 1');
+  assert.equal(await b.evaluate('proof.rows[0].noteKey'), '00000000-0000-7000-8000-000000000002');
+  assert.deepEqual(await b.evaluate('(async () => (await proof.late())[0].changes.map(c => c.id))()'), ['00000000-0000-7000-8000-000000000002']);
+
+  // A normal reconnect must not empty query/entity readers or reload the cache.
+  // Recovery of removals missed while offline is tracked separately.
+  await a.evaluate("proof.edit('visible')");
+  await b.waitForFunction('proof.connected && proof.rows.length === 2');
+  await b.waitForFunction('async () => (await proof.persisted()).length === 2');
+  const beforeReconnect = await (await a.request.get(`${url}/stats`)).json();
+  const beforeRows = await b.evaluate('proof.rows');
+  await b.evaluate('proof.rowHistory.length = 0; proof.batches.length = 0');
+  await bContext.setOffline(true);
+  await a.request.get(`${url}/disconnect-b`);
+  assert.deepEqual(await b.evaluate('proof.rows'), beforeRows);
+  await bContext.setOffline(false);
+  const reconnectDeadline = Date.now() + 30000;
+  while (true) {
+    const stats = await (await a.request.get(`${url}/stats`)).json();
+    if (stats.handshakes > beforeReconnect.handshakes && stats.connections.includes('b')) break;
+    assert(Date.now() < reconnectDeadline, 'Reader must re-establish its SSE connection');
+    await Bun.sleep(50);
+  }
+  await a.evaluate("proof.edit('after reconnect')");
+  await a.waitForFunction("proof.rows[0].title === 'AFTER RECONNECT'");
+  await b.waitForFunction("proof.rows[0].title === 'AFTER RECONNECT'");
+  assert(await b.evaluate('proof.rowHistory.every(rows => rows.length === 2)'));
+  assert(await b.evaluate("proof.batches.every(batch => batch.changes.every(change => change.op !== 'remove'))"));
+  assert.equal((await (await a.request.get(`${url}/stats`)).json()).catchup, beforeReconnect.catchup);
+  await b.waitForFunction("async () => (await proof.persisted())[0].title === 'AFTER RECONNECT'");
+  console.log('PASS: two native clients, atomic submission/rollback, incremental authority, held-response safety, reconnect reader continuity, persistence and reload');
+} finally { await browser.close(); }

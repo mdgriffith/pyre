@@ -281,6 +281,7 @@ fn snapshot_select_duplicate_nested_link_names() {
 
 fn duplicate_image_link_schema() -> &'static str {
     r#"
+@syncable(false)
 record Outfit {
     id Int @id
     garments @link(id, OutfitGarment.outfitId)
@@ -489,6 +490,7 @@ fn snapshot_insert_nested_zero_field_union() {
     check_snapshot(
         "insert_nested_zero_field_union",
         r#"
+@syncable(false)
 type VoteHandState
    = HandLowered
    | HandRaised
@@ -644,6 +646,7 @@ fn snapshot_perm_select_session_membership() {
     check_snapshot(
         "perm_select_session_membership",
         r#"
+@syncable(false)
 session {
     activeClocktowerGameIds Json<List<String>>
 }
@@ -671,6 +674,7 @@ fn snapshot_constant_query_permissions() {
     check_snapshot(
         "constant_query_permissions",
         r#"
+@syncable(false)
 record VisiblePost {
     id Int @id
     @allow(query) { True }

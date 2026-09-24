@@ -1,7 +1,7 @@
 -- query: SeedNull
 -- statement 1 of 1 (returns rows)
 insert into clocktowerLifecycles (id, end, status, updatedAt)
-values ($id, null, 'running', unixepoch()) returning json_object('id', "id", 'end', json("end"), 'status', "status") as "clocktowerLifecycle", json_array(json_object('table_name', 'clocktowerLifecycles', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt")))) as _affectedRows
+values ($id, null, 'running', unixepoch()) returning json_object('id', "id", 'end', json("end"), 'status', "status") as "clocktowerLifecycle", json_array(json_object('table_name', 'clocktowerLifecycles', 'primary_key', 'id', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt")))) as _affectedRows
 
 -- query: GetNull
 -- statement 1 of 1 (returns rows)
@@ -23,17 +23,21 @@ select
 from temp_selected_clocktowerLifecycle
 
 -- query: EndLifecycle
--- statement 1 of 1 (returns rows)
+-- statement 1 of 2 (returns rows)
+select json_array(json_insert(json_object('table_name', 'clocktowerLifecycles', 'primary_key', 'id', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt"))), '$.headers[#]', '_pyre_preimage', '$.rows[0][#]', json('true'))) as _affectedRows from clocktowerLifecycles
+where
+ "clocktowerLifecycles"."end" is null
+
+-- statement 2 of 2 (returns rows)
 update clocktowerLifecycles
 set status = 'ended', updatedAt = unixepoch()
 where
  "clocktowerLifecycles"."end" is null
- returning json_object('status', "status") as "clocktowerLifecycle", json_array(json_object('table_name', 'clocktowerLifecycles', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt")))) as _affectedRows
+ returning json_object('status', "status") as "clocktowerLifecycle", json_array(json_object('table_name', 'clocktowerLifecycles', 'primary_key', 'id', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt")))) as _affectedRows
 
 -- query: DeleteNull
 -- statement 1 of 1 (returns rows)
 delete from clocktowerLifecycles
 where
  "clocktowerLifecycles"."end" is null
- returning json_object() as "clocktowerLifecycle", json_array(json_object('table_name', 'clocktowerLifecycles', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt")))) as _affectedRows
-
+ returning json_object() as "clocktowerLifecycle", json_array(json_insert(json_object('table_name', 'clocktowerLifecycles', 'primary_key', 'id', 'headers', json_array('id', 'end', 'status', 'updatedAt'), 'rows', json_array(json_array("id", "end", "status", "updatedAt"))), '$.headers[#]', '_pyre_removed', '$.rows[0][#]', json('true'))) as _affectedRows

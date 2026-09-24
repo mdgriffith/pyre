@@ -27,7 +27,7 @@ session {
     root Root
 }
 record Note {
-    id Id.Int @id
+    id Id.Uuid @id
     ownerId Int
     score Float
     scope Scope
@@ -36,7 +36,7 @@ record Note {
     @allow(*) { ownerId == Session.userId }
 }
 record Reply {
-    id Id.Int @id
+    id Id.Uuid @id
     noteId Note.id
     ownerId Int
     @public
@@ -113,6 +113,7 @@ record Reply {
 #[test]
 fn generated_typescript_transaction_has_shared_input_and_step_results() {
     let schema_source = r#"
+@syncable(false)
 record Note {
     id Id.Int @id
     body String
@@ -173,7 +174,7 @@ session {
 record Rulebook {
     @public
 
-    id Id.Int @id
+    id Id.Uuid @id
     ownerId Int
     name String
 }
@@ -230,6 +231,7 @@ query GetRulebookByName($name: String) {
 #[test]
 fn generated_typescript_query_input_validates_typed_json_params_without_stringifying() {
     let schema_source = r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -306,6 +308,7 @@ insert SeedEvent($payload: Json<Lifecycle>) {
 #[test]
 fn generated_typescript_datetime_input_preserves_public_type_and_coerces_at_runtime() {
     let schema_source = r#"
+@syncable(false)
 record Event {
     @public
     id Id.Int @id
@@ -354,7 +357,7 @@ fn generated_typescript_crud_omits_immutable_update_artifacts() {
         r#"
 record Document {
     @public
-    id      Int @id
+    id      Id.Uuid @id
     ownerId Int @immutable
     title   String
 }

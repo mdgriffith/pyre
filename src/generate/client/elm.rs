@@ -121,7 +121,7 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
 
     result.push_str("type EntityChange\n");
     if records.is_empty() {
-        result.push_str("    = EntityDecodeFailed String Decode.Value\n\n\n");
+        result.push_str("    = EntityDecodeFailed String Decode.Value\n    | EntityRemoved String Decode.Value\n\n\n");
     } else {
         for (index, record) in records.iter().enumerate() {
             let prefix = if index == 0 { "    = " } else { "    | " };
@@ -130,7 +130,7 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
                 prefix, record.record_name, record.table_module_segment
             ));
         }
-        result.push_str("    | EntityDecodeFailed String Decode.Value\n\n\n");
+        result.push_str("    | EntityDecodeFailed String Decode.Value\n    | EntityRemoved String Decode.Value\n\n\n");
     }
 
     result.push_str("type EntityChangeBatchSource\n    = IndexedDbInitial\n    | Catchup\n    | Live\n    | UnknownSource String\n\n\n");
@@ -193,6 +193,10 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
 
     result.push_str("entityChangeDecoder : Decode.Decoder EntityChange\n");
     result.push_str("entityChangeDecoder =\n");
+    result.push_str("    Decode.field \"op\" Decode.string\n        |> Decode.andThen\n            (\\op ->\n                case op of\n                    \"remove\" ->\n                        Decode.map2 EntityRemoved\n                            (Decode.field \"tableName\" Decode.string)\n                            (Decode.field \"id\" Decode.value)\n\n                    \"row\" ->\n                        rowEntityChangeDecoder\n\n                    _ ->\n                        Decode.fail (\"Unknown entity operation: \" ++ op)\n            )\n\n\n");
+    result.push_str(
+        "rowEntityChangeDecoder : Decode.Decoder EntityChange\nrowEntityChangeDecoder =\n",
+    );
     result.push_str("    Decode.map2 Tuple.pair\n");
     result.push_str("        (Decode.field \"tableName\" Decode.string)\n");
     result.push_str("        (Decode.field \"row\" Decode.value)\n");
@@ -712,7 +716,7 @@ fn database_column_type(
 fn entity_stream_id_type(fields: &Vec<ast::Field>) -> Option<(String, &'static str)> {
     for field in fields {
         if let ast::Field::Column(column) = field {
-            if column.name != "id" {
+            if !ast::is_primary_key(column) {
                 continue;
             }
 
@@ -917,15 +921,27 @@ fn collect_id_brands(database: &ast::Database) -> Vec<(String, IdKind)> {
     for schema in &database.schemas {
         for file in &schema.files {
             for definition in &file.definitions {
-                if let ast::Definition::Record { fields, .. } = definition {
+                if let ast::Definition::Record { name, fields, .. } = definition {
                     for field in fields {
                         if let ast::Field::Column(column) = field {
                             match &column.type_ {
-                                ast::ColumnType::IdInt { table } if !table.is_empty() => {
-                                    brands.entry(table.clone()).or_insert(IdKind::Int);
+                                ast::ColumnType::IdInt { table } => {
+                                    brands
+                                        .entry(if table.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            table.clone()
+                                        })
+                                        .or_insert(IdKind::Int);
                                 }
-                                ast::ColumnType::IdUuid { table } if !table.is_empty() => {
-                                    brands.entry(table.clone()).or_insert(IdKind::Uuid);
+                                ast::ColumnType::IdUuid { table } => {
+                                    brands
+                                        .entry(if table.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            table.clone()
+                                        })
+                                        .or_insert(IdKind::Uuid);
                                 }
                                 _ => {}
                             }
@@ -955,22 +971,16 @@ fn find_table<'a>(lookup: &'a ElmLookup, table_name: &str) -> Option<&'a ast::Re
     lookup.records_by_name.get(&table_name.to_ascii_lowercase())
 }
 
-fn get_id_kind_for_brand(lookup: &ElmLookup, brand: &str) -> Option<IdKind> {
-    let table = find_table(lookup, brand)?;
-
-    for field in &table.fields {
-        if let ast::Field::Column(column) = field {
-            if column.name == "id" {
-                return match &column.type_ {
-                    ast::ColumnType::IdInt { .. } => Some(IdKind::Int),
-                    ast::ColumnType::IdUuid { .. } => Some(IdKind::Uuid),
-                    _ => None,
-                };
-            }
-        }
+fn branded_column_type(type_: &ast::ColumnType, record: &str) -> ast::ColumnType {
+    match type_ {
+        ast::ColumnType::IdUuid { table } if table.is_empty() => ast::ColumnType::IdUuid {
+            table: record.into(),
+        },
+        ast::ColumnType::IdInt { table } if table.is_empty() => ast::ColumnType::IdInt {
+            table: record.into(),
+        },
+        _ => type_.clone(),
     }
-
-    None
 }
 
 fn resolve_foreign_key_column_type(lookup: &ElmLookup, type_: &str) -> Option<ast::ColumnType> {
@@ -980,26 +990,12 @@ fn resolve_foreign_key_column_type(lookup: &ElmLookup, type_: &str) -> Option<as
     for field in &table.fields {
         if let ast::Field::Column(column) = field {
             if column.name == field_name {
-                return Some(column.type_.clone());
+                return Some(branded_column_type(&column.type_, &table.name));
             }
         }
     }
 
     None
-}
-
-fn id_encoder(kind: IdKind) -> &'static str {
-    match kind {
-        IdKind::Int => "Db.Id.encodeInt",
-        IdKind::Uuid => "Db.Id.encodeUuid",
-    }
-}
-
-fn id_decoder(kind: IdKind) -> &'static str {
-    match kind {
-        IdKind::Int => "Db.Id.decodeInt",
-        IdKind::Uuid => "Db.Id.decodeUuid",
-    }
 }
 
 pub fn write_schema(database: &ast::Database) -> String {
@@ -1388,7 +1384,7 @@ fn id_kind_for_brand(database: &ast::Database, brand: &str) -> Option<IdKind> {
 
                     for field in fields {
                         if let ast::Field::Column(column) = field {
-                            if column.name == "id" {
+                            if ast::is_primary_key(column) {
                                 return match &column.type_ {
                                     ast::ColumnType::IdInt { .. } => Some(IdKind::Int),
                                     ast::ColumnType::IdUuid { .. } => Some(IdKind::Uuid),
@@ -1607,13 +1603,7 @@ fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
         ),
         ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.encodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(kind) = get_id_kind_for_brand(lookup, table) {
-                    return id_encoder(kind).to_string();
-                }
-            }
-
+        ast::ColumnType::ForeignKey { .. } => {
             if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
                 return to_elm_encoder(lookup, &col_type);
             }
@@ -1635,6 +1625,34 @@ pub fn generate_queries(
     files: &mut Vec<GeneratedFile<String>>,
 ) {
     let mut query_names: Vec<String> = Vec::new();
+    files.push(generate_text_file(
+        base_out_dir.join("Db/Edit.elm"),
+        include_str!("./static/elm/src/Db/Edit.elm"),
+    ));
+    files.push(generate_text_file(
+        base_out_dir.join("Db/Internal/Edit.elm"),
+        include_str!("./static/elm/src/Db/Internal/Edit.elm"),
+    ));
+
+    let mut edit_modules: HashMap<String, Vec<&ast::Query>> = HashMap::new();
+    for definition in &query_list.queries {
+        if let ast::QueryDef::Query(query) = definition {
+            if let Some(table) = crate::generated_queries::generated_crud_table(context, query) {
+                edit_modules
+                    .entry(table.record.name.clone())
+                    .or_default()
+                    .push(query);
+            }
+        }
+    }
+    let mut records: Vec<_> = edit_modules.into_iter().collect();
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+    for (record, queries) in records {
+        files.push(generate_text_file(
+            base_out_dir.join(format!("Db/Edit/{record}.elm")),
+            to_edit_module(context, all_query_info, &record, &queries),
+        ));
+    }
 
     for operation in &query_list.queries {
         match operation {
@@ -1661,6 +1679,251 @@ pub fn generate_queries(
             generate_pyre_module(context, all_query_info, query_list, &query_names),
         ));
     }
+}
+
+// Named values exposed by Elm 0.19's default Basics import. Keep this exception
+// local to Elm identifier generation; schema and wire names remain unchanged.
+const ELM_PRELUDE_VALUE_NAMES: &[&str] = &[
+    "identity",
+    "always",
+    "never",
+    "not",
+    "xor",
+    "compare",
+    "min",
+    "max",
+    "clamp",
+    "toFloat",
+    "round",
+    "floor",
+    "ceiling",
+    "truncate",
+    "modBy",
+    "remainderBy",
+    "negate",
+    "abs",
+    "sqrt",
+    "logBase",
+    "e",
+    "pi",
+    "cos",
+    "sin",
+    "tan",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "degrees",
+    "radians",
+    "turns",
+    "toPolar",
+    "fromPolar",
+    "isNaN",
+    "isInfinite",
+];
+
+fn to_edit_module(
+    context: &typecheck::Context,
+    info: &HashMap<String, typecheck::QueryInfo>,
+    record: &str,
+    queries: &[&ast::Query],
+) -> String {
+    let lookup = ElmLookup::from_context(context);
+    let mut exposing = vec!["Patch".to_string(), "CreateOption".to_string()];
+    let mut used_names: HashSet<String> = [
+        "create",
+        "update",
+        "delete",
+        "optimistic",
+        "createResult",
+        "updateResult",
+        "deleteResult",
+        "optimisticCreate",
+        "optimisticDelete",
+        "id",
+        "value",
+        "input",
+        "options",
+        "patches",
+        "pair",
+    ]
+    .into_iter()
+    .chain(ELM_PRELUDE_VALUE_NAMES.iter().copied())
+    .map(str::to_string)
+    .collect();
+    let mut builder_names = HashMap::new();
+    // Reserve patch names first, then disambiguate optional-create builders.
+    for operation in [ast::QueryOperation::Update, ast::QueryOperation::Insert] {
+        for query in queries.iter().filter(|query| query.operation == operation) {
+            for arg in query.args.iter().filter(|arg| arg.omittable) {
+                let prefix = if operation == ast::QueryOperation::Update {
+                    "patch"
+                } else {
+                    "create"
+                };
+                let mut name = if operation == ast::QueryOperation::Update {
+                    arg.name.clone()
+                } else {
+                    format!("with{}", string::capitalize(&arg.name))
+                };
+                while !used_names.insert(name.clone()) {
+                    name.push('_');
+                }
+                builder_names.insert((prefix, arg.name.clone()), name);
+            }
+        }
+    }
+    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Internal.Edit as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict\nimport Json.Encode as Encode\nimport Time\n");
+    for query in queries {
+        body.push_str(&format!("import Query.{}\n", query.name));
+    }
+    body.push_str("\n\ntype Patch\n    = Patch ( String, Encode.Value )\n\n\ntype CreateOption\n    = CreateOption ( String, Encode.Value )\n\n\n");
+    for query in queries {
+        let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
+        let key = ast::collect_columns(&table.record.fields)
+            .into_iter()
+            .find(|c| ast::is_primary_key(c))
+            .unwrap();
+        let namespace = elm_database_namespace(&info[&query.name].primary_db);
+        let edit_type = format!("Internal.Edit Db.Database.{namespace}");
+        let result_name = match query.operation {
+            ast::QueryOperation::Insert => "createResult",
+            ast::QueryOperation::Update => "updateResult",
+            _ => "deleteResult",
+        };
+        exposing.push(result_name.into());
+        body.push_str(&format!("{result_name} : Int -> Db.Edit.Receipt Db.Database.{namespace} -> Result String Query.{0}.ReturnData\n{result_name} =\n    Db.Edit.result Query.{0}.id Query.{0}.decodeReturnData\n\n\n", query.name));
+        let construct = |input: &str, optimistic: &str, create_id: &str| {
+            format!(
+                "Internal.Edit {{ queryId = {}, input = {}, optimistic = {}, createId = {} }}",
+                string::quote(&query.interface_hash),
+                input,
+                optimistic,
+                create_id
+            )
+        };
+        match query.operation {
+            ast::QueryOperation::Update | ast::QueryOperation::Delete => {
+                let key_arg = query.args.iter().find(|arg| arg.name == key.name).unwrap();
+                let key_type = to_elm_typename(&lookup, key_arg.type_.as_deref().unwrap(), false);
+                let key_encoder =
+                    to_param_encoder_str(&lookup, key_arg.type_.as_deref().unwrap(), false);
+                let key_pair = format!("( {}, {} id )", string::quote(&key.name), key_encoder);
+                if query.operation == ast::QueryOperation::Update {
+                    exposing.push("update".into());
+                    // Prediction is compiler-owned and independent of argument values.
+                    let optimistic = to_optimistic_update_elm(context, query, "optimistic", "()")
+                        .unwrap_or_else(|| {
+                            "optimistic : () -> Encode.Value\noptimistic _ =\n    Encode.null\n\n\n"
+                                .into()
+                        });
+                    body.push_str(&optimistic);
+                    body.push_str(&format!("update : ({key_type}) -> List Patch -> {edit_type}\nupdate id patches =\n    {}\n\n\n", construct(&format!("(Encode.object ({key_pair} :: List.map (\\(Patch pair) -> pair) patches))"), "(optimistic ())", "Nothing")));
+                    for arg in query.args.iter().filter(|arg| arg.omittable) {
+                        let name = builder_names[&("patch", arg.name.clone())].clone();
+                        exposing.push(name.clone());
+                        let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                        let type_ = if arg.nullable {
+                            format!("Maybe ({base})")
+                        } else {
+                            base
+                        };
+                        let encoder = to_param_encoder_str(
+                            &lookup,
+                            arg.type_.as_deref().unwrap(),
+                            arg.nullable,
+                        );
+                        body.push_str(&format!("{name} : ({type_}) -> Patch\n{name} value =\n    Patch ( {}, {} value )\n\n\n", string::quote(&arg.name), encoder));
+                    }
+                } else {
+                    exposing.push("delete".into());
+                    body.push_str(
+                        &to_optimistic_update_elm(context, query, "optimisticDelete", "()")
+                            .unwrap(),
+                    );
+                    body.push_str(&format!(
+                        "delete : ({key_type}) -> {edit_type}\ndelete id =\n    {}\n\n\n",
+                        construct(
+                            &format!("(Encode.object [ {key_pair} ])"),
+                            "(optimisticDelete ())",
+                            "Nothing"
+                        )
+                    ));
+                }
+            }
+            ast::QueryOperation::Insert => {
+                exposing.extend(["create".into(), "Required".into()]);
+                let allocated_id = matches!(key.type_, ast::ColumnType::IdUuid { .. });
+                let args: Vec<_> = query
+                    .args
+                    .iter()
+                    .filter(|arg| !(allocated_id && arg.name == key.name))
+                    .collect();
+                let required: Vec<_> = args.iter().filter(|arg| !arg.omittable).collect();
+                let fields: Vec<_> = required
+                    .iter()
+                    .map(|arg| {
+                        let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                        format!(
+                            "{} : {}",
+                            arg.name,
+                            if arg.nullable {
+                                format!("Maybe ({base})")
+                            } else {
+                                base
+                            }
+                        )
+                    })
+                    .collect();
+                body.push_str(&format!(
+                    "type alias Required =\n    {{ {} }}\n\n\n",
+                    fields.join("\n    , ")
+                ));
+                let pairs: Vec<_> = required
+                    .iter()
+                    .map(|arg| {
+                        format!(
+                            "( {}, {} input.{} )",
+                            string::quote(&arg.name),
+                            to_param_encoder_str(
+                                &lookup,
+                                arg.type_.as_deref().unwrap(),
+                                arg.nullable
+                            ),
+                            arg.name
+                        )
+                    })
+                    .collect();
+                let prediction = if let Some(optimistic) =
+                    to_optimistic_update_elm(context, query, "optimisticCreate", "()")
+                {
+                    body.push_str(&optimistic);
+                    "(optimisticCreate ())"
+                } else {
+                    "Encode.null"
+                };
+                body.push_str(&format!("create : Required -> List CreateOption -> {edit_type}\ncreate input options =\n    {}\n\n\n", construct(&format!("(Encode.object ([ {} ] ++ List.map (\\(CreateOption pair) -> pair) options))", pairs.join(", ")), prediction, &if allocated_id { format!("(Just {})", string::quote(&key.name)) } else { "Nothing".into() })));
+                for arg in args.iter().filter(|arg| arg.omittable) {
+                    let name = builder_names[&("create", arg.name.clone())].clone();
+                    exposing.push(name.clone());
+                    let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                    let type_ = if arg.nullable {
+                        format!("Maybe ({base})")
+                    } else {
+                        base
+                    };
+                    let encoder =
+                        to_param_encoder_str(&lookup, arg.type_.as_deref().unwrap(), arg.nullable);
+                    body.push_str(&format!("{name} : ({type_}) -> CreateOption\n{name} value =\n    CreateOption ( {}, {} value )\n\n\n", string::quote(&arg.name), encoder));
+                }
+            }
+            _ => {}
+        }
+    }
+    format!(
+        "module Db.Edit.{record} exposing ({})\n\n{body}",
+        exposing.join(", ")
+    )
 }
 
 fn to_query_file(
@@ -1821,7 +2084,7 @@ fn to_query_file(
                 namespace, namespace
             ));
         }
-        let optimistic_field = if optimistic_update_metadata(query).is_some() {
+        let optimistic_field = if optimistic_update_metadata(context, query).is_some() {
             "        , ( \"optimistic\", optimistic input )\n"
         } else {
             ""
@@ -1830,7 +2093,7 @@ fn to_query_file(
             "mutationRequest : {} -> RequestId -> Input -> Encode.Value\nmutationRequest databaseId requestId input =\n    Encode.object\n        [ ( \"type\", Encode.string \"mutate\" )\n        , ( \"databaseId\", Db.Database.encode databaseId )\n        , ( \"requestId\", Encode.string requestId )\n        , ( \"mutationId\", Encode.string id )\n        , ( \"mutationName\", Encode.string name )\n        , ( \"mutationInput\", encode input )\n{}        ]\n\n\n",
             database_type, optimistic_field
         ));
-        if let Some(optimistic) = to_optimistic_update_elm(query) {
+        if let Some(optimistic) = to_optimistic_update_elm(context, query, "optimistic", "Input") {
             result.push_str(&optimistic);
         }
         result.push_str(
@@ -1867,10 +2130,11 @@ fn to_query_file(
         exposing_items.push("id".to_string());
         exposing_items.push("name".to_string());
         exposing_items.push("mutationRequest".to_string());
-        if optimistic_update_metadata(query).is_some() {
+        if optimistic_update_metadata(context, query).is_some() {
             exposing_items.push("optimistic".to_string());
         }
         exposing_items.push("decodeMutationResult".to_string());
+        exposing_items.push("decodeReturnData".to_string());
         exposing_items.push("MutationResult".to_string());
     }
 
@@ -1906,8 +2170,40 @@ struct OptimisticUpdateMetadata {
     set_fields: Vec<(String, String)>,
 }
 
-fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMetadata> {
-    if query.operation != ast::QueryOperation::Update {
+fn optimistic_update_metadata(
+    context: &typecheck::Context,
+    query: &ast::Query,
+) -> Option<OptimisticUpdateMetadata> {
+    if query.operation == ast::QueryOperation::Insert {
+        let table = crate::generated_queries::generated_crud_table(context, query)?;
+        let key = ast::collect_columns(&table.record.fields)
+            .into_iter()
+            .find(|column| ast::is_primary_key(column))?;
+        let [ast::TopLevelQueryField::Field(root)] = query.fields.as_slice() else {
+            return None;
+        };
+        let set_fields = ast::collect_query_fields(&root.fields)
+            .iter()
+            .map(|field| match &field.set {
+                Some(ast::QueryValue::Variable((_, variable)))
+                    if variable.session_field.is_none() =>
+                {
+                    Some((field.name.clone(), variable.name.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let (_, id_input) = set_fields.iter().find(|(field, _)| field == &key.name)?;
+        return Some(OptimisticUpdateMetadata {
+            query_field: root.name.clone(),
+            where_field: key.name.clone(),
+            where_input: id_input.clone(),
+            set_fields,
+        });
+    }
+    if query.operation != ast::QueryOperation::Update
+        && query.operation != ast::QueryOperation::Delete
+    {
         return None;
     }
 
@@ -1948,7 +2244,7 @@ fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMeta
         })
         .collect();
 
-    if set_fields.is_empty() {
+    if set_fields.is_empty() && query.operation != ast::QueryOperation::Delete {
         return None;
     }
 
@@ -1960,8 +2256,13 @@ fn optimistic_update_metadata(query: &ast::Query) -> Option<OptimisticUpdateMeta
     })
 }
 
-fn to_optimistic_update_elm(query: &ast::Query) -> Option<String> {
-    let metadata = optimistic_update_metadata(query)?;
+fn to_optimistic_update_elm(
+    context: &typecheck::Context,
+    query: &ast::Query,
+    name: &str,
+    argument_type: &str,
+) -> Option<String> {
+    let metadata = optimistic_update_metadata(context, query)?;
     let set_fields = metadata
         .set_fields
         .iter()
@@ -1976,7 +2277,8 @@ fn to_optimistic_update_elm(query: &ast::Query) -> Option<String> {
         .join("\n                , ");
 
     Some(format!(
-        "optimistic : Input -> Encode.Value\noptimistic _ =\n    Encode.object\n        [ ( \"queryField\", Encode.string {} )\n        , ( \"where\"\n          , Encode.object\n                [ ( \"field\", Encode.string {} )\n                , ( \"input\", Encode.string {} )\n                ]\n          )\n        , ( \"set\"\n          , Encode.list identity\n                [ {}\n                ]\n          )\n        ]\n\n\n",
+        "{name} : {argument_type} -> Encode.Value\n{name} _ =\n    Encode.object\n        [ ( \"kind\", Encode.string {} )\n        , ( \"queryField\", Encode.string {} )\n        , ( \"where\"\n          , Encode.object\n                [ ( \"field\", Encode.string {} )\n                , ( \"input\", Encode.string {} )\n                ]\n          )\n        , ( \"set\"\n          , Encode.list identity\n                [ {}\n                ]\n          )\n        ]\n\n\n",
+        string::quote(match query.operation { ast::QueryOperation::Insert => "create", ast::QueryOperation::Delete => "delete", _ => "update" }),
         string::quote(&metadata.query_field),
         string::quote(&metadata.where_field),
         string::quote(&metadata.where_input),
@@ -2153,14 +2455,7 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
                 "String".to_string()
             }
         }
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(table_def) = find_table(lookup, table) {
-                    return format!("Db.Id.{}", table_def.name);
-                }
-                return format!("Db.Id.{}", table);
-            }
-
+        ast::ColumnType::ForeignKey { .. } => {
             if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
                 return to_elm_type_from_column_type(lookup, &col_type);
             }
@@ -2209,13 +2504,7 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
         }
         ast::ColumnType::IdInt { .. } => "Db.Id.decodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.decodeUuid".to_string(),
-        ast::ColumnType::ForeignKey { table, field, .. } => {
-            if field == "id" {
-                if let Some(kind) = get_id_kind_for_brand(lookup, table) {
-                    return id_decoder(kind).to_string();
-                }
-            }
-
+        ast::ColumnType::ForeignKey { .. } => {
             if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
                 return to_elm_decoder_from_column_type(lookup, &col_type);
             }
@@ -2258,6 +2547,7 @@ fn to_query_shape_json(context: &typecheck::Context, query: &ast::Query) -> Stri
                         query_field,
                         context.tables.get(&query_field.name),
                         3,
+                        None,
                     )
                 ));
             }
@@ -2274,10 +2564,20 @@ fn to_query_field_spec_json(
     query_field: &ast::QueryField,
     table: Option<&typecheck::Table>,
     indent_level: usize,
+    source: Option<&str>,
 ) -> String {
     let indent = "    ".repeat(indent_level);
     let mut result = format!("Encode.object\n{}[ ", indent);
     let mut is_first = true;
+
+    if let Some(source) = source {
+        result.push_str(&format!(
+            "({}, Encode.string {})",
+            string::quote("@source"),
+            string::quote(source)
+        ));
+        is_first = false;
+    }
 
     // Get table info for relationship detection
     let table = table.or_else(|| context.tables.get(&query_field.name));
@@ -2383,6 +2683,9 @@ fn to_query_field_spec_json(
     }
 
     if let Some(where_clause) = where_clause {
+        if !is_first {
+            result.push_str(&format!("\n{}, ", indent));
+        }
         result.push_str(&format!("({}, {})", string::quote("@where"), where_clause));
         is_first = false;
     }
@@ -2417,7 +2720,7 @@ fn to_query_field_spec_json(
                 result.push_str(&format!(
                     "({}, {})",
                     string::quote(&aliased_name),
-                    to_query_field_spec_json_with_source(
+                    to_query_field_spec_json(
                         context,
                         nested_field,
                         nested_table,
@@ -2640,29 +2943,6 @@ fn to_query_delta_types(context: &typecheck::Context, query: &ast::Query) -> Str
     // Generate applyDelta function with lens-based approach
     result.push_str(&to_apply_delta_function_with_lenses(context, query));
 
-    result
-}
-
-fn to_query_field_spec_json_with_source(
-    context: &typecheck::Context,
-    query_field: &ast::QueryField,
-    table: Option<&typecheck::Table>,
-    indent_level: usize,
-    source: Option<&str>,
-) -> String {
-    let mut result = to_query_field_spec_json(context, query_field, table, indent_level);
-    if let Some(source_name) = source {
-        let indent = "    ".repeat(indent_level);
-        let marker = format!("Encode.object\n{}[ ", indent);
-        let replacement = format!(
-            "Encode.object\n{}[ ({}, Encode.string {})\n{}, ",
-            indent,
-            string::quote("@source"),
-            string::quote(source_name),
-            indent,
-        );
-        result = result.replacen(&marker, &replacement, 1);
-    }
     result
 }
 
@@ -3080,12 +3360,12 @@ fn generate_pyre_module(
         let field_name = string::decapitalize(name);
         if i == 0 {
             result.push_str(&format!(
-                " {} : Dict String (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
+                " {} : Dict ( String, String ) (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
                 field_name, name, name
             ));
         } else {
             result.push_str(&format!(
-                "    , {} : Dict String (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
+                "    , {} : Dict ( String, String ) (QueryModel Query.{}.Input Query.{}.ReturnData)\n",
                 field_name, name, name
             ));
         }
@@ -3132,7 +3412,7 @@ fn generate_pyre_module(
     result.push_str("    = QueryUpdate Query\n");
     for name in query_names {
         result.push_str(&format!(
-            "    | {}_DataReceived QueryId Query.{}.QueryDelta\n",
+            "    | {}_DataReceived String QueryId Query.{}.QueryDelta\n",
             name, name
         ));
         let database_type = all_query_info
@@ -3152,7 +3432,7 @@ fn generate_pyre_module(
     result.push_str("type Effect\n");
     result.push_str("    = NoEffect\n");
     result.push_str("    | Send Encode.Value\n");
-    result.push_str("    | QueryUpdated QueryId\n");
+    result.push_str("    | QueryUpdated String QueryId\n");
     result.push_str("    | LogError Encode.Value\n\n\n");
 
     // Error type
@@ -3189,9 +3469,12 @@ fn generate_pyre_module(
         let field_name = string::decapitalize(name);
 
         // DataReceived
-        result.push_str(&format!("        {}_DataReceived queryId delta ->\n", name));
         result.push_str(&format!(
-            "            case Dict.get queryId model.{} of\n",
+            "        {}_DataReceived databaseId queryId delta ->\n",
+            name
+        ));
+        result.push_str(&format!(
+            "            case Dict.get ( databaseId, queryId ) model.{} of\n",
             field_name
         ));
         result.push_str("                Just queryModel ->\n");
@@ -3215,10 +3498,10 @@ fn generate_pyre_module(
         result.push_str("                                            rev\n");
         result.push_str("                            in\n");
         result.push_str(&format!(
-            "                            ( {{ model | {} = Dict.insert queryId {{ queryModel | result = newResult, revision = newRevision }} model.{} }}\n",
+            "                            ( {{ model | {} = Dict.insert ( databaseId, queryId ) {{ queryModel | result = newResult, revision = newRevision }} model.{} }}\n",
             field_name, field_name
         ));
-        result.push_str("                            , QueryUpdated queryId\n");
+        result.push_str("                            , QueryUpdated databaseId queryId\n");
         result.push_str("                            )\n\n");
         result.push_str("                        Err errMsg ->\n");
         result.push_str("                            ( model\n");
@@ -3233,7 +3516,7 @@ fn generate_pyre_module(
             name
         ));
         result.push_str(&format!(
-            "            ( {{ model | {} = Dict.remove queryId model.{} }}\n",
+            "            ( {{ model | {} = Dict.remove ( Db.Database.toString databaseId, queryId ) model.{} }}\n",
             field_name, field_name
         ));
         result.push_str("            , Send (encodeUnregister databaseId queryId)\n");
@@ -3259,17 +3542,20 @@ fn generate_pyre_module(
 
     result.push_str("incomingDeltaDecoder : Decode.Decoder Msg\n");
     result.push_str("incomingDeltaDecoder =\n");
-    result.push_str("    Decode.map2 Tuple.pair\n");
+    result.push_str(
+        "    Decode.map3 (\\source queryId databaseId -> ( source, queryId, databaseId ))\n",
+    );
     result.push_str("        (Decode.field \"queryName\" Decode.string)\n");
     result.push_str("        (Decode.field \"queryId\" Decode.string)\n");
+    result.push_str("        (Decode.field \"databaseId\" Decode.string)\n");
     result.push_str("        |> Decode.andThen\n");
-    result.push_str("            (\\( source, queryId ) ->\n");
+    result.push_str("            (\\( source, queryId, databaseId ) ->\n");
     result.push_str("                case source of\n");
 
     for name in query_names {
         result.push_str(&format!("                    \"{}\" ->\n", name));
         result.push_str(&format!(
-            "                        Decode.map ({}_DataReceived queryId) Query.{}.decodeQueryDelta\n\n",
+            "                        Decode.map ({}_DataReceived databaseId queryId) Query.{}.decodeQueryDelta\n\n",
             name, name
         ));
     }
@@ -3299,12 +3585,12 @@ fn generate_pyre_module(
 
         result.push_str(&format!("        {} databaseId queryId input ->\n", name));
         result.push_str(&format!(
-            "            case Dict.get queryId model.{} of\n",
+            "            case Dict.get ( Db.Database.toString databaseId, queryId ) model.{} of\n",
             field_name
         ));
         result.push_str("                Just queryModel ->\n");
         result.push_str(&format!(
-            "                    ( {{ model | {} = Dict.insert queryId {{ queryModel | input = input }} model.{} }}\n",
+            "                    ( {{ model | {} = Dict.insert ( Db.Database.toString databaseId, queryId ) {{ queryModel | input = input }} model.{} }}\n",
             field_name, field_name
         ));
         result.push_str(&format!(
@@ -3321,7 +3607,7 @@ fn generate_pyre_module(
         ));
         result.push_str("                    in\n");
         result.push_str(&format!(
-            "                    ( {{ model | {} = Dict.insert queryId queryModel model.{} }}\n",
+            "                    ( {{ model | {} = Dict.insert ( Db.Database.toString databaseId, queryId ) queryModel model.{} }}\n",
             field_name, field_name
         ));
         result.push_str(&format!(
@@ -3332,10 +3618,10 @@ fn generate_pyre_module(
     }
 
     result.push_str(
-        "getResult : QueryId -> Dict QueryId (QueryModel input result) -> Maybe result\n",
+        "getResult : DatabaseId namespace -> QueryId -> Dict ( String, String ) (QueryModel input result) -> Maybe result\n",
     );
-    result.push_str("getResult queryId queries =\n");
-    result.push_str("    Dict.get queryId queries\n");
+    result.push_str("getResult databaseId queryId queries =\n");
+    result.push_str("    Dict.get ( Db.Database.toString databaseId, queryId ) queries\n");
     result.push_str("        |> Maybe.map .result\n\n\n");
 
     // Encoders

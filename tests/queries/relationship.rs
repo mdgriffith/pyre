@@ -99,6 +99,7 @@ async fn test_query_with_many_to_one() -> Result<(), TestError> {
 #[tokio::test]
 async fn test_nested_json_column_is_returned_as_json_value() -> Result<(), TestError> {
     let schema = r#"
+@syncable(false)
 record Game {
     id Int @id
     entities @link(id, GameEntity.gameId)
@@ -162,6 +163,7 @@ record GameEntity {
 #[tokio::test]
 async fn test_duplicate_nested_link_names_use_distinct_ctes() -> Result<(), TestError> {
     let schema = r#"
+@syncable(false)
 record Outfit {
     id Int @id
     garments @link(id, OutfitGarment.outfitId)

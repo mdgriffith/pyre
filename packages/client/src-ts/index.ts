@@ -1,11 +1,20 @@
 import loadElm from '../dist/engine.mjs';
+import { primaryKeys } from './service/identity';
+import {
+  captureOperations,
+  createId,
+  decodeOperationResults,
+  type Operation,
+  type OperationResults,
+  type SubmissionResult,
+  type SubmissionTarget,
+} from './operations';
 import { IndexedDBStorage, IndexedDbService } from './service/indexeddb';
 import {
   EntityStreamService,
   validateEntitySubscription,
   type EntityChangeBatch,
   type EntitySubscription,
-  type ServerTableGroup,
 } from './service/entity-stream';
 import { QueryClientService, resolveLocalQuerySource } from './service/query-client';
 import { QueryManagerService, type MutationResult } from './service/query-manager';
@@ -62,6 +71,7 @@ export type {
   EntityWhereValue,
 } from './service/entity-stream';
 export type { CacheNamespace, DatabaseId } from './routing';
+export { operation, type Operation } from './operations';
 
 interface PyreBridgeClient {
   run<Input = unknown>(
@@ -237,6 +247,7 @@ export interface ElmBridgeMutationMessage {
 
 export interface ElmBridgeMutationResultMessage {
   type: 'mutation-result';
+  databaseId: DatabaseId;
   requestId: string;
   mutationId: string;
   mutationName: string | null;
@@ -367,8 +378,6 @@ class SingleDatabasePyreClient {
   private lastSyncProgress: SyncProgress | null = null;
   private pendingLiveState: SyncState | null = null;
   private pendingLiveQueries: Set<string> = new Set();
-  private lastAppliedServerRevision: number | null = null;
-  private databaseEpoch: string | null = null;
   private queryManager: QueryManagerService;
   private queryClient: QueryClientService;
   private entityStream: EntityStreamService;
@@ -441,15 +450,10 @@ class SingleDatabasePyreClient {
       throw new Error(`[PyreClient ctor] Elm.Main.init failed: ${message}`);
     }
 
-    this.storage = new IndexedDBStorage(dbName);
-    this.entityStream = new EntityStreamService();
-    this.indexedDbService = new IndexedDbService(this.storage, this.logDebug, (tableGroups, source) => {
-      this.entityStream.handleTableDelta(tableGroups, source, this.databaseId);
-    }, () => {
-      this.lastAppliedServerRevision = null;
-    }, (databaseEpoch) => {
-      this.databaseEpoch = databaseEpoch;
-    });
+    const keys = primaryKeys(config.schema);
+    this.storage = new IndexedDBStorage(dbName, keys);
+    this.entityStream = new EntityStreamService(keys);
+    this.indexedDbService = new IndexedDbService(this.storage, this.logDebug);
     this.sseManager = new SSEManager({
       baseUrl: config.server.baseUrl,
       eventsPath: this.endpoints.events,
@@ -480,6 +484,9 @@ class SingleDatabasePyreClient {
     this.webSocketManager.attachPorts(this.elmApp);
     this.queryManager.attachPorts(this.elmApp);
     this.queryClient.attachPorts(this.elmApp);
+    this.elmApp.ports.visibleStateOut?.subscribe((message) => {
+      this.entityStream.handleVisibleState(message.snapshot, message.source, this.databaseId);
+    });
 
     if (this.elmApp.ports.debugOut) {
       this.elmApp.ports.debugOut.subscribe((message) => {
@@ -546,8 +553,6 @@ class SingleDatabasePyreClient {
 
   async init(): Promise<void> {
     await this.storage.init();
-    this.lastAppliedServerRevision = await this.storage.getServerRevision();
-    this.databaseEpoch = await this.storage.getDatabaseEpoch();
   }
 
   startSync(): void {
@@ -626,7 +631,7 @@ class SingleDatabasePyreClient {
       pendingBatches.push(batch);
     });
 
-    const initialRows = await this.loadInitialEntityRows(subscription);
+    const initialRows = this.entityStream.snapshot();
     const initialBatch = this.entityStream.createBatchFromRows(
       subscription,
       initialRows,
@@ -737,64 +742,6 @@ class SingleDatabasePyreClient {
     };
   }
 
-  private async loadInitialEntityRows(subscription: EntitySubscription): Promise<Map<string, Array<Record<string, unknown>>>> {
-    const rowsByTable = new Map<string, Array<Record<string, unknown>>>();
-    const tableNames = Array.from(new Set(subscription.tables.map((table) => table.tableName)));
-    const loadStartedAt = Date.now();
-
-    this.logDebug('[PyreClient] Entity stream IndexedDB snapshot scan started', {
-      databaseId: this.databaseId,
-      tableNames,
-      tableCount: tableNames.length,
-    });
-
-    await Promise.all(tableNames.map(async (tableName) => {
-      const tableStartedAt = Date.now();
-      const rows: Array<Record<string, unknown>> = [];
-      let offset = 0;
-      const limit = 500;
-      let pageCount = 0;
-
-      while (true) {
-        const page = await this.storage.getRowsPage(tableName, offset, limit);
-        pageCount += 1;
-        page.rows.forEach((row) => {
-          if (isRecord(row)) {
-            rows.push(row);
-          }
-        });
-
-        if (!page.hasMore) {
-          break;
-        }
-
-        offset += limit;
-      }
-
-      if (rows.length > 0) {
-        rowsByTable.set(tableName, rows);
-      }
-
-      this.logDebug('[PyreClient] Entity stream IndexedDB snapshot table loaded', {
-        databaseId: this.databaseId,
-        tableName,
-        rowCount: rows.length,
-        pageCount,
-        elapsedMs: Date.now() - tableStartedAt,
-      });
-    }));
-
-    this.logDebug('[PyreClient] Entity stream IndexedDB snapshot scan finished', {
-      databaseId: this.databaseId,
-      tableCount: tableNames.length,
-      totalRowCount: Array.from(rowsByTable.values()).reduce((sum, rows) => sum + rows.length, 0),
-      elapsedMs: Date.now() - loadStartedAt,
-    });
-
-    return rowsByTable;
-  }
-
-
   setDevtoolsDebugValue(name: string, value: unknown): void {
     if (value === undefined) {
       delete this.devtoolsDebugValues[name];
@@ -845,23 +792,6 @@ class SingleDatabasePyreClient {
   private handleLiveSyncMessage = (message: LiveSyncMessage): void => {
     this.emitDevtoolsEvent(`sync:${message.type}`, message);
 
-    if (message.type === 'delta' && this.shouldAcceptLiveDelta(message)) {
-      const tableGroups = message.data as ServerTableGroup[];
-      this.logDebug('[PyreClient] Live sync delta accepted', {
-        databaseId: this.databaseId,
-        source: this.lastSyncState.status === 'live' ? 'live' : 'catchup',
-        serverRevision: message.serverRevision,
-        tableGroupCount: tableGroups.length,
-        rowCount: tableGroups.reduce((sum, group) => sum + group.rows.length, 0),
-      });
-      this.noteAppliedServerRevision(message.serverRevision);
-      this.entityStream.handleTableDelta(
-        tableGroups,
-        this.lastSyncState.status === 'live' ? 'live' : 'catchup',
-        this.databaseId
-      );
-    }
-
     if (message.type === 'connected') {
       const connectionId = message.connectionId;
       if (connectionId) {
@@ -871,157 +801,7 @@ class SingleDatabasePyreClient {
         });
       }
     }
-
-    if (message.type === 'syncProgress') {
-      const nextState = {
-        ...this.lastSyncState,
-        status: 'catching_up' as const,
-      };
-      this.handleRawSyncState(nextState);
-    }
-
-    if ((message.type === 'syncRequired' || message.type === 'catchupRequired') && this.shouldAcceptLiveControlMessage(message)) {
-      const nextState = {
-        ...this.lastSyncState,
-        status: 'catching_up' as const,
-      };
-      this.handleRawSyncState(nextState);
-    }
-
-    if (message.type === 'syncComplete') {
-      const liveTables: Record<string, TableSyncStatus> = {};
-      Object.keys(this.lastSyncState.tables).forEach((tableName) => {
-        liveTables[tableName] = 'live';
-      });
-      const nextState = {
-        ...this.lastSyncState,
-        status: 'live' as const,
-        tables: liveTables,
-      };
-      this.handleRawSyncState(nextState);
-    }
   };
-
-  private async notifyEntityStreamFromOptimisticMutation(optimistic: unknown, input: unknown): Promise<void> {
-    const metadata = parseOptimisticMutation(optimistic);
-    if (!metadata) {
-      return;
-    }
-
-    try {
-      const tableGroups = await this.buildOptimisticTableGroups(metadata, input);
-      this.entityStream.handleTableDelta(tableGroups, 'optimistic', this.databaseId);
-    } catch (error) {
-      console.error('[PyreClient] Failed to notify optimistic entity stream:', error);
-    }
-  }
-
-  private async buildOptimisticTableGroups(
-    optimistic: OptimisticMutationMetadata,
-    input: unknown
-  ): Promise<ServerTableGroup[]> {
-    if (!isRecord(input)) {
-      return [];
-    }
-
-    const whereValue = input[optimistic.where.input];
-    if (whereValue === undefined) {
-      return [];
-    }
-
-    const tableName = this.schema.queryFieldToTable?.[optimistic.queryField] ?? optimistic.queryField;
-    const setValues = Object.fromEntries(
-      optimistic.set
-        .filter((field) => input[field.input] !== undefined)
-        .map((field) => [field.field, input[field.input]])
-    );
-
-    if (Object.keys(setValues).length === 0) {
-      return [];
-    }
-
-    const rows = await this.storage.getAllRows(tableName);
-    const matchingRows = rows
-      .filter(isRecord)
-      .filter((row) => row[optimistic.where.field] === whereValue)
-      .map((row) => ({ ...row, ...setValues }));
-    const optimisticRows = matchingRows.length > 0
-      ? matchingRows
-      : [{ [optimistic.where.field]: whereValue, ...setValues }];
-
-    return tableGroupsFromRows(tableName, optimisticRows);
-  }
-
-  private notifyEntityStreamFromMutationResult(result: unknown): void {
-    const envelope = mutationResultEnvelope(result);
-    const serverRevision = extractServerRevision(envelope);
-    if (this.isStaleServerRevision(serverRevision)) {
-      return;
-    }
-
-    const syncDelta = extractMutationSyncDelta(envelope);
-    if (!syncDelta) {
-      return;
-    }
-
-    if (this.databaseId && syncDelta.databaseId !== undefined && syncDelta.databaseId !== this.databaseId) {
-      return;
-    }
-
-    this.entityStream.handleTableDelta(syncDelta.data, 'mutation-response', this.databaseId);
-  }
-
-  private shouldAcceptLiveDelta(message: LiveSyncMessage): boolean {
-    if (!Array.isArray(message.data)) {
-      return false;
-    }
-
-    if (this.databaseEpoch !== null && message.databaseEpoch !== undefined && message.databaseEpoch !== this.databaseEpoch) {
-      return false;
-    }
-
-    if (this.isStaleServerRevision(message.serverRevision)) {
-      return false;
-    }
-
-    if (!this.databaseId) {
-      return true;
-    }
-
-    return message.databaseId === this.databaseId;
-  }
-
-  private shouldAcceptLiveControlMessage(message: LiveSyncMessage): boolean {
-    const epochChanged = this.databaseEpoch !== null
-      && message.databaseEpoch !== undefined
-      && message.databaseEpoch !== this.databaseEpoch;
-    if (!epochChanged && this.isStaleServerRevision(message.serverRevision)) {
-      return false;
-    }
-
-    if (!this.databaseId) {
-      return true;
-    }
-
-    return message.databaseId === this.databaseId;
-  }
-
-  private isStaleServerRevision(serverRevision: number | undefined): boolean {
-    return typeof serverRevision === 'number'
-      && this.lastAppliedServerRevision !== null
-      && serverRevision <= this.lastAppliedServerRevision;
-  }
-
-  private noteAppliedServerRevision(serverRevision: number | undefined): void {
-    if (typeof serverRevision !== 'number') {
-      return;
-    }
-
-    this.lastAppliedServerRevision = Math.max(this.lastAppliedServerRevision ?? 0, serverRevision);
-    void this.storage.putServerRevision(this.lastAppliedServerRevision).catch((error) => {
-      console.error('[PyreClient] Failed to persist server revision:', error);
-    });
-  }
 
   private handleRawSyncState(state: SyncState): void {
     if (state.status !== 'live') {
@@ -1372,7 +1152,6 @@ class SingleDatabasePyreClient {
     });
     this.emitDevtoolsEvent('mutation:request', { requestId, mutationId, databaseId, input: payload, optimistic });
     void (async () => {
-      await this.notifyEntityStreamFromOptimisticMutation(optimistic, payload);
       this.queryManager.sendMutation(
         requestId,
         mutationId,
@@ -1380,8 +1159,6 @@ class SingleDatabasePyreClient {
         payload,
         optimistic,
         (result) => {
-          this.notifyEntityStreamFromMutationResult(result);
-          this.noteAppliedServerRevision(extractServerRevision(mutationResultEnvelope(result)));
           const appResult = unwrapMutationResultEnvelope(result);
           this.emitDevtoolsEvent('mutation:result', { requestId, mutationId, result });
           callback(appResult);
@@ -1390,7 +1167,7 @@ class SingleDatabasePyreClient {
         getServerCredentials(this.server),
         this.server.withCredentials === true
       );
-    })();
+    })().catch((error) => callback({ ok: false, error: String(error) }));
   }
 
   private runBridgeMutation(
@@ -1411,7 +1188,6 @@ class SingleDatabasePyreClient {
       optimistic: message.optimistic,
     });
     void (async () => {
-      await this.notifyEntityStreamFromOptimisticMutation(message.optimistic, message.mutationInput ?? {});
       this.queryManager.sendMutation(
         message.requestId,
         message.mutationId,
@@ -1419,8 +1195,6 @@ class SingleDatabasePyreClient {
         message.mutationInput ?? {},
         message.optimistic,
         (result) => {
-          this.notifyEntityStreamFromMutationResult(result);
-          this.noteAppliedServerRevision(extractServerRevision(mutationResultEnvelope(result)));
           const appResult = unwrapMutationResultEnvelope(result);
           this.emitDevtoolsEvent('mutation:result', {
             requestId: message.requestId,
@@ -1430,6 +1204,7 @@ class SingleDatabasePyreClient {
           });
           mutationResultPort?.send?.({
             type: 'mutation-result',
+            databaseId: message.databaseId,
             requestId: message.requestId,
             mutationId: message.mutationId,
             mutationName: message.mutationName ?? null,
@@ -1440,7 +1215,13 @@ class SingleDatabasePyreClient {
         getServerCredentials(this.server),
         this.server.withCredentials === true
       );
-    })();
+    })().catch((error) => {
+      mutationResultPort?.send?.({
+        databaseId: message.databaseId,
+        type: 'mutation-result', requestId: message.requestId, mutationId: message.mutationId,
+        mutationName: message.mutationName ?? null, result: { ok: false, error: String(error) },
+      } satisfies ElmBridgeMutationResultMessage);
+    });
   }
 
   private emitDevtoolsEvent(type: string, payload?: unknown): void {
@@ -1522,6 +1303,39 @@ export class PyreClient {
     return this.getOrCreateClient(databaseId).then((client) => (
       client.run(databaseId, queryModule, input, callback)
     ));
+  }
+
+  /** Execute one ordered, atomic batch through the existing mutation engine. */
+  submit<const Items extends readonly Operation[]>(
+    target: SubmissionTarget<Items>,
+    operations: Items,
+  ): Promise<SubmissionResult<OperationResults<Items>>> {
+    const items = Object.freeze([...operations]) as unknown as Items;
+    const captured = captureOperations(items, typeof target === 'string' ? undefined : target);
+    if (typeof target === 'string' && captured.some(item => item.namespace !== undefined)) {
+      throw new Error('Namespace-scoped operations require a database target');
+    }
+    const databaseId = typeof target === 'string' ? target : target.databaseId;
+    requireDatabaseId(databaseId);
+    if (captured.length === 0) return Promise.resolve({ ok: true, value: [] as unknown as OperationResults<Items> });
+    const input = captured.map(({ queryId, input }) => ({ queryId, input }));
+    const optimistic = captured.filter((item) => item.optimistic != null)
+      .map(({ input, optimistic }) => ({ input, optimistic }));
+    return new Promise((resolve, reject) => {
+      void this.run(databaseId, { operation: 'transaction', id: '$batch', optimistic }, input,
+        (result) => {
+          const receipt = result as MutationResult;
+          if (!receipt.ok) {
+            resolve({ ok: false, error: receipt.error ?? 'Mutation failed' });
+            return;
+          }
+          try {
+            resolve({ ok: true, value: decodeOperationResults(items, receipt.value) });
+          } catch (error) {
+            reject(error);
+          }
+        }).catch(reject);
+    });
   }
 
   async getOrCreateClient(databaseId: DatabaseId): Promise<PyreInternalClient> {
@@ -1819,6 +1633,7 @@ export class PyreClient {
                 (result) => {
                   mutationResultPort?.send?.({
                     type: 'mutation-result',
+                    databaseId: message.databaseId,
                     requestId: message.requestId,
                     mutationId: message.mutationId,
                     mutationName: message.mutationName ?? null,
@@ -1899,7 +1714,8 @@ export class PyreClient {
             const querySource = asQueryShape(message.querySource);
             resolveLocalQuerySource(message.queryId, querySource, message.queryInput ?? {});
 
-            const existingRegistration = registrations.get(message.queryId);
+            const registrationKey = JSON.stringify([message.databaseId, message.queryId]);
+            const existingRegistration = registrations.get(registrationKey);
             if (existingRegistration) {
               void existingRegistration.then((subscription) => subscription?.unsubscribe());
             }
@@ -1914,6 +1730,7 @@ export class PyreClient {
               (result) => {
                 queryResultPort?.send?.({
                   type: 'full',
+                  databaseId: message.databaseId,
                   queryId: message.queryId,
                   queryName,
                   revision: Date.now(),
@@ -1921,18 +1738,18 @@ export class PyreClient {
                 });
               }
             )).catch((error) => {
-              if (registrations.get(message.queryId) === subscriptionPromise) {
-                registrations.delete(message.queryId);
+              if (registrations.get(registrationKey) === subscriptionPromise) {
+                registrations.delete(registrationKey);
               }
               reportElmBridgeError(config, error, 'incoming-message');
             });
 
-            registrations.set(message.queryId, subscriptionPromise);
+            registrations.set(registrationKey, subscriptionPromise);
             return;
           }
 
           if (message.type === 'update-input') {
-            const registration = registrations.get(message.queryId);
+            const registration = registrations.get(JSON.stringify([message.databaseId, message.queryId]));
             if (!registration) {
               throw new Error(`update-input for unknown query id: ${message.queryId}`);
             }
@@ -1942,14 +1759,15 @@ export class PyreClient {
             return;
           }
 
-          const registration = registrations.get(message.queryId);
+          const registrationKey = JSON.stringify([message.databaseId, message.queryId]);
+          const registration = registrations.get(registrationKey);
           if (!registration) {
             return;
           }
 
           const subscription = await registration;
           subscription?.unsubscribe();
-          registrations.delete(message.queryId);
+          registrations.delete(registrationKey);
         } catch (error) {
           reportElmBridgeError(config, error, 'incoming-message');
         }
@@ -2325,105 +2143,6 @@ function hasServerHeaders(server: ServerConfig): boolean {
   return Boolean(server.headers);
 }
 
-interface OptimisticMutationMetadata {
-  queryField: string;
-  where: {
-    field: string;
-    input: string;
-  };
-  set: Array<{
-    field: string;
-    input: string;
-  }>;
-}
-
-function parseOptimisticMutation(value: unknown): OptimisticMutationMetadata | null {
-  if (!isRecord(value) || typeof value.queryField !== 'string' || !isRecord(value.where) || !Array.isArray(value.set)) {
-    return null;
-  }
-
-  if (typeof value.where.field !== 'string' || typeof value.where.input !== 'string') {
-    return null;
-  }
-
-  const set = value.set.filter((field): field is { field: string; input: string } => (
-    isRecord(field) && typeof field.field === 'string' && typeof field.input === 'string'
-  ));
-  if (set.length === 0) {
-    return null;
-  }
-
-  return {
-    queryField: value.queryField,
-    where: {
-      field: value.where.field,
-      input: value.where.input,
-    },
-    set,
-  };
-}
-
-function tableGroupsFromRows(tableName: string, rows: Array<Record<string, unknown>>): ServerTableGroup[] {
-  if (rows.length === 0) {
-    return [];
-  }
-
-  const headers = rows.reduce<string[]>((acc, row) => {
-    Object.keys(row).forEach((field) => {
-      if (!acc.includes(field)) {
-        acc.push(field);
-      }
-    });
-    return acc;
-  }, []);
-
-  return [{
-    table_name: tableName,
-    headers,
-    rows: rows.map((row) => headers.map((header) => row[header] ?? null)),
-  }];
-}
-
-function mutationResultEnvelope(result: unknown): unknown {
-  if (!isRecord(result) || result.ok !== true || !('value' in result)) {
-    return result;
-  }
-
-  return result.value;
-}
-
-function extractServerRevision(result: unknown): number | undefined {
-  if (!result || typeof result !== 'object') {
-    return undefined;
-  }
-
-  const serverRevision = (result as { serverRevision?: unknown }).serverRevision;
-  return typeof serverRevision === 'number' ? serverRevision : undefined;
-}
-
-function extractMutationSyncDelta(result: unknown): { databaseId?: string; data: ServerTableGroup[] } | null {
-  if (!isRecord(result) || !isRecord(result.sync) || result.sync.type !== 'delta' || !Array.isArray(result.sync.data)) {
-    return null;
-  }
-
-  const databaseId = typeof result.sync.databaseId === 'string'
-    ? result.sync.databaseId
-    : undefined;
-
-  return {
-    databaseId,
-    data: result.sync.data.filter(isServerTableGroup),
-  };
-}
-
-function isServerTableGroup(value: unknown): value is ServerTableGroup {
-  return isRecord(value)
-    && typeof value.table_name === 'string'
-    && Array.isArray(value.headers)
-    && value.headers.every((header) => typeof header === 'string')
-    && Array.isArray(value.rows);
-}
-
 function unwrapMutationResultEnvelope(result: unknown): unknown {
   if (!isRecord(result)) {
     return result;
@@ -2611,6 +2330,26 @@ function entityValuesEqual(left: unknown, right: unknown): boolean {
 function parseElmBridgeIncomingMessage(message: unknown): ElmBridgeIncomingMessage {
   const raw = asObject(message, 'Pyre bridge message');
   const type = raw.type;
+
+  if (type === 'submit') {
+    if (!Array.isArray(raw.operations)) throw new Error('Expected an operation batch');
+    const captured = raw.operations.map((value) => {
+      const descriptor = asObject(value, 'operation');
+      const input = { ...asObject(descriptor.input, 'operation input') };
+      if (descriptor.createId != null) {
+        input[asNonEmptyString(descriptor.createId, 'create identity field')] = createId();
+      }
+      return { queryId: asNonEmptyString(descriptor.queryId, 'operation queryId'), input, optimistic: descriptor.optimistic };
+    });
+    return {
+      type: 'mutate',
+      databaseId: requireDatabaseId(raw.databaseId, 'submit message databaseId'),
+      requestId: asNonEmptyString(raw.requestId, 'submit message requestId'),
+      mutationId: '$batch',
+      mutationInput: captured.map(({ queryId, input }) => ({ queryId, input })),
+      optimistic: captured.filter(item => item.optimistic != null).map(({ input, optimistic }) => ({ input, optimistic })),
+    };
+  }
 
   if (type === 'mutate') {
     return {

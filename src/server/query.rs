@@ -7,6 +7,15 @@ use std::collections::{HashMap, HashSet};
 pub struct QueryResult {
     pub response: JsonValue,
     pub affected_rows: Vec<AffectedRowTableGroup>,
+    pub committed_revision: Option<(String, i64)>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationDescriptor {
+    #[serde(rename = "queryId")]
+    pub query_id: String,
+    pub input: JsonValue,
 }
 
 #[derive(Debug)]
@@ -124,6 +133,11 @@ async fn run_inner(
     session: &PyreSession,
     sync_mode: bool,
 ) -> Result<QueryResult, Error> {
+    if query_id == "$batch" {
+        let operations: Vec<OperationDescriptor> =
+            serde_json::from_value(input).map_err(Error::Json)?;
+        return run_operations(conn, manifest, &operations, session, sync_mode).await;
+    }
     let query = manifest
         .queries
         .get(query_id)
@@ -136,18 +150,32 @@ async fn run_inner(
     };
 
     if query.operation == "query" {
-        return execute_generated_sql(conn, sql, &args).await;
+        return execute_generated_sql(conn, sql, &args, None).await;
     }
 
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
         .map_err(|error| Error::Database(error).execution("begin transaction", None))?;
-    match execute_generated_sql(&tx, sql, &args).await {
-        Ok(result) => {
-            tx.commit()
-                .await
-                .map_err(|error| Error::Database(error).execution("commit transaction", None))?;
+    let checked_write = query.generated_edit.as_ref().map(|edit| {
+        if sync_mode {
+            edit.sync_write_statement
+        } else {
+            edit.write_statement
+        }
+    });
+    match execute_generated_sql(&tx, sql, &args, checked_write).await {
+        Ok(mut result) => {
+            if sync_mode && !result.affected_rows.is_empty() {
+                match allocate_revision(&tx).await {
+                    Ok(revision) => result.committed_revision = Some(revision),
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        return Err(error);
+                    }
+                }
+            }
+            tx.commit().await.map_err(Error::OutcomeUnknown)?;
             Ok(result)
         }
         Err(error) => {
@@ -157,11 +185,87 @@ async fn run_inner(
     }
 }
 
+/// Execute an ordered batch with the existing bindings, SQL and result formatter.
+pub async fn run_operations(
+    conn: &libsql::Connection,
+    manifest: &Manifest,
+    operations: &[OperationDescriptor],
+    session: &PyreSession,
+    sync_mode: bool,
+) -> Result<QueryResult, Error> {
+    let mut prepared = Vec::new();
+    let mut namespace = None;
+    for (index, operation) in operations.iter().enumerate() {
+        let query = manifest
+            .queries
+            .get(&operation.query_id)
+            .ok_or_else(|| Error::UnknownQuery(operation.query_id.clone()))?;
+        if namespace.is_some_and(|name| name != &query.primary_db) || !query.attached_dbs.is_empty()
+        {
+            return Err(Error::InvalidInput(
+                "operations must target one namespace".into(),
+            ));
+        }
+        namespace = Some(&query.primary_db);
+        let args = build_args(query, operation.input.clone(), session)
+            .map_err(|error| error.execution("operation", Some(index)))?;
+        prepared.push((query, args));
+    }
+    let mut result = QueryResult {
+        response: JsonValue::Array(Vec::new()),
+        affected_rows: Vec::new(),
+        committed_revision: None,
+    };
+    if prepared.is_empty() {
+        return Ok(result);
+    }
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .map_err(Error::Database)?;
+    let execution = async {
+        for (index, (query, args)) in prepared.iter().enumerate() {
+            let sql = if sync_mode { query.sync_sql.as_ref().unwrap_or(&query.sql) } else { &query.sql };
+            let checked = query.generated_edit.as_ref().map(|edit| if sync_mode { edit.sync_write_statement } else { edit.write_statement });
+            let output = execute_generated_sql(&tx, sql, args, checked).await.map_err(|error| error.execution("operation", Some(index)))?;
+            result.response.as_array_mut().unwrap().push(serde_json::json!({ "index": index, "queryId": query.id, "result": output.response }));
+            result.affected_rows.extend(output.affected_rows);
+        }
+        if sync_mode && !result.affected_rows.is_empty() { result.committed_revision = Some(allocate_revision(&tx).await?); }
+        Ok::<_, Error>(())
+    }.await;
+    if let Err(error) = execution {
+        let _ = tx.rollback().await;
+        return Err(error);
+    }
+    tx.commit().await.map_err(Error::OutcomeUnknown)?;
+    Ok(result)
+}
+
+async fn allocate_revision(conn: &libsql::Connection) -> Result<(String, i64), Error> {
+    let mut rows = conn.query("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision", ()).await.map_err(Error::Database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(Error::Database)?
+        .ok_or_else(|| Error::InvalidInput("missing sync revision".into()))?;
+    Ok((
+        row.get(0).map_err(Error::Database)?,
+        row.get(1).map_err(Error::Database)?,
+    ))
+}
+
 async fn execute_generated_sql(
     conn: &libsql::Connection,
     sql: &[SqlInfo],
     args: &HashMap<String, JsonValue>,
+    checked_write: Option<usize>,
 ) -> Result<QueryResult, Error> {
+    if checked_write.is_some_and(|index| index >= sql.len()) {
+        return Err(Error::InvalidInput(
+            "invalid generated edit metadata".into(),
+        ));
+    }
     let mut included_result_sets = Vec::new();
 
     for (index, statement) in sql.iter().enumerate() {
@@ -176,6 +280,22 @@ async fn execute_generated_sql(
             } else {
                 execute_statement(conn, &sql, values).await?;
             }
+            if checked_write == Some(index) {
+                let mut count = conn
+                    .query("select changes()", ())
+                    .await
+                    .map_err(Error::Database)?;
+                let count = count
+                    .next()
+                    .await
+                    .map_err(Error::Database)?
+                    .ok_or_else(|| Error::InvalidInput("missing write cardinality".into()))?;
+                if count.get::<i64>(0).map_err(Error::Database)? != 1 {
+                    return Err(Error::InvalidInput(
+                        "generated edit must affect exactly one row".into(),
+                    ));
+                }
+            }
             Ok::<_, Error>(())
         }
         .await
@@ -183,6 +303,7 @@ async fn execute_generated_sql(
     }
 
     Ok(QueryResult {
+        committed_revision: None,
         response: format_response(&included_result_sets)?,
         affected_rows: extract_affected_rows(&included_result_sets)?,
     })
@@ -199,6 +320,33 @@ fn build_args(
         ));
     };
     let mut args = HashMap::new();
+    if let Some(field) = query
+        .generated_edit
+        .as_ref()
+        .and_then(|edit| edit.create_id.as_ref())
+    {
+        let valid = input_object
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .is_some_and(|id| {
+                let bytes = id.as_bytes();
+                bytes.len() == 36
+                    && bytes[14] == b'7'
+                    && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+                    && bytes.iter().enumerate().all(|(index, byte)| {
+                        if matches!(index, 8 | 13 | 18 | 23) {
+                            *byte == b'-'
+                        } else {
+                            byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+                        }
+                    })
+            });
+        if !valid {
+            return Err(Error::InvalidInput(
+                "generated creates require a canonical UUIDv7".into(),
+            ));
+        }
+    }
     let optional_args = query
         .optional_input_args
         .iter()
@@ -572,6 +720,7 @@ fn libsql_to_json(value: libsql::Value) -> JsonValue {
 
 #[derive(Debug)]
 pub enum Error {
+    OutcomeUnknown(libsql::Error),
     Database(libsql::Error),
     Execution {
         stage: &'static str,
@@ -598,6 +747,9 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::OutcomeUnknown(error) => {
+                write!(f, "commit transaction: database error: {}; outcome unknown; do not automatically replay", error)
+            }
             Error::Database(error) => write!(f, "database error: {}", error),
             Error::Execution {
                 stage,

@@ -4,6 +4,7 @@ pub mod snapshot;
 pub fn union_predicate_schema(permission: bool) -> String {
     format!(
         r#"
+@syncable(false)
 type ProviderReason
    = ProviderRejected {{
         code String?
@@ -66,6 +67,7 @@ record Account {
 /// triggered the aliased-CTE permission predicate regression.
 pub fn permissions_schema() -> String {
     r#"
+@syncable(false)
 session {
     userId Int
     role String
@@ -117,6 +119,7 @@ record Document {
 /// Schema exercising Json<T> columns (typed JSON documents).
 pub fn json_schema() -> String {
     r#"
+@syncable(false)
 record Event {
     id Int @id
     name String

@@ -143,7 +143,7 @@ pub struct DeltaMessage {
     pub database_epoch: Option<String>,
     #[serde(rename = "databaseId", skip_serializing_if = "Option::is_none")]
     pub database_id: Option<DatabaseId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub data: Vec<AffectedRowTableGroup>,
 }
 
@@ -224,6 +224,29 @@ pub struct SessionDeltaMessage {
 
 /// Run a catchup sync request using a client cursor and logical session values.
 pub async fn catchup(
+    conn: &libsql::Connection,
+    context: &typecheck::Context,
+    sync_cursor: &SyncCursor,
+    session: &SyncSession,
+    page_size: usize,
+) -> Result<SyncPageResult, Error> {
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
+        .await
+        .map_err(Error::Database)?;
+    match catchup_snapshot(&tx, context, sync_cursor, session, page_size).await {
+        Ok(page) => {
+            tx.commit().await.map_err(Error::Database)?;
+            Ok(page)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+async fn catchup_snapshot(
     conn: &libsql::Connection,
     context: &typecheck::Context,
     sync_cursor: &SyncCursor,
@@ -393,7 +416,11 @@ async fn stamp_messages_and_response_with_next_server_revision(
         return Ok(messages);
     }
 
-    let (database_epoch, server_revision) = next_server_revision(conn).await?;
+    let (database_epoch, server_revision) = match &query_result.committed_revision {
+        Some(revision) => revision.clone(),
+        None => next_server_revision(conn).await?,
+    };
+    query_result.committed_revision = Some((database_epoch.clone(), server_revision));
     for message in &mut messages {
         message.message.server_revision = Some(server_revision);
         message.message.database_epoch = Some(database_epoch.clone());
@@ -403,6 +430,14 @@ async fn stamp_messages_and_response_with_next_server_revision(
         origin_message.database_epoch = Some(database_epoch.clone());
     }
 
+    if query_result
+        .response
+        .get("serverRevision")
+        .and_then(JsonValue::as_i64)
+        == Some(server_revision)
+    {
+        return Ok(messages);
+    }
     let mut envelope = serde_json::Map::new();
     envelope.insert(
         "serverRevision".to_string(),
@@ -446,34 +481,140 @@ fn build_delta_messages(
         return Ok(Vec::new());
     }
 
-    let result =
-        sync_deltas::calculate_sync_deltas(affected_row_groups, connected_sessions, context)
-            .map_err(Error::SyncDeltas)?;
+    let primary_key = |table_name: &str| {
+        context
+            .tables
+            .values()
+            .find(|table| {
+                crate::ast::get_tablename(&table.record.name, &table.record.fields) == table_name
+            })
+            .and_then(|table| {
+                crate::ast::collect_columns(&table.record.fields)
+                    .into_iter()
+                    .find(|column| crate::ast::is_primary_key(column))
+            })
+            .map(|column| column.name.clone())
+            .unwrap_or_else(|| "id".into())
+    };
+    let key = |group: &AffectedRowTableGroup, row: &Vec<JsonValue>| {
+        let index = group
+            .headers
+            .iter()
+            .position(|header| *header == primary_key(&group.table_name));
+        (
+            group.table_name.clone(),
+            index
+                .and_then(|i| row.get(i))
+                .unwrap_or(&JsonValue::Null)
+                .to_string(),
+        )
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut before = Vec::new();
+    let mut final_rows = std::collections::BTreeMap::new();
+    for group in affected_row_groups {
+        let preimage = group
+            .headers
+            .iter()
+            .any(|header| header == "_pyre_preimage");
+        let removed = group.headers.iter().any(|header| header == "_pyre_removed");
+        for row in &group.rows {
+            let identity = key(group, row);
+            let single = AffectedRowTableGroup {
+                rows: vec![row.clone()],
+                ..group.clone()
+            };
+            if seen.insert(identity.clone()) && (preimage || removed) {
+                before.push(single.clone());
+            }
+            if !preimage {
+                final_rows.insert(identity, if removed { None } else { Some(single) });
+            }
+        }
+    }
+    let after = final_rows.into_values().flatten().collect::<Vec<_>>();
+    let visible = |rows: &[AffectedRowTableGroup]| -> Result<HashMap<String, Vec<AffectedRowTableGroup>>, Error> {
+        let result = sync_deltas::calculate_sync_deltas(rows, connected_sessions, context).map_err(Error::SyncDeltas)?;
+        let mut sessions: HashMap<String, Vec<AffectedRowTableGroup>> = HashMap::new();
+        for group in result.groups {
+            let data = sync_shape::reshape_table_groups(&group.table_groups, context);
+            for id in group.session_ids { sessions.entry(id).or_default().extend(data.clone()); }
+        }
+        Ok(sessions)
+    };
+    let (before, after) = match (visible(&before), visible(&after)) {
+        (Ok(before), Ok(after)) => (before, after),
+        _ => {
+            return connected_sessions
+                .keys()
+                .map(|id| {
+                    let mut message = match &database_id {
+                        Some(database) => DeltaMessage::delta_for_database(database, Vec::new())?,
+                        None => DeltaMessage::delta(Vec::new()),
+                    };
+                    message.type_ = "invalidate".into();
+                    Ok(SessionDeltaMessage {
+                        session_id: id.clone(),
+                        message,
+                    })
+                })
+                .collect();
+        }
+    };
     let mut messages = Vec::new();
 
-    for group in result.groups {
-        let reshaped_table_groups = sync_shape::reshape_table_groups(&group.table_groups, context);
+    for session_id in connected_sessions.keys() {
+        let mut reshaped_table_groups = after.get(session_id).cloned().unwrap_or_default();
+        let keys = reshaped_table_groups
+            .iter()
+            .flat_map(|group| group.rows.iter().map(|row| key(group, row)))
+            .collect::<std::collections::HashSet<_>>();
+        for group in before.get(session_id).into_iter().flatten() {
+            let primary = primary_key(&group.table_name);
+            let Some(index) = group.headers.iter().position(|header| *header == primary) else {
+                continue;
+            };
+            let rows = group
+                .rows
+                .iter()
+                .filter(|row| !keys.contains(&key(group, row)))
+                .map(|row| vec![row[index].clone(), JsonValue::Bool(true)])
+                .collect::<Vec<_>>();
+            if !rows.is_empty() {
+                reshaped_table_groups.push(AffectedRowTableGroup {
+                    table_name: group.table_name.clone(),
+                    headers: vec![primary, "_pyre_removed".into()],
+                    rows,
+                });
+            }
+        }
         let delta_message = match &database_id {
             Some(database_id) => {
                 DeltaMessage::delta_for_database(database_id, reshaped_table_groups)?
             }
             None => DeltaMessage::delta(reshaped_table_groups),
         };
-        let message = if live_sync_requires_catchup(&delta_message, group.session_ids.len())? {
-            match &database_id {
+        let message = if live_sync_requires_catchup(&delta_message, connected_sessions.len())? {
+            let mut recovery = match &database_id {
                 Some(database_id) => DeltaMessage::sync_required_for_database(database_id)?,
                 None => DeltaMessage::sync_required(),
+            };
+            if delta_message
+                .data
+                .iter()
+                .any(|group| group.headers.iter().any(|header| header == "_pyre_removed"))
+            {
+                recovery.type_ = "invalidate".into();
             }
+            recovery
         } else {
             delta_message
         };
 
-        for session_id in group.session_ids {
-            messages.push(SessionDeltaMessage {
-                session_id,
-                message: message.clone(),
-            });
-        }
+        messages.push(SessionDeltaMessage {
+            session_id: session_id.clone(),
+            message: message.clone(),
+        });
     }
 
     messages.sort_by(|a, b| a.session_id.cmp(&b.session_id));

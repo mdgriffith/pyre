@@ -158,6 +158,45 @@ fn reshape_table_group(
     table_group: &AffectedRowTableGroup,
     context: &typecheck::Context,
 ) -> AffectedRowTableGroup {
+    // Permission filtering consumes the full deleted preimage first. The wire
+    // representation must disclose only its identity, never its old contents.
+    if table_group
+        .headers
+        .iter()
+        .any(|header| header == "_pyre_removed")
+    {
+        let primary = context
+            .tables
+            .values()
+            .find(|table| {
+                ast::get_tablename(&table.record.name, &table.record.fields)
+                    == table_group.table_name
+            })
+            .and_then(|table| {
+                ast::collect_columns(&table.record.fields)
+                    .into_iter()
+                    .find(|column| ast::is_primary_key(column))
+            })
+            .map(|column| column.name.clone());
+        if let Some(id_index) = table_group
+            .headers
+            .iter()
+            .position(|header| Some(header) == primary.as_ref())
+        {
+            return AffectedRowTableGroup {
+                table_name: table_group.table_name.clone(),
+                headers: vec![
+                    table_group.headers[id_index].clone(),
+                    "_pyre_removed".into(),
+                ],
+                rows: table_group
+                    .rows
+                    .iter()
+                    .map(|row| vec![row[id_index].clone(), JsonValue::Bool(true)])
+                    .collect(),
+            };
+        }
+    }
     let Some(table) = context.tables.values().find(|table| {
         ast::get_tablename(&table.record.name, &table.record.fields) == table_group.table_name
     }) else {

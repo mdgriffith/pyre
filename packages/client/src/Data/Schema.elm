@@ -1,4 +1,4 @@
-module Data.Schema exposing (IndexInfo, LinkInfo, LinkTarget, LinkType(..), SchemaMetadata, TableMetadata, decodeIndexInfo, decodeLinkInfo, decodeLinkTarget, decodeLinkType, decodeSchemaMetadata, decodeTableMetadata)
+module Data.Schema exposing (IndexInfo, LinkInfo, LinkTarget, LinkType(..), SchemaMetadata, TableMetadata, decodeIndexInfo, decodeLinkInfo, decodeLinkTarget, decodeLinkType, decodeSchemaMetadata, decodeTableMetadata, primaryKey)
 
 import Dict exposing (Dict)
 import Json.Decode as Decode
@@ -41,6 +41,14 @@ type alias SchemaMetadata =
     { tables : Dict String TableMetadata
     , queryFieldToTable : Dict String String
     }
+
+
+primaryKey : SchemaMetadata -> String -> String
+primaryKey schema tableName =
+    Dict.get tableName schema.tables
+        |> Maybe.andThen (\table -> List.filter .primary table.indices |> List.head)
+        |> Maybe.map .field
+        |> Maybe.withDefault "id"
 
 
 decodeLinkType : Decode.Decoder LinkType

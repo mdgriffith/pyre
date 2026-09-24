@@ -8,7 +8,7 @@ fn workspace() -> TempDir {
     std::fs::write(dir.path().join("pyre/session.pyre"), "session {\n}\n").unwrap();
     std::fs::write(
         dir.path().join("pyre/schema.pyre"),
-        "record User {\n    id Int @id\n    name String\n    @public\n}\n",
+        "@syncable(false)\nrecord User {\n    id Int @id\n    name String\n    @public\n}\n",
     )
     .unwrap();
     dir

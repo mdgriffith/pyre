@@ -26,6 +26,17 @@ struct QueryManifest {
     sql: Vec<SqlInfo>,
     #[serde(rename = "syncSql", skip_serializing_if = "Option::is_none")]
     sync_sql: Option<Vec<SqlInfo>>,
+    #[serde(rename = "generatedEdit", skip_serializing_if = "Option::is_none")]
+    generated_edit: Option<GeneratedEdit>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedEdit {
+    write_statement: usize,
+    sync_write_statement: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    create_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -127,6 +138,21 @@ fn query_manifest(
             .map(|arg| arg.name.clone())
             .collect(),
         sql: query_sql(context, query, query_info, false),
+        generated_edit: crate::generated_queries::generated_crud_table(context, query).map(
+            |table| GeneratedEdit {
+                write_statement: sql::to_sql::format_attach(query_info).len(),
+                sync_write_statement: sql::to_sql::format_attach(query_info).len()
+                    + usize::from(query.operation == ast::QueryOperation::Update),
+                create_id: ast::collect_columns(&table.record.fields)
+                    .into_iter()
+                    .find(|column| ast::is_primary_key(column))
+                    .filter(|column| {
+                        query.operation == ast::QueryOperation::Insert
+                            && matches!(column.type_, ast::ColumnType::IdUuid { .. })
+                    })
+                    .map(|column| column.name.clone()),
+            },
+        ),
         sync_sql: if query.operation == ast::QueryOperation::Query {
             None
         } else {

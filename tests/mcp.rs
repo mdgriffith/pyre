@@ -38,6 +38,7 @@ fn write_schema(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id   Int    @id
     name String
@@ -63,6 +64,7 @@ session {
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
 
+@syncable(false)
 record Note {
     id      Int    @id
     ownerId Int
@@ -78,6 +80,7 @@ fn write_nullable_schema(ctx: &TestContext) {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record User {
     id       Int     @id
     nickname String?
@@ -431,7 +434,7 @@ fn docs_are_exposed_as_resources() {
     assert!(query_docs["content"]
         .as_str()
         .unwrap()
-        .contains("generated update inputs omit them"));
+        .contains("updates omit protected fields"));
 
     let migration_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "migrations" }));
     assert!(migration_docs["content"]
@@ -516,12 +519,35 @@ fn sync_and_optional_guides_are_discoverable_and_retrievable() {
                 "The accessible-list check is UI behavior, not authorization",
                 "query.md#local-queries-and-session",
                 "one client per schema family",
+                "client.submit(target, edits)",
+                "not yet recovered",
             ],
         ),
         (
             "elm-sync",
             "Elm + Sync Runtime Setup",
-            vec!["Db.Database.fromString", "elm:", "setSyncedDatabases"],
+            vec![
+                "Db.Database.fromString",
+                "elm:",
+                "setSyncedDatabases",
+                "Db.Edit.submit",
+                "Db.Edit.receive",
+                "Pyre.getResult databaseId",
+            ],
+        ),
+        (
+            "seeding",
+            "Seeding And Server-Owned Writes",
+            vec![
+                "executeOperations",
+                "mode: 'normal'",
+                "bypasses query permissions",
+            ],
+        ),
+        (
+            "rust-server",
+            "Rust Server Integration",
+            vec!["query::run_operations", "query::run_sync", "OutcomeUnknown"],
         ),
         (
             "multi-database-upgrade",
@@ -666,7 +692,7 @@ fn init_creates_single_database_schema_from_required_source() {
         "pyre_init",
         json!({
             "dir": "app-pyre",
-            "schema": "record User {\n    id Int @id\n    name String\n    @public\n}\n"
+            "schema": "@syncable(false)\nrecord User {\n    id Int @id\n    name String\n    @public\n}\n"
         }),
     );
 
@@ -695,7 +721,7 @@ fn init_accepts_shared_session_source() {
         json!({
             "dir": "app-pyre",
             "session": "session {\n    userId Int\n}\n",
-            "schema": "record User {\n    id Int @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}\n"
+            "schema": "record User {\n    id Id.Uuid @id\n    ownerId Int\n    @allow(query) { ownerId == Session.userId }\n    @allow(insert, update, delete) { False }\n}\n"
         }),
     );
 
@@ -716,7 +742,7 @@ fn init_creates_namespaced_schema() {
         json!({
             "dir": "multi-pyre",
             "namespace": "Billing",
-            "schema": "record Invoice {\n    id Int @id\n    amount Int\n    @public\n}\n"
+            "schema": "record Invoice {\n    id Id.Uuid @id\n    amount Int\n    @public\n}\n"
         }),
     );
 
@@ -897,7 +923,7 @@ fn init_can_create_and_migrate_local_database() {
         "pyre_init",
         json!({
             "dir": "db-pyre",
-            "schema": "record User {\n    id Int @id\n    name String\n    @public\n}\n",
+            "schema": "@syncable(false)\nrecord User {\n    id Int @id\n    name String\n    @public\n}\n",
             "database": "pyre.db"
         }),
     );
@@ -1057,6 +1083,7 @@ fn pyre_query_binds_tagged_unit_enum_parameters() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 type Status
     = Running
     | Stopped
@@ -1155,6 +1182,7 @@ fn pyre_preview_query_rejects_immutable_updates() {
     std::fs::write(
         ctx.workspace_path.join("pyre/schema.pyre"),
         r#"
+@syncable(false)
 record Document {
     id      Int @id
     ownerId Int @immutable

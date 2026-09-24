@@ -93,7 +93,10 @@ For a new project, a good default read-first flow is:
 2. `pyre_schema`
 3. `pyre_check`
 4. `pyre_db_status` if a database is in play
-5. `pyre_preview_query` or `pyre_query` for ad hoc exploration
+5. Read the relevant bundled guides before writing integration code (see below).
+6. Use `pyre_preview_query` for ad hoc query validation; use `pyre_query` when execution is intended.
+
+For application writes, first choose the operation boundary: generated CRUD/composition, a named command, or a trusted import. MCP dynamic query tools are for inspection and explicit ad hoc execution; they are not the browser submission protocol. Inspect the actual generated modules for field names, required inputs, namespace markers, and result shapes rather than inventing helpers from examples. After schema/query changes, run `pyre_check` and `pyre_generate` and compile the application's TypeScript/Elm integration.
 
 ## Bundled Docs And Resources
 
@@ -107,7 +110,9 @@ Examples:
 - `pyre_docs` with topic `multi-database-upgrade` to extend sync to multiple source databases
 - `pyre_docs` with topic `server-contexts` for the optional server-side session caching API and invalidation
 - `pyre_docs` with topic `schema`
-- `pyre_docs` with topic `query` for selects, mutations, and transaction blocks
+- `pyre_docs` with topic `query` for selects, named transactions, CRUD/composition contracts, and operation results
+- `pyre_docs` with topic `seeding` for explicit-session composed writes and the separate import helper
+- `pyre_docs` with topic `rust-server` for native manifest execution and sync integration
 - `pyre_docs` with topic `migrations`
 - `pyre_docs` with topic `serve`
 - `pyre_docs` with topic `project-structure`
@@ -118,6 +123,8 @@ Examples:
 - `pyre://guides/elm-sync`
 - `pyre://guides/multi-database-upgrade`
 - `pyre://guides/server-contexts`
+- `pyre://guides/seeding`
+- `pyre://guides/rust-server`
 
 Discover topics through `tools/list` (the `pyre_docs` topic enum) or guides through
 `resources/list`. Retrieve a guide with `tools/call` using
@@ -125,7 +132,16 @@ Discover topics through `tools/list` (the `pyre_docs` topic enum) or guides thro
 `resources/read` using `{"uri":"pyre://guides/sync"}`. The same topics
 are available through `pyre docs` and `pyre docs <topic>`.
 
-Read `sync` first for authentication, app-owned database selection, and local query boundaries. Continue with `elm-sync` if the UI uses Elm or `multi-database-upgrade` when adding databases. `server-contexts` is optional and is not a prerequisite for these workflows.
+Use this reading order for application integration:
+
+1. `schema`: syncability and UUID identity, fields, and server permissions.
+2. `query`: named commands versus pure generated builders, explicit atomic submission, nullable inputs, cardinality, and typed indexed results.
+3. `sync`: TypeScript client setup, local reads, `client.submit`, custom `$batch` routing, one-worker reconciliation, and recovery limits.
+4. `elm-sync` for Elm apps, or `seeding` / `rust-server` for server-owned execution without a browser. Use `multi-database-upgrade` when adding instances and `migrations` when upgrading an existing deployment.
+
+These guides are the canonical application-facing explanations; repository specs contain design/conformance detail. The same existing Markdown files are embedded at CLI build time for both `pyre docs` and MCP, so rebuild/upgrade the executable and restart the MCP process to pick up documentation changes. A checked-out Markdown change alone does not change a running MCP binary.
+
+When generating code or explaining guarantees, preserve these boundaries: synced records use non-null UUID primary keys; builders do not execute until submission; the server owns permissions; one batch targets one database; pending edits are memory-only; unknown outcomes are not automatically replayed; ordinary reconnect does not recover removals missed during delivery gaps. `server-contexts` remains optional server-side session caching, not a required handshake.
 
 ## When Not To Use MCP
 

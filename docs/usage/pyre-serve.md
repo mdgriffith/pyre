@@ -110,6 +110,10 @@ POST /db/:queryId
 
 These are the default endpoints expected by `@pyre/client`.
 
+`POST /db/$batch` accepts an ordered JSON array of `{ queryId, input }` descriptors for compiled operations. Generated TS `client.submit` and Elm `Db.Edit.submit` use this route; a client sends identifiers and values, not SQL. Execution is atomic under the authenticated request session. Generated writes require exactly one affected row and generated UUID creates require UUIDv7. See [Query Guide](./query.md#generated-crud-and-composed-operations).
+
+For synced requests (`sync=true`), the server allocates revisions in the write transaction and returns permission-filtered HTTP authority even without an SSE connection. The server creates its own logical response origin: a supplied `connectionId` cannot choose response permissions or suppress a peer's broadcast. Real live connections receive their own authorized rows/removals, and the worker handles duplicate HTTP/SSE delivery by revision. Unknown commit outcomes return HTTP 500 rather than a definite rejection; do not automatically retry.
+
 ## Options
 
 ```text

@@ -115,6 +115,26 @@ fn generated_crud_queries(context: &typecheck::Context) -> Vec<ast::Query> {
     result
 }
 
+/// Recognize compiler-owned CRUD by its complete definition, never just its name.
+/// Named commands retain their existing execution semantics.
+pub fn generated_crud_table<'a>(
+    context: &'a typecheck::Context,
+    query: &ast::Query,
+) -> Option<&'a typecheck::Table> {
+    let [ast::TopLevelQueryField::Field(field)] = query.fields.as_slice() else {
+        return None;
+    };
+    let table = context.tables.get(&field.name)?;
+    let generated = match query.operation {
+        ast::QueryOperation::Insert => build_create_query(table),
+        ast::QueryOperation::Update => build_update_query(table),
+        ast::QueryOperation::Delete => build_delete_query(table),
+        _ => return None,
+    };
+    (generated.name == query.name && generated.full_hash == hash::hash_query_full(query))
+        .then_some(table)
+}
+
 fn sorted_tables(context: &typecheck::Context) -> Vec<&typecheck::Table> {
     let mut tables = context.tables.values().collect::<Vec<&typecheck::Table>>();
     tables.sort_by(|a, b| a.record.name.cmp(&b.record.name));

@@ -6,7 +6,7 @@ This guide explains how Pyre namespaces work today, how to structure files, and 
 
 - A namespace is a schema partition name (for example `App` or `Auth`).
 - Namespaces are discovered from folder names under `pyre/schema/`.
-- If you use a single `pyre/schema.pyre` file, Pyre treats it as the default namespace.
+- If you use a single `pyre/schema.pyre` file, Pyre treats it as the default namespace, named `_default` in TypeScript operation targets (for example `database('_default', 'tenant:1')`). A namespace identifies a schema; `databaseId` identifies an application-selected database instance.
 
 ## Project layouts
 
@@ -51,8 +51,8 @@ Use fully-qualified form: `Namespace.Record.field`.
 
 ```pyre
 record Post {
-    id Int @id
-    authorId Int
+    id Id.Uuid @id
+    authorId Auth.User.id
     author @link(authorId, Auth.User.id)
     @public
 }
@@ -66,7 +66,7 @@ namespace explicitly:
 
 ```pyre
 record Post {
-    id Id.Int @id
+    id Id.Uuid @id
     authorId Auth.User.id
     author @link(authorId, Auth.User.id)
 }
@@ -85,6 +85,8 @@ cross-database SQLite foreign-key constraint.
 
 Namespaces sync by default. Add `@syncable(false)` at the top of a schema file when a namespace should be queryable through Pyre but excluded from catchup/live sync. You can use `@syncable(true)` to be explicit about the default synced behavior.
 
+Every record in a synced namespace must have one non-null `Id.Uuid @id` primary key, including records with custom primary-key field names. Query-only namespaces retain integer and plain-string keys. This policy applies to the namespace across its schema files.
+
 ```pyre
 @syncable(false)
 
@@ -95,6 +97,8 @@ record Account {
 ```
 
 For a main/campaign split, mark the `Main` namespace with `@syncable(false)` and leave `Campaign` as the default synced namespace.
+
+Composed operations must target one namespace and one database instance. A typed target prevents accidental namespace mixing but does not authorize access; the server resolves and authorizes the database. Cross-namespace links do not make cross-database atomic batches possible.
 
 ## Practical checklist
 

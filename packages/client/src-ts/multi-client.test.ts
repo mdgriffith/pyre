@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { expect, test } from 'bun:test';
 
-import { PyreClient } from './index';
+import { operation, PyreClient } from './index';
 import { QueryClientService } from './service/query-client';
 import {
   __resetPyreDevtoolsRegistryForTests,
@@ -98,6 +98,53 @@ test('PyreClient requires cacheNamespace', async () => {
     schema,
     server,
   })).rejects.toThrow('PyreClient.create requires cacheNamespace');
+});
+
+test('explicit submission snapshots pure operations and forwards one ordered batch through run', async () => {
+  const runs = [];
+  let created = 0;
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'batch',
+    createInternalClient: async (config) => {
+      created++;
+      return { ...fakeInternalClient([], config.databaseId),
+        run(databaseId, module, input, callback) {
+          runs.push({ databaseId, module, input });
+          callback({ ok: true, value: input.map((op, index) => ({ index, queryId: op.queryId, result: op.input })) });
+        },
+      };
+    },
+  });
+  const module = { operation: 'update', id: 'edit', optimistic: {
+    queryField: 'notes', where: { field: 'id', input: 'id' }, set: [{ field: 'title', input: 'title' }],
+  } };
+  const input = { id: 1, title: 'Captured', nested: { value: 1 } };
+  const first = operation(module, input);
+  input.title = 'Changed';
+  input.nested.value = 2;
+  const second = operation(module, input);
+  module.optimistic.set[0].field = 'wrong';
+  expect(created).toBe(0);
+  expect(await client.submit('main', [])).toEqual({ ok: true, value: [] });
+  expect(created).toBe(0);
+  const submitted = [first, second];
+  const completion = client.submit('main', submitted);
+  submitted.reverse();
+  const result = await completion;
+  expect(runs).toHaveLength(1);
+  expect(runs[0]).toMatchObject({ databaseId: 'main', module: { id: '$batch', operation: 'transaction' }, input: [
+    { queryId: 'edit', input: { id: 1, title: 'Captured', nested: { value: 1 } } },
+    { queryId: 'edit', input: { id: 1, title: 'Changed', nested: { value: 2 } } },
+  ] });
+  expect(runs[0].module.optimistic.map(op => op.optimistic.set[0].field)).toEqual(['title', 'title']);
+  expect(result.value.map(op => op.index)).toEqual([0, 1]);
+  expect(() => client.submit('main', [{}])).toThrow('Expected an operation');
+  const scoped = operation({ operation: 'update', id: 'edit', primary_db: 'Main' }, {});
+  expect(() => client.submit('main', [scoped])).toThrow('require a database target');
+  expect(() => client.submit({ namespace: 'Other', databaseId: 'main' }, [scoped])).toThrow('one database namespace');
+  expect(runs).toHaveLength(1);
+  expect(() => operation({ id: 'read', operation: 'query' }, {})).toThrow('compiled mutation');
+  client.disconnect();
 });
 
 test('connect and sync selection create session-free internal clients', async () => {
@@ -557,6 +604,7 @@ test('Elm bridge routes register messages by databaseId', async () => {
   expect(results.sent).toEqual([
     {
       type: 'full',
+      databaseId: 'campaign:123',
       queryId: 'q1',
       queryName: 'CampaignNotes',
       revision: expect.any(Number),
@@ -610,12 +658,44 @@ test('Elm bridge routes mutation messages by databaseId', async () => {
   expect(results.sent).toEqual([
     {
       type: 'mutation-result',
+      databaseId: 'campaign:123',
       requestId: 'm1',
       mutationId: 'CreateNote',
       mutationName: 'CreateNote',
       result: { kind: 'success' },
     },
   ]);
+});
+
+test('Elm edit submission allocates UUIDv7 once and shares captured input with prediction', async () => {
+  const received: any[] = [];
+  const outbound = fakePort();
+  const results = fakePort();
+  await PyreClient.create({
+    schema, server, cacheNamespace: 'edit-bridge',
+    createInternalClient: async config => ({
+      ...fakeInternalClient([], config.databaseId),
+      run(databaseId: string, queryModule: any, input: any, callback: any) {
+        received.push({ databaseId, queryModule, input });
+        callback({ ok: true, value: [] });
+      },
+    }),
+    elm: { app: { ports: { pyreStoreOut: outbound.port, pyre_receiveMutationResult: results.port } } },
+  });
+  const prediction = { queryField: 'notes', where: { field: 'id', input: 'id' }, set: [] };
+  outbound.emit({ type: 'submit', databaseId: 'campaign:123', requestId: 'create-batch', operations: [
+    { queryId: 'create', input: { title: 'Title' }, createId: 'id', optimistic: prediction },
+    { queryId: 'update', input: { id: 'existing', title: 'Updated' }, optimistic: prediction },
+  ] });
+  await Bun.sleep(0);
+  expect(received).toHaveLength(1);
+  const sent = received[0];
+  expect(sent.queryModule.id).toBe('$batch');
+  expect(sent.input[0].input.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  expect(sent.queryModule.optimistic[0].input).toEqual(sent.input[0].input);
+  expect(sent.input[0]).not.toHaveProperty('createId');
+  expect(sent.input[1].input).toEqual({ id: 'existing', title: 'Updated' });
+  expect(results.sent[0]).toMatchObject({ databaseId: 'campaign:123', requestId: 'create-batch', result: { ok: true } });
 });
 
 test('Elm bridge routes entity stream registrations and batches by streamId', async () => {
@@ -884,8 +964,8 @@ test('devtools mutation events include database metadata and retain newest event
     actor: 'APP',
     operation: 'mutation.failed',
     level: 'error',
-    summary: '[pyre] APP mutation.failed secondary mutation=FailMutation duration=0ms error=nope',
-    type: '[pyre] APP mutation.failed secondary mutation=FailMutation duration=0ms error=nope',
+    summary: expect.stringMatching(/^\[pyre\] APP mutation\.failed secondary mutation=FailMutation duration=\d+ms error=nope$/),
+    type: snapshot?.events[0].summary,
   });
   expect(snapshot?.events[0].payload).toMatchObject({
     instanceId,

@@ -254,6 +254,37 @@ export async function catchup(
     databaseId?: DatabaseId,
     clientDatabaseEpoch?: string,
 ): Promise<CatchupResult> {
+    validateSyncCursor(syncCursor);
+    normalizePageSize(pageSize);
+    // Local interactive transactions detach the client's connection. A subsequent
+    // use would open an empty private in-memory database, so reject it first.
+    if (db.protocol === "file") {
+        const databases = await db.execute("pragma database_list");
+        if (!databases.rows.some(row => row.name === "main" && typeof row.file === "string" && row.file.length > 0)) {
+            throw new Error("Catchup requires a file-backed local database");
+        }
+    }
+    const tx = await db.transaction("read");
+    try {
+        const result = await catchupSnapshot(tx, syncCursor, session, pageSize, databaseId, clientDatabaseEpoch);
+        await tx.commit();
+        return result;
+    } catch (error) {
+        if (!tx.closed) await tx.rollback();
+        throw error;
+    } finally {
+        tx.close();
+    }
+}
+
+async function catchupSnapshot(
+    db: Pick<Client, "execute" | "batch">,
+    syncCursor: SyncCursor,
+    session: SyncSession,
+    pageSize: number,
+    databaseId?: DatabaseId,
+    clientDatabaseEpoch?: string,
+): Promise<CatchupResult> {
     activateSchemaForDatabase(databaseId);
     const effectivePageSize = normalizePageSize(pageSize);
     validateSyncCursor(syncCursor);
@@ -290,6 +321,7 @@ export async function catchup(
     }
 
     // Step 3: Get sync SQL for tables that need syncing
+    activateSchemaForDatabase(databaseId);
     const syncSqlResult = wasm.get_sync_sql(statusResult.rows, syncCursor, wasmSession, effectivePageSize);
     if (typeof syncSqlResult === "string" && syncSqlResult.startsWith("Error:")) {
         throw new Error(syncSqlResult);
@@ -328,6 +360,7 @@ export async function catchup(
 
     // Execute all SQL statements in a single batch
     const allQueryResults = await db.batch(allSqlStatements);
+    activateSchemaForDatabase(databaseId);
 
     // Process results for each table
     let resultIndex = 0;

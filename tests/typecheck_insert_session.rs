@@ -6,6 +6,7 @@ use pyre::typecheck;
 #[test]
 fn test_insert_with_session_variable() {
     let schema_source = r#"
+@syncable(false)
 session {
     userId Int
     role   String

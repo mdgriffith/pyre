@@ -7,6 +7,7 @@ import Db.Query
 import Dict exposing (Dict)
 import Expect
 import Test exposing (Test, describe, test)
+import Uuid
 
 
 suite : Test
@@ -34,7 +35,7 @@ suite =
                             [ { tableName = "games"
                               , headers = [ "id", "name" ]
                               , rows =
-                                    [ [ Data.Value.IntValue 1
+                                    [ [ Uuid.value 1
                                       , Data.Value.StringValue "The Broken Tower"
                                       ]
                                     ]
@@ -53,7 +54,7 @@ suite =
                     (Dict.fromList
                         [ ( "game"
                           , [ Dict.fromList
-                                [ ( "id", Data.Value.IntValue 1 )
+                                [ ( "id", Uuid.value 1 )
                                 , ( "name", Data.Value.StringValue "The Broken Tower" )
                                 , ( "gameMembers", Data.Value.ArrayValue [] )
                                 ]
@@ -72,13 +73,13 @@ suite =
                     (Dict.fromList
                         [ ( "game"
                           , [ Dict.fromList
-                                [ ( "id", Data.Value.IntValue 1 )
+                                [ ( "id", Uuid.value 1 )
                                 , ( "members"
                                   , Data.Value.ArrayValue
                                         [ Data.Value.ObjectValue
                                             (Dict.fromList
-                                                [ ( "id", Data.Value.IntValue 10 )
-                                                , ( "userId", Data.Value.IntValue 20 )
+                                                [ ( "id", Uuid.value 10 )
+                                                , ( "userId", Uuid.value 20 )
                                                 ]
                                             )
                                         ]
@@ -178,9 +179,9 @@ dbWithEmptyRelatedTable =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Uuid.id 1
                       , Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
                             ]
                       )
@@ -189,6 +190,7 @@ dbWithEmptyRelatedTable =
             , ( "game_members", Dict.empty )
             ]
     , indices = Dict.empty
+    , primaryKeys = Dict.empty
     }
 
 
@@ -198,9 +200,9 @@ dbWithoutRelatedTable =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Uuid.id 1
                       , Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
                             ]
                       )
@@ -208,6 +210,7 @@ dbWithoutRelatedTable =
               )
             ]
     , indices = Dict.empty
+    , primaryKeys = Dict.empty
     }
 
 
@@ -217,9 +220,9 @@ dbWithRelatedRows =
         Dict.fromList
             [ ( "games"
               , Dict.fromList
-                    [ ( 1
+                    [ ( Uuid.id 1
                       , Dict.fromList
-                            [ ( "id", Data.Value.IntValue 1 )
+                            [ ( "id", Uuid.value 1 )
                             , ( "name", Data.Value.StringValue "The Broken Tower" )
                             ]
                       )
@@ -227,17 +230,18 @@ dbWithRelatedRows =
               )
             , ( "game_members"
               , Dict.fromList
-                    [ ( 10
+                    [ ( Uuid.id 10
                       , Dict.fromList
-                            [ ( "id", Data.Value.IntValue 10 )
-                            , ( "gameId", Data.Value.IntValue 1 )
-                            , ( "userId", Data.Value.IntValue 20 )
+                            [ ( "id", Uuid.value 10 )
+                            , ( "gameId", Uuid.value 1 )
+                            , ( "userId", Uuid.value 20 )
                             ]
                       )
                     ]
               )
             ]
     , indices = Dict.empty
+    , primaryKeys = Dict.empty
     }
 
 
@@ -246,7 +250,7 @@ expectedResult =
     Dict.fromList
         [ ( "game"
           , [ Dict.fromList
-                [ ( "id", Data.Value.IntValue 1 )
+                [ ( "id", Uuid.value 1 )
                 , ( "name", Data.Value.StringValue "The Broken Tower" )
                 , ( "gameMembers", Data.Value.ArrayValue [] )
                 ]

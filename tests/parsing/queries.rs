@@ -61,7 +61,7 @@ type JobState
      }
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     state JobState
     @public
 }
@@ -126,7 +126,7 @@ session {
 }
 
 record Resource {
-    id Int @id
+    id Id.Uuid @id
     ownerId Int?
     label String
     @public
@@ -285,7 +285,7 @@ type State
    | Ready
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     payload Json<State>
     @public
 }
@@ -318,7 +318,7 @@ type State
    | Ready
 
 record Job {
-    id Int @id
+    id Id.Uuid @id
     state State
     @public
 }
@@ -379,7 +379,7 @@ fn query_predicate_validates_function_return_type() {
         "schema.pyre",
         r#"
 record Metric {
-    id Int @id
+    id Id.Uuid @id
     label String
     score Float
     @public

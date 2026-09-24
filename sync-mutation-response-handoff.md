@@ -1,4 +1,11 @@
-# Sync mutation responses are not typed mutation responses
+# Historical sync mutation response investigation
+
+**Current contract:** both Rust and TypeScript preserve the generated mutation
+result in normal and sync execution. Sync publication wraps that result under
+`result` alongside revision/authority; decode the inner result, not the envelope.
+Ordered batches retain `{ index, queryId, result }` entries. The discarded-response
+behavior and workaround below describe the earlier implementation, not the current
+API. See `docs/spec/composed-operation-builders.md` for executable examples.
 
 ## Part 1: Problem and original implementation reasoning
 

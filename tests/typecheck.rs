@@ -4,6 +4,102 @@ use pyre::error::ErrorType;
 use pyre::parser;
 use pyre::typecheck;
 
+#[test]
+fn synced_records_require_one_non_null_uuid_primary_key() {
+    for key in ["Int", "Id.Int", "String", "Id.Uuid?"] {
+        let mut schema = ast::Schema::default();
+        parser::run(
+            "schema.pyre",
+            &format!("record Item {{\n @public\n id {key} @id\n}}"),
+            &mut schema,
+        )
+        .unwrap();
+        let errors = typecheck::check_schema(&ast::Database {
+            schemas: vec![schema],
+        })
+        .err()
+        .unwrap();
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.error_type, ErrorType::InvalidSyncedPrimaryKey { .. })),
+            "{key}"
+        );
+    }
+    checked_context("record Item {\n @public\n id Id.Uuid @id\n}");
+    for key in ["Int", "Id.Int", "String"] {
+        checked_context(&format!(
+            "@syncable(false)\nrecord Item {{\n @public\n id {key} @id\n}}"
+        ));
+    }
+    for (fields, multiple) in [
+        ("value String", false),
+        ("id Id.Uuid @id\n other Id.Uuid @id", true),
+    ] {
+        let mut schema = ast::Schema::default();
+        parser::run(
+            "schema.pyre",
+            &format!("record Item {{\n @public\n {fields}\n}}"),
+            &mut schema,
+        )
+        .unwrap();
+        let errors = typecheck::check_schema(&ast::Database {
+            schemas: vec![schema],
+        })
+        .err()
+        .unwrap();
+        assert!(errors.iter().any(|error| if multiple {
+            matches!(error.error_type, ErrorType::MultiplePrimaryKeys { .. })
+        } else {
+            matches!(error.error_type, ErrorType::NoPrimaryKey { .. })
+        }));
+    }
+}
+
+#[test]
+fn sync_identity_requirement_is_namespace_wide() {
+    let mut server = ast::Schema {
+        namespace: "Server".to_string(),
+        ..ast::Schema::default()
+    };
+    parser::run(
+        "Server/schema.pyre",
+        "@syncable(false)\nrecord Account {\n @public\n id Id.Int @id\n}",
+        &mut server,
+    )
+    .unwrap();
+    let mut synced = ast::Schema {
+        namespace: "Client".to_string(),
+        ..ast::Schema::default()
+    };
+    parser::run(
+        "Client/schema.pyre",
+        "@syncable(true)\nrecord Document {\n @public\n documentId Id.Uuid @id\n}",
+        &mut synced,
+    )
+    .unwrap();
+    typecheck::check_schema(&ast::Database {
+        schemas: vec![server.clone(), synced.clone()],
+    })
+    .unwrap();
+    parser::run(
+        "Client/legacy.pyre",
+        "record Legacy {\n @public\n id Id.Int @id\n}",
+        &mut synced,
+    )
+    .unwrap();
+    let errors = typecheck::check_schema(&ast::Database {
+        schemas: vec![server, synced],
+    })
+    .err()
+    .unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].filepath, "Client/legacy.pyre");
+    assert!(
+        matches!(&errors[0].error_type, ErrorType::InvalidSyncedPrimaryKey { record, field } if record == "Legacy" && field == "id")
+    );
+}
+
 fn check_schema_and_get_layers(schema_source: &str) -> std::collections::HashMap<String, usize> {
     let mut schema = ast::Schema::default();
     parser::run("schema.pyre", schema_source, &mut schema).expect("Failed to parse schema");
@@ -39,6 +135,7 @@ fn checked_context(schema_source: &str) -> typecheck::Context {
 fn integer_foreign_key_parameters_remain_compatible_with_record_id_aliases() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Game {
     @public
     id Id.Int @id
@@ -71,6 +168,7 @@ insert CreateMapScene($gameId: Game.id) {
 fn timestamps_add_managed_timestamp_fields() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Note {
     @public
     id Int @id
@@ -95,6 +193,7 @@ record Note {
 fn managed_fields_and_integer_ids_cannot_be_set_in_insert_mutations() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Note {
     @public
     id Int @id
@@ -141,6 +240,7 @@ insert CreateNote($id: Int, $body: String, $createdAt: DateTime, $updatedAt: Dat
 fn generated_create_excludes_integer_ids_and_managed_timestamps() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Note {
     @public
     id Int @id
@@ -175,6 +275,7 @@ record Note {
 fn immutable_fields_are_insertable_but_not_updateable() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -232,6 +333,7 @@ update TransferDocument($documentId: Int, $ownerId: Int) {
 fn immutable_fields_can_receive_schema_defaults_on_insert() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -261,6 +363,7 @@ insert CreateDocument($title: String) {
 fn immutable_assignments_are_rejected_regardless_of_value() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Document {
     @public
     id         Int @id
@@ -302,6 +405,7 @@ update RewriteDocument($id: Int) {
 fn immutable_fields_can_be_selected_from_updates_and_mutable_fields_still_update() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -332,6 +436,7 @@ update RenameDocument($documentId: Int, $title: String) {
 fn transaction_update_steps_cannot_assign_immutable_fields() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -367,6 +472,7 @@ transaction TransferDocument($documentId: Int, $ownerId: Int) {
 fn structured_immutable_fields_cannot_be_updated() {
     let context = checked_context(
         r#"
+@syncable(false)
 type EventPayload
     = Created { title String }
     | Renamed { previousTitle String, title String }
@@ -405,6 +511,7 @@ update ReplacePayload($id: Int, $payload: EventPayload) {
 fn immutable_inline_structured_assignment_marks_nested_parameters_used() {
     let context = checked_context(
         r#"
+@syncable(false)
 type EventPayload
     = Created { title String }
     | Renamed { previousTitle String, title String }
@@ -450,6 +557,7 @@ update ReplacePayload($id: Int, $previousTitle: String, $title: String) {
 fn nested_insert_rejects_explicit_immutable_parent_key_without_unused_param() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Parent {
     @public
     id       Id.Int @id
@@ -497,6 +605,7 @@ insert CreateParent($parentId: Parent.id, $body: String) {
 fn generated_crud_keeps_immutable_create_inputs_and_omits_update_inputs() {
     let context = checked_context(
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -533,6 +642,7 @@ record Document {
 fn generated_crud_update_with_only_immutable_fields_omits_them() {
     let context = checked_context(
         r#"
+@syncable(false)
 record DocumentOwner {
     @public
     id      Int @id
@@ -624,7 +734,7 @@ fn test_tablename_rejects_unsafe_sql_identifier() {
 record User {
     @tablename("users-with-dash")
     @public
-    id Int @id
+    id Id.Uuid @id
 }
     "#;
 
@@ -648,7 +758,7 @@ fn test_list_type_must_be_wrapped_in_json() {
     let schema_source = r#"
 record User {
     @public
-    id Int @id
+    id Id.Uuid @id
     tags List<String>
 }
     "#;
@@ -672,7 +782,7 @@ fn test_dict_type_must_be_wrapped_in_json() {
     let schema_source = r#"
 record User {
     @public
-    id Int @id
+    id Id.Uuid @id
     metadata Dict<String>
 }
     "#;
@@ -706,7 +816,7 @@ type GroupState
 
 record Game {
     @public
-    id Int @id
+    id Id.Uuid @id
     state Json<GameState>
 }
     "#;
@@ -738,7 +848,7 @@ type Attribute
 
 record Entity {
     @public
-    id Int @id
+    id Id.Uuid @id
     attrs Json<Dict<Attribute>>
 }
     "#;
@@ -774,7 +884,7 @@ type Attribute
 
 record Entity {
     @public
-    id Int @id
+    id Id.Uuid @id
     attrs Json<Dict<Attribute>>
 }
     "#;
@@ -803,7 +913,7 @@ type DocumentVisibility
 
 record Document {
     @public
-    id Int @id
+    id Id.Uuid @id
     visibility DocumentVisibility
 }
     "#;
@@ -832,7 +942,7 @@ type Preferences
 
 record User {
     @public
-    id Int @id
+    id Id.Uuid @id
     preferences Json<Preferences> @default(null)
 }
     "#;
@@ -856,7 +966,7 @@ fn test_raw_json_field_cannot_have_default() {
     let schema_source = r#"
 record User {
     @public
-    id Int @id
+    id Id.Uuid @id
     payload JSON @default(null)
 }
     "#;
@@ -886,7 +996,7 @@ type Preferences
 
 record User {
     @public
-    id Int @id
+    id Id.Uuid @id
     preferences Json<Preferences>
 }
     "#;
@@ -908,6 +1018,7 @@ record User {
 #[test]
 fn test_json_typed_field_accepts_union_literal_in_insert() {
     let schema_source = r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -969,7 +1080,7 @@ type DevKeyKind
 
 record Event {
     @public
-    id Int @id
+    id Id.Uuid @id
     eventType DevEventType
 }
     "#;
@@ -1198,6 +1309,7 @@ record Task {
 #[test]
 fn test_invalid_id_int_default_has_no_allowed_defaults() {
     let schema_source = r#"
+@syncable(false)
 record Counter {
     @public
     id Id.Int @id @default(1)
@@ -1237,22 +1349,22 @@ fn test_simple_linear_dependency() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    bId Int
+    id Id.Uuid @id
+    bId B.id
     b @link(bId, B.id)
     @public
 }
@@ -1272,22 +1384,22 @@ fn test_multiple_dependencies() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
@@ -1307,16 +1419,16 @@ fn test_circular_dependency() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int?
+    id Id.Uuid @id
+    aId A.id?
     a @link(aId, A.id)
     @public
 }
@@ -1341,19 +1453,19 @@ fn test_independent_tables() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 "#;
@@ -1373,32 +1485,32 @@ fn test_complex_graph() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record D {
     @tablename("d")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
-    cId Int?
+    cId C.id?
     c @link(cId, C.id)
     @public
 }
@@ -1419,24 +1531,24 @@ fn test_three_way_cycle() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    cId Int?
+    id Id.Uuid @id
+    cId C.id?
     c @link(cId, C.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    aId Int?
+    id Id.Uuid @id
+    aId A.id?
     a @link(aId, A.id)
     @public
 }
@@ -1461,30 +1573,30 @@ fn test_cycle_with_external_dependency() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    cId Int?
+    id Id.Uuid @id
+    cId C.id?
     c @link(cId, C.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
     @public
 }
 
 record D {
     @tablename("d")
-    id Int @id
-    bId Int
+    id Id.Uuid @id
+    bId B.id
     b @link(bId, B.id)
     @public
 }
@@ -1516,38 +1628,38 @@ fn test_deep_nested_dependencies() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    bId Int
+    id Id.Uuid @id
+    bId B.id
     b @link(bId, B.id)
     @public
 }
 
 record D {
     @tablename("d")
-    id Int @id
-    cId Int
+    id Id.Uuid @id
+    cId C.id
     c @link(cId, C.id)
     @public
 }
 
 record E {
     @tablename("e")
-    id Int @id
-    dId Int
+    id Id.Uuid @id
+    dId D.id
     d @link(dId, D.id)
     @public
 }
@@ -1570,16 +1682,16 @@ fn test_multiple_links_same_table() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId1 Int
+    id Id.Uuid @id
+    aId1 A.id
     a1 @link(aId1, A.id)
-    aId2 Int
+    aId2 A.id
     a2 @link(aId2, A.id)
     @public
 }
@@ -1598,21 +1710,21 @@ fn test_table_with_no_links() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
+    id Id.Uuid @id
     name String
     @public
 }
@@ -1640,32 +1752,32 @@ fn test_diamond_pattern() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
+    id Id.Uuid @id
     @public
 }
 
 record B {
     @tablename("b")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record C {
     @tablename("c")
-    id Int @id
-    aId Int
+    id Id.Uuid @id
+    aId A.id
     a @link(aId, A.id)
     @public
 }
 
 record D {
     @tablename("d")
-    id Int @id
-    bId Int?
+    id Id.Uuid @id
+    bId B.id?
     b @link(bId, B.id)
-    cId Int?
+    cId C.id?
     c @link(cId, C.id)
     @public
 }
@@ -1686,8 +1798,8 @@ fn test_self_referential_table() {
     let schema = r#"
 record A {
     @tablename("a")
-    id Int @id
-    parentId Int?
+    id Id.Uuid @id
+    parentId A.id?
     parent @link(parentId, A.id)
     @public
 }
@@ -1709,7 +1821,7 @@ fn test_nullable_query_parameter_typechecking() {
     // against a nullable String column without typechecking errors.
     let schema = r#"
 record User {
-    id   Int    @id
+    id Id.Uuid @id
     name String?
     @public
 }
@@ -1765,7 +1877,7 @@ fn test_nullable_query_parameter_with_non_nullable_column() {
     // simply does not match under SQL comparison semantics.
     let schema = r#"
 record User {
-    id   Int    @id
+    id Id.Uuid @id
     name String
     @public
 }
@@ -1805,7 +1917,7 @@ session {
 }
 
 record ClocktowerGame {
-    id Id.Int @id
+    id Id.Uuid @id
     @allow(query) { id == Session.currentClocktowerGameId }
     @allow(insert, update, delete) { False }
 }
@@ -1823,6 +1935,7 @@ record ClocktowerGame {
 #[test]
 fn session_type_mismatch_uses_authored_name_and_nullable_syntax() {
     let schema = r#"
+@syncable(false)
 session {
     currentClocktowerGameId String?
 }
@@ -1857,7 +1970,7 @@ fn test_json_param_only() {
     let schema = r#"
 record Task {
     @public
-    id Id.Int @id
+    id Id.Uuid @id
     metadata Json
 }
 "#;
@@ -1913,6 +2026,7 @@ record Task {
 fn test_nullable_param_in_update_set_with_non_nullable_column() {
     // Test that nullable parameters cannot be used in SET operations with non-nullable columns
     let schema = r#"
+@syncable(false)
 record Post {
     id        Int    @id
     title     String
@@ -1969,6 +2083,7 @@ record Post {
 fn test_nullable_param_in_insert_set_with_non_nullable_column() {
     // Test that nullable parameters cannot be used in INSERT SET operations with non-nullable columns
     let schema = r#"
+@syncable(false)
 record Post {
     id        Int    @id
     title     String
@@ -2025,6 +2140,7 @@ record Post {
 #[test]
 fn test_wildcard_disallowed_in_update() {
     let schema = r#"
+@syncable(false)
 record User {
     id   Int    @id
     name String
@@ -2078,6 +2194,7 @@ record User {
 #[test]
 fn test_wildcard_disallowed_in_insert() {
     let schema = r#"
+@syncable(false)
 record User {
     id   Int    @id
     name String
@@ -2134,7 +2251,7 @@ fn test_non_nullable_param_with_nullable_column() {
     // Non-null values are valid for nullable columns
     let schema = r#"
 record User {
-    id   Int    @id
+    id Id.Uuid @id
     name String?
     @public
 }
@@ -2188,6 +2305,7 @@ record User {
 fn test_non_nullable_param_in_update_set_with_nullable_column() {
     // Test that non-nullable parameters can be used in SET operations with nullable columns
     let schema = r#"
+@syncable(false)
 record Post {
     id        Int    @id
     title     String?
@@ -2244,6 +2362,7 @@ record Post {
 fn test_non_nullable_param_in_insert_set_with_nullable_column() {
     // Test that non-nullable parameters can be used in INSERT SET operations with nullable columns
     let schema = r#"
+@syncable(false)
 record Post {
     id        Int    @id
     title     String?
@@ -2303,6 +2422,7 @@ record Post {
 fn test_type_mismatch_error_column_position() {
     // Test that error highlighting for type mismatch errors has correct column position
     let schema = r#"
+@syncable(false)
 record Post {
     id        Int    @id
     title     String
@@ -2414,7 +2534,7 @@ record Post {
     @allow(insert, update, delete) { False }
     @watch
 
-    id           Int     @id
+    id           Id.Uuid @id
     createdAt    DateTime @default(now)
     authorUserId Int
     title        String
@@ -2497,6 +2617,7 @@ record Post {
 #[test]
 fn test_link_fails_when_table_exists_in_different_namespace() {
     let app_source = r#"
+@syncable(false)
 record User {
     id Int @id
     @public
@@ -2511,6 +2632,7 @@ record Post {
     "#;
 
     let auth_source = r#"
+@syncable(false)
 record Account {
     id Int @id
     @public
@@ -2556,6 +2678,7 @@ record Account {
 #[test]
 fn test_query_allows_cross_namespace_link_traversal() {
     let app_source = r#"
+@syncable(false)
 record Post {
     id Int @id
     userId Int
@@ -2565,6 +2688,7 @@ record Post {
     "#;
 
     let auth_source = r#"
+@syncable(false)
 record User {
     id Int @id
     email String
@@ -2619,6 +2743,7 @@ fn transaction_rejects_writes_to_multiple_namespaces() {
     parser::run(
         "pyre/schema/App/schema.pyre",
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -2634,6 +2759,7 @@ record Note {
     parser::run(
         "pyre/schema/Auth/schema.pyre",
         r#"
+@syncable(false)
 record Account {
     id Int @id
     name String
@@ -2696,7 +2822,7 @@ fn foreign_key_requires_namespace_to_reference_external_table() {
         "pyre/schema/App/schema.pyre",
         r#"
 record Post {
-    id Id.Int @id
+    id Id.Uuid @id
     userId User.id
     @public
 }
@@ -2742,7 +2868,7 @@ fn foreign_key_allows_explicit_external_namespace() {
         "pyre/schema/App/schema.pyre",
         r#"
 record Post {
-    id Id.Int @id
+    id Id.Uuid @id
     userId Auth.User.id
     @public
 }
@@ -2794,14 +2920,14 @@ record User {
 fn test_duplicate_record_name_across_namespaces_fails_today() {
     let app_source = r#"
 record User {
-    id Int @id
+    id Id.Uuid @id
     @public
 }
     "#;
 
     let auth_source = r#"
 record User {
-    id Int @id
+    id Id.Uuid @id
     @public
 }
     "#;

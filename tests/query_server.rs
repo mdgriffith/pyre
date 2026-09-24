@@ -51,9 +51,266 @@ fn only_query(manifest: &Manifest) -> &QueryManifest {
 }
 
 #[tokio::test]
+async fn native_composed_generated_writes_are_atomic_and_revision_order_is_commit_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    @public
+    key Id.Uuid @id
+    id String
+    title String
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = &query_by_operation(&manifest, "insert").id;
+    let update = &query_by_operation(&manifest, "update").id;
+    let delete = &query_by_operation(&manifest, "delete").id;
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let key = "01900000-0000-7000-8000-000000000001";
+    let mut first = query::run_sync(
+        &conn,
+        &manifest,
+        "$batch",
+        json!([
+        {"queryId":create,"input":{"key":key,"id":"ordinary","title":"Initial"}},
+            {"queryId":update,"input":{"key":key,"title":"Final"}}
+        ]),
+        &session,
+    )
+    .await?;
+    assert_eq!(first.response[0]["index"], 0);
+    assert_eq!(first.response[1]["result"]["note"][0]["title"], "Final");
+    let mut second = query::run_sync(
+        &conn,
+        &manifest,
+        update,
+        json!({"key":key,"title":"Later"}),
+        &session,
+    )
+    .await?;
+    assert!(
+        first.committed_revision.as_ref().unwrap().1
+            < second.committed_revision.as_ref().unwrap().1
+    );
+    let committed = second.committed_revision.clone();
+    let failed = query::run_sync(
+        &conn,
+        &manifest,
+        "$batch",
+        json!([
+            {"queryId":update,"input":{"key":key,"title":"Rollback"}},
+            {"queryId":delete,"input":{"key":"01900000-0000-7000-8000-000000000999"}}
+        ]),
+        &session,
+    )
+    .await;
+    assert!(failed.is_err());
+    let mut rows = conn.query("select title from notes", ()).await?;
+    assert_eq!(rows.next().await?.unwrap().get::<String>(0)?, "Later");
+    let sessions: ConnectedSessions =
+        std::collections::HashMap::from([("origin".into(), SyncSession::new())]);
+    let server = SyncServer::new(&db.context);
+    server
+        .calculate_deltas(&conn, &mut second, &sessions, "test", Some("origin"))
+        .await?;
+    server
+        .calculate_deltas(&conn, &mut first, &sessions, "test", Some("origin"))
+        .await?;
+    let response = first.response.clone();
+    server
+        .calculate_deltas(&conn, &mut first, &sessions, "test", Some("origin"))
+        .await?;
+    assert_eq!(first.response, response);
+    assert_eq!(second.committed_revision, committed);
+    assert!(first.response["serverRevision"].as_i64() < second.response["serverRevision"].as_i64());
+    assert_eq!(
+        first.response["sync"]["data"][0]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut removed =
+        query::run_sync(&conn, &manifest, delete, json!({"key":key}), &session).await?;
+    server
+        .calculate_deltas(&conn, &mut removed, &sessions, "test", Some("origin"))
+        .await?;
+    assert_eq!(
+        removed.response["sync"]["data"][0]["headers"],
+        json!(["key", "_pyre_removed"])
+    );
+    assert_eq!(
+        removed.response["sync"]["data"][0]["rows"],
+        json!([[key, true]])
+    );
+    let many = (0..=pyre::server::sync::MAX_LIVE_SYNC_FANOUT_RECIPIENTS)
+        .map(|index| (format!("peer-{index}"), SyncSession::new()))
+        .collect();
+    let capped = server
+        .calculate_deltas(&conn, &mut removed, &many, "test", None)
+        .await?;
+    assert!(capped
+        .iter()
+        .all(|message| message.message.type_ == "invalidate"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn generated_uuid_creates_validate_manifest_identity_and_cardinality_in_both_modes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    key Id.Uuid @id
+    body String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(&db.context, "", true)?;
+    let create = query_by_operation(&manifest, "insert");
+    assert_eq!(
+        create.generated_edit.as_ref().unwrap().create_id.as_deref(),
+        Some("key")
+    );
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    for sync in [false, true] {
+        for invalid in [
+            "01900000-0000-4000-8000-000000000001",
+            "01900000-0000-7000-0000-000000000001",
+            "01900000-0000-7000-C000-000000000001",
+            "01900000-0000-7000-8000-00000000000A",
+            "01900000000070008000000000000001",
+            "",
+            "not-a-uuid",
+        ] {
+            let input = json!({"key": invalid, "body": "invalid"});
+            let result = if sync {
+                query::run_sync(&conn, &manifest, &create.id, input, &session).await
+            } else {
+                query::run(&conn, &manifest, &create.id, input, &session).await
+            };
+            assert!(result.is_err(), "accepted {invalid}");
+        }
+        let id = if sync {
+            "01900000-0000-7000-b000-000000000002"
+        } else {
+            "01900000-0000-7000-8000-000000000001"
+        };
+        let input = json!({"key": id, "body": "created"});
+        let result = if sync {
+            query::run_sync(&conn, &manifest, &create.id, input, &session).await?
+        } else {
+            query::run(&conn, &manifest, &create.id, input, &session).await?
+        };
+        assert_eq!(result.response["note"][0]["key"], id);
+        for operation in ["update", "delete"] {
+            let metadata = query_by_operation(&manifest, operation);
+            let input = if operation == "update" {
+                json!({"key": "01900000-0000-7000-8000-000000000099", "body": "missing"})
+            } else {
+                json!({"key": "01900000-0000-7000-8000-000000000099"})
+            };
+            let result = if sync {
+                query::run_sync(&conn, &manifest, &metadata.id, input, &session).await
+            } else {
+                query::run(&conn, &manifest, &metadata.id, input, &session).await
+            };
+            assert!(result.is_err(), "zero-row {operation} must reject");
+        }
+    }
+    let count = conn
+        .query("select count(*) from notes", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get::<i64>(0)?;
+    assert_eq!(count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_mixed_writes_authorize_removals_from_original_visibility(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Note {
+    key Id.Uuid @id
+    body String
+    @allow(query) { body != "hidden" }
+    @allow(insert, update, delete) { True }
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let manifest = manifest_for(
+        &db.context,
+        r#"
+transaction ChangeAndDelete($key: Note.key, $body: String) {
+    update changed: note {
+        @where { key == $key }
+        body = $body
+        key
+    }
+    delete removed: note {
+        @where { key == $key }
+        key
+    }
+}
+"#,
+        false,
+    )?;
+    let id = "01900000-0000-7000-8000-000000000001";
+    let session = PyreSession::new(json!({}), &manifest.session_schema)?;
+    let sessions = ConnectedSessions::from([("reader".into(), SyncSession::new())]);
+    for (initial, intermediate, expected) in
+        [("hidden", "visible", false), ("visible", "hidden", true)]
+    {
+        conn.execute(
+            "insert into notes (key, body) values (?, ?)",
+            libsql::params![id, initial],
+        )
+        .await?;
+        let mut result = query::run_sync(
+            &conn,
+            &manifest,
+            &only_query(&manifest).id,
+            json!({"key": id, "body": intermediate}),
+            &session,
+        )
+        .await?;
+        let messages = SyncServer::new(&db.context)
+            .calculate_deltas(&conn, &mut result, &sessions, "main", None)
+            .await?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(!messages[0].message.data.is_empty(), expected);
+        if expected {
+            assert_eq!(
+                messages[0].message.data[0].headers,
+                vec!["key", "_pyre_removed"]
+            );
+            assert_eq!(
+                messages[0].message.data[0].rows,
+                vec![vec![json!(id), json!(true)]]
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_insert_roundtrips_nested_zero_field_union() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type VoteHandState
    = HandLowered
    | HandRaised
@@ -252,6 +509,7 @@ async fn generated_manifest_distinguishes_bool_from_unit_enum(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Status
     = Running
     | Stopped
@@ -317,6 +575,7 @@ fn generated_rust_crud_omits_immutable_update_input_but_returns_field() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 record Document {
     @public
     id      Int @id
@@ -772,6 +1031,7 @@ struct ClocktowerParticipantCreateOutput {
 async fn run_mutations_roundtrip_tagged_union_variants() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type ClocktowerGameStatus
     = ClocktowerRunning
     | ClocktowerStopped
@@ -1309,6 +1569,7 @@ transaction ReplaceTask($id: Task.id, $action: Action) {
 async fn run_query_binds_tagged_enum_session_values() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Role
     = Admin
     | Member
@@ -1425,6 +1686,7 @@ delete DeleteNote($id: Note.id) {
 async fn run_query_binds_tagged_union_session_paths() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type SessionScope
     = Workspace {
         id Int
@@ -1523,6 +1785,7 @@ async fn run_query_binds_recursive_tagged_union_session_paths(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type SessionScope
     = Leaf {
         id Int
@@ -1585,6 +1848,7 @@ async fn generated_update_roundtrips_omittable_unit_enum_input(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Status
     = Running
     | Stopped
@@ -1666,6 +1930,7 @@ async fn run_mutation_roundtrips_recursive_union_json_payloads(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Action
     = Create { title String }
     | Delete { id Int }
@@ -1722,6 +1987,7 @@ insert CreateTreeDocument($tree: Tree) {
 async fn run_select_query_formats_response() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -1769,7 +2035,7 @@ async fn run_insert_mutation_returns_result_and_extracts_affected_rows_in_sync_m
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -1781,11 +2047,11 @@ record Note {
     let manifest = manifest_for(
         &db.context,
         r#"
-insert CreateNote($body: String) {
+insert CreateNote($id: Note.id, $body: String) {
     note {
+        id = $id
         body = $body
         updatedAt = 10
-        id
     }
 }
 "#,
@@ -1796,12 +2062,15 @@ insert CreateNote($body: String) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "body": "one" }),
+        json!({ "id": "01900000-0000-7000-8000-000000000001", "body": "one" }),
         &session,
     )
     .await?;
 
-    assert_eq!(result.response["note"][0]["id"], json!(1));
+    assert_eq!(
+        result.response["note"][0]["id"],
+        json!("01900000-0000-7000-8000-000000000001")
+    );
     assert_eq!(result.response["note"][0]["body"], json!("one"));
     assert_eq!(result.affected_rows.len(), 1);
     assert_eq!(result.affected_rows[0].table_name, "notes");
@@ -1816,19 +2085,19 @@ async fn run_transaction_returns_all_steps_and_aggregates_affected_rows(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
 }
 record Counter {
-    id Int @id
+    id Id.Uuid @id
     value Int
     updatedAt Int
     @public
 }
 record Pending {
-    id Int @id
+    id Id.Uuid @id
     updatedAt Int
     @public
 }
@@ -1837,26 +2106,26 @@ record Pending {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into counters (id, value, updatedAt) values (1, 0, 10);\n\
-         insert into pendings (id, updatedAt) values (1, 10);",
+        "insert into counters (id, value, updatedAt) values ('01900000-0000-7000-8000-000000000001', 0, 10);\n\
+         insert into pendings (id, updatedAt) values ('01900000-0000-7000-8000-000000000001', 10);",
     )
     .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-transaction Apply($body: String, $value: Int) {
+transaction Apply($id: Note.id, $counterId: Counter.id, $pendingId: Pending.id, $body: String, $value: Int) {
     insert created: note {
+        id = $id
         body = $body
         updatedAt = 10
-        id
     }
     update changed: counter {
-        @where { id == 1 }
+        @where { id == $counterId }
         value = $value
         id
     }
     delete removed: pending {
-        @where { id == 1 }
+        @where { id == $pendingId }
         id
     }
 }
@@ -1871,18 +2140,22 @@ transaction Apply($body: String, $value: Int) {
         &conn,
         &manifest,
         &transaction.id,
-        json!({ "body": "one", "value": 2 }),
+        json!({ "id": "01900000-0000-7000-8000-000000000001", "counterId": "01900000-0000-7000-8000-000000000001", "pendingId": "01900000-0000-7000-8000-000000000001", "body": "one", "value": 2 }),
         &session,
     )
     .await?;
 
     assert_eq!(result.response["created"][0]["body"], json!("one"));
     assert_eq!(result.response["changed"][0]["value"], json!(2));
-    assert_eq!(result.response["removed"][0]["id"], json!(1));
-    assert_eq!(result.affected_rows.len(), 3);
+    assert_eq!(
+        result.response["removed"][0]["id"],
+        json!("01900000-0000-7000-8000-000000000001")
+    );
+    assert_eq!(result.affected_rows.len(), 4);
     assert_eq!(result.affected_rows[0].table_name, "notes");
     assert_eq!(result.affected_rows[1].table_name, "counters");
-    assert_eq!(result.affected_rows[2].table_name, "pendings");
+    assert_eq!(result.affected_rows[2].table_name, "counters");
+    assert_eq!(result.affected_rows[3].table_name, "pendings");
     Ok(())
 }
 
@@ -1891,6 +2164,7 @@ async fn run_transaction_preserves_aliases_zero_rows_and_shared_session_permissi
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -1967,6 +2241,7 @@ async fn run_transaction_rolls_back_on_late_unique_constraint_failure(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String @unique
@@ -2024,7 +2299,7 @@ async fn failed_nested_transaction_rolls_back_without_sync_publication(
     let db = TestDatabase::new(
         r#"
 record Parent {
-    id Int @id
+    id Id.Uuid @id
     name String
     updatedAt Int
     children @link(Child.parentId)
@@ -2032,8 +2307,8 @@ record Parent {
 }
 
 record Child {
-    id Int @id
-    parentId Int
+    id Id.Uuid @id
+    parentId Parent.id
     slug String @unique
     updatedAt Int
     parent @link(parentId, Parent.id)
@@ -2044,26 +2319,30 @@ record Child {
     .await?;
     let conn = db.db.connect()?;
     conn.execute_batch(
-        "insert into parents (id, name, updatedAt) values (1, 'baseline', 10);\n\
-         insert into children (id, parentId, slug, updatedAt) values (1, 1, 'taken', 10);",
+        "insert into parents (id, name, updatedAt) values ('01900000-0000-7000-8000-000000000001', 'baseline', 10);\n\
+         insert into children (id, parentId, slug, updatedAt) values ('01900000-0000-7000-8000-000000000001', '01900000-0000-7000-8000-000000000001', 'taken', 10);",
     )
     .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-transaction CreateParents {
+transaction CreateParents($firstId: Parent.id, $secondId: Parent.id, $firstChildId: Child.id, $secondChildId: Child.id) {
     insert first: parent {
+        id = $firstId
         name = "first"
         updatedAt = 10
         children {
+            id = $firstChildId
             slug = "ok"
             updatedAt = 10
         }
     }
     insert second: parent {
+        id = $secondId
         name = "second"
         updatedAt = 10
         children {
+            id = $secondChildId
             slug = "taken"
             updatedAt = 10
         }
@@ -2079,7 +2358,7 @@ transaction CreateParents {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({}),
+        json!({ "firstId": "01900000-0000-7000-8000-000000000002", "firstChildId": "01900000-0000-7000-8000-000000000002", "secondId": "01900000-0000-7000-8000-000000000003", "secondChildId": "01900000-0000-7000-8000-000000000003" }),
         &session,
     )
     .await
@@ -2216,6 +2495,7 @@ insert CreateUserWithPost($name: String, $status: Status) {
 async fn run_query_applies_json_and_session_args() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -2271,6 +2551,7 @@ async fn generated_update_respects_omitted_vs_null_optional_args(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String?
@@ -2334,6 +2615,7 @@ query GetNotes {
 async fn run_query_reports_unknown_and_invalid_input() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -2384,6 +2666,7 @@ query GetNote($id: Int) {
 async fn run_query_reports_invalid_session() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -2438,6 +2721,7 @@ async fn run_query_handles_parameter_names_with_shared_prefixes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     id2 Int
@@ -2487,7 +2771,7 @@ async fn run_delete_mutation_extracts_affected_rows_in_sync_mode(
     let db = TestDatabase::new(
         r#"
 record Note {
-    id Int @id
+    id Id.Uuid @id
     body String
     updatedAt Int
     @public
@@ -2496,12 +2780,12 @@ record Note {
     )
     .await?;
     let conn = db.db.connect()?;
-    conn.execute_batch("insert into notes (id, body, updatedAt) values (1, 'one', 10);")
+    conn.execute_batch("insert into notes (id, body, updatedAt) values ('01900000-0000-7000-8000-000000000001', 'one', 10);")
         .await?;
     let manifest = manifest_for(
         &db.context,
         r#"
-delete DeleteNote($id: Int) {
+delete DeleteNote($id: Note.id) {
     note {
         @where { id == $id }
         id
@@ -2517,14 +2801,17 @@ delete DeleteNote($id: Int) {
         &conn,
         &manifest,
         &only_query(&manifest).id,
-        json!({ "id": 1 }),
+        json!({ "id": "01900000-0000-7000-8000-000000000001" }),
         &session,
     )
     .await?;
 
     assert_eq!(result.affected_rows.len(), 1);
     assert_eq!(result.affected_rows[0].table_name, "notes");
-    assert_eq!(result.affected_rows[0].rows[0][0], json!(1));
+    assert_eq!(
+        result.affected_rows[0].rows[0][0],
+        json!("01900000-0000-7000-8000-000000000001")
+    );
     let mut rows = conn.query("select count(*) from notes", ()).await?;
     let row = rows.next().await?.expect("count row should exist");
     assert_eq!(row.get::<i64>(0)?, 0);
@@ -2537,6 +2824,7 @@ async fn generated_crud_create_and_delete_run_through_manifest_runtime(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Note {
     id Int @id
     body String
@@ -2601,6 +2889,7 @@ async fn generated_crud_runtime_excludes_immutable_update_inputs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Document {
     id      Int @id
     ownerId Int @immutable
@@ -2661,6 +2950,7 @@ async fn generated_crud_creates_and_returns_immutable_tagged_union(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type ActionState
    = Open { startedAt String }
    | Completed { completedAt String }
@@ -2715,6 +3005,7 @@ async fn nested_insert_populates_immutable_parent_foreign_key(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record Parent {
     @public
     id       Id.Int @id
@@ -2774,6 +3065,7 @@ async fn generated_crud_create_enforces_insert_permission() -> Result<(), Box<dy
 {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 session {
     userId Int
 }
@@ -2799,7 +3091,8 @@ record Note {
         json!({ "ownerId": 2, "body": "denied" }),
         &session,
     )
-    .await?;
+    .await
+    .expect_err("denied generated create must reject rather than succeed with zero rows");
 
     let mut rows = conn.query("select count(*) from notes", ()).await?;
     let row = rows.next().await?.expect("count row should exist");
@@ -2812,6 +3105,7 @@ async fn run_insert_mutation_binds_repeated_json_union_parameter(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Visibility
    = Hidden
    | Everyone
@@ -2882,6 +3176,7 @@ async fn literal_union_insert_binds_null_for_omitted_nullable_fields(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type Lifecycle
    = Running
    | Finished {
@@ -3076,7 +3371,10 @@ update EndLifecycle {
         &session,
     )
     .await?;
-    assert_eq!(updated.affected_rows.len(), 1);
+    assert_eq!(updated.affected_rows.len(), 2);
+    assert!(updated.affected_rows[0]
+        .headers
+        .contains(&"_pyre_preimage".into()));
     assert_eq!(updated.affected_rows[0].rows.len(), 1);
 
     let mut status_rows = conn
@@ -3093,6 +3391,7 @@ async fn generated_crud_reuses_shared_tagged_union_columns(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 type ActionState
    = Open {
         startedAt String?
@@ -3177,6 +3476,7 @@ async fn run_multi_top_level_query_formats_all_response_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
         r#"
+@syncable(false)
 record User {
     id Int @id
     name String
@@ -3255,6 +3555,7 @@ fn generated_manifest_validates_integer_session_foreign_keys() {
     parser::run(
         "schema.pyre",
         r#"
+@syncable(false)
 session {
     userId User.id
 }

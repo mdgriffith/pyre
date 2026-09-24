@@ -471,7 +471,7 @@ fn test_select_type_columns_unknown_type() {
     let mut schema = ast::Schema::default();
     let schema_source = r#"
 record User {
-    id Int @id
+    id Id.Uuid @id
     name String
     @public
 }

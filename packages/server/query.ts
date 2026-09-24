@@ -1,4 +1,4 @@
-import { Client, InStatement } from "@libsql/client";
+import { Client, InStatement, type Transaction } from "@libsql/client";
 import type { LinkInfo, SchemaMetadata, TableMetadata } from "@pyre/core";
 import type { ZodType } from "zod";
 import { buildArgs, formatResultData, toSqlStatements, type SqlInfo } from "./runtime/sql";
@@ -25,11 +25,15 @@ export interface QueryMetadata {
     attached_dbs?: string[];
     sql: SqlInfo[];
     syncSql?: SqlInfo[];
+    /** Compiler-owned sync effects for each SQL variant; never inferred from SQL text. */
+    syncEffects?: { sql: boolean; syncSql: boolean };
     session_args: string[];
     optional_input_args: string[];
     json_input_args: string[];
     InputValidator: Validator<any>;
     SessionValidator: Validator<any>;
+    /** Compiler-owned index of the direct write whose cardinality must be one. */
+    generatedEdit?: { writeStatement: number; syncWriteStatement?: number; createId?: string };
 }
 
 /**
@@ -37,6 +41,12 @@ export interface QueryMetadata {
  */
 export interface QueryMap {
     [queryId: string]: QueryMetadata;
+}
+
+/** Transport contains identifiers and values only; SQL and authority stay on the server. */
+export interface OperationDescriptor {
+    queryId: string;
+    input: unknown;
 }
 
 /**
@@ -65,6 +75,7 @@ export interface QueryResult {
     error?: {
         errorType: string;
         message: string;
+        operationIndex?: number;
     };
     /**
      * Broadcast sync deltas to connected clients.
@@ -94,11 +105,13 @@ export type SyncDeltasFn = (
     affectedRowGroups: any[],
     connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
     sendToSession: (sessionId: string, message: any) => void,
-    originSessionId?: string
+    originSessionId?: string,
+    committedRevision?: { databaseEpoch: string; serverRevision: number }
 ) => Promise<SyncResult | void>;
 
 export interface RunOptions {
     mode?: "normal" | "sync";
+    allocateSyncRevision?: boolean;
 }
 
 export type SeedPrimitive = null | boolean | number | string | Uint8Array;
@@ -209,7 +222,7 @@ function decodeOrError<T>(validator: Validator<T>, data: unknown, context: strin
 export async function run(
     db: Client,
     queryMap: QueryMap,
-    queryId: string,
+    queryId: string | readonly OperationDescriptor[],
     args: any,
     executingSession: Session,
     connectedSessions?: Map<string, { session: Record<string, SessionValue>;[key: string]: any }>,
@@ -217,8 +230,12 @@ export async function run(
     originSessionId?: string,
     options: RunOptions = {},
 ): Promise<QueryResult> {
+    if (Array.isArray(queryId)) {
+        return runOperations(db, queryMap, queryId, executingSession, connectedSessions, syncDeltas, originSessionId, options);
+    }
     // Look up query metadata
-    const query = queryMap[queryId];
+    const id = queryId as string;
+    const query = Object.hasOwn(queryMap, id) ? queryMap[id] : undefined;
     if (!query) {
         return {
             kind: "error",
@@ -228,6 +245,9 @@ export async function run(
             },
             async sync() { return {}; },
         };
+    }
+    if (query.generatedEdit) {
+        return runOperations(db, queryMap, [{ queryId: id, input: args }], executingSession, connectedSessions, syncDeltas, originSessionId, options, true);
     }
 
     // Validate input
@@ -271,11 +291,37 @@ export async function run(
     const useSyncMode = options.mode === "sync";
     const activeSql = useSyncMode ? query.syncSql ?? query.sql : query.sql;
     const sqlStatements: InStatement[] = toSqlStatements(activeSql, validArgs);
+    const allocateRevision = options.allocateSyncRevision && hasSyncEffect(query, options.mode);
 
     // Execute query
-    const resultSets = await db.batch(sqlStatements);
+    // Allocate in the mutation's transaction, never in the later fanout callback.
+    // Otherwise delayed publication could give older row values a newer revision.
+    if (allocateRevision) {
+        sqlStatements.push("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
+    }
+    const resultSets = allocateRevision ? await db.batch(sqlStatements, "write") : await db.batch(sqlStatements);
+    let committedRevision: { databaseEpoch: string; serverRevision: number } | undefined;
+    if (allocateRevision) {
+        const stamp = resultSets.pop()?.rows[0];
+        if (typeof stamp?.database_epoch !== "string" || (typeof stamp?.server_revision !== "number" && typeof stamp?.server_revision !== "bigint")) {
+            throw new Error("Failed to allocate Pyre sync server revision");
+        }
+        committedRevision = { databaseEpoch: stamp.database_epoch, serverRevision: Number(stamp.server_revision) };
+    }
     const affectedRowGroups: unknown[] = extractAffectedRowGroups(activeSql, resultSets);
     const response = formatResultData(activeSql, resultSets);
+
+    return executionResult(response, combineAffectedRows(affectedRowGroups), connectedSessions, syncDeltas, originSessionId, committedRevision);
+}
+
+function executionResult(
+    response: unknown,
+    affectedRowGroups: any[],
+    connectedSessions?: Map<string, { session: Record<string, SessionValue>; [key: string]: any }>,
+    syncDeltas?: SyncDeltasFn,
+    originSessionId?: string,
+    committedRevision?: { databaseEpoch: string; serverRevision: number },
+): QueryResult {
 
     // Always create sync function - it will be a no-op if there's nothing to send
     /**
@@ -300,7 +346,13 @@ export async function run(
      * ]
      * ```
      */
-    async function sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
+    let syncPromise: Promise<SyncResult> | undefined;
+    function sync(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
+        syncPromise ??= publish(sendToSession);
+        return syncPromise;
+    }
+
+    async function publish(sendToSession: (sessionId: string, message: any) => void): Promise<SyncResult> {
         // Early return if nothing to sync
         if (affectedRowGroups.length === 0) {
             return {};
@@ -310,7 +362,7 @@ export async function run(
             return {};
         }
 
-        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId) ?? {};
+        const syncResult = await syncDeltas(affectedRowGroups, connectedSessions ?? new Map(), sendToSession, originSessionId, committedRevision) ?? {};
         if (typeof syncResult.serverRevision === "number") {
             queryResult.response = {
                 ...(syncResult.databaseEpoch === undefined ? {} : { databaseEpoch: syncResult.databaseEpoch }),
@@ -330,6 +382,185 @@ export async function run(
     };
 
     return queryResult;
+}
+
+async function writeTransaction<T>(db: Client, execute: (tx: Transaction) => Promise<T>): Promise<T> {
+    // The local adapter detaches the client's connection for an interactive
+    // transaction. Private in-memory databases would silently lose their state.
+    if (db.protocol === "file") {
+        const databases = await db.execute("pragma database_list");
+        if (!databases.rows.some(row => row.name === "main" && typeof row.file === "string" && row.file.length > 0)) {
+            throw new Error("Composed/generated operations require a file-backed local database");
+        }
+    }
+    const tx = await db.transaction("write");
+    let committing = false;
+    try {
+        const result = await execute(tx);
+        committing = true;
+        await tx.commit();
+        return result;
+    } catch (error) {
+        try { if (!tx.closed) await tx.rollback(); } catch (_) { /* Preserve the execution outcome. */ }
+        if (committing) throw new CommitOutcomeUnknown();
+        throw error;
+    } finally {
+        tx.close();
+    }
+}
+
+class CommitOutcomeUnknown extends Error {}
+
+async function runOperations(
+    db: Client,
+    queryMap: QueryMap,
+    operations: readonly OperationDescriptor[],
+    executingSession: Session,
+    connectedSessions: Map<string, { session: Record<string, SessionValue>; [key: string]: any }> | undefined,
+    syncDeltas: SyncDeltasFn | undefined,
+    originSessionId: string | undefined,
+    options: RunOptions,
+    single = false,
+): Promise<QueryResult> {
+    const fail = (errorType: string, message: string, operationIndex?: number): QueryResult => ({
+        kind: "error", error: { errorType, message, ...(operationIndex === undefined ? {} : { operationIndex }) },
+        async sync() { return {}; },
+    });
+    let namespace: string | undefined;
+    for (const [index, operation] of operations.entries()) {
+        if (!operation || typeof operation.queryId !== "string" || !Object.hasOwn(operation, "input") || Object.keys(operation).some(key => key !== "queryId" && key !== "input")) {
+            return fail("InvalidInput", "Expected an operation descriptor", index);
+        }
+        const query = Object.hasOwn(queryMap, operation.queryId) ? queryMap[operation.queryId] : undefined;
+        if (!query) return fail("UnknownQuery", "Unknown operation", index);
+        if (query.generatedEdit?.createId) {
+            const input = operation.input as Record<string, unknown> | null;
+            const id = input?.[query.generatedEdit.createId];
+            if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) {
+                return fail("InvalidInput", "Generated creates require a canonical UUIDv7", index);
+            }
+        }
+        const currentNamespace = query.primary_db ?? "";
+        namespace ??= currentNamespace;
+        if (namespace !== currentNamespace || query.attached_dbs?.length) return fail("InvalidInput", "Operations must target one database namespace", index);
+        for (const [validator, value, type] of [
+            [query.InputValidator, operation.input, "InvalidInput"],
+            [query.SessionValidator, executingSession, "InvalidSession"],
+        ] as const) {
+            if (!validator.safeParse(value).success) return fail(type, "Operation validation failed", index);
+        }
+    }
+    if (operations.length === 0) return executionResult([], [], connectedSessions, syncDeltas, originSessionId);
+    const responses: Array<{ index: number; queryId: string; result: unknown }> = [];
+    const affected: any[] = [];
+    let finalGroups: any[] = [];
+    let operationIndex: number | undefined;
+    let revision: { databaseEpoch: string; serverRevision: number } | undefined;
+    try {
+        const statements: InStatement[] = [];
+        const prepared = operations.map((operation, index) => {
+            operationIndex = index;
+            const metadata = queryMap[operation.queryId];
+            const input = metadata.InputValidator.safeParse(operation.input);
+            const session = metadata.SessionValidator.safeParse(executingSession);
+            if (!input.success || !session.success) throw new Error("Operation validation failed");
+            const args = buildArgs(input.data ?? {}, session.data ?? {}, metadata.session_args, metadata.optional_input_args, metadata.json_input_args);
+            const sql = options.mode === "sync" ? metadata.syncSql ?? metadata.sql : metadata.sql;
+            const bound = toSqlStatements(sql, args);
+            const checked = metadata.generatedEdit && (options.mode === "sync"
+                ? metadata.generatedEdit.syncWriteStatement ?? metadata.generatedEdit.writeStatement
+                : metadata.generatedEdit.writeStatement);
+            if (checked !== undefined && (!Number.isInteger(checked) || checked < 0 || checked >= bound.length)) {
+                throw new Error("Invalid generated edit metadata");
+            }
+            const resultIndexes: number[] = [];
+            let countIndex: number | undefined;
+            for (const [statementIndex, statement] of bound.entries()) {
+                resultIndexes.push(statements.length);
+                statements.push(statement);
+                if (statementIndex === checked) {
+                    // Capture immediately: later writes would overwrite changes().
+                    // RETURNING rowsAffected is not reliable in every adapter.
+                    countIndex = statements.length;
+                    statements.push("select changes() as count");
+                }
+            }
+            return { operation, sql, resultIndexes, countIndex };
+        });
+        const allocateRevision = options.allocateSyncRevision && operations.some(op => {
+            const query = queryMap[op.queryId];
+            return hasSyncEffect(query, options.mode);
+        });
+        const revisionIndex = statements.length;
+        if (allocateRevision) statements.push("update _pyre_sync set server_revision = server_revision + 1 where id = 1 returning database_epoch, server_revision");
+        // Database-level batch errors may not carry a statement index. Do not
+        // attribute those to an arbitrary operation; our own checks retain it.
+        operationIndex = undefined;
+        await writeTransaction(db, async tx => {
+            // One execution request, then one commit/rollback request. Keep all
+            // checks and result formatting before commit, including sync metadata.
+            const results = await tx.batch(statements);
+            if (results.length !== statements.length) throw new Error("Invalid batch result count");
+            for (const [index, item] of prepared.entries()) {
+                operationIndex = index;
+                if (item.countIndex !== undefined && Number(results[item.countIndex].rows[0]?.count) !== 1) {
+                    throw new Error("Generated edit must affect exactly one row");
+                }
+                const output = item.resultIndexes.map(index => results[index]);
+                responses.push({ index, queryId: item.operation.queryId, result: formatResultData(item.sql, output) });
+                affected.push(...extractAffectedRowGroups(item.sql, output));
+            }
+            operationIndex = undefined;
+            finalGroups = combineAffectedRows(affected);
+            if (allocateRevision) {
+                const stamp = results[revisionIndex].rows[0];
+                const serverRevision = Number(stamp?.server_revision);
+                if (typeof stamp?.database_epoch !== "string" || !Number.isSafeInteger(serverRevision)) throw new Error("Invalid sync revision");
+                revision = { databaseEpoch: stamp.database_epoch, serverRevision };
+            }
+        });
+    } catch (error) {
+        if (error instanceof CommitOutcomeUnknown) return fail("OutcomeUnknown", "Commit outcome unknown; do not automatically replay");
+        return fail("TransactionFailed", "Operation batch failed", operationIndex);
+    }
+    return executionResult(single ? responses[0].result : responses, finalGroups, connectedSessions, syncDeltas, originSessionId, revision);
+}
+
+function hasSyncEffect(query: QueryMetadata, mode?: "sync" | "normal"): boolean {
+    return (mode === "sync" && query.syncSql !== undefined
+        ? query.syncEffects?.syncSql
+        : query.syncEffects?.sql) ?? false;
+}
+
+function combineAffectedRows(affected: any[]): any[] {
+    // Only final row versions may be authorized/published: intermediate versions
+    // could leak data after a later operation revokes access to the same row.
+    const finalGroups = new Map<string, any>();
+    const preimages = new Map<string, any>();
+    const seen = new Set<string>();
+    for (const group of affected) {
+        const idIndex = group.headers.indexOf(group.primary_key ?? "id");
+        if (idIndex < 0) throw new Error("Affected rows require identity");
+        for (const row of group.rows) {
+            const key = JSON.stringify([group.table_name, row[idIndex]]);
+            const preimage = group.headers.includes("_pyre_preimage");
+            const removed = group.headers.includes("_pyre_removed");
+            if (!seen.has(key) && (preimage || removed)) {
+                const headers = group.headers.filter((header: string) => !header.startsWith("_pyre_"));
+                preimages.set(key, { ...group, headers: [...headers, "_pyre_preimage"], rows: [[...headers.map((header: string) => row[group.headers.indexOf(header)]), true]] });
+            }
+            seen.add(key);
+            if (!preimage) finalGroups.set(key, { ...group, rows: [row] });
+        }
+    }
+    const tables = new Map<string, any>();
+    for (const group of [...preimages.values(), ...finalGroups.values()]) {
+        const key = JSON.stringify([group.table_name, group.headers]);
+        const table = tables.get(key);
+        if (table) table.rows.push(...group.rows);
+        else tables.set(key, group);
+    }
+    return [...tables.values()];
 }
 
 /**

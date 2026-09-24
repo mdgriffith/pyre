@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { afterEach, expect, mock, test } from "bun:test";
+import { createClient } from "@libsql/client";
 
 const defaultSyncSql = () => ({
   tables: [
@@ -61,8 +62,29 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   sql_introspect_uninitialized: () => "select uninitialized introspection",
 }));
 
-const { catchup, rotateDatabaseEpoch } = await import("./sync");
+const { catchup: catchupImplementation, rotateDatabaseEpoch } = await import("./sync");
+const catchup = (db: any, ...args: any[]) => catchupImplementation({
+  ...db,
+  transaction: mock(async () => ({ ...db, commit: async () => {}, rollback: async () => {}, close() {}, closed: false })),
+}, ...args);
 const { ensureDatabase, loadSchemaFromDatabase } = await import("./schema");
+
+test("catchup rejects private in-memory storage without losing its data", async () => {
+  const db = createClient({ url: "file::memory:" });
+  try {
+    await db.batch([
+      "create table notes (id integer primary key, title text)",
+      "insert into notes values (1, 'Preserved')",
+    ]);
+    await expect(catchupImplementation(db, { tables: {} }, {}))
+      .rejects.toThrow("Catchup requires a file-backed local database");
+    const result = await db.execute("select id, title from notes");
+    expect(result.rows.map(row => ({ id: row.id, title: row.title })))
+      .toEqual([{ id: 1, title: "Preserved" }]);
+  } finally {
+    db.close();
+  }
+});
 
 afterEach(() => {
   getSyncSqlMock = defaultSyncSql;

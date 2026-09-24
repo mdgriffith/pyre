@@ -1,6 +1,42 @@
-# Seeding Data
+# Seeding And Server-Owned Writes
 
-Pyre provides a server-side seed helper for creating fixture or import data without writing one-off mutation queries.
+Choose the path based on the write contract:
+
+- **Application-authorized writes:** use generated builders with `executeOperations` under an explicit session. These obey compiled validation/permissions and can publish normal sync authority.
+- **Trusted initial fixtures/imports:** use the generated `seed` helper. It connects nested records but bypasses query permissions and does not publish sync metadata.
+
+## Explicit-Session Composed Operations
+
+For a writable `Document` with UUID identity, `title String`, and `summary String?`:
+
+```ts
+import { executeOperations } from '@pyre/server/operations';
+import { queries } from './pyre/generated/typescript/server';
+import { Document, database } from './pyre/generated/typescript/core/edits';
+
+const outcome = await executeOperations(
+  authorizedConnection,
+  queries,
+  database('_default', databaseId),
+  [Document.create({ title: 'Initial document', summary: null })],
+  authenticatedSession,
+  { mode: 'sync', sessions: connectedSessions, publish: sendToSession },
+);
+if (!outcome.ok) throw new Error(outcome.error.message);
+const createdId = outcome.value[0].result.document[0].id;
+```
+
+The application must authorize `databaseId`, resolve it to `authorizedConnection`, and construct the explicit session (use `{}` only for a schema without session fields). A typed target is not an access token. Keep connected sessions and publication scoped to that database. Sync mode allocates transaction-time revisions even without active subscribers; `sessions` is optional, but supply a `publish` callback.
+
+Use `{ mode: 'normal' }` for simple request/response execution without live publication. Both modes run one ordered transaction, enforce generated-write cardinality, and return typed indexed results. Construction is browser-independent; no worker, IndexedDB, or SSE connection is required. Local TypeScript execution requires file-backed libSQL.
+
+Generated UUID creates capture UUIDv7 once and omit identity from input. Use the committed `createdId` in a later submission for dependent records; there is no intra-batch result binding. A definite execution rejection rolls back the batch. `OutcomeUnknown`, a publication exception, or a post-commit decoding exception must not trigger automatic replay. See [Operation Semantics](./query.md#generated-crud-and-composed-operations).
+
+Rust applications use manifest descriptors with `query::run_operations`, or `$batch` through `query::run` / `query::run_sync`; see [Rust Server](./rust-server.md#composed-operations).
+
+## Import-Oriented Seed Helper
+
+The remaining examples describe the separate server-side `seed` helper. Their integer IDs assume a query-only schema declared with `@syncable(false)`. Use UUID primary keys and matching foreign-key values for synced schemas.
 
 Seed data is shaped like the database schema. Top-level keys are table names, and nested keys are links declared in the Pyre schema.
 
@@ -76,6 +112,8 @@ Seed input should use the normal serialized JavaScript shape for JSON and custom
 For a JSON column:
 
 ```pyre
+@syncable(false)
+
 record Game {
     id    Id.Int @id
     state Json<GameState>
@@ -104,6 +142,8 @@ Do not pre-stringify JSON values. Pyre handles that before insert.
 For a custom type stored across multiple SQLite columns:
 
 ```pyre
+@syncable(false)
+
 record MapEntity {
     id        Id.Int @id
     placement MapEntityPlacement
