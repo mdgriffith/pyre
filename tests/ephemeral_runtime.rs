@@ -1,13 +1,13 @@
 use pyre::server::runtime::{
-    DatabaseRuntime, JoinEvidence, RuntimeConfig, RuntimeEnvironment, RuntimeError, RuntimeTime,
-    SharedWritePolicy,
+    DatabaseRuntime, Delivery, JoinEvidence, RuntimeConfig, RuntimeEnvironment, RuntimeError,
+    RuntimeTime, SharedWritePolicy,
 };
 use pyre::{ast, ephemeral::Contract, parser, typecheck};
 use serde_json::json;
 use std::{
     sync::{
         atomic::{AtomicI64, AtomicU64, Ordering},
-        Arc,
+        Arc, Barrier,
     },
     thread,
     time::Duration,
@@ -111,13 +111,11 @@ fn runtimes_isolate_databases_and_same_owner_connections() {
     let first = left.join(evidence("session-a", 1, true)).unwrap();
     let second = left.join(evidence("session-a", 1, true)).unwrap();
     let other = right.join(evidence("session-a", 1, true)).unwrap();
-    assert_eq!(first.snapshot.revision, first.change.revision);
     assert!(first
         .snapshot
         .connections
         .contains_key(first.participant.connection_id()));
-    assert_eq!(second.snapshot.revision, second.change.revision);
-    assert_eq!(second.change.revision, first.change.revision + 1);
+    assert_eq!(second.snapshot.revision, first.snapshot.revision + 1);
     assert_ne!(
         first.participant.connection_id(),
         second.participant.connection_id()
@@ -244,10 +242,7 @@ fn leave_transport_close_expiry_and_renewal_publish_removals() {
         .join(evidence("transport", 2, true))
         .unwrap()
         .participant;
-    let expiring = runtime
-        .join(evidence("expiring", 3, true))
-        .unwrap()
-        .participant;
+    let expiring = runtime.join(evidence("expiring", 3, true)).unwrap();
 
     let left_change = runtime.leave(&left).unwrap().unwrap();
     assert_eq!(left_change.removed_connections, [left.connection_id()]);
@@ -257,16 +252,23 @@ fn leave_transport_close_expiry_and_renewal_publish_removals() {
         [transport.connection_id()]
     );
     environment.advance(9_000);
-    runtime.renew(&expiring, "expiring").unwrap();
+    runtime.renew(&expiring.participant, "expiring").unwrap();
     environment.advance(2_000);
     assert!(runtime.expire_leases().unwrap().is_none());
     environment.advance(8_000);
     assert_eq!(
-        runtime.renew(&expiring, "expiring"),
+        runtime.renew(&expiring.participant, "expiring"),
         Err(RuntimeError::LeaseExpired)
     );
     let expired = runtime.expire_leases().unwrap().unwrap();
-    assert_eq!(expired.removed_connections, [expiring.connection_id()]);
+    assert_eq!(
+        expired.removed_connections,
+        [expiring.participant.connection_id()]
+    );
+    assert_eq!(
+        runtime.poll(&expiring.subscription),
+        Err(RuntimeError::UnknownSubscription)
+    );
     assert!(runtime.snapshot().unwrap().connections.is_empty());
 }
 
@@ -494,4 +496,301 @@ fn generated_id_collisions_and_clock_overflow_do_not_mutate_state() {
         DatabaseRuntime::new("overflow", (), contract(), config(overflowing)),
         Err(RuntimeError::ClockOverflow)
     ));
+}
+
+fn delivery_change(delivery: Delivery) -> pyre::server::runtime::Change {
+    match delivery {
+        Delivery::Changes { change } => change,
+        other => panic!("expected changes delivery, got {other:?}"),
+    }
+}
+
+#[test]
+fn subscription_snapshot_has_no_concurrent_update_gap() {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment.clone());
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    let runtime = Arc::new(DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap());
+    let barrier = Arc::new(Barrier::new(3));
+
+    let joining = {
+        let runtime = runtime.clone();
+        let barrier = barrier.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            runtime.join(evidence("joining", 1, true)).unwrap()
+        })
+    };
+    let updating = {
+        let runtime = runtime.clone();
+        let barrier = barrier.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            runtime.patch_shared(&json!({"count": 1})).unwrap();
+        })
+    };
+    barrier.wait();
+    let joined = joining.join().unwrap();
+    updating.join().unwrap();
+
+    let current = runtime.snapshot().unwrap();
+    let mut reconstructed = joined.snapshot.clone();
+    if let Some(delivery) = runtime.poll(&joined.subscription).unwrap() {
+        let change = delivery_change(delivery);
+        reconstructed.revision = change.revision;
+        if change.shared.is_some() {
+            reconstructed.shared = change.shared;
+        }
+        reconstructed.connections.extend(change.connections);
+        for id in change.removed_connections {
+            reconstructed.connections.remove(&id);
+        }
+    }
+    assert_eq!(reconstructed, current);
+}
+
+#[test]
+fn coalesces_complete_entries_and_delivers_on_trailing_cadence() {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment.clone());
+    runtime_config.downstream_delivery_cadence = Duration::from_millis(10);
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let observer = runtime.join(evidence("observer", 1, true)).unwrap();
+    let actor = runtime.join(evidence("actor", 2, true)).unwrap();
+
+    assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
+    environment.advance(10);
+    let joined = delivery_change(runtime.poll(&observer.subscription).unwrap().unwrap());
+    assert_eq!(
+        joined.connections[actor.participant.connection_id()]["color"],
+        "blue"
+    );
+
+    runtime
+        .patch_connection(&actor.participant, "actor", &json!({"cursor": "first"}))
+        .unwrap();
+    runtime
+        .patch_connection(
+            &actor.participant,
+            "actor",
+            &json!({"cursor": "last", "color": "red"}),
+        )
+        .unwrap();
+    runtime.patch_shared(&json!({"count": 3})).unwrap();
+    runtime.patch_shared(&json!({"label": "settled"})).unwrap();
+
+    assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
+    environment.advance(9);
+    assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
+    environment.advance(1);
+    let change = delivery_change(runtime.poll(&observer.subscription).unwrap().unwrap());
+    let connection = &change.connections[actor.participant.connection_id()];
+    assert_eq!(connection["userId"], 2);
+    assert_eq!(connection["cursor"], "last");
+    assert_eq!(connection["color"], "red");
+    let shared = change.shared.unwrap();
+    assert_eq!(shared["count"], 3);
+    assert_eq!(shared["label"], "settled");
+    assert_eq!(change.revision, runtime.snapshot().unwrap().revision);
+    assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
+
+    assert_eq!(
+        runtime
+            .patch_connection(&actor.participant, "actor", &json!({"cursor": "last"}),)
+            .unwrap(),
+        None
+    );
+    environment.advance(100);
+    assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
+}
+
+#[test]
+fn removals_dominate_older_values_and_a_later_rejoin_wins() {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment.clone());
+    runtime_config.downstream_delivery_cadence = Duration::from_millis(10);
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let observer = runtime.join(evidence("observer", 1, true)).unwrap();
+    let actor = runtime.join(evidence("actor", 2, true)).unwrap();
+    let actor_id = actor.participant.connection_id().to_string();
+    runtime.leave(&actor.participant).unwrap();
+    environment.advance(10);
+    let removed = delivery_change(runtime.poll(&observer.subscription).unwrap().unwrap());
+    assert_eq!(removed.removed_connections, [actor_id.as_str()]);
+    assert!(removed.connections.is_empty());
+
+    environment.ids.store(2, Ordering::SeqCst);
+    let replacement = runtime.join(evidence("replacement", 9, true)).unwrap();
+    assert_eq!(replacement.participant.connection_id(), actor_id);
+    environment.advance(10);
+    let rejoined = delivery_change(runtime.poll(&observer.subscription).unwrap().unwrap());
+    assert!(rejoined.removed_connections.is_empty());
+    assert_eq!(rejoined.connections[&actor_id]["userId"], 9);
+
+    runtime.leave(&replacement.participant).unwrap();
+    environment.ids.store(2, Ordering::SeqCst);
+    let newest = runtime.join(evidence("newest", 10, true)).unwrap();
+    assert_eq!(newest.participant.connection_id(), actor_id);
+    environment.advance(10);
+    let churn = delivery_change(runtime.poll(&observer.subscription).unwrap().unwrap());
+    assert!(churn.removed_connections.is_empty());
+    assert_eq!(churn.connections[&actor_id]["userId"], 10);
+}
+
+#[test]
+fn entry_overflow_requests_immediate_resync_and_suppresses_deltas() {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment.clone());
+    runtime_config.downstream_delivery_cadence = Duration::from_secs(60);
+    runtime_config.max_pending_entries = 1;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let observer = runtime.join(evidence("observer", 1, true)).unwrap();
+    let first = runtime.join(evidence("first", 2, true)).unwrap();
+    runtime.join(evidence("second", 3, true)).unwrap();
+
+    let recovery_revision = match runtime.poll(&observer.subscription).unwrap().unwrap() {
+        Delivery::ResyncRequired { recovery } => recovery.revision,
+        other => panic!("expected recovery delivery, got {other:?}"),
+    };
+    assert_eq!(recovery_revision, runtime.snapshot().unwrap().revision);
+    runtime
+        .patch_connection(&first.participant, "first", &json!({"cursor": "later"}))
+        .unwrap();
+    assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
+
+    let refreshed = runtime.resubscribe(&observer.subscription).unwrap();
+    assert_eq!(
+        runtime.poll(&observer.subscription),
+        Err(RuntimeError::StaleSubscription)
+    );
+    assert_eq!(refreshed.snapshot, runtime.snapshot().unwrap());
+    runtime
+        .patch_connection(&first.participant, "first", &json!({"cursor": "latest"}))
+        .unwrap();
+    assert_eq!(runtime.poll(&refreshed.subscription).unwrap(), None);
+    environment.advance(60_000);
+    let change = delivery_change(runtime.poll(&refreshed.subscription).unwrap().unwrap());
+    assert_eq!(
+        change.connections[first.participant.connection_id()]["cursor"],
+        "latest"
+    );
+}
+
+#[test]
+fn payload_and_transport_bounds_fail_explicitly() {
+    let environment = Arc::new(Environment::default());
+    let mut invalid = config(environment.clone());
+    invalid.max_pending_controls = 0;
+    assert!(matches!(
+        DatabaseRuntime::new("db", (), contract(), invalid),
+        Err(RuntimeError::InvalidTransportBounds)
+    ));
+
+    let mut snapshot_limited = config(environment.clone());
+    snapshot_limited.max_delivery_bytes = 1;
+    let runtime = DatabaseRuntime::new("tiny", (), contract(), snapshot_limited).unwrap();
+    assert_eq!(runtime.snapshot(), Err(RuntimeError::PayloadTooLarge));
+    assert!(matches!(
+        runtime.join(evidence("owner", 1, true)),
+        Err(RuntimeError::PayloadTooLarge)
+    ));
+
+    let mut delivery_limited = config(environment);
+    delivery_limited.downstream_delivery_cadence = Duration::from_secs(60);
+    delivery_limited.max_delivery_bytes = 1024;
+    let runtime = DatabaseRuntime::new("bounded", (), contract(), delivery_limited).unwrap();
+    let observer = runtime.join(evidence("observer", 1, true)).unwrap();
+    runtime
+        .patch_shared(&json!({"label": "x".repeat(5_000)}))
+        .unwrap();
+    assert!(matches!(
+        runtime.poll(&observer.subscription).unwrap(),
+        Some(Delivery::ResyncRequired { .. })
+    ));
+    assert_eq!(
+        runtime.resubscribe(&observer.subscription),
+        Err(RuntimeError::PayloadTooLarge)
+    );
+}
+
+#[test]
+fn subscription_cleanup_stale_handles_and_database_isolation() {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment.clone());
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    let left = DatabaseRuntime::new("left", (), contract(), runtime_config.clone()).unwrap();
+    let right = DatabaseRuntime::new("right", (), contract(), runtime_config).unwrap();
+    let observer = left.join(evidence("observer", 1, true)).unwrap();
+    let leaving = left.join(evidence("leaving", 2, true)).unwrap();
+
+    left.transport_closed(&leaving.participant).unwrap();
+    assert_eq!(
+        left.poll(&leaving.subscription),
+        Err(RuntimeError::UnknownSubscription)
+    );
+    let removal = delivery_change(left.poll(&observer.subscription).unwrap().unwrap());
+    assert_eq!(
+        removal.removed_connections,
+        [leaving.participant.connection_id()]
+    );
+    assert_eq!(
+        right.poll(&observer.subscription),
+        Err(RuntimeError::WrongDatabase)
+    );
+
+    left.authorization_lost(&observer.participant).unwrap();
+    assert_eq!(
+        left.poll(&observer.subscription),
+        Err(RuntimeError::UnknownSubscription)
+    );
+
+    let closing = right.join(evidence("closing", 3, true)).unwrap();
+    right.close().unwrap();
+    assert_eq!(right.poll(&closing.subscription), Err(RuntimeError::Closed));
+
+    let reopened = DatabaseRuntime::new("left", (), contract(), config(environment)).unwrap();
+    assert_eq!(
+        reopened.poll(&observer.subscription),
+        Err(RuntimeError::StaleEpoch)
+    );
+}
+
+#[test]
+fn reconnect_has_a_fresh_identity_snapshot_and_no_replay() {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment);
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let first = runtime.join(evidence("owner", 1, true)).unwrap();
+    runtime.patch_shared(&json!({"count": 7})).unwrap();
+    runtime.transport_closed(&first.participant).unwrap();
+
+    let reconnected = runtime.join(evidence("owner", 1, true)).unwrap();
+    assert_ne!(
+        reconnected.participant.connection_id(),
+        first.participant.connection_id()
+    );
+    assert_eq!(reconnected.snapshot.shared.as_ref().unwrap()["count"], 7);
+    assert!(reconnected
+        .snapshot
+        .connections
+        .contains_key(reconnected.participant.connection_id()));
+    assert_eq!(runtime.poll(&reconnected.subscription).unwrap(), None);
+}
+
+#[test]
+fn delivery_envelopes_serialize_with_ephemeral_identity() {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment.clone());
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let observer = runtime.join(evidence("observer", 1, true)).unwrap();
+    runtime.patch_shared(&json!({"count": 4})).unwrap();
+    let delivery = runtime.poll(&observer.subscription).unwrap().unwrap();
+    let encoded = serde_json::to_value(delivery).unwrap();
+    assert_eq!(encoded["type"], "changes");
+    assert_eq!(encoded["change"]["databaseId"], "db");
+    assert_eq!(encoded["change"]["epoch"], runtime.epoch());
+    assert!(encoded["change"]["revision"].as_u64().is_some());
+    assert!(encoded.get("cursor").is_none());
 }
