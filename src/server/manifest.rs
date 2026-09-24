@@ -81,6 +81,7 @@ pub struct SqlInfo {
 
 #[derive(Clone, Debug)]
 pub struct PyreSession {
+    json: JsonValue,
     logical: HashMap<String, sync::SessionValue>,
     sql_args: HashMap<String, JsonValue>,
 }
@@ -120,7 +121,16 @@ impl PyreSession {
             )?;
         }
 
-        Ok(Self { logical, sql_args })
+        Ok(Self {
+            json: JsonValue::Object(object),
+            logical,
+            sql_args,
+        })
+    }
+
+    /// The validated logical session JSON used for trusted runtime derivations.
+    pub fn json(&self) -> &JsonValue {
+        &self.json
     }
 
     pub fn logical(&self) -> &HashMap<String, sync::SessionValue> {

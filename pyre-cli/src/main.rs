@@ -166,6 +166,10 @@ enum Commands {
         /// Allow unsigned trusted session headers on non-loopback bind addresses.
         #[arg(long, default_value_t = false)]
         allow_unsafe_unsigned_session: bool,
+
+        /// Allow authenticated participants to patch Shared ephemeral state.
+        #[arg(long, default_value_t = false)]
+        participant_shared_writes: bool,
     },
 
     /// Start the Pyre MCP server over stdio.
@@ -265,6 +269,7 @@ async fn run() -> io::Result<()> {
             page_size,
             allow_unsafe_dev_session,
             allow_unsafe_unsigned_session,
+            participant_shared_writes,
         } => {
             command::serve(
                 &options,
@@ -282,6 +287,7 @@ async fn run() -> io::Result<()> {
                     page_size: *page_size,
                     allow_unsafe_dev_session: *allow_unsafe_dev_session,
                     allow_unsafe_unsigned_session: *allow_unsafe_unsigned_session,
+                    participant_shared_writes: *participant_shared_writes,
                 },
             )
             .await?;

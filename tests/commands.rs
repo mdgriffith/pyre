@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use libsql;
 use predicates::prelude::*;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Stdio};
@@ -184,6 +184,34 @@ fn wait_for_health(port: u16) {
     }
 
     panic!("pyre serve did not become healthy on port {}", port);
+}
+
+fn open_sse(port: u16, extra_headers: &str) -> BufReader<TcpStream> {
+    open_sse_with_query(port, "databaseId=default", extra_headers)
+}
+
+fn open_sse_with_query(port: u16, query: &str, extra_headers: &str) -> BufReader<TcpStream> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(
+            format!("GET /sync/events?{query} HTTP/1.1\r\nHost: localhost\r\n{extra_headers}\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+    BufReader::new(stream)
+}
+
+fn next_sse_event(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        if let Some(data) = line.strip_prefix("data:") {
+            return serde_json::from_str(data.trim()).unwrap();
+        }
+    }
 }
 
 fn write_multi_namespace_schemas(ctx: &TestContext) {
@@ -1571,6 +1599,385 @@ record Note {
         broadcast["serverRevision"],
         second["sync"]["serverRevision"]
     );
+}
+
+#[test]
+fn test_serve_ephemeral_http_sse_lifecycle_and_fencing() {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/session.pyre"),
+        "session {\n    userId Int\n    role String\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+state Connection {
+    userId Int = Session.userId
+    role String = Session.role
+    cursor String?
+}
+
+state Shared {
+    count Int @default(0)
+}
+
+record Note {
+    @allow(query) { role == Session.role }
+    @allow(insert, update, delete) { True }
+    key Id.Uuid @id
+    role String
+}
+"#,
+    )
+    .unwrap();
+    let db_path = ctx.workspace_path.join("db/app.db");
+    ctx.run_command("migrate")
+        .arg(&db_path)
+        .arg("--push")
+        .assert()
+        .success();
+    ctx.run_command("generate").assert().success();
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let create = manifest["queries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|query| query["operation"] == "insert")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    let port = free_loopback_port();
+    let child = StdCommand::new(assert_cmd::cargo::cargo_bin("pyre"))
+        .current_dir(&ctx.workspace_path)
+        .arg("serve")
+        .arg(&db_path)
+        .args([
+            "--port",
+            &port.to_string(),
+            "--session-header",
+            "x-pyre-session",
+            "--session-secret",
+            "test-secret",
+            "--participant-shared-writes",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server = ServerGuard { child };
+    wait_for_health(port);
+
+    let auth = |user_id, role: &str, session_key: Option<&str>| {
+        let mut payload = serde_json::json!({
+            "session": {"userId": user_id, "role": role},
+            "exp": 4_102_444_800_i64,
+        });
+        if let Some(session_key) = session_key {
+            payload["sessionKey"] = serde_json::json!(session_key);
+        }
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"test-secret").unwrap();
+        mac.update(payload.as_bytes());
+        let signature =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("x-pyre-session: {payload}.{signature}\r\n")
+    };
+    let owner = auth(1, "member", Some("owner-session"));
+    let mut first = open_sse(port, &owner);
+    let first_connected = next_sse_event(&mut first);
+    let first_snapshot = next_sse_event(&mut first);
+    assert_eq!(first_connected["type"], "connected");
+    assert_eq!(first_snapshot["type"], "ephemeralSnapshot");
+    let first_id = first_connected["connectionId"].as_str().unwrap();
+    let epoch = first_connected["ephemeralEpoch"].as_str().unwrap();
+    assert_eq!(
+        first_snapshot["ephemeralSnapshot"]["connections"][first_id]["userId"],
+        1
+    );
+
+    let mut second = open_sse(port, &owner);
+    let second_connected = next_sse_event(&mut second);
+    let second_snapshot = next_sse_event(&mut second);
+    let second_id = second_connected["connectionId"].as_str().unwrap();
+    assert_ne!(first_id, second_id);
+    assert!(second_snapshot["ephemeralSnapshot"]["connections"]
+        .as_object()
+        .unwrap()
+        .contains_key(first_id));
+    assert!(
+        next_sse_event(&mut first)["ephemeralChanges"]["connections"]
+            .as_object()
+            .unwrap()
+            .contains_key(second_id)
+    );
+
+    let request = |connection_id: &str, sequence, patch: serde_json::Value| {
+        serde_json::json!({
+            "databaseId": "default",
+            "ephemeralEpoch": epoch,
+            "connectionId": connection_id,
+            "clientRequestSequence": sequence,
+            "patch": patch,
+        })
+        .to_string()
+    };
+    let (status, body) = http_request_with_headers(
+        port,
+        "PATCH",
+        "/ephemeral/connection",
+        Some(&request(
+            first_id,
+            10,
+            serde_json::json!({"cursor": "left"}),
+        )),
+        &owner,
+    );
+    assert_eq!(status, 200, "{body}");
+    let accepted: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(accepted["clientRequestSequence"], 10);
+    for event in [next_sse_event(&mut first), next_sse_event(&mut second)] {
+        assert_eq!(event["type"], "ephemeralChanges");
+        assert_eq!(
+            event["ephemeralChanges"]["connections"][first_id]["cursor"],
+            "left"
+        );
+    }
+
+    let forged = auth(2, "member", Some("different-session"));
+    let (status, body) = http_request_with_headers(
+        port,
+        "PATCH",
+        "/ephemeral/connection",
+        Some(&request(
+            first_id,
+            11,
+            serde_json::json!({"cursor": "forged"}),
+        )),
+        &forged,
+    );
+    assert_eq!(status, 403, "{body}");
+    let rejected: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rejected["type"], "ephemeralRejected");
+    assert_eq!(rejected["clientRequestSequence"], 11);
+
+    let missing_key = auth(1, "member", None);
+    let (status, _) = http_request_with_headers(
+        port,
+        "PATCH",
+        "/ephemeral/connection",
+        Some(&request(
+            first_id,
+            112,
+            serde_json::json!({"cursor": "missing-key"}),
+        )),
+        &missing_key,
+    );
+    assert_eq!(status, 401);
+
+    let stale = serde_json::json!({
+        "databaseId": "default",
+        "ephemeralEpoch": "forged",
+        "connectionId": first_id,
+        "clientRequestSequence": 111,
+        "patch": {"cursor": "forged"},
+    })
+    .to_string();
+    let (status, body) =
+        http_request_with_headers(port, "PATCH", "/ephemeral/connection", Some(&stale), &owner);
+    assert_eq!(status, 409, "{body}");
+
+    let (status, body) = http_request_with_headers(
+        port,
+        "PATCH",
+        "/ephemeral/shared",
+        Some(&request(first_id, 12, serde_json::json!({"count": 7}))),
+        &owner,
+    );
+    assert_eq!(status, 200, "{body}");
+
+    let identity_request = |sequence| {
+        serde_json::json!({
+            "databaseId": "default",
+            "ephemeralEpoch": epoch,
+            "connectionId": first_id,
+            "clientRequestSequence": sequence,
+        })
+        .to_string()
+    };
+    let refreshed_owner = auth(1, "admin", Some("owner-session"));
+    let lease = identity_request(13);
+    let (status, body) = http_request_with_headers(
+        port,
+        "POST",
+        "/ephemeral/lease",
+        Some(&lease),
+        &refreshed_owner,
+    );
+    assert_eq!(status, 200, "{body}");
+    let lease_response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(lease_response["leaseDeadlineMillis"].is_number());
+
+    let input = serde_json::json!({
+        "key": "01900000-0000-7000-8000-000000000099",
+        "role": "admin",
+    })
+    .to_string();
+    let (status, body) = http_request_with_headers(
+        port,
+        "POST",
+        &format!("/db/{create}?sync=true"),
+        Some(&input),
+        &refreshed_owner,
+    );
+    assert_eq!(status, 200, "{body}");
+    let mut durable = None;
+    for _ in 0..4 {
+        let event = next_sse_event(&mut first);
+        if event["type"] == "delta" {
+            durable = Some(event);
+            break;
+        }
+    }
+    let durable = durable.expect("refreshed connection did not receive a durable delta");
+    assert_ne!(durable["data"], serde_json::json!([]), "{durable}");
+
+    let resnapshot_request = identity_request(14);
+    let (status, body) = http_request_with_headers(
+        port,
+        "POST",
+        "/ephemeral/resnapshot",
+        Some(&resnapshot_request),
+        &refreshed_owner,
+    );
+    assert_eq!(status, 200, "{body}");
+    let resnapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resnapshot["clientRequestSequence"], 14);
+    assert_eq!(resnapshot["ephemeralSnapshot"]["shared"]["count"], 7);
+
+    let mut reconnected = open_sse(port, &owner);
+    let reconnected_event = next_sse_event(&mut reconnected);
+    assert_ne!(reconnected_event["connectionId"], first_id);
+    assert_eq!(
+        next_sse_event(&mut reconnected)["type"],
+        "ephemeralSnapshot"
+    );
+
+    second.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+    drop(second);
+    let (status, body) = http_request_with_headers(
+        port,
+        "PATCH",
+        "/ephemeral/shared",
+        Some(&request(first_id, 15, serde_json::json!({"count": 8}))),
+        &refreshed_owner,
+    );
+    assert_eq!(status, 200, "{body}");
+    let mut removed = false;
+    for _ in 0..6 {
+        let event = next_sse_event(&mut first);
+        removed = event["ephemeralChanges"]["removedConnections"]
+            .as_array()
+            .is_some_and(|connections| connections.iter().any(|id| id == second_id));
+        if removed {
+            break;
+        }
+    }
+    assert!(
+        removed,
+        "transport close did not publish Connection removal"
+    );
+}
+
+#[test]
+fn test_serve_shared_only_write_intent() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+state Shared {
+    count Int @default(0)
+}
+
+@syncable(false)
+record Dummy {
+    id Int @id
+    @public
+}
+"#,
+    )
+    .unwrap();
+    let db_path = ctx.workspace_path.join("db/app.db");
+    ctx.run_command("migrate")
+        .arg(&db_path)
+        .arg("--push")
+        .assert()
+        .success();
+    ctx.run_command("generate").assert().success();
+
+    let port = free_loopback_port();
+    let child = StdCommand::new(assert_cmd::cargo::cargo_bin("pyre"))
+        .current_dir(&ctx.workspace_path)
+        .arg("serve")
+        .arg(&db_path)
+        .args(["--port", &port.to_string(), "--participant-shared-writes"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server = ServerGuard { child };
+    wait_for_health(port);
+
+    let mut writer = open_sse(port, "");
+    let writer_connected = next_sse_event(&mut writer);
+    assert_eq!(next_sse_event(&mut writer)["type"], "ephemeralSnapshot");
+    let writer_id = writer_connected["connectionId"].as_str().unwrap();
+    let epoch = writer_connected["ephemeralEpoch"].as_str().unwrap();
+
+    let mut reader = open_sse_with_query(port, "databaseId=default&ephemeralWrite=false", "");
+    let reader_connected = next_sse_event(&mut reader);
+    assert_eq!(next_sse_event(&mut reader)["type"], "ephemeralSnapshot");
+    let reader_id = reader_connected["connectionId"].as_str().unwrap();
+    let request = |connection_id: &str, sequence: u64, count: i64| {
+        serde_json::json!({
+            "databaseId": "default",
+            "ephemeralEpoch": epoch,
+            "connectionId": connection_id,
+            "clientRequestSequence": sequence,
+            "patch": {"count": count},
+        })
+        .to_string()
+    };
+
+    let (status, body) = http_request(
+        port,
+        "PATCH",
+        "/ephemeral/shared",
+        Some(&request(writer_id, 1, 7)),
+    );
+    assert_eq!(status, 200, "{body}");
+    let change = next_sse_event(&mut reader);
+    assert_eq!(change["ephemeralChanges"]["shared"]["count"], 7);
+
+    let (status, body) = http_request(
+        port,
+        "PATCH",
+        "/ephemeral/shared",
+        Some(&request(reader_id, 2, 8)),
+    );
+    assert_eq!(status, 403, "{body}");
+    let rejected: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rejected["type"], "ephemeralRejected");
+    assert!(rejected["error"].as_str().unwrap().contains("read-only"));
 }
 
 #[test]

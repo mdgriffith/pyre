@@ -16,6 +16,7 @@ serve = [
     "tokio/macros",
     "tokio/net",
     "tokio/sync",
+    "tokio/time",
 ]
 lsp = ["tokio/io-std", "tokio/sync", "tower-lsp"]
 wasm = ["getrandom/js"]

@@ -411,6 +411,148 @@ fn shared_only_runtime_supports_shared_state_but_rejects_join() {
 }
 
 #[test]
+fn shared_only_subscribers_enforce_write_intent_owner_policy_and_lease() {
+    let environment = Arc::new(Environment::default());
+    let contract = contract_with_states(
+        r#"state Shared {
+    count Int @default(0)
+}
+"#,
+    );
+    let server_only = DatabaseRuntime::new(
+        "server-only",
+        (),
+        contract.clone(),
+        config(environment.clone()),
+    )
+    .unwrap();
+    let server_only_writer = server_only.subscribe("writer", true).unwrap();
+    assert_eq!(
+        server_only.patch_shared_from_subscription(
+            &server_only_writer.subscription,
+            "writer",
+            &json!({"count": 1}),
+        ),
+        Err(RuntimeError::SharedServerOnly)
+    );
+    let mut runtime_config = config(environment.clone());
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    runtime_config.shared_write_policy = SharedWritePolicy::ParticipantWritable;
+    let runtime = DatabaseRuntime::new("db", (), contract, runtime_config).unwrap();
+    let subscribed = runtime.subscribe("reader", false).unwrap();
+    let writer = runtime.subscribe("writer", true).unwrap();
+
+    assert!(subscribed.snapshot.connections.is_empty());
+    assert_eq!(subscribed.snapshot.shared.as_ref().unwrap()["count"], 0);
+    assert!(!subscribed.subscription.is_writable());
+    assert!(writer.subscription.is_writable());
+    assert_eq!(
+        runtime.patch_shared_from_subscription(
+            &subscribed.subscription,
+            "reader",
+            &json!({"count": 3}),
+        ),
+        Err(RuntimeError::ReadOnly)
+    );
+    assert_eq!(
+        runtime.patch_shared_from_subscription(
+            &writer.subscription,
+            "reader",
+            &json!({"count": 3}),
+        ),
+        Err(RuntimeError::OwnerMismatch)
+    );
+    runtime
+        .patch_shared_from_subscription(&writer.subscription, "writer", &json!({"count": 4}))
+        .unwrap();
+    let changed = delivery_change(runtime.poll(&subscribed.subscription).unwrap().unwrap());
+    assert_eq!(changed.shared.unwrap()["count"], 4);
+    assert_eq!(
+        runtime.resubscribe(&subscribed.subscription, "forged"),
+        Err(RuntimeError::OwnerMismatch)
+    );
+    let refreshed = runtime
+        .resubscribe(&subscribed.subscription, "reader")
+        .unwrap();
+    assert_eq!(refreshed.snapshot.shared.unwrap()["count"], 4);
+    assert!(!refreshed.subscription.is_writable());
+    environment.advance(9_000);
+    runtime
+        .renew_subscription(&refreshed.subscription, "reader")
+        .unwrap();
+    environment.advance(10_000);
+    assert_eq!(
+        runtime.renew_subscription(&refreshed.subscription, "forged"),
+        Err(RuntimeError::OwnerMismatch)
+    );
+    assert_eq!(
+        runtime.patch_shared_from_subscription(
+            &writer.subscription,
+            "writer",
+            &json!({"count": 5}),
+        ),
+        Err(RuntimeError::LeaseExpired)
+    );
+    assert!(runtime.expire_leases().unwrap().is_none());
+    assert_eq!(
+        runtime.poll(&refreshed.subscription),
+        Err(RuntimeError::UnknownSubscription)
+    );
+    assert_eq!(
+        runtime.patch_shared_from_subscription(
+            &writer.subscription,
+            "writer",
+            &json!({"count": 5}),
+        ),
+        Err(RuntimeError::UnknownSubscription)
+    );
+}
+
+#[test]
+fn refresh_and_renew_is_atomic_and_owner_mismatch_does_not_renew() {
+    let environment = Arc::new(Environment::default());
+    let runtime = DatabaseRuntime::new("db", (), contract(), config(environment.clone())).unwrap();
+    let participant = runtime
+        .join(evidence("owner", 1, true))
+        .unwrap()
+        .participant;
+    runtime
+        .patch_connection(&participant, "owner", &json!({"cursor": "kept"}))
+        .unwrap();
+    environment.advance(9_000);
+
+    assert_eq!(
+        runtime.refresh_and_renew(
+            &participant,
+            "forged",
+            &json!({"userId": 2, "role": "admin"}),
+        ),
+        Err(RuntimeError::OwnerMismatch)
+    );
+    environment.advance(1_000);
+    assert_eq!(
+        runtime.refresh_and_renew(
+            &participant,
+            "owner",
+            &json!({"userId": 2, "role": "admin"}),
+        ),
+        Err(RuntimeError::LeaseExpired)
+    );
+
+    let active = runtime
+        .join(evidence("active", 3, true))
+        .unwrap()
+        .participant;
+    let (change, _) = runtime
+        .refresh_and_renew(&active, "active", &json!({"userId": 4, "role": "admin"}))
+        .unwrap();
+    assert_eq!(
+        change.unwrap().connections[active.connection_id()]["userId"],
+        4
+    );
+}
+
+#[test]
 fn rejects_empty_trusted_owner_evidence_without_mutation() {
     let environment = Arc::new(Environment::default());
     let runtime = DatabaseRuntime::new("db", (), contract(), config(environment)).unwrap();
@@ -658,7 +800,9 @@ fn entry_overflow_requests_immediate_resync_and_suppresses_deltas() {
         .unwrap();
     assert_eq!(runtime.poll(&observer.subscription).unwrap(), None);
 
-    let refreshed = runtime.resubscribe(&observer.subscription).unwrap();
+    let refreshed = runtime
+        .resubscribe(&observer.subscription, "observer")
+        .unwrap();
     assert_eq!(
         runtime.poll(&observer.subscription),
         Err(RuntimeError::StaleSubscription)
@@ -708,7 +852,7 @@ fn payload_and_transport_bounds_fail_explicitly() {
         Some(Delivery::ResyncRequired { .. })
     ));
     assert_eq!(
-        runtime.resubscribe(&observer.subscription),
+        runtime.resubscribe(&observer.subscription, "observer"),
         Err(RuntimeError::PayloadTooLarge)
     );
 }
@@ -788,9 +932,9 @@ fn delivery_envelopes_serialize_with_ephemeral_identity() {
     runtime.patch_shared(&json!({"count": 4})).unwrap();
     let delivery = runtime.poll(&observer.subscription).unwrap().unwrap();
     let encoded = serde_json::to_value(delivery).unwrap();
-    assert_eq!(encoded["type"], "changes");
-    assert_eq!(encoded["change"]["databaseId"], "db");
-    assert_eq!(encoded["change"]["epoch"], runtime.epoch());
-    assert!(encoded["change"]["revision"].as_u64().is_some());
+    assert_eq!(encoded["type"], "ephemeralChanges");
+    assert_eq!(encoded["ephemeralChanges"]["databaseId"], "db");
+    assert_eq!(encoded["ephemeralChanges"]["epoch"], runtime.epoch());
+    assert!(encoded["ephemeralChanges"]["revision"].as_u64().is_some());
     assert!(encoded.get("cursor").is_none());
 }

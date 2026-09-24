@@ -155,6 +155,39 @@ delivers snapshots, changes, removals, and recovery instructions. The live
 connection outbox must be bounded rather than adding an ephemeral queue beside the
 current unbounded sender.
 
+`GET /sync/events` accepts `ephemeralWrite=true|false`, defaulting to `true`.
+The value declares participation intent at subscription creation. Read-only and
+writable subscribers both receive state; writable intent grants no authority
+unless participant writes are enabled and the trusted owner and lease also match.
+
+`pyre serve` uses these authenticated routes:
+
+- `PATCH /ephemeral/connection` patches the caller's `Connection` value.
+- `PATCH /ephemeral/shared` patches `Shared` when participant writes are enabled.
+- `POST /ephemeral/lease` revalidates the request session, refreshes derived fields,
+  and renews the lease atomically.
+- `POST /ephemeral/resnapshot` replaces the subscription ordering boundary and
+  returns a complete snapshot.
+
+Each request includes `databaseId`, `ephemeralEpoch`, `connectionId`, and
+`clientRequestSequence`; patch requests also include `patch`. The server echoes the
+sequence in `ephemeralAccepted` or `ephemeralRejected`. The live stream uses the
+explicit envelope types `ephemeralSnapshot`, `ephemeralChanges`, and
+`ephemeralResyncRequired`, with payloads under fields of the same name. Durable
+`databaseEpoch` and ephemeral `ephemeralEpoch` remain separate.
+`clientRequestSequence` must be a non-negative JavaScript-safe integer.
+
+Signed session payloads use `{ session, exp, sessionKey }`. When ephemeral state
+is active, `sessionKey` is required and is the stable server-authenticated owner
+identity across token expiration or signature refresh; Pyre stores only its hash.
+Unsigned trusted headers derive identity from the complete credential, so changing
+session JSON changes the ephemeral owner. Static development sessions share one
+process-wide owner for the configured database.
+
+Participant `Shared` writes are disabled by default. `pyre serve` enables them only
+with `--participant-shared-writes`; trusted server code retains the runtime's
+server-owned `Shared` API regardless of this transport policy.
+
 ## Reconnection
 
 Reconnection creates a fresh connection identity and begins with a fresh ephemeral

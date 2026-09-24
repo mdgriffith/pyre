@@ -151,6 +151,7 @@ pub struct Subscription {
     epoch: String,
     connection_id: String,
     generation: u64,
+    writable: bool,
 }
 
 impl Subscription {
@@ -164,6 +165,10 @@ impl Subscription {
 
     pub fn connection_id(&self) -> &str {
         &self.connection_id
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.writable
     }
 }
 
@@ -203,11 +208,23 @@ pub struct Recovery {
 /// Serializable transport messages. These revisions are scoped only to the
 /// resident ephemeral runtime and are unrelated to durable sync cursors.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type")]
 pub enum Delivery {
-    Snapshot { snapshot: Snapshot },
-    Changes { change: Change },
-    ResyncRequired { recovery: Recovery },
+    #[serde(rename = "ephemeralSnapshot")]
+    Snapshot {
+        #[serde(rename = "ephemeralSnapshot")]
+        snapshot: Snapshot,
+    },
+    #[serde(rename = "ephemeralChanges")]
+    Changes {
+        #[serde(rename = "ephemeralChanges")]
+        change: Change,
+    },
+    #[serde(rename = "ephemeralResyncRequired")]
+    ResyncRequired {
+        #[serde(rename = "ephemeralResyncRequired")]
+        recovery: Recovery,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -341,6 +358,9 @@ enum OutboxMode {
 
 struct Outbox {
     generation: u64,
+    owner_id: String,
+    writable: bool,
+    standalone_lease_deadline: Option<u64>,
     next_delivery_millis: u64,
     mode: OutboxMode,
 }
@@ -437,6 +457,52 @@ impl<H> DatabaseRuntime<H> {
         self.snapshot_locked(&state)
     }
 
+    pub fn revision(&self) -> Result<u64, RuntimeError> {
+        let state = self.lock_state()?;
+        ensure_open(&state)?;
+        Ok(state.revision)
+    }
+
+    /// Registers a subscriber without creating Connection state.
+    pub fn subscribe(
+        &self,
+        trusted_owner_id: &str,
+        writable: bool,
+    ) -> Result<SubscriptionResult, RuntimeError> {
+        let now = self.config.environment.now();
+        let mut state = self.lock_state()?;
+        ensure_open(&state)?;
+        self.require_state("Shared")?;
+        require_owner_id(trusted_owner_id)?;
+        if state.outboxes.len() >= self.config.max_participants {
+            return Err(RuntimeError::Capacity);
+        }
+        let snapshot = self.snapshot_locked(&state)?;
+        let subscription_id = self.new_id()?;
+        let deadline = self.deadline(now)?;
+        if state.outboxes.contains_key(&subscription_id) {
+            return Err(RuntimeError::IdCollision);
+        }
+        let generation = state
+            .subscription_generation
+            .checked_add(1)
+            .ok_or(RuntimeError::GenerationExhausted)?;
+        state.subscription_generation = generation;
+        let subscription = self.insert_outbox_locked(
+            &mut state,
+            subscription_id,
+            generation,
+            trusted_owner_id.to_string(),
+            writable,
+            Some(deadline),
+            now.monotonic_millis,
+        )?;
+        Ok(SubscriptionResult {
+            subscription,
+            snapshot,
+        })
+    }
+
     pub fn join(&self, evidence: JoinEvidence) -> Result<JoinResult, RuntimeError> {
         let mut state = self.lock_state()?;
         ensure_open(&state)?;
@@ -503,6 +569,9 @@ impl<H> DatabaseRuntime<H> {
             &mut state,
             participant.connection_id.clone(),
             subscription_generation,
+            participant.owner_id.clone(),
+            evidence.writable,
+            None,
             now.monotonic_millis,
         )?;
         Ok(JoinResult {
@@ -517,11 +586,31 @@ impl<H> DatabaseRuntime<H> {
     pub fn resubscribe(
         &self,
         subscription: &Subscription,
+        trusted_owner_id: &str,
     ) -> Result<SubscriptionResult, RuntimeError> {
         let now = self.config.environment.now();
         let mut state = self.lock_state()?;
         ensure_open(&state)?;
         self.validate_subscription(&state, subscription)?;
+        require_owner_id(trusted_owner_id)?;
+        if state
+            .outboxes
+            .get(&subscription.connection_id)
+            .expect("validated subscription")
+            .owner_id
+            != trusted_owner_id
+        {
+            return Err(RuntimeError::OwnerMismatch);
+        }
+        let outbox = state
+            .outboxes
+            .get(&subscription.connection_id)
+            .expect("validated subscription");
+        let standalone_lease_deadline = outbox.standalone_lease_deadline;
+        let writable = outbox.writable;
+        if standalone_lease_deadline.is_some_and(|deadline| now.monotonic_millis >= deadline) {
+            return Err(RuntimeError::LeaseExpired);
+        }
         let snapshot = self.snapshot_locked(&state)?;
         now.monotonic_millis
             .checked_add(duration_millis(self.config.downstream_delivery_cadence)?)
@@ -535,6 +624,9 @@ impl<H> DatabaseRuntime<H> {
             &mut state,
             subscription.connection_id.clone(),
             generation,
+            trusted_owner_id.to_string(),
+            writable,
+            standalone_lease_deadline,
             now.monotonic_millis,
         )?;
         Ok(SubscriptionResult {
@@ -676,6 +768,56 @@ impl<H> DatabaseRuntime<H> {
         Ok(Some(change))
     }
 
+    /// Revalidates derived fields and renews the lease at one ordering boundary.
+    pub fn refresh_and_renew(
+        &self,
+        participant: &Participant,
+        trusted_owner_id: &str,
+        trusted_session: &Value,
+    ) -> Result<(Option<Change>, Lease), RuntimeError> {
+        let now = self.config.environment.now();
+        let mut state = self.lock_state()?;
+        self.validate_participant(&state, participant, trusted_owner_id, now)?;
+        let current = &state
+            .connections
+            .get(&participant.connection_id)
+            .expect("validated connection")
+            .value;
+        let refreshed =
+            self.contract
+                .refresh_connection(current, trusted_session, now.unix_seconds)?;
+        let deadline = self.deadline(now)?;
+        let change = if refreshed.changed {
+            let revision = advance(&mut state)?;
+            let connection = state
+                .connections
+                .get_mut(&participant.connection_id)
+                .expect("validated connection");
+            connection.value = refreshed.value.clone();
+            connection.lease_deadline = deadline;
+            let change = self.connection_change(
+                revision,
+                participant.connection_id.clone(),
+                refreshed.value,
+            );
+            self.publish_locked(&mut state, &change);
+            Some(change)
+        } else {
+            state
+                .connections
+                .get_mut(&participant.connection_id)
+                .expect("validated connection")
+                .lease_deadline = deadline;
+            None
+        };
+        Ok((
+            change,
+            Lease {
+                deadline_millis: deadline,
+            },
+        ))
+    }
+
     pub fn patch_shared_from_participant(
         &self,
         participant: &Participant,
@@ -695,6 +837,40 @@ impl<H> DatabaseRuntime<H> {
             .expect("validated connection")
             .writable
         {
+            return Err(RuntimeError::ReadOnly);
+        }
+        self.patch_shared_locked(&mut state, patch)
+    }
+
+    pub fn patch_shared_from_subscription(
+        &self,
+        subscription: &Subscription,
+        trusted_owner_id: &str,
+        patch: &Value,
+    ) -> Result<Option<Change>, RuntimeError> {
+        let now = self.config.environment.now();
+        let mut state = self.lock_state()?;
+        ensure_open(&state)?;
+        self.validate_subscription(&state, subscription)?;
+        self.require_state("Shared")?;
+        require_owner_id(trusted_owner_id)?;
+        if self.config.shared_write_policy != SharedWritePolicy::ParticipantWritable {
+            return Err(RuntimeError::SharedServerOnly);
+        }
+        let outbox = state
+            .outboxes
+            .get(&subscription.connection_id)
+            .expect("validated subscription");
+        if outbox.owner_id != trusted_owner_id {
+            return Err(RuntimeError::OwnerMismatch);
+        }
+        let Some(deadline) = outbox.standalone_lease_deadline else {
+            return Err(RuntimeError::UnknownConnection);
+        };
+        if now.monotonic_millis >= deadline {
+            return Err(RuntimeError::LeaseExpired);
+        }
+        if !outbox.writable || !subscription.writable {
             return Err(RuntimeError::ReadOnly);
         }
         self.patch_shared_locked(&mut state, patch)
@@ -727,6 +903,39 @@ impl<H> DatabaseRuntime<H> {
         })
     }
 
+    pub fn renew_subscription(
+        &self,
+        subscription: &Subscription,
+        trusted_owner_id: &str,
+    ) -> Result<Lease, RuntimeError> {
+        let now = self.config.environment.now();
+        let mut state = self.lock_state()?;
+        ensure_open(&state)?;
+        self.validate_subscription(&state, subscription)?;
+        require_owner_id(trusted_owner_id)?;
+        let outbox = state
+            .outboxes
+            .get_mut(&subscription.connection_id)
+            .expect("validated subscription");
+        if outbox.owner_id != trusted_owner_id {
+            return Err(RuntimeError::OwnerMismatch);
+        }
+        let Some(current_deadline) = outbox.standalone_lease_deadline else {
+            return Err(RuntimeError::UnknownConnection);
+        };
+        if now.monotonic_millis >= current_deadline {
+            return Err(RuntimeError::LeaseExpired);
+        }
+        let deadline = now
+            .monotonic_millis
+            .checked_add(duration_millis(self.config.lease_duration)?)
+            .ok_or(RuntimeError::ClockOverflow)?;
+        outbox.standalone_lease_deadline = Some(deadline);
+        Ok(Lease {
+            deadline_millis: deadline,
+        })
+    }
+
     pub fn leave(&self, participant: &Participant) -> Result<Option<Change>, RuntimeError> {
         let mut state = self.lock_state()?;
         ensure_open(&state)?;
@@ -737,6 +946,15 @@ impl<H> DatabaseRuntime<H> {
         let change = self.removal_change(revision, vec![participant.connection_id.clone()]);
         self.publish_locked(&mut state, &change);
         Ok(Some(change))
+    }
+
+    /// Removes a subscription that has no associated Connection value.
+    pub fn unsubscribe(&self, subscription: &Subscription) -> Result<(), RuntimeError> {
+        let mut state = self.lock_state()?;
+        ensure_open(&state)?;
+        self.validate_subscription(&state, subscription)?;
+        state.outboxes.remove(&subscription.connection_id);
+        Ok(())
     }
 
     /// Hook for a host transport's close notification.
@@ -765,6 +983,19 @@ impl<H> DatabaseRuntime<H> {
             .filter(|(_, connection)| now.monotonic_millis >= connection.lease_deadline)
             .map(|(id, _)| id.clone())
             .collect();
+        let expired_subscriptions: Vec<_> = state
+            .outboxes
+            .iter()
+            .filter(|(_, outbox)| {
+                outbox
+                    .standalone_lease_deadline
+                    .is_some_and(|deadline| now.monotonic_millis >= deadline)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired_subscriptions {
+            state.outboxes.remove(&id);
+        }
         if removed.is_empty() {
             return Ok(None);
         }
@@ -917,6 +1148,9 @@ impl<H> DatabaseRuntime<H> {
         state: &mut State,
         connection_id: String,
         generation: u64,
+        owner_id: String,
+        writable: bool,
+        standalone_lease_deadline: Option<u64>,
         now_millis: u64,
     ) -> Result<Subscription, RuntimeError> {
         let next_delivery_millis = now_millis
@@ -926,6 +1160,9 @@ impl<H> DatabaseRuntime<H> {
             connection_id.clone(),
             Outbox {
                 generation,
+                owner_id,
+                writable,
+                standalone_lease_deadline,
                 next_delivery_millis,
                 mode: OutboxMode::Active {
                     shared: None,
@@ -939,6 +1176,7 @@ impl<H> DatabaseRuntime<H> {
             epoch: self.epoch.clone(),
             connection_id,
             generation,
+            writable,
         })
     }
 
