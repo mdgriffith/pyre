@@ -1030,6 +1030,7 @@ fn to_string_definition(definition: &ast::Definition) -> String {
             }
         }
         ast::Definition::Session(_) => "".to_string(),
+        ast::Definition::State { .. } => "".to_string(),
         ast::Definition::Comment { .. } => "".to_string(),
         ast::Definition::SyncMode(_) => "".to_string(),
         ast::Definition::Tagged { name, variants, .. } => {
@@ -1272,6 +1273,7 @@ fn to_decoder_definition(
     match definition {
         ast::Definition::Lines { .. } => (),
         ast::Definition::Session(_) => (),
+        ast::Definition::State { .. } => (),
         ast::Definition::Comment { .. } => (),
         ast::Definition::SyncMode(_) => (),
         ast::Definition::Tagged { name, variants, .. } => {
@@ -1473,6 +1475,7 @@ fn to_encoder_definition(database: &ast::Database, definition: &ast::Definition)
         ast::Definition::Lines { .. } => "".to_string(),
         ast::Definition::Comment { .. } => "".to_string(),
         ast::Definition::Session(_) => "".to_string(),
+        ast::Definition::State { .. } => "".to_string(),
         ast::Definition::SyncMode(_) => "".to_string(),
         ast::Definition::Tagged { name, variants, .. } => {
             let mut result = "".to_string();

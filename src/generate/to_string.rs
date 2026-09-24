@@ -27,6 +27,17 @@ pub fn standalone_schema_to_string(context: &typecheck::Context, schema: &ast::S
                 ast::Definition::Record { fields, .. } => {
                     collect_field_type_names(fields, &mut required_types)
                 }
+                ast::Definition::State { fields, .. } => {
+                    for field in fields {
+                        match field {
+                            ast::StateField::Writable(column)
+                            | ast::StateField::Derived { column, .. } => {
+                                column.type_.collect_custom_type_names(&mut required_types)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 ast::Definition::Tagged { variants, .. } => {
                     collect_variant_type_names(variants, &mut required_types)
                 }
@@ -140,6 +151,66 @@ fn to_string_definition(namespace: &str, definition: &ast::Definition) -> String
                     index,
                     field,
                 ));
+            }
+            result.push_str("}\n");
+            result
+        }
+        ast::Definition::State { name, fields, .. } => {
+            let columns = fields
+                .iter()
+                .filter_map(|field| match field {
+                    ast::StateField::Writable(column) | ast::StateField::Derived { column, .. } => {
+                        Some(column)
+                    }
+                    _ => None,
+                })
+                .map(|column| ast::Field::Column(column.clone()))
+                .collect::<Vec<_>>();
+            let indentation = collect_indentation(&columns, 4);
+            let mut column_index = 0;
+            let mut result = format!("state {} {{\n", name);
+            for field in fields {
+                match field {
+                    ast::StateField::Writable(column) => {
+                        result.push_str(&to_string_column(&indentation, column_index, column));
+                        column_index += 1;
+                    }
+                    ast::StateField::Derived { column, source } => {
+                        let mut rendered = to_string_column(&indentation, column_index, column);
+                        rendered.pop();
+                        if let Some(comment) = &column.inline_comment {
+                            let suffix = format!(" //{}", comment);
+                            rendered.truncate(rendered.len() - suffix.len());
+                        }
+                        rendered.push_str(" = ");
+                        rendered.push_str(&source.root);
+                        for segment in &source.path {
+                            rendered.push('.');
+                            rendered.push_str(segment);
+                        }
+                        if let Some(comment) = &column.inline_comment {
+                            rendered.push_str(" //");
+                            rendered.push_str(comment);
+                        }
+                        rendered.push('\n');
+                        result.push_str(&rendered);
+                        column_index += 1;
+                    }
+                    ast::StateField::Lines { count } => {
+                        result.push_str(&"\n".repeat((*count).min(2)))
+                    }
+                    ast::StateField::Comment { text } => {
+                        result.push_str(&format!("    //{}\n", text))
+                    }
+                    ast::StateField::Directive(directive) => {
+                        result.push_str(&to_string_field_directive(
+                            namespace,
+                            &indentation,
+                            column_index,
+                            directive,
+                        ))
+                    }
+                }
             }
             result.push_str("}\n");
             result

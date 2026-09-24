@@ -579,6 +579,50 @@ async fn immutable_changes_produce_no_sql_migration() -> Result<(), TestError> {
 }
 
 #[tokio::test]
+async fn state_only_changes_produce_no_sql_migration() -> Result<(), TestError> {
+    let base = r#"record Document {
+    id Id.Uuid @id
+    @public
+}"#;
+    let with_state = r#"record Document {
+    id Id.Uuid @id
+    @public
+}
+
+state Connection {
+    cursor String?
+}
+
+state Shared {
+    slide Int @default(0)
+}"#;
+    let changed_state = r#"record Document {
+    id Id.Uuid @id
+    @public
+}
+
+state Connection {
+    cursor Json<List<String>>?
+}
+
+state Shared {
+    slide Int @default(1)
+}"#;
+
+    for (old, new) in [
+        (base, with_state),
+        (with_state, changed_state),
+        (changed_state, base),
+    ] {
+        let db_diff = create_migration_diff(old, new).await?;
+        assert!(diff::is_empty(&db_diff));
+        assert!(diff::to_sql::to_sql(&db_diff).is_empty());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn immutable_and_physical_changes_produce_only_physical_sql() -> Result<(), TestError> {
     let old = r#"record Document {
     id      Id.Uuid @id
