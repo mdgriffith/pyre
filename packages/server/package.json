@@ -1,6 +1,6 @@
 {
   "name": "@pyre/server",
-  "version": "0.1.19",
+  "version": "0.2.0",
   "description": "Server runtime for executing generated Pyre queries",
   "license": "MIT",
   "type": "module",
@@ -55,8 +55,8 @@
     }
   },
   "dependencies": {
-    "@pyre/client": "0.1.19",
-    "@pyre/core": "0.1.19",
+    "@pyre/client": "0.2.0",
+    "@pyre/core": "0.2.0",
     "@libsql/client": "^0.14.0"
   },
   "peerDependencies": {
