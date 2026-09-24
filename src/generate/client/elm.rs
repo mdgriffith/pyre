@@ -957,16 +957,6 @@ fn collect_id_brands(database: &ast::Database) -> Vec<(String, IdKind)> {
     out
 }
 
-fn split_foreign_key_type(type_: &str) -> Option<(&str, &str)> {
-    let mut parts = type_.split('.');
-    let table = parts.next()?;
-    let field = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((table, field))
-}
-
 fn find_table<'a>(lookup: &'a ElmLookup, table_name: &str) -> Option<&'a ast::RecordDetails> {
     lookup.records_by_name.get(&table_name.to_ascii_lowercase())
 }
@@ -984,12 +974,40 @@ fn branded_column_type(type_: &ast::ColumnType, record: &str) -> ast::ColumnType
 }
 
 fn resolve_foreign_key_column_type(lookup: &ElmLookup, type_: &str) -> Option<ast::ColumnType> {
-    let (table_name, field_name) = split_foreign_key_type(type_)?;
-    let table = find_table(lookup, table_name)?;
+    resolve_foreign_key_type(lookup, &ast::ColumnType::from_str(type_))
+}
+
+fn resolve_foreign_key_type(
+    lookup: &ElmLookup,
+    type_: &ast::ColumnType,
+) -> Option<ast::ColumnType> {
+    let ast::ColumnType::ForeignKey {
+        table,
+        field: field_name,
+        serialization_type,
+        ..
+    } = type_
+    else {
+        return None;
+    };
+    match serialization_type {
+        Some(ast::ConcreteSerializationType::IdUuid) => {
+            return Some(ast::ColumnType::IdUuid {
+                table: table.clone(),
+            })
+        }
+        Some(ast::ConcreteSerializationType::IdInt) => {
+            return Some(ast::ColumnType::IdInt {
+                table: table.clone(),
+            })
+        }
+        _ => {}
+    }
+    let table = find_table(lookup, table)?;
 
     for field in &table.fields {
         if let ast::Field::Column(column) = field {
-            if column.name == field_name {
+            if column.name == *field_name {
                 return Some(branded_column_type(&column.type_, &table.name));
             }
         }
@@ -1987,11 +2005,16 @@ fn to_query_file(
             move |name,
                   type_,
                   typealias::FieldMetadata {
-                      is_link,
                       is_optional,
                       is_array_relationship: _,
                   }| {
-                let base_type = to_elm_typename(&elm_lookup_for_types, type_, is_link);
+                let is_link = matches!(type_, typealias::FieldType::Relationship(_));
+                let base_type = match type_ {
+                    typealias::FieldType::Relationship(name) => name.clone(),
+                    typealias::FieldType::Column(column) => {
+                        to_elm_type_from_column_type(&elm_lookup_for_types, column)
+                    }
+                };
 
                 let type_str = if is_link {
                     if is_optional {
@@ -2037,11 +2060,16 @@ fn to_query_file(
             move |name,
                   type_,
                   typealias::FieldMetadata {
-                      is_link,
                       is_optional,
                       is_array_relationship: _,
                   }| {
-                let decoder = to_elm_decoder(&elm_lookup_for_decoders, type_, is_link);
+                let is_link = matches!(type_, typealias::FieldType::Relationship(_));
+                let decoder = match type_ {
+                    typealias::FieldType::Relationship(name) => format!("decode{}", name),
+                    typealias::FieldType::Column(column) => {
+                        to_elm_decoder_from_column_type(&elm_lookup_for_decoders, column)
+                    }
+                };
 
                 let final_decoder: String = if is_optional {
                     format!("(Decode.nullable {})", decoder)
@@ -2456,21 +2484,13 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
             }
         }
         ast::ColumnType::ForeignKey { .. } => {
-            if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
+            if let Some(col_type) = resolve_foreign_key_type(lookup, type_) {
                 return to_elm_type_from_column_type(lookup, &col_type);
             }
 
             "String".to_string()
         }
         ast::ColumnType::Custom(name) => format!("Db.{}", name),
-    }
-}
-
-fn to_elm_decoder(lookup: &ElmLookup, type_: &str, is_link: bool) -> String {
-    if is_link {
-        format!("decode{}", type_)
-    } else {
-        to_elm_decoder_from_column_type(lookup, &ast::ColumnType::from_str(type_))
     }
 }
 
@@ -2505,7 +2525,7 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
         ast::ColumnType::IdInt { .. } => "Db.Id.decodeInt".to_string(),
         ast::ColumnType::IdUuid { .. } => "Db.Id.decodeUuid".to_string(),
         ast::ColumnType::ForeignKey { .. } => {
-            if let Some(col_type) = resolve_foreign_key_column_type(lookup, &type_.to_string()) {
+            if let Some(col_type) = resolve_foreign_key_type(lookup, type_) {
                 return to_elm_decoder_from_column_type(lookup, &col_type);
             }
 

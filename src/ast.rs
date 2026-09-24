@@ -733,6 +733,10 @@ impl ColumnType {
     /// Returns the concrete query type for a resolved foreign key.
     pub fn query_type_string(&self) -> String {
         match self {
+            ColumnType::JsonTyped(inner) => format!("Json<{}>", inner.query_type_string()),
+            ColumnType::List(inner) => format!("List<{}>", inner.query_type_string()),
+            ColumnType::Dict(inner) => format!("Dict<{}>", inner.query_type_string()),
+            ColumnType::Nullable(inner) => format!("{}?", inner.query_type_string()),
             ColumnType::ForeignKey {
                 table,
                 serialization_type: Some(ConcreteSerializationType::IdUuid),

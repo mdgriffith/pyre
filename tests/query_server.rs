@@ -570,6 +570,151 @@ fn generated_rust_server(
 }
 
 #[test]
+fn generated_rust_preserves_nested_identity_types() {
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", r#"
+@syncable(false)
+type Origin
+    = Owned { ownerEntityId Entity.id, portraitAssetId Entity.id?, active Json<List<Entity.id>>, byName Json<Dict<Entity.id?>>, legacy Legacy.id }
+
+record Entity {
+    @public
+    id Id.Uuid @id
+    origin Origin
+    active Json<List<Entity.id>>
+}
+record Legacy {
+    @public
+    id Id.Int @id
+}
+"#, &mut schema).expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let mut queries = ast::QueryList { queries: vec![] };
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+    typecheck::check_queries(&queries, &context).expect("CRUD typechecks");
+    let mut files = vec![];
+    pyre::generate::server::rust::generate_queries(
+        &context,
+        &queries,
+        Path::new("rust"),
+        &mut files,
+    );
+    pyre::generate::server::rust::generate_schema(
+        &context,
+        &database,
+        Path::new("rust"),
+        &mut files,
+    );
+    let server = &files
+        .iter()
+        .find(|file| file.path == Path::new("rust/server.rs"))
+        .unwrap()
+        .contents;
+    for expected in [
+        "owner_entity_id: String",
+        "portrait_asset_id: Option<String>",
+        "active: Vec<String>",
+        "by_name: std::collections::HashMap<String, Option<String>>",
+        "legacy: i64",
+        "pub active: Vec<String>",
+    ] {
+        assert!(server.contains(expected), "missing {expected}:\n{server}");
+    }
+    let seed = &files
+        .iter()
+        .find(|file| file.path == Path::new("rust/seed.rs"))
+        .unwrap()
+        .contents;
+    assert!(seed.contains("owner_entity_id: String"));
+    assert!(seed.contains("active: Vec<String>"));
+    let source = "update Save($active: Json<List<Entity.id>>) { entity { active = $active } }";
+    let explicit_queries = parser::parse_query("query.pyre", source).unwrap();
+    typecheck::check_queries(&explicit_queries, &context).expect("explicit references typecheck");
+    let wrong_kind =
+        parser::parse_query("query.pyre", &source.replace("Entity.id", "Legacy.id")).unwrap();
+    assert!(typecheck::check_queries(&wrong_kind, &context).is_err());
+    let explicit = generated_rust_server(&context, source).unwrap();
+    assert!(explicit.contains("pub active: Vec<String>"));
+    assert_eq!(
+        typecheck::resolve_query_param_type(&context, "Json<Dict<Entity.id?>>"),
+        "Json<Dict<Id.Uuid<Entity>?>>"
+    );
+}
+
+#[test]
+fn unresolved_nested_references_report_source_diagnostics() {
+    for reference in ["Missing.id", "Entity.missing", "Entity.title"] {
+        for declaration in [
+            format!("type Origin = Owned {{ owner Json<List<{reference}>> }}"),
+            format!(
+                "record Holder {{\n @public\n id Id.Uuid @id\n owner Json<Dict<{reference}?>>\n }}"
+            ),
+        ] {
+            let source = format!(
+                "record Entity {{\n @public\n id Id.Uuid @id\n title String\n }}\n{declaration}"
+            );
+            let mut schema = ast::Schema::default();
+            parser::run("schema.pyre", &source, &mut schema).unwrap();
+            let errors = typecheck::check_schema(&ast::Database {
+                schemas: vec![schema],
+            })
+            .expect_err("invalid nested references must fail schema checking");
+            let error = errors
+                .iter()
+                .find(|error| {
+                    matches!(
+                        error.error_type,
+                        pyre::error::ErrorType::ForeignKeyToUnknownTable { .. }
+                            | pyre::error::ErrorType::ForeignKeyToUnknownField { .. }
+                            | pyre::error::ErrorType::ForeignKeyToNonIdField { .. }
+                    )
+                })
+                .expect("reference diagnostic");
+            assert!(!error.locations[0].primary.is_empty());
+            let rendered = pyre::error::format_error(&source, error, false);
+            assert!(rendered.contains("schema.pyre"), "{rendered}");
+            assert!(
+                rendered.contains(reference.split('.').next().unwrap()),
+                "{rendered}"
+            );
+        }
+    }
+
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "record Entity {\n @public\n id Id.Uuid @id\n }",
+        &mut schema,
+    )
+    .unwrap();
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .unwrap();
+    for reference in ["Missing.id", "Entity.missing"] {
+        let source = format!("query Bad($ids: Json<List<{reference}>>) {{ entity {{ id }} }}");
+        let queries = parser::parse_query("query.pyre", &source).unwrap();
+        let errors = typecheck::check_queries(&queries, &context)
+            .err()
+            .expect("invalid query reference");
+        let error = errors
+            .iter()
+            .find(|error| {
+                matches!(
+                    error.error_type,
+                    pyre::error::ErrorType::ForeignKeyToUnknownTable { .. }
+                        | pyre::error::ErrorType::ForeignKeyToUnknownField { .. }
+                )
+            })
+            .expect("query reference diagnostic");
+        assert!(!error.locations[0].primary.is_empty());
+    }
+}
+
+#[test]
 fn generated_rust_crud_omits_immutable_update_input_but_returns_field() {
     let mut schema = ast::Schema::default();
     parser::run(
@@ -1493,7 +1638,7 @@ transaction ReplaceTask($id: Task.id, $action: Action) {
     let result = query::run(
         &conn,
         &manifest,
-        &query_by_input_signature(&manifest, &["id"], "id", "Id.Int").id,
+        &query_by_input_signature(&manifest, &["id"], "id", "Id.Int<Task>").id,
         json!({ "id": 2 }),
         &session,
     )
@@ -1526,7 +1671,7 @@ transaction ReplaceTask($id: Task.id, $action: Action) {
     let result = query::run(
         &conn,
         &manifest,
-        &query_by_input_type(&manifest, "id", "Id.Uuid").id,
+        &query_by_input_type(&manifest, "id", "Id.Uuid<UuidGame>").id,
         json!({ "id": uuid }),
         &session,
     )

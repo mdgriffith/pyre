@@ -4,17 +4,23 @@ use crate::typecheck;
 pub struct TypeFormatter {
     pub to_comment: Box<dyn Fn(&str) -> String>,
     pub to_type_def_start: Box<dyn Fn(&str) -> String>,
-    pub to_field: Box<dyn Fn(&str, &str, FieldMetadata) -> String>,
+    pub to_field: Box<dyn Fn(&str, &FieldType, FieldMetadata) -> String>,
     pub to_type_def_end: Box<dyn Fn() -> String>,
     pub to_field_separator: Box<dyn Fn(bool) -> String>,
 }
 
+/// Semantic column types stay typed until target-language rendering. Relationship
+/// names are opaque references to result types emitted by this traversal.
+pub enum FieldType {
+    Column(ast::ColumnType),
+    Relationship(String),
+}
+
 #[derive(Clone, Copy)]
 pub struct FieldMetadata {
-    pub is_link: bool,
     pub is_optional: bool,
     /// If true, this relationship should be an array (one-to-many).
-    /// If false and is_link is true, it's many-to-one or one-to-one (optional object).
+    /// If false for a relationship, it's many-to-one or one-to-one (optional object).
     pub is_array_relationship: bool,
 }
 
@@ -22,7 +28,7 @@ pub struct FieldMetadata {
 ///
 /// # Example
 /// ```rust,no_run
-/// use pyre::generate::typealias::{TypeFormatter, FieldMetadata, return_data_aliases};
+/// use pyre::generate::typealias::{TypeFormatter, FieldType, FieldMetadata, return_data_aliases};
 /// use pyre::typecheck;
 /// use pyre::ast;
 ///
@@ -32,7 +38,10 @@ pub struct FieldMetadata {
 ///     to_comment: Box::new(|s| format!("{{-| {} -}}\n", s)),
 ///     to_type_def_start: Box::new(|name| format!("type alias {} =\n", name)),
 ///     to_field: Box::new(|name, type_, metadata: FieldMetadata| {
-///         let type_str = type_.to_string();
+///         let type_str = match type_ {
+///             FieldType::Column(column) => render_elm_type(column),
+///             FieldType::Relationship(name) => name.clone(),
+///         };
 ///         format!("    {} : {}", name, type_str)
 ///     }),
 ///     to_type_def_end: Box::new(|| "    }\n".to_string()),
@@ -41,6 +50,7 @@ pub struct FieldMetadata {
 ///
 /// let mut result = String::new();
 /// return_data_aliases(context, query, &mut result, &elm_formatter);
+/// # fn render_elm_type(_: &ast::ColumnType) -> String { todo!() }
 /// ```
 pub fn return_data_aliases(
     context: &typecheck::Context,
@@ -96,9 +106,8 @@ pub fn return_data_aliases(
 
                 result.push_str(&(formatter.to_field)(
                     &crate::ext::string::decapitalize(&field_name),
-                    &string::capitalize(&field_name),
+                    &FieldType::Relationship(string::capitalize(&field_name)),
                     FieldMetadata {
-                        is_link: true,
                         is_optional: false,
                         is_array_relationship: true, // Top-level query fields are always arrays
                     },
@@ -193,7 +202,7 @@ fn to_query_type_alias(
         }
     }
 
-    let mut rendered_fields: Vec<(String, String, FieldMetadata)> = Vec::new();
+    let mut rendered_fields: Vec<(String, FieldType, FieldMetadata)> = Vec::new();
     let mut wildcard_rendered = false;
 
     for field in fields.iter() {
@@ -210,9 +219,8 @@ fn to_query_type_alias(
                     }
                     rendered_fields.push((
                         column.name.clone(),
-                        return_column_type(table, column),
+                        FieldType::Column(return_column_type(table, column)),
                         FieldMetadata {
-                            is_link: false,
                             is_optional: column.nullable,
                             is_array_relationship: false,
                         },
@@ -232,9 +240,8 @@ fn to_query_type_alias(
                 ast::Field::Column(col) => {
                     rendered_fields.push((
                         aliased_name,
-                        return_column_type(table, col),
+                        FieldType::Column(return_column_type(table, col)),
                         FieldMetadata {
-                            is_link: false,
                             is_optional: col.nullable,
                             is_array_relationship: false,
                         },
@@ -262,9 +269,8 @@ fn to_query_type_alias(
 
                     rendered_fields.push((
                         aliased_name.clone(),
-                        get_name(&alias_stack, &aliased_name),
+                        FieldType::Relationship(get_name(&alias_stack, &aliased_name)),
                         FieldMetadata {
-                            is_link: true,
                             is_optional: !is_one_to_many && linked_to_unique,
                             is_array_relationship: is_one_to_many,
                         },
@@ -286,17 +292,15 @@ fn to_query_type_alias(
     result.push_str("\n\n");
 }
 
-fn return_column_type(table: &ast::RecordDetails, column: &ast::Column) -> String {
+fn return_column_type(table: &ast::RecordDetails, column: &ast::Column) -> ast::ColumnType {
     match &column.type_ {
         ast::ColumnType::IdUuid { table: brand } if brand.is_empty() => ast::ColumnType::IdUuid {
             table: table.name.clone(),
-        }
-        .query_type_string(),
+        },
         ast::ColumnType::IdInt { table: brand } if brand.is_empty() => ast::ColumnType::IdInt {
             table: table.name.clone(),
-        }
-        .query_type_string(),
-        _ => column.type_.query_type_string(),
+        },
+        _ => column.type_.clone(),
     }
 }
 

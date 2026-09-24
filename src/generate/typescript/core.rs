@@ -411,70 +411,20 @@ fn to_metadata_formatter() -> typealias::TypeFormatter {
     typealias::TypeFormatter {
         to_comment: Box::new(|s| format!("// {}\n", s)),
         to_type_def_start: Box::new(|name| format!("const {} = z.object({{\n", name)),
-        to_field: Box::new(
-            |name,
-             type_,
-             typealias::FieldMetadata {
-                 is_link,
-                 is_optional,
-                 is_array_relationship,
-             }| {
-                let parsed_type = ast::ColumnType::from_str(type_);
-                let (base_type, is_primitive, needs_coercion) = if is_link {
-                    (type_.to_string(), false, false)
-                } else {
-                    match &parsed_type {
-                        ast::ColumnType::String => ("z.string()".to_string(), true, false),
-                        ast::ColumnType::Int | ast::ColumnType::Float => {
-                            ("z.number()".to_string(), true, false)
-                        }
-                        ast::ColumnType::Bool => ("z.boolean()".to_string(), true, true),
-                        ast::ColumnType::DateTime => ("z.date()".to_string(), true, true),
-                        ast::ColumnType::IdInt { .. } => ("z.number()".to_string(), true, false),
-                        ast::ColumnType::IdUuid { .. } => ("z.string()".to_string(), true, false),
-                        ast::ColumnType::ForeignKey { .. } => {
-                            ("z.number()".to_string(), true, false)
-                        }
-                        _ => (output_zod_type_for_column_type(&parsed_type), false, false),
-                    }
-                };
-
-                let type_str = if needs_coercion {
-                    match type_ {
-                        "DateTime" => match (is_link, is_array_relationship, is_optional) {
-                            (true, true, _) => "CoercedDate.array()".to_string(),
-                            (true, false, true) => "CoercedDate.nullable()".to_string(),
-                            (true, false, false) => "CoercedDate".to_string(),
-                            (false, _, true) => "CoercedDate.nullable()".to_string(),
-                            (false, _, false) => "CoercedDate".to_string(),
-                        },
-                        "Bool" => match (is_link, is_array_relationship, is_optional) {
-                            (true, true, _) => "CoercedBool.array()".to_string(),
-                            (true, false, true) => "CoercedBool.nullable()".to_string(),
-                            (true, false, false) => "CoercedBool".to_string(),
-                            (false, _, true) => "CoercedBool.nullable()".to_string(),
-                            (false, _, false) => "CoercedBool".to_string(),
-                        },
-                        _ => unreachable!(),
-                    }
-                } else {
-                    match (is_primitive, is_link, is_array_relationship, is_optional) {
-                        (true, true, true, _) => format!("{}.array()", base_type),
-                        (true, true, false, true) => format!("{}.nullable()", base_type),
-                        (true, true, false, false) => base_type.to_string(),
-                        (true, false, _, true) => format!("{}.nullable()", base_type),
-                        (true, false, _, false) => base_type.to_string(),
-                        (false, true, true, _) => format!("{}.array()", base_type),
-                        (false, true, false, true) => format!("{}.nullable()", base_type),
-                        (false, true, false, false) => base_type.to_string(),
-                        (false, false, _, true) => format!("{}.nullable()", base_type),
-                        (false, false, _, false) => base_type.to_string(),
-                    }
-                };
-
-                format!("  {}: {}", name, type_str)
-            },
-        ),
+        to_field: Box::new(|name, type_, metadata| {
+            let base_type = match type_ {
+                typealias::FieldType::Relationship(name) => name.clone(),
+                typealias::FieldType::Column(column) => output_zod_type_for_column_type(column),
+            };
+            let type_str = if metadata.is_array_relationship {
+                format!("{}.array()", base_type)
+            } else if metadata.is_optional {
+                format!("{}.nullable()", base_type)
+            } else {
+                base_type
+            };
+            format!("  {}: {}", name, type_str)
+        }),
         to_type_def_end: Box::new(|| "});\n".to_string()),
         to_field_separator: Box::new(|is_last| {
             if is_last {
@@ -1615,9 +1565,14 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("{}.nullable()", output_zod_type_for_column_type(inner))
         }
-        ast::ColumnType::IdInt { .. } | ast::ColumnType::ForeignKey { .. } => {
-            "z.number()".to_string()
-        }
+        ast::ColumnType::IdInt { .. } => "z.number()".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type, ..
+        } => match serialization_type {
+            Some(ast::ConcreteSerializationType::IdUuid) => "z.string()".to_string(),
+            Some(ast::ConcreteSerializationType::IdInt) => "z.number()".to_string(),
+            _ => unreachable!("typechecked identity references must have a resolved ID type"),
+        },
         ast::ColumnType::IdUuid { .. } => "z.string()".to_string(),
         ast::ColumnType::Custom(name) => format!("Decode.{}", name),
     }

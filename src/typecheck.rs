@@ -537,8 +537,10 @@ fn validate_type_expr(
         | ast::ColumnType::Date
         | ast::ColumnType::Json
         | ast::ColumnType::IdInt { .. }
-        | ast::ColumnType::IdUuid { .. }
-        | ast::ColumnType::ForeignKey { .. } => {}
+        | ast::ColumnType::IdUuid { .. } => {}
+        ast::ColumnType::ForeignKey { .. } => {
+            validate_reference_type(context, filepath, contexts, primary, type_, true, errors);
+        }
         ast::ColumnType::JsonTyped(inner) => validate_type_expr(
             context, filepath, contexts, primary, inner, true, seen_types, errors,
         ),
@@ -1004,21 +1006,52 @@ pub fn query_param_type_for_column(table: &ast::RecordDetails, column: &ast::Col
 /// Resolves record field references used in query parameter declarations to the
 /// field's concrete type. Parsed references otherwise retain an integer fallback.
 pub fn resolve_query_param_type(context: &Context, type_: &str) -> String {
+    resolve_query_param_column_type(context, &ast::ColumnType::from_str(type_)).query_type_string()
+}
+
+/// Resolve nested parameter references without discarding canonical column metadata.
+pub fn resolve_query_param_column_type(
+    context: &Context,
+    type_: &ast::ColumnType,
+) -> ast::ColumnType {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner) => {
+            return ast::ColumnType::JsonTyped(Box::new(resolve_query_param_column_type(
+                context, inner,
+            )));
+        }
+        ast::ColumnType::List(inner) => {
+            return ast::ColumnType::List(Box::new(resolve_query_param_column_type(
+                context, inner,
+            )));
+        }
+        ast::ColumnType::Dict(inner) => {
+            return ast::ColumnType::Dict(Box::new(resolve_query_param_column_type(
+                context, inner,
+            )));
+        }
+        ast::ColumnType::Nullable(inner) => {
+            return ast::ColumnType::Nullable(Box::new(resolve_query_param_column_type(
+                context, inner,
+            )));
+        }
+        _ => {}
+    }
     let ast::ColumnType::ForeignKey {
         schema,
         table,
         field,
         ..
-    } = ast::ColumnType::from_str(type_)
+    } = type_
     else {
-        return type_.to_string();
+        return type_.clone();
     };
 
     context
         .tables
         .values()
         .find(|candidate| {
-            candidate.record.name == table
+            candidate.record.name == *table
                 && schema
                     .as_ref()
                     .map(|schema| candidate.schema == *schema)
@@ -1030,13 +1063,23 @@ pub fn resolve_query_param_type(context: &Context, type_: &str) -> String {
                 .fields
                 .iter()
                 .find_map(|field_| match field_ {
-                    ast::Field::Column(column) if column.name == field => {
-                        Some(column.type_.query_type_string())
+                    ast::Field::Column(column) if column.name == *field => {
+                        let mut type_ = column.type_.clone();
+                        match &mut type_ {
+                            ast::ColumnType::IdInt { table }
+                            | ast::ColumnType::IdUuid { table }
+                                if table.is_empty() =>
+                            {
+                                *table = candidate.record.name.clone()
+                            }
+                            _ => {}
+                        }
+                        Some(type_)
                     }
                     _ => None,
                 })
         })
-        .unwrap_or_else(|| type_.to_string())
+        .unwrap_or_else(|| type_.clone())
 }
 
 /// Gathers information for a context.
@@ -1306,12 +1349,20 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                     }
 
                                     // Validate foreign key references
+                                    let mut reference_type = &column.type_;
+                                    while let ast::ColumnType::JsonTyped(inner)
+                                    | ast::ColumnType::List(inner)
+                                    | ast::ColumnType::Dict(inner)
+                                    | ast::ColumnType::Nullable(inner) = reference_type
+                                    {
+                                        reference_type = inner;
+                                    }
                                     if let ast::ColumnType::ForeignKey {
                                         schema: ref_schema,
                                         table: ref_table,
                                         field: ref_field,
                                         ..
-                                    } = &column.type_
+                                    } = reference_type
                                     {
                                         let target_schema =
                                             ref_schema.as_ref().unwrap_or(&schema.namespace);
@@ -1920,6 +1971,15 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                         }
 
                         for column in ast::collect_columns(&session.fields) {
+                            validate_reference_type(
+                                context,
+                                &file.path,
+                                to_range(&session.start, &session.end),
+                                to_range(&column.start_typename, &column.end_typename),
+                                &column.type_,
+                                true,
+                                errors,
+                            );
                             if ast::is_immutable(&column) {
                                 errors.push(Error {
                                     filepath: file.path.clone(),
@@ -2233,6 +2293,15 @@ pub fn check_query(context: &Context, errors: &mut Vec<Error>, query: &ast::Quer
             }
 
             Some(type_) => {
+                validate_reference_type(
+                    context,
+                    &context.current_filepath,
+                    vec![],
+                    to_range(&param_def.start_type, &param_def.end_type),
+                    &ast::ColumnType::from_str(type_),
+                    false,
+                    errors,
+                );
                 if !is_known_query_param_type(context, type_) {
                     errors.push(Error {
                         filepath: context.current_filepath.clone(),
@@ -2411,6 +2480,87 @@ pub fn check_query(context: &Context, errors: &mut Vec<Error>, query: &ast::Quer
         variables: param_names,
         primary_db,
         attached_dbs: secondary_dbs,
+    }
+}
+
+fn validate_reference_type(
+    context: &Context,
+    filepath: &str,
+    contexts: Vec<Range>,
+    primary: Vec<Range>,
+    type_: &ast::ColumnType,
+    require_id: bool,
+    errors: &mut Vec<Error>,
+) {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner)
+        | ast::ColumnType::List(inner)
+        | ast::ColumnType::Dict(inner)
+        | ast::ColumnType::Nullable(inner) => {
+            validate_reference_type(
+                context, filepath, contexts, primary, inner, require_id, errors,
+            );
+        }
+        ast::ColumnType::ForeignKey {
+            schema,
+            table,
+            field,
+            ..
+        } => {
+            let referenced_table = schema
+                .as_ref()
+                .map(|schema| format!("{schema}.{table}"))
+                .unwrap_or_else(|| table.clone());
+            let target = context.tables.values().find(|candidate| {
+                candidate.record.name == *table
+                    && schema
+                        .as_ref()
+                        .map(|schema| candidate.schema == *schema)
+                        .unwrap_or(true)
+            });
+            let error_type = match target {
+                None => Some(ErrorType::ForeignKeyToUnknownTable {
+                    field_name: type_.to_string(),
+                    referenced_table,
+                    existing_tables: context
+                        .tables
+                        .values()
+                        .map(|table| table.record.name.clone())
+                        .collect(),
+                }),
+                Some(target) => {
+                    let columns = ast::collect_columns(&target.record.fields);
+                    match columns.iter().find(|column| column.name == *field) {
+                        None => Some(ErrorType::ForeignKeyToUnknownField {
+                            field_name: type_.to_string(),
+                            referenced_table,
+                            referenced_field: field.clone(),
+                            existing_fields: columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect(),
+                        }),
+                        Some(column) if require_id && !column.type_.is_id_type() => {
+                            Some(ErrorType::ForeignKeyToNonIdField {
+                                field_name: type_.to_string(),
+                                referenced_table,
+                                referenced_field: field.clone(),
+                                referenced_field_type: column.type_.to_string(),
+                            })
+                        }
+                        Some(_) => None,
+                    }
+                }
+            };
+            if let Some(error_type) = error_type {
+                errors.push(Error {
+                    filepath: filepath.to_string(),
+                    error_type,
+                    locations: vec![Location { contexts, primary }],
+                });
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3061,7 +3211,7 @@ fn check_permission_membership_value(
         return;
     };
     let terminal_type = query_param_type_for_column(table, terminal_column);
-    if !are_query_types_compatible(&element_type.to_string(), &terminal_type) {
+    if !are_query_types_compatible(context, &element_type.to_string(), &terminal_type) {
         invalid(
             format!(
                 "Session.{} contains {}, but {}.{} requires {} values.",
@@ -3588,7 +3738,7 @@ fn check_value(
             }
         }
         ast::QueryValue::Int((range, _)) => {
-            if !are_query_types_compatible("Int", table_type_string) {
+            if !are_query_types_compatible(context, "Int", table_type_string) {
                 errors.push(Error {
                     filepath: context.current_filepath.clone(),
                     error_type: ErrorType::LiteralTypeMismatch {
@@ -3603,7 +3753,7 @@ fn check_value(
             }
         }
         ast::QueryValue::Float((range, _)) => {
-            if !are_query_types_compatible("Float", table_type_string) {
+            if !are_query_types_compatible(context, "Float", table_type_string) {
                 errors.push(Error {
                     filepath: context.current_filepath.clone(),
                     error_type: ErrorType::LiteralTypeMismatch {
@@ -3679,6 +3829,7 @@ fn check_value(
                             );
                         }
                         if !are_query_types_compatible(
+                            context,
                             &func_definition.return_type,
                             table_type_string,
                         ) {
@@ -3767,7 +3918,11 @@ fn check_value(
                                 Some(type_name) => {
                                     // Check type compatibility:
                                     // 1. Base types must match
-                                    if !are_query_types_compatible(type_name, table_type_string) {
+                                    if !are_query_types_compatible(
+                                        context,
+                                        type_name,
+                                        table_type_string,
+                                    ) {
                                         errors.push(Error {
                                             filepath: context.current_filepath.clone(),
                                             error_type: ErrorType::TypeMismatch {
@@ -3901,7 +4056,7 @@ fn format_query_type(type_name: &str, nullable: bool) -> String {
     }
 }
 
-fn are_query_types_compatible(left: &str, right: &str) -> bool {
+fn are_query_types_compatible(context: &Context, left: &str, right: &str) -> bool {
     if left == right {
         return true;
     }
@@ -3912,44 +4067,8 @@ fn are_query_types_compatible(left: &str, right: &str) -> bool {
         return true;
     }
 
-    match (
-        ast::ColumnType::from_str(left),
-        ast::ColumnType::from_str(right),
-    ) {
-        (
-            ast::ColumnType::IdInt { table: left_table },
-            ast::ColumnType::ForeignKey {
-                table: right_table,
-                field,
-                ..
-            },
-        ) if field == "id" => left_table == right_table,
-        (
-            ast::ColumnType::ForeignKey {
-                table: left_table,
-                field,
-                ..
-            },
-            ast::ColumnType::IdInt { table: right_table },
-        ) if field == "id" => left_table == right_table,
-        (
-            ast::ColumnType::IdUuid { table: left_table },
-            ast::ColumnType::ForeignKey {
-                table: right_table,
-                field,
-                ..
-            },
-        ) if field == "id" => left_table == right_table,
-        (
-            ast::ColumnType::ForeignKey {
-                table: left_table,
-                field,
-                ..
-            },
-            ast::ColumnType::IdUuid { table: right_table },
-        ) if field == "id" => left_table == right_table,
-        _ => false,
-    }
+    resolve_query_param_column_type(context, &ast::ColumnType::from_str(left))
+        == resolve_query_param_column_type(context, &ast::ColumnType::from_str(right))
 }
 
 /// Primary schemas/namespaces are the only ones that can accept writes.

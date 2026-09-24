@@ -207,10 +207,10 @@ fn seed_rust_type(type_: &ast::ColumnType) -> String {
         ast::ColumnType::IdUuid { .. } => "String".to_string(),
         ast::ColumnType::ForeignKey {
             serialization_type, ..
-        } => seed_concrete_rust_type(
+        } => concrete_rust_type(
             serialization_type
                 .as_ref()
-                .unwrap_or(&ast::ConcreteSerializationType::Integer),
+                .expect("foreign key types must be resolved before Rust generation"),
         ),
         ast::ColumnType::Float => "f64".to_string(),
         ast::ColumnType::Bool => "bool".to_string(),
@@ -226,7 +226,7 @@ fn seed_rust_type(type_: &ast::ColumnType) -> String {
     }
 }
 
-fn seed_concrete_rust_type(type_: &ast::ConcreteSerializationType) -> String {
+fn concrete_rust_type(type_: &ast::ConcreteSerializationType) -> String {
     match type_ {
         ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt => {
             "i64".to_string()
@@ -441,27 +441,27 @@ fn input_struct(context: &typecheck::Context, query: &ast::Query) -> String {
                 result.push_str(&format!(
                     "        pub {}: OptionalField<{}>,\n",
                     field_name,
-                    rust_type(resolve_arg_type(context, arg).as_deref())
+                    rust_type_for_column(&resolve_arg_type(context, arg))
                 ));
             } else {
                 result.push_str("        #[serde(skip_serializing_if = \"Option::is_none\")]\n");
                 result.push_str(&format!(
                     "        pub {}: Option<{}>,\n",
                     field_name,
-                    rust_type(resolve_arg_type(context, arg).as_deref())
+                    rust_type_for_column(&resolve_arg_type(context, arg))
                 ));
             }
         } else if arg.nullable {
             result.push_str(&format!(
                 "        pub {}: Option<{}>,\n",
                 field_name,
-                rust_type(resolve_arg_type(context, arg).as_deref())
+                rust_type_for_column(&resolve_arg_type(context, arg))
             ));
         } else {
             result.push_str(&format!(
                 "        pub {}: {},\n",
                 field_name,
-                rust_type(resolve_arg_type(context, arg).as_deref())
+                rust_type_for_column(&resolve_arg_type(context, arg))
             ));
         }
     }
@@ -479,10 +479,12 @@ fn input_struct(context: &typecheck::Context, query: &ast::Query) -> String {
 fn resolve_arg_type(
     context: &typecheck::Context,
     arg: &ast::QueryParamDefinition,
-) -> Option<String> {
-    arg.type_
+) -> ast::ColumnType {
+    let type_ = arg
+        .type_
         .as_deref()
-        .map(|type_| typecheck::resolve_query_param_type(context, type_))
+        .expect("query parameter types must be resolved before Rust generation");
+    typecheck::resolve_query_param_column_type(context, &ast::ColumnType::from_str(type_))
 }
 
 fn output_structs(context: &typecheck::Context, query: &ast::Query) -> String {
@@ -521,11 +523,10 @@ fn output_structs(context: &typecheck::Context, query: &ast::Query) -> String {
     result.trim_end().to_string()
 }
 
-fn output_rust_type(type_: &str, metadata: typealias::FieldMetadata) -> String {
-    let type_ = if metadata.is_link {
-        to_pascal_name(type_)
-    } else {
-        rust_type(Some(type_))
+fn output_rust_type(type_: &typealias::FieldType, metadata: typealias::FieldMetadata) -> String {
+    let type_ = match type_ {
+        typealias::FieldType::Relationship(name) => to_pascal_name(name),
+        typealias::FieldType::Column(column) => rust_type_for_column(column),
     };
 
     if metadata.is_array_relationship {
@@ -537,38 +538,37 @@ fn output_rust_type(type_: &str, metadata: typealias::FieldMetadata) -> String {
     }
 }
 
-fn rust_type(type_: Option<&str>) -> String {
-    match type_.map(ast::ColumnType::from_str) {
-        Some(ast::ColumnType::String) => "String".to_string(),
-        Some(ast::ColumnType::DateTime) => "DateTime".to_string(),
-        Some(ast::ColumnType::Date) => "String".to_string(),
-        Some(ast::ColumnType::Int)
-        | Some(ast::ColumnType::IdInt { .. })
-        | Some(ast::ColumnType::ForeignKey { .. }) => "i64".to_string(),
-        Some(ast::ColumnType::IdUuid { .. }) => "String".to_string(),
-        Some(ast::ColumnType::Float) => "f64".to_string(),
-        Some(ast::ColumnType::Bool) => "bool".to_string(),
-        Some(ast::ColumnType::Json) => "serde_json::Value".to_string(),
-        Some(ast::ColumnType::JsonTyped(inner)) => rust_type_for_column(&inner),
-        Some(ast::ColumnType::List(inner)) => {
-            format!("Vec<{}>", rust_type_for_column(&inner))
+fn rust_type_for_column(type_: &ast::ColumnType) -> String {
+    match type_ {
+        ast::ColumnType::String | ast::ColumnType::Date => "String".to_string(),
+        ast::ColumnType::DateTime => "DateTime".to_string(),
+        ast::ColumnType::Int | ast::ColumnType::IdInt { .. } => "i64".to_string(),
+        ast::ColumnType::ForeignKey {
+            serialization_type, ..
+        } => concrete_rust_type(
+            serialization_type
+                .as_ref()
+                .expect("foreign key types must be resolved before Rust generation"),
+        ),
+        ast::ColumnType::IdUuid { .. } => "String".to_string(),
+        ast::ColumnType::Float => "f64".to_string(),
+        ast::ColumnType::Bool => "bool".to_string(),
+        ast::ColumnType::Json => "serde_json::Value".to_string(),
+        ast::ColumnType::JsonTyped(inner) => rust_type_for_column(inner),
+        ast::ColumnType::List(inner) => {
+            format!("Vec<{}>", rust_type_for_column(inner))
         }
-        Some(ast::ColumnType::Dict(inner)) => {
+        ast::ColumnType::Dict(inner) => {
             format!(
                 "std::collections::HashMap<String, {}>",
-                rust_type_for_column(&inner)
+                rust_type_for_column(inner)
             )
         }
-        Some(ast::ColumnType::Nullable(inner)) => {
-            format!("Option<{}>", rust_type_for_column(&inner))
+        ast::ColumnType::Nullable(inner) => {
+            format!("Option<{}>", rust_type_for_column(inner))
         }
-        Some(ast::ColumnType::Custom(name)) => to_pascal_name(&name),
-        _ => "serde_json::Value".to_string(),
+        ast::ColumnType::Custom(name) => to_pascal_name(name),
     }
-}
-
-fn rust_type_for_column(type_: &ast::ColumnType) -> String {
-    rust_type(Some(&type_.to_string()))
 }
 
 fn custom_types(context: &typecheck::Context) -> String {
