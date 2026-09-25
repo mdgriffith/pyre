@@ -37,7 +37,7 @@
       "patterns": [
         {
           "name": "keyword.control.pyre",
-          "match": "\\b(record|type|query|insert|delete|update)\\b"
+          "match": "\\b(record|state|type|query|insert|delete|update)\\b"
         },
         {
           "name": "keyword.other.pyre",
@@ -80,7 +80,7 @@
       "patterns": [
         {
           "name": "entity.name.type.class.pyre",
-          "match": "\\b(record|type)\\s+([A-Za-z_][A-Za-z0-9_]*)"
+          "match": "\\b(record|state|type)\\s+([A-Za-z_][A-Za-z0-9_]*)"
         }
       ]
     },

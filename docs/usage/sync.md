@@ -10,6 +10,9 @@ Use this guide when you want:
 - explicit composed writes with optimistic feedback through the same local read model
 
 If your main goal is Elm port wiring, also see [Elm + Sync Runtime Setup](./elm-sync.md).
+For typed presence, cursors, and other non-durable live values, see
+[Ephemeral State](./ephemeral-state.md); its lifetime and reconnect rules are
+separate from durable sync and IndexedDB.
 
 ## Quick Start
 

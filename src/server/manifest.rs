@@ -1,4 +1,4 @@
-use crate::sync;
+use crate::{ephemeral, sync};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -20,6 +20,8 @@ pub struct Manifest {
     pub version: u32,
     pub session_schema: HashMap<String, FieldSchema>,
     pub queries: HashMap<String, QueryManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<ephemeral::Contract>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,9 +37,13 @@ pub struct QueryManifest {
     pub optional_input_args: Vec<String>,
     pub json_input_args: Vec<String>,
     pub sql: Vec<SqlInfo>,
-    #[serde(default, rename = "syncSql")]
+    #[serde(default, rename = "syncSql", skip_serializing_if = "Option::is_none")]
     pub sync_sql: Option<Vec<SqlInfo>>,
-    #[serde(default, rename = "generatedEdit")]
+    #[serde(
+        default,
+        rename = "generatedEdit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub generated_edit: Option<GeneratedEdit>,
 }
 
@@ -46,6 +52,7 @@ pub struct QueryManifest {
 pub struct GeneratedEdit {
     pub write_statement: usize,
     pub sync_write_statement: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_id: Option<String>,
 }
 
@@ -74,6 +81,7 @@ pub struct SqlInfo {
 
 #[derive(Clone, Debug)]
 pub struct PyreSession {
+    json: JsonValue,
     logical: HashMap<String, sync::SessionValue>,
     sql_args: HashMap<String, JsonValue>,
 }
@@ -92,6 +100,7 @@ impl PyreSession {
 
         let mut logical = HashMap::new();
         let mut sql_args = HashMap::new();
+        let mut canonical = serde_json::Map::new();
 
         for (name, field_schema) in schema {
             let value = object.get(name).unwrap_or(&JsonValue::Null);
@@ -111,9 +120,22 @@ impl PyreSession {
                 &mut logical,
                 &mut sql_args,
             )?;
+            canonical.insert(
+                name.clone(),
+                canonicalize_session_value(value, field_schema, &field_schema.tagged_union_types),
+            );
         }
 
-        Ok(Self { logical, sql_args })
+        Ok(Self {
+            json: JsonValue::Object(canonical),
+            logical,
+            sql_args,
+        })
+    }
+
+    /// The validated logical session JSON used for trusted runtime derivations.
+    pub fn json(&self) -> &JsonValue {
+        &self.json
     }
 
     pub fn logical(&self) -> &HashMap<String, sync::SessionValue> {
@@ -123,6 +145,67 @@ impl PyreSession {
     pub fn sql_args(&self) -> &HashMap<String, JsonValue> {
         &self.sql_args
     }
+}
+
+fn canonicalize_session_value(
+    value: &JsonValue,
+    schema: &FieldSchema,
+    tagged_union_types: &HashMap<String, HashMap<String, HashMap<String, FieldSchema>>>,
+) -> JsonValue {
+    if value.is_null() {
+        return JsonValue::Null;
+    }
+
+    let tagged_union_variants = if schema.tagged_union_variants.is_empty() {
+        tagged_union_types.get(&schema.type_)
+    } else {
+        Some(&schema.tagged_union_variants)
+    };
+    if let Some(variants) = tagged_union_variants {
+        let tag = value
+            .get("_type")
+            .and_then(JsonValue::as_str)
+            .expect("tagged union was validated");
+        let fields = &variants[tag];
+        let object = value.as_object().expect("tagged union was validated");
+        let mut canonical = serde_json::Map::new();
+        canonical.insert("_type".to_string(), JsonValue::String(tag.to_string()));
+        for (name, field_schema) in fields {
+            canonical.insert(
+                name.clone(),
+                canonicalize_session_value(
+                    object.get(name).unwrap_or(&JsonValue::Null),
+                    field_schema,
+                    tagged_union_types,
+                ),
+            );
+        }
+        return JsonValue::Object(canonical);
+    }
+
+    if schema.is_enum {
+        let tag = match value {
+            JsonValue::String(tag) => tag.as_str(),
+            JsonValue::Object(_) => value
+                .get("_type")
+                .and_then(JsonValue::as_str)
+                .expect("enum was validated"),
+            _ => unreachable!("enum was validated"),
+        };
+        return serde_json::json!({ "_type": tag });
+    }
+
+    if schema.type_ == "Bool" {
+        return JsonValue::Bool(value.as_bool().unwrap_or_else(|| value.as_i64() == Some(1)));
+    }
+
+    if schema.type_ == "DateTime" {
+        if let Some(seconds) = datetime_to_epoch_seconds(value) {
+            return JsonValue::from(seconds);
+        }
+    }
+
+    value.clone()
 }
 
 fn prepare_field(

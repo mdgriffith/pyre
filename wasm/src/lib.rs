@@ -3,6 +3,8 @@ use js_sys;
 use log::Level;
 use wasm_bindgen::prelude::*;
 mod cache;
+mod database_runtime;
+mod ephemeral;
 mod migrate;
 mod query;
 mod seed;
@@ -24,6 +26,26 @@ pub fn set_schema(introspection: JsValue) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn process_introspection(introspection: JsValue) -> Result<JsValue, JsValue> {
     cache::process_introspection(introspection)
+}
+
+#[wasm_bindgen]
+pub fn ephemeral_initialize(
+    contract: JsValue,
+    state: String,
+    trusted_session: JsValue,
+    now_seconds: i64,
+) -> JsValue {
+    ephemeral::initialize(contract, state, trusted_session, now_seconds)
+}
+
+#[wasm_bindgen]
+pub fn ephemeral_apply_patch(
+    contract: JsValue,
+    state: String,
+    current: JsValue,
+    patch: JsValue,
+) -> JsValue {
+    ephemeral::apply_patch(contract, state, current, patch)
 }
 
 #[wasm_bindgen]

@@ -26,6 +26,48 @@ annotated example and invalidation requirements.
 
 For the normal client/server integration, start with the [sync guide](../../docs/usage/sync.md). The context manager is not required for sync.
 
+## Ephemeral Database Runtime
+
+See the [Ephemeral State guide](../../docs/usage/ephemeral-state.md) for the
+application-facing schema, generated types, client semantics, lifetime, and
+deployment model. This section and the
+[custom runtime guide](../../docs/usage/ephemeral-runtime.md) focus on custom
+server ownership.
+
+`createDatabaseRuntime` from `@pyre/server/ephemeral` pairs an application-owned
+database handle with one isolated Rust/WASM ephemeral runtime. Initialize WASM,
+then pass the canonical `ephemeral` contract from the generated `manifest.json`:
+
+```ts
+import { createDatabaseRuntime } from "@pyre/server/ephemeral";
+import { init } from "@pyre/server/wasm";
+import manifest from "./pyre/generated/manifest.json";
+
+await init();
+const runtime = createDatabaseRuntime({
+  databaseId: "campaign-123",
+  database,
+  contract: manifest.ephemeral!,
+  config: { leaseDurationMs: 30_000 },
+});
+
+const joined = runtime.join({
+  ownerId: authenticatedSessionId,
+  trustedSession: session,
+  writable: true,
+});
+send(joined.snapshot);
+const delivery = runtime.poll(joined.connectionId);
+if (delivery) send(delivery);
+```
+
+The application must retain exactly one runtime for each resident database and
+must explicitly call `poll`, `expire`, `leave`, and `close` at its own transport
+and database lifecycle boundaries. The helper owns no registry, timer, route, or
+HTTP transport. `ContextManager` remains separate. Do not reconstruct a runtime
+while its database is resident: replacement creates a new epoch and intentionally
+fences every old connection.
+
 ## Database Provisioning
 
 Generated output embeds each namespaced schema and binds it to the transactional

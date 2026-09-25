@@ -10,6 +10,7 @@ pub mod local_query;
 pub mod manifest;
 pub mod server;
 pub mod sql;
+pub mod state;
 pub mod to_string;
 pub mod typealias;
 pub mod typescript;
@@ -31,6 +32,7 @@ pub fn generate_schema(
     );
     generate::typescript::targets::simple::generate_schema(database, typescript_dir, files);
     generate::server::rust::generate_schema(context, database, Path::new("rust"), files);
+    generate::state::generate(context, typescript_core_dir, Path::new("rust"), files);
     generate::manifest::generate_schema(context, files);
 }
 

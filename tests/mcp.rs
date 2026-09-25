@@ -351,6 +351,7 @@ fn docs_are_exposed_as_resources() {
     assert!(resource_uris.contains(&"pyre://guides/getting-started"));
     assert!(resource_uris.contains(&"pyre://guides/schema"));
     assert!(resource_uris.contains(&"pyre://guides/query"));
+    assert!(resource_uris.contains(&"pyre://guides/ephemeral-state"));
     assert!(resource_uris.contains(&"pyre://guides/namespacing"));
     assert!(resource_uris.contains(&"pyre://guides/mcp"));
     assert!(resource_uris.contains(&"pyre://guides/project-structure"));
@@ -521,6 +522,19 @@ fn sync_and_optional_guides_are_discoverable_and_retrievable() {
                 "one client per schema family",
                 "client.submit(target, edits)",
                 "not yet recovered",
+            ],
+        ),
+        (
+            "ephemeral-state",
+            "Ephemeral State",
+            vec![
+                "state Connection",
+                "state Shared",
+                "updateEphemeralConnection",
+                "authoritative.freshness.stale",
+                "sessionKey",
+                "exactly one authoritative `DatabaseRuntime`",
+                "never written",
             ],
         ),
         (

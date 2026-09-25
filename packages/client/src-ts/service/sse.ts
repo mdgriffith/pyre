@@ -7,12 +7,14 @@ export interface SSEConfig {
   credentials?: RequestCredentials;
   withCredentials?: boolean;
   databaseId?: DatabaseId;
+  ephemeralWrite?: boolean;
 }
 
 export interface LiveSyncMessage {
   type: string;
   databaseId?: string;
   connectionId?: string;
+  ephemeralCapability?: string;
   serverRevision?: number;
   databaseEpoch?: string;
   data?: unknown;
@@ -25,8 +27,11 @@ export class SSEManager {
   private config: SSEConfig | null = null;
   private shouldReconnect = true;
   private onMessage: ((message: LiveSyncMessage) => void) | null = null;
+  private onEphemeralMessage: ((message: LiveSyncMessage) => void) | null = null;
   private elmApp: ElmApp | null = null;
   private debugLog: (...args: unknown[]) => void;
+  private onStateChange: ((state: 'connecting' | 'disconnected') => void) | null = null;
+  private state: 'connecting' | 'disconnected' = 'disconnected';
 
   constructor(
     config: SSEConfig,
@@ -40,6 +45,14 @@ export class SSEManager {
 
   setOnMessage(callback: (message: LiveSyncMessage) => void): void {
     this.onMessage = callback;
+  }
+
+  setOnEphemeralMessage(callback: (message: LiveSyncMessage) => void): void {
+    this.onEphemeralMessage = callback;
+  }
+
+  setOnStateChange(callback: (state: 'connecting' | 'disconnected') => void): void {
+    this.onStateChange = callback;
   }
 
   attachPorts(elmApp: ElmApp): void {
@@ -66,13 +79,27 @@ export class SSEManager {
   connect(): void {
     this.shouldReconnect = true;
     this.debugLog('[PyreClient] SSE connect requested');
+    if (this.eventSource) {
+      const eventSource = this.eventSource;
+      this.eventSource = null;
+      this.connectionId = null;
+      eventSource.close();
+      this.setState('disconnected');
+    }
+    this.setState('connecting');
     this.attemptConnect();
   }
 
   private emitMessage(message: LiveSyncMessage): void {
-    this.onMessage?.(message);
-    this.elmApp?.ports.receiveSSEMessage?.send(message);
-    this.debugLog('[PyreClient] port receiveSSEMessage ->', message);
+    if (message.type === 'connected' || message.type.startsWith('ephemeral')) {
+      this.onEphemeralMessage?.(message);
+    }
+    const publicMessage = redactEphemeralCapability(message);
+    this.onMessage?.(publicMessage);
+    if (!message.type.startsWith('ephemeral')) {
+      this.elmApp?.ports.receiveSSEMessage?.send(publicMessage);
+      this.debugLog('[PyreClient] port receiveSSEMessage ->', publicMessage);
+    }
   }
 
   private attemptConnect(): void {
@@ -87,20 +114,23 @@ export class SSEManager {
       const eventSource = new EventSource(sseUrl, {
         withCredentials: shouldIncludeCredentials(this.config),
       });
+      this.eventSource = eventSource;
       this.debugLog('[PyreClient] SSE EventSource constructed', {
         sseUrl,
         withCredentials: shouldIncludeCredentials(this.config),
       });
 
       eventSource.onopen = () => {
-        this.eventSource = eventSource;
+        if (this.eventSource !== eventSource) return;
         this.debugLog('[PyreClient] SSE connection opened', { sseUrl });
       };
 
       eventSource.onmessage = (event: MessageEvent) => {
+        if (this.eventSource !== eventSource) return;
         try {
           const message = JSON.parse(event.data) as LiveSyncMessage;
           if (message.type === 'connected' && message.connectionId) {
+            this.setState('connecting');
             this.connectionId = message.connectionId;
             this.debugLog('[PyreClient] SSE connected', { connectionId: message.connectionId });
           }
@@ -111,19 +141,24 @@ export class SSEManager {
       };
 
       eventSource.onerror = () => {
+        if (this.eventSource !== eventSource) return;
         const state = eventSource.readyState;
+        const hadConnection = this.connectionId !== null;
+        const wasDisconnected = this.state === 'disconnected';
         this.debugLog('[PyreClient] SSE connection state changed', {
           readyState: state,
           connectionId: this.connectionId,
           shouldReconnect: this.shouldReconnect,
         });
+        this.connectionId = null;
+        this.setState('disconnected');
 
         if (state === EventSource.CLOSED) {
           console.warn('[PyreClient] SSE connection closed');
           if (this.shouldReconnect) {
             this.debugLog('[PyreClient] SSE waiting for EventSource auto-reconnect');
           }
-        } else if (state === EventSource.CONNECTING && !this.connectionId) {
+        } else if (state === EventSource.CONNECTING && !hadConnection && !wasDisconnected) {
           this.debugLog('[PyreClient] SSE failed before session established');
           const errorMessage = {
             type: 'error',
@@ -133,6 +168,7 @@ export class SSEManager {
         }
       };
     } catch (error) {
+      this.setState('disconnected');
       const errorMessage = {
         type: 'error',
         error: `SSE connection error: ${error}`,
@@ -151,15 +187,29 @@ export class SSEManager {
     }
 
     this.connectionId = null;
+    this.setState('disconnected');
+  }
+
+  private setState(state: 'connecting' | 'disconnected'): void {
+    if (this.state === state) return;
+    this.state = state;
+    this.onStateChange?.(state);
   }
 }
 
 export function buildSSEUrl(config: SSEConfig): string {
   return resolveEndpointUrl(config.baseUrl, config.eventsPath, {
     databaseId: config.databaseId,
+    ephemeralWrite: config.ephemeralWrite === undefined ? undefined : String(config.ephemeralWrite),
   });
 }
 
 function shouldIncludeCredentials(config: SSEConfig): boolean {
   return config.credentials === 'include' || config.withCredentials === true;
+}
+
+export function redactEphemeralCapability(message: LiveSyncMessage): LiveSyncMessage {
+  if (!Object.prototype.hasOwnProperty.call(message, 'ephemeralCapability')) return message;
+  const { ephemeralCapability: _ephemeralCapability, ...publicMessage } = message;
+  return publicMessage;
 }

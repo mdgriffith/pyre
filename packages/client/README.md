@@ -30,7 +30,7 @@ npm run typecheck
 
 ## Usage
 
-Start with the [sync guide](../../docs/usage/sync.md) for authentication, app-owned database selection, and local query boundaries. See [Elm integration](../../docs/usage/elm-sync.md) for generated UI wiring and [multi-database integration](../../docs/usage/multi-database-upgrade.md) when adding source databases.
+Start with the [sync guide](../../docs/usage/sync.md) for authentication, app-owned database selection, and local query boundaries. See [ephemeral state](../../docs/usage/ephemeral-state.md) for typed Connection/Shared subscriptions and updates, [Elm integration](../../docs/usage/elm-sync.md) for generated UI wiring, and [multi-database integration](../../docs/usage/multi-database-upgrade.md) when adding source databases.
 
 Use one `PyreClient` per schema family in your browser app. A `databaseId` selects a source database within that family, not a different schema.
 

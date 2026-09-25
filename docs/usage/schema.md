@@ -181,6 +181,15 @@ session {
 
 The browser client does not hold the effective Pyre session. Using `Session` only in schema permissions does not prevent local queries: the server enforces permissions when selecting synced data. For explicit local query filters, see [Local Queries And Session](./query.md#local-queries-and-session); for server and client setup, see [Sync Setup](./sync.md).
 
+## Ephemeral State
+
+`state Connection` and `state Shared` declare typed, database-scoped values that
+are live but never persisted. Connection fields may derive trusted Session values;
+Shared fields may not. Writable fields must be nullable or have a default, and
+state declarations do not support relational/table directives. See the
+[Ephemeral State guide](./ephemeral-state.md) for schema examples, generated types,
+client APIs, ownership, reconnect behavior, and deployment limits.
+
 ## Permissions
 
 Permissions filter operations using fields from the current row and trusted,
