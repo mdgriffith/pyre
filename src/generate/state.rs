@@ -90,16 +90,22 @@ fn typescript_state_types(name: &str, state: &StateContract) -> String {
     }
     result.push_str("}\n\n");
 
-    result.push_str(&format!("export interface {name}Patch {{\n"));
-    for (field, contract) in &state.fields {
-        if contract.writable {
-            result.push_str(&format!(
-                "  {field}?: {};\n",
-                typescript_type(&contract.schema)
-            ));
+    if state.fields.values().any(|field| field.writable) {
+        result.push_str(&format!("export interface {name}Patch {{\n"));
+        for (field, contract) in &state.fields {
+            if contract.writable {
+                result.push_str(&format!(
+                    "  {field}?: {};\n",
+                    typescript_type(&contract.schema)
+                ));
+            }
         }
+        result.push_str("}\n\n");
+    } else {
+        result.push_str(&format!(
+            "export type {name}Patch = Record<string, never>;\n\n"
+        ));
     }
-    result.push_str("}\n\n");
     result
 }
 

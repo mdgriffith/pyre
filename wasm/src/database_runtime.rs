@@ -28,6 +28,7 @@ struct JsRuntimeConfig {
     max_pending_entries: Option<usize>,
     max_pending_controls: Option<usize>,
     max_delivery_bytes: Option<usize>,
+    max_pending_bytes: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +64,9 @@ impl JsRuntimeConfig {
         }
         if let Some(value) = self.max_delivery_bytes {
             config.max_delivery_bytes = value;
+        }
+        if let Some(value) = self.max_pending_bytes {
+            config.max_pending_bytes = value;
         }
         config
     }

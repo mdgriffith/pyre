@@ -25,6 +25,10 @@ const runtime = createDatabaseRuntime<typeof database, StateTypes>({
     sharedWritePolicy: "serverOnly",
     leaseDurationMs: 30_000,
     downstreamDeliveryCadenceMs: 50,
+    maxParticipants: 256,
+    maxDeliveryBytes: 256 * 1024,
+    maxPendingEntries: 256,
+    maxPendingBytes: 8 * 1024 * 1024,
   },
 });
 
@@ -61,3 +65,10 @@ JSON/WASM boundary, become integer Unix seconds before `pyre serve` derives
 `Connection` state. A custom runtime that calls `join` directly must provide this
 canonical trusted-session JSON; in particular, its `DateTime` values are integer
 Unix seconds.
+
+`maxDeliveryBytes` and `maxPendingEntries` bound each subscriber. The runtime-wide
+`maxPendingBytes` budget bounds the serialized pending data retained across all
+subscribers. If retaining a change would exceed any pending bound, that subscriber
+receives `ephemeralResyncRequired` and must resubscribe from a complete snapshot.
+The aggregate budget covers runtime outboxes; buffering after `poll` belongs to the
+application transport.

@@ -56,6 +56,10 @@ pyre serve <database>
   --allow-unsafe-dev-session
   --allow-unsafe-unsigned-session
   --participant-shared-writes
+  --ephemeral-max-participants <N>
+  --ephemeral-max-delivery-bytes <BYTES>
+  --ephemeral-max-pending-entries <N>
+  --ephemeral-max-pending-bytes <BYTES>
 ```
 
 Defaults:
@@ -66,9 +70,17 @@ Defaults:
 --generated pyre/generated
 --database-id default
 --page-size 1000
+--ephemeral-max-participants 256
+--ephemeral-max-delivery-bytes 262144
+--ephemeral-max-pending-entries 256
+--ephemeral-max-pending-bytes 8388608
 ```
 
 `--page-size` is capped by the server runtime's maximum page size.
+
+Ephemeral delivery bytes and pending entries are bounded per subscriber. Pending
+bytes are bounded in aggregate across the database runtime. Exceeding a pending
+bound transitions the affected subscriber to explicit resnapshot recovery.
 
 `--auth` is database authentication, such as a Turso/libSQL auth token. It is not end-user authentication.
 

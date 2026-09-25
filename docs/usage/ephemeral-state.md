@@ -142,6 +142,11 @@ size, and pending delivery are bounded. Overflow produces an explicit resnapshot
 instead of silent divergence; `@pyre/client` performs that authenticated recovery
 and marks authority stale while it is in progress.
 
+The built-in defaults allow 256 participants, 256 KiB per delivery, 256 pending
+entries per subscriber, and 8 MiB of serialized pending data across the runtime.
+Use the `pyre serve --ephemeral-max-*` options to set application-specific limits.
+Custom runtimes expose the same capacity controls through `DatabaseRuntimeConfig`.
+
 ## Disconnect And Reconnect
 
 On disconnect, `authoritative.freshness.stale` is `true`; the last remote view may

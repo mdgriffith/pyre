@@ -943,6 +943,96 @@ fn validate_variant_field_type_collisions(
     }
 }
 
+fn state_type_reaches_record(
+    context: &Context,
+    type_: &ast::ColumnType,
+    visiting: &mut HashSet<String>,
+) -> Option<String> {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner)
+        | ast::ColumnType::List(inner)
+        | ast::ColumnType::Dict(inner)
+        | ast::ColumnType::Nullable(inner) => state_type_reaches_record(context, inner, visiting),
+        ast::ColumnType::Custom(name) => {
+            let Some((_, definition)) = context.types.get(name) else {
+                return None;
+            };
+            match definition {
+                Type::Record(_) => Some(name.clone()),
+                Type::OneOf { variants } if visiting.insert(name.clone()) => {
+                    let record = variants.iter().find_map(|variant| {
+                        variant.fields.as_ref().and_then(|fields| {
+                            ast::collect_columns(fields).into_iter().find_map(|column| {
+                                state_type_reaches_record(context, &column.type_, visiting)
+                            })
+                        })
+                    });
+                    visiting.remove(name);
+                    record
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn directly_sized_union_references(context: &Context, type_: &ast::ColumnType) -> Vec<String> {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner) | ast::ColumnType::Nullable(inner) => {
+            directly_sized_union_references(context, inner)
+        }
+        ast::ColumnType::Custom(name)
+            if matches!(context.types.get(name), Some((_, Type::OneOf { .. }))) =>
+        {
+            vec![name.clone()]
+        }
+        ast::ColumnType::List(_) | ast::ColumnType::Dict(_) => Vec::new(),
+        _ => Vec::new(),
+    }
+}
+
+fn directly_sized_union_cycle(context: &Context, root: &str) -> Option<Vec<String>> {
+    fn visit(
+        context: &Context,
+        root: &str,
+        current: &str,
+        visiting: &mut HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        let Some((_, Type::OneOf { variants })) = context.types.get(current) else {
+            return None;
+        };
+
+        for column in variants
+            .iter()
+            .filter_map(|variant| variant.fields.as_ref())
+            .flat_map(|fields| ast::collect_columns(fields))
+        {
+            for next in directly_sized_union_references(context, &column.type_) {
+                if next == root {
+                    let mut cycle = path.clone();
+                    cycle.push(next);
+                    return Some(cycle);
+                }
+                if visiting.insert(next.clone()) {
+                    path.push(next.clone());
+                    if let Some(cycle) = visit(context, root, &next, visiting, path) {
+                        return Some(cycle);
+                    }
+                    path.pop();
+                    visiting.remove(&next);
+                }
+            }
+        }
+        None
+    }
+
+    let mut visiting = HashSet::from([root.to_string()]);
+    let mut path = vec![root.to_string()];
+    visit(context, root, root, &mut visiting, &mut path)
+}
+
 pub fn check_schema(db: &ast::Database) -> Result<Context, Vec<Error>> {
     let mut context = populate_context(db)?;
 
@@ -2188,6 +2278,7 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
     let mut session_found = false;
     let mut state_definitions = HashSet::new();
     let mut generated_rust_type_names: HashMap<String, String> = HashMap::new();
+    let mut reported_recursive_types = HashSet::new();
 
     // Check definitions
     for schema in database.schemas.iter() {
@@ -2224,6 +2315,22 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                             ));
                         } else {
                             generated_rust_type_names.insert(rust_name, name.clone());
+                        }
+
+                        if !reported_recursive_types.contains(name) {
+                            if let Some(cycle) = directly_sized_union_cycle(context, name) {
+                                reported_recursive_types.extend(cycle.iter().cloned());
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "Tagged union '{}' has a directly sized recursive cycle ({}). Recursive references must pass through List or Dict.",
+                                        name,
+                                        cycle.join(" -> ")
+                                    ),
+                                    to_range(start, end),
+                                    to_range(start, end),
+                                ));
+                            }
                         }
                     }
                     ast::Definition::Session(session) => {
@@ -2285,6 +2392,8 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                         }
 
                         let mut field_names: HashMap<String, Option<Range>> = HashMap::new();
+                        let mut rust_field_names: HashMap<String, (String, Option<Range>)> =
+                            HashMap::new();
                         for field in fields {
                             let (column, derived) = match field {
                                 ast::StateField::Writable(column) => (column, None),
@@ -2333,6 +2442,22 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                                 errors,
                             );
 
+                            if let Some(record) = state_type_reaches_record(
+                                context,
+                                &column.type_,
+                                &mut HashSet::new(),
+                            ) {
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "State field '{}' cannot use record type '{}', directly or through tagged unions or containers.",
+                                        column.name, record
+                                    ),
+                                    state_context.clone(),
+                                    to_range(&column.start_typename, &column.end_typename),
+                                ));
+                            }
+
                             if let Some(previous) = field_names.insert(
                                 column.name.clone(),
                                 to_single_range(&column.start_name, &column.end_name),
@@ -2350,6 +2475,44 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                                         primary,
                                     }],
                                 });
+                            }
+
+                            let rust_name =
+                                crate::generate::server::rust::to_field_name(&column.name);
+                            if matches!(
+                                rust_name.as_str(),
+                                "r#self" | "r#Self" | "r#crate" | "r#super"
+                            ) {
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "State field '{}' emits the Rust special identifier '{}', which cannot be used as a field name.",
+                                        column.name,
+                                        rust_name.trim_start_matches("r#")
+                                    ),
+                                    state_context.clone(),
+                                    to_range(&column.start_name, &column.end_name),
+                                ));
+                            } else if let Some((previous_name, previous_range)) = rust_field_names
+                                .insert(
+                                    rust_name.clone(),
+                                    (
+                                        column.name.clone(),
+                                        to_single_range(&column.start_name, &column.end_name),
+                                    ),
+                                )
+                            {
+                                let mut primary = previous_range.into_iter().collect::<Vec<_>>();
+                                primary.extend(to_range(&column.start_name, &column.end_name));
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "State fields '{}' and '{}' both emit the generated Rust field identifier '{}'.",
+                                        previous_name, column.name, rust_name
+                                    ),
+                                    state_context.clone(),
+                                    primary,
+                                ));
                             }
 
                             if let Some(source) = derived {

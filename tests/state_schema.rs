@@ -397,3 +397,138 @@ state Shared {
     check("type StateTypes\n   = Value\n")
         .expect("reserved state names remain legal without state generation");
 }
+
+#[test]
+fn rejects_records_reachable_from_state_fields() {
+    for source in [
+        r#"@syncable(false)
+record Profile {
+    @public
+    id Id.Int @id
+}
+
+state Shared {
+    profile Profile?
+}
+"#,
+        r#"@syncable(false)
+record Profile {
+    @public
+    id Id.Int @id
+}
+
+type Envelope
+   = Profiles { values Json<List<Dict<Profile>>> }
+
+state Shared {
+    envelope Envelope?
+}
+"#,
+    ] {
+        assert!(messages(source).iter().any(|message| message.contains(
+            "cannot use record type 'Profile', directly or through tagged unions or containers"
+        )));
+    }
+}
+
+#[test]
+fn rejects_directly_sized_recursive_tagged_unions_when_state_is_generated() {
+    for source in [
+        r#"type Node
+   = Next { node Node? }
+
+state Shared {
+    value Int @default(0)
+}
+"#,
+        r#"type First
+   = Next { value Json<Second?> }
+
+type Second
+   = Next { value First }
+
+state Shared {
+    value Int @default(0)
+}
+"#,
+    ] {
+        assert!(messages(source)
+            .iter()
+            .any(|message| message.contains("directly sized recursive cycle")));
+    }
+}
+
+#[test]
+fn allows_list_and_dict_recursive_tagged_unions() {
+    check(
+        r#"type ListNode
+   = Next { nodes List<ListNode?> }
+
+type DictNode
+   = Next { nodes Dict<DictNode> }
+
+state Shared {
+    list ListNode?
+    dict DictNode?
+}
+"#,
+    )
+    .expect("List and Dict provide recursion indirection");
+}
+
+#[test]
+fn allows_records_unrelated_to_state_fields() {
+    check(
+        r#"@syncable(false)
+record Profile {
+    @public
+    id Id.Int @id
+}
+
+state Shared {
+    profileId Int?
+}
+"#,
+    )
+    .expect("unrelated records do not participate in generated state");
+}
+
+#[test]
+fn rejects_colliding_and_special_generated_rust_state_field_names() {
+    let collision = messages(
+        r#"state Shared {
+    fooBar String?
+    foo_bar String?
+}
+"#,
+    );
+    assert!(collision.iter().any(|message| message.contains(
+        "State fields 'fooBar' and 'foo_bar' both emit the generated Rust field identifier 'foo_bar'"
+    )));
+
+    for name in ["self", "crate", "super"] {
+        let source = format!("state Shared {{\n    {name} String?\n}}\n");
+        assert!(messages(&source)
+            .iter()
+            .any(|message| message.contains("Rust special identifier")));
+    }
+
+    let mut schema = parse("state Shared {\n    placeholder String?\n}\n");
+    let ast::Definition::State { fields, .. } = &mut schema.files[0].definitions[0] else {
+        panic!("state definition");
+    };
+    let ast::StateField::Writable(column) = &mut fields[0] else {
+        panic!("writable state field");
+    };
+    column.name = "Self".to_string();
+    let errors = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect_err("Self must be rejected");
+    assert!(errors.iter().any(|error| {
+        pyre::error::to_error_description(error, false).contains("Rust special identifier")
+    }));
+
+    check("state Shared {\n    type String?\n}\n")
+        .expect("ordinary Rust keywords are emitted as raw identifiers");
+}

@@ -53,6 +53,10 @@ pub struct ServeOptions<'a> {
     pub allow_unsafe_dev_session: bool,
     pub allow_unsafe_unsigned_session: bool,
     pub participant_shared_writes: bool,
+    pub ephemeral_max_participants: Option<usize>,
+    pub ephemeral_max_delivery_bytes: Option<usize>,
+    pub ephemeral_max_pending_entries: Option<usize>,
+    pub ephemeral_max_pending_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -259,6 +263,18 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
             let mut config = RuntimeConfig::default();
             if options.participant_shared_writes {
                 config.shared_write_policy = SharedWritePolicy::ParticipantWritable;
+            }
+            if let Some(value) = options.ephemeral_max_participants {
+                config.max_participants = value;
+            }
+            if let Some(value) = options.ephemeral_max_delivery_bytes {
+                config.max_delivery_bytes = value;
+            }
+            if let Some(value) = options.ephemeral_max_pending_entries {
+                config.max_pending_entries = value;
+            }
+            if let Some(value) = options.ephemeral_max_pending_bytes {
+                config.max_pending_bytes = value;
             }
             DatabaseOwner::Ephemeral(
                 DatabaseRuntime::new(database_id.clone(), db, contract, config).map_err(
@@ -1468,6 +1484,10 @@ mod tests {
             allow_unsafe_dev_session: false,
             allow_unsafe_unsigned_session: false,
             participant_shared_writes: false,
+            ephemeral_max_participants: None,
+            ephemeral_max_delivery_bytes: None,
+            ephemeral_max_pending_entries: None,
+            ephemeral_max_pending_bytes: None,
         }
     }
 

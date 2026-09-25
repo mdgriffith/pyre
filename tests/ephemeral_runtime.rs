@@ -707,6 +707,18 @@ fn delivery_change(delivery: Delivery) -> pyre::server::runtime::Change {
     }
 }
 
+fn serialized_shared_change_len(label: &str) -> usize {
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment);
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let observer = runtime.subscribe("observer", true).unwrap();
+    runtime.patch_shared(&json!({"label": label})).unwrap();
+    serde_json::to_vec(&runtime.poll(&observer.subscription).unwrap().unwrap())
+        .unwrap()
+        .len()
+}
+
 #[test]
 fn subscription_snapshot_has_no_concurrent_update_gap() {
     let environment = Arc::new(Environment::default());
@@ -881,6 +893,90 @@ fn entry_overflow_requests_immediate_resync_and_suppresses_deltas() {
 }
 
 #[test]
+fn aggregate_pending_byte_overflow_resyncs_only_the_outbox_that_exceeds_it() {
+    let pending_bytes = serialized_shared_change_len("budget");
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment);
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    runtime_config.max_pending_bytes = pending_bytes;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let first = runtime.subscribe("first", true).unwrap();
+    let second = runtime.subscribe("second", true).unwrap();
+
+    runtime.patch_shared(&json!({"label": "budget"})).unwrap();
+
+    assert!(matches!(
+        runtime.poll(&first.subscription).unwrap(),
+        Some(Delivery::Changes { .. })
+    ));
+    assert!(matches!(
+        runtime.poll(&second.subscription).unwrap(),
+        Some(Delivery::ResyncRequired { .. })
+    ));
+}
+
+#[test]
+fn latest_pending_value_replaces_its_accounted_bytes() {
+    let pending_bytes = serialized_shared_change_len("first");
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment);
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    runtime_config.max_pending_bytes = pending_bytes;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let observer = runtime.subscribe("observer", true).unwrap();
+
+    runtime.patch_shared(&json!({"label": "first"})).unwrap();
+    runtime.patch_shared(&json!({"label": "later"})).unwrap();
+
+    let change = delivery_change(runtime.poll(&observer.subscription).unwrap().unwrap());
+    assert_eq!(change.shared.unwrap()["label"], "later");
+}
+
+#[test]
+fn polling_releases_pending_byte_budget() {
+    let pending_bytes = serialized_shared_change_len("first");
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment);
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    runtime_config.max_pending_bytes = pending_bytes;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let observer = runtime.subscribe("observer", true).unwrap();
+
+    runtime.patch_shared(&json!({"label": "first"})).unwrap();
+    assert!(matches!(
+        runtime.poll(&observer.subscription).unwrap(),
+        Some(Delivery::Changes { .. })
+    ));
+    runtime.patch_shared(&json!({"label": "later"})).unwrap();
+    assert!(matches!(
+        runtime.poll(&observer.subscription).unwrap(),
+        Some(Delivery::Changes { .. })
+    ));
+}
+
+#[test]
+fn unsubscribe_and_resubscribe_release_pending_byte_budget() {
+    let pending_bytes = serialized_shared_change_len("first");
+    let environment = Arc::new(Environment::default());
+    let mut runtime_config = config(environment);
+    runtime_config.downstream_delivery_cadence = Duration::ZERO;
+    runtime_config.max_pending_bytes = pending_bytes;
+    let runtime = DatabaseRuntime::new("db", (), contract(), runtime_config).unwrap();
+    let first = runtime.subscribe("first", true).unwrap();
+    let second = runtime.subscribe("second", true).unwrap();
+
+    runtime.patch_shared(&json!({"label": "first"})).unwrap();
+    runtime.unsubscribe(&first.subscription).unwrap();
+    let second = runtime.resubscribe(&second.subscription, "second").unwrap();
+    runtime.patch_shared(&json!({"label": "later"})).unwrap();
+
+    assert!(matches!(
+        runtime.poll(&second.subscription).unwrap(),
+        Some(Delivery::Changes { .. })
+    ));
+}
+
+#[test]
 fn payload_and_transport_bounds_fail_explicitly() {
     let environment = Arc::new(Environment::default());
     let mut invalid = config(environment.clone());
@@ -889,6 +985,19 @@ fn payload_and_transport_bounds_fail_explicitly() {
         DatabaseRuntime::new("db", (), contract(), invalid),
         Err(RuntimeError::InvalidTransportBounds)
     ));
+
+    let mut invalid = config(environment.clone());
+    invalid.max_pending_bytes = 0;
+    assert!(matches!(
+        DatabaseRuntime::new("db", (), contract(), invalid),
+        Err(RuntimeError::InvalidTransportBounds)
+    ));
+
+    let defaults = RuntimeConfig::default();
+    assert_eq!(defaults.max_participants, 256);
+    assert_eq!(defaults.max_pending_entries, 256);
+    assert_eq!(defaults.max_delivery_bytes, 256 * 1024);
+    assert_eq!(defaults.max_pending_bytes, 8 * 1024 * 1024);
 
     let mut snapshot_limited = config(environment.clone());
     snapshot_limited.max_delivery_bytes = 1;

@@ -75,6 +75,7 @@ pub struct RuntimeConfig {
     pub max_pending_entries: usize,
     pub max_pending_controls: usize,
     pub max_delivery_bytes: usize,
+    pub max_pending_bytes: usize,
     pub environment: Arc<dyn RuntimeEnvironment>,
 }
 
@@ -92,6 +93,7 @@ impl fmt::Debug for RuntimeConfig {
             .field("max_pending_entries", &self.max_pending_entries)
             .field("max_pending_controls", &self.max_pending_controls)
             .field("max_delivery_bytes", &self.max_delivery_bytes)
+            .field("max_pending_bytes", &self.max_pending_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -106,12 +108,13 @@ impl RuntimeConfig {
     pub fn with_environment(environment: Arc<dyn RuntimeEnvironment>) -> Self {
         Self {
             shared_write_policy: SharedWritePolicy::ServerOnly,
-            max_participants: 1_024,
+            max_participants: 256,
             lease_duration: Duration::from_secs(30),
             downstream_delivery_cadence: Duration::from_millis(50),
-            max_pending_entries: 1_024,
+            max_pending_entries: 256,
             max_pending_controls: 1,
-            max_delivery_bytes: 1024 * 1024,
+            max_delivery_bytes: 256 * 1024,
+            max_pending_bytes: 8 * 1024 * 1024,
             environment,
         }
     }
@@ -408,6 +411,7 @@ struct Outbox {
     writable: bool,
     standalone_lease_deadline: Option<u64>,
     next_delivery_millis: u64,
+    pending_bytes: usize,
     mode: OutboxMode,
 }
 
@@ -418,6 +422,7 @@ struct State {
     shared: Option<Value>,
     connections: BTreeMap<String, Connection>,
     outboxes: BTreeMap<String, Outbox>,
+    pending_bytes: usize,
     closed: bool,
 }
 
@@ -447,6 +452,7 @@ impl<H> DatabaseRuntime<H> {
         if config.max_pending_entries == 0
             || config.max_pending_controls == 0
             || config.max_delivery_bytes == 0
+            || config.max_pending_bytes == 0
         {
             return Err(RuntimeError::InvalidTransportBounds);
         }
@@ -481,6 +487,7 @@ impl<H> DatabaseRuntime<H> {
                 shared,
                 connections: BTreeMap::new(),
                 outboxes: BTreeMap::new(),
+                pending_bytes: 0,
                 closed: false,
             }),
         };
@@ -695,8 +702,12 @@ impl<H> DatabaseRuntime<H> {
         let mut state = self.lock_state()?;
         ensure_open(&state)?;
         self.validate_subscription(&state, subscription)?;
-        let outbox = state
-            .outboxes
+        let State {
+            outboxes,
+            pending_bytes,
+            ..
+        } = &mut *state;
+        let outbox = outboxes
             .get_mut(&subscription.connection_id)
             .expect("validated subscription");
         match &mut outbox.mode {
@@ -708,6 +719,7 @@ impl<H> DatabaseRuntime<H> {
                     return Ok(None);
                 }
                 *delivered = true;
+                release_pending_bytes(pending_bytes, &mut outbox.pending_bytes);
                 Ok(Some(Delivery::ResyncRequired {
                     recovery: Recovery {
                         database_id: self.database_id.clone(),
@@ -750,6 +762,7 @@ impl<H> DatabaseRuntime<H> {
                 };
                 *through_revision = None;
                 outbox.next_delivery_millis = next_delivery_millis;
+                release_pending_bytes(pending_bytes, &mut outbox.pending_bytes);
                 Ok(Some(Delivery::Changes { change }))
             }
         }
@@ -1007,7 +1020,7 @@ impl<H> DatabaseRuntime<H> {
         self.validate_handle(&state, participant)?;
         let revision = advance(&mut state)?;
         state.connections.remove(&participant.connection_id);
-        state.outboxes.remove(&participant.connection_id);
+        remove_outbox_locked(&mut state, &participant.connection_id);
         let change = self.removal_change(revision, vec![participant.connection_id.clone()]);
         self.publish_locked(&mut state, &change);
         Ok(Some(change))
@@ -1022,7 +1035,7 @@ impl<H> DatabaseRuntime<H> {
         if state.connections.contains_key(&subscription.connection_id) {
             return Err(RuntimeError::UnknownConnection);
         }
-        state.outboxes.remove(&subscription.connection_id);
+        remove_outbox_locked(&mut state, &subscription.connection_id);
         Ok(())
     }
 
@@ -1068,7 +1081,7 @@ impl<H> DatabaseRuntime<H> {
             .map(|(id, _)| id.clone())
             .collect();
         for id in &expired_subscriptions {
-            state.outboxes.remove(id);
+            remove_outbox_locked(&mut state, id);
         }
         if removed.is_empty() {
             return Ok(Expiration {
@@ -1080,7 +1093,7 @@ impl<H> DatabaseRuntime<H> {
         let revision = advance(&mut state)?;
         for id in &removed {
             state.connections.remove(id);
-            state.outboxes.remove(id);
+            remove_outbox_locked(&mut state, id);
         }
         let change = self.removal_change(revision, removed.clone());
         self.publish_locked(&mut state, &change);
@@ -1107,6 +1120,7 @@ impl<H> DatabaseRuntime<H> {
         state.shared = None;
         state.connections.clear();
         state.outboxes.clear();
+        state.pending_bytes = 0;
         Ok(revision.map(|revision| self.removal_change(revision, removed)))
     }
 
@@ -1240,7 +1254,7 @@ impl<H> DatabaseRuntime<H> {
         let next_delivery_millis = now_millis
             .checked_add(duration_millis(self.config.downstream_delivery_cadence)?)
             .ok_or(RuntimeError::ClockOverflow)?;
-        state.outboxes.insert(
+        let replaced = state.outboxes.insert(
             connection_id.clone(),
             Outbox {
                 generation,
@@ -1248,6 +1262,7 @@ impl<H> DatabaseRuntime<H> {
                 writable,
                 standalone_lease_deadline,
                 next_delivery_millis,
+                pending_bytes: 0,
                 mode: OutboxMode::Active {
                     shared: None,
                     connections: BTreeMap::new(),
@@ -1255,6 +1270,12 @@ impl<H> DatabaseRuntime<H> {
                 },
             },
         );
+        if let Some(replaced) = replaced {
+            state.pending_bytes = state
+                .pending_bytes
+                .checked_sub(replaced.pending_bytes)
+                .expect("outbox pending bytes are included in runtime total");
+        }
         Ok(Subscription {
             database_id: self.database_id.clone(),
             epoch: self.epoch.clone(),
@@ -1265,6 +1286,7 @@ impl<H> DatabaseRuntime<H> {
     }
 
     fn publish_locked(&self, state: &mut State, change: &Change) {
+        let mut total_pending_bytes = state.pending_bytes;
         for outbox in state.outboxes.values_mut() {
             let OutboxMode::Active {
                 shared,
@@ -1274,6 +1296,9 @@ impl<H> DatabaseRuntime<H> {
             else {
                 continue;
             };
+            total_pending_bytes = total_pending_bytes
+                .checked_sub(outbox.pending_bytes)
+                .expect("outbox pending bytes are included in runtime total");
             if let Some(value) = &change.shared {
                 *shared = Some(value.clone());
             }
@@ -1287,8 +1312,8 @@ impl<H> DatabaseRuntime<H> {
 
             let entry_count = usize::from(shared.is_some()) + connections.len();
             let too_many_entries = entry_count > self.config.max_pending_entries;
-            let too_large = if too_many_entries {
-                false
+            let pending_bytes = if too_many_entries {
+                None
             } else {
                 let pending = pending_delivery(
                     &self.database_id,
@@ -1297,19 +1322,31 @@ impl<H> DatabaseRuntime<H> {
                     shared,
                     connections,
                 );
-                serde_json::to_vec(&pending)
-                    .map(|bytes| bytes.len() > self.config.max_delivery_bytes)
-                    .unwrap_or(true)
+                serde_json::to_vec(&pending).ok().map(|bytes| bytes.len())
             };
-            if too_many_entries || too_large {
+            let over_outbox_limit =
+                pending_bytes.map_or(true, |bytes| bytes > self.config.max_delivery_bytes);
+            let over_runtime_limit = pending_bytes.map_or(true, |bytes| {
+                total_pending_bytes
+                    .checked_add(bytes)
+                    .map_or(true, |total| total > self.config.max_pending_bytes)
+            });
+            if too_many_entries || over_outbox_limit || over_runtime_limit {
                 // There is exactly one bounded control slot per subscriber.
                 debug_assert!(self.config.max_pending_controls >= 1);
                 outbox.mode = OutboxMode::ResyncRequired {
                     revision: change.revision,
                     delivered: false,
                 };
+                outbox.pending_bytes = 0;
+            } else {
+                outbox.pending_bytes = pending_bytes.expect("checked above");
+                total_pending_bytes = total_pending_bytes
+                    .checked_add(outbox.pending_bytes)
+                    .expect("pending byte limit prevents overflow");
             }
         }
+        state.pending_bytes = total_pending_bytes;
     }
 
     fn ensure_delivery_size(&self, delivery: &Delivery) -> Result<(), RuntimeError> {
@@ -1423,6 +1460,22 @@ fn participation_count(state: &State) -> usize {
             .keys()
             .filter(|id| !state.connections.contains_key(*id))
             .count()
+}
+
+fn release_pending_bytes(total: &mut usize, outbox: &mut usize) {
+    *total = total
+        .checked_sub(*outbox)
+        .expect("outbox pending bytes are included in runtime total");
+    *outbox = 0;
+}
+
+fn remove_outbox_locked(state: &mut State, id: &str) -> Option<Outbox> {
+    let outbox = state.outboxes.remove(id)?;
+    state.pending_bytes = state
+        .pending_bytes
+        .checked_sub(outbox.pending_bytes)
+        .expect("outbox pending bytes are included in runtime total");
+    Some(outbox)
 }
 
 fn advance(state: &mut State) -> Result<u64, RuntimeError> {

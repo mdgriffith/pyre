@@ -156,7 +156,19 @@ pyre serve <database>
   --allow-unsafe-dev-session
   --allow-unsafe-unsigned-session
   --participant-shared-writes
+  --ephemeral-max-participants <N>       default: 256
+  --ephemeral-max-delivery-bytes <BYTES> default: 262144
+  --ephemeral-max-pending-entries <N>    default: 256
+  --ephemeral-max-pending-bytes <BYTES>  default: 8388608
 ```
+
+The delivery and entry limits apply to each subscriber. The pending-byte limit is
+the aggregate serialized size retained by the runtime across all subscribers.
+When a slow subscriber would exceed any pending limit, the server sends
+`ephemeralResyncRequired` instead of retaining another copy of the update. Choose
+application-specific values based on expected state size and concurrent
+participants; these limits do not replace authentication or upstream request
+rate limits.
 
 ## Limits
 

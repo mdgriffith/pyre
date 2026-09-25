@@ -163,6 +163,67 @@ void [derivedPatch, invalidNull, partialNestedPatch, incompleteShared, invalidDa
 }
 
 #[test]
+fn generated_typescript_derived_only_patch_rejects_all_fields() {
+    let (database, context) = fixture(
+        r#"session {
+    userId Int
+}
+
+state Connection {
+    userId Int = Session.userId
+}
+"#,
+    );
+    let mut files = Vec::new();
+    generate::generate_schema(&context, &database, &mut files);
+    let state = files
+        .iter()
+        .find(|file| file.path == Path::new("typescript/core/state.ts"))
+        .expect("generated TypeScript state module");
+    assert!(state
+        .contents
+        .contains("export type ConnectionPatch = Record<string, never>;"));
+
+    let temp_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    std::fs::write(temp_dir.path().join("state.ts"), &state.contents).unwrap();
+    std::fs::write(
+        temp_dir.path().join("verify.ts"),
+        r#"import type { ConnectionPatch } from "./state";
+
+const empty: ConnectionPatch = {};
+// @ts-expect-error Derived fields are not writable.
+const derived: ConnectionPatch = { userId: 1 };
+// @ts-expect-error Unknown fields are not writable.
+const unknown: ConnectionPatch = { arbitrary: true };
+void [empty, derived, unknown];
+"#,
+    )
+    .unwrap();
+
+    let tsc = Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/tsc");
+    let output = Command::new(tsc)
+        .args([
+            "--noEmit",
+            "--strict",
+            "--skipLibCheck",
+            "--module",
+            "preserve",
+            "--moduleResolution",
+            "bundler",
+            "verify.ts",
+        ])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("typecheck derived-only patch type");
+    assert!(
+        output.status.success(),
+        "derived-only TypeScript patch failed to enforce an empty object\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn generated_rust_state_surface_compiles_and_preserves_patch_null_semantics() {
     let files = generated_state_files();
     let state = files

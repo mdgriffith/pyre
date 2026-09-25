@@ -58,6 +58,7 @@ export interface DatabaseRuntimeConfig {
   maxPendingEntries?: number;
   maxPendingControls?: number;
   maxDeliveryBytes?: number;
+  maxPendingBytes?: number;
 }
 
 export interface EphemeralStateTypes {
