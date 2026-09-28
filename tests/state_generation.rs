@@ -17,6 +17,20 @@ fn generated_state_files() -> Vec<pyre::filesystem::GeneratedFile<String>> {
         r#"type Node
    = Text { value String }
    | Children { items List<Node?> }
+   | Wrapped { values Json<Dict<List<Leaf?>>> }
+
+type Leaf
+   = LeafText { text String }
+   | Branch { nodes List<Node> }
+
+@syncable(false)
+record Profile {
+    @public
+    id Id.Int @id
+}
+
+type Envelope
+   = Profiles { values Json<List<Profile>> }
 
 session {
     userId Int
@@ -38,6 +52,23 @@ state Shared {
     );
     let mut files = Vec::new();
     generate::generate_schema(&context, &database, &mut files);
+    let contract = pyre::ephemeral::Contract::from_context(&context).unwrap();
+    assert_eq!(
+        contract
+            .types
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["Leaf", "Node"]
+    );
+    for file in files
+        .iter()
+        .filter(|file| file.path.ends_with("state.ts") || file.path.ends_with("state.rs"))
+    {
+        assert!(file.contents.contains("Leaf"));
+        assert!(!file.contents.contains("Envelope"));
+        assert!(!file.contents.contains("Profile"));
+    }
     files
 }
 

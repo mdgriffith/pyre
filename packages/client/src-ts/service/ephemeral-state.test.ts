@@ -461,6 +461,60 @@ test('a second overflow during recovery triggers another authenticated resnapsho
   });
 });
 
+test('repeated successful recovery does not postpone the lease deadline', async () => {
+  const { service, requests, advance, connect } = harness({ leaseCadenceMs: 100 });
+  connect();
+  for (const revision of [2, 3, 4]) {
+    advance(30);
+    service.handleMessage({
+      type: 'ephemeralResyncRequired',
+      ephemeralResyncRequired: { databaseId: 'alpha', epoch: 'epoch-1', revision },
+    });
+    await tick();
+    requests.at(-1).accept({
+      revision,
+      ephemeralSnapshot: {
+        databaseId: 'alpha', epoch: 'epoch-1', revision,
+        connections: { 'connection-1': { cursor: null } },
+      },
+    });
+    await tick();
+    expect(service.getSnapshot().authoritative.freshness.status).toBe('live');
+  }
+  advance(10);
+  await tick();
+  expect(requests).toHaveLength(4);
+  expect(requests[3].url).toContain('/ephemeral/lease');
+  service.dispose();
+});
+
+test('lease renewals continue while recovery is pending and rejection aborts recovery', async () => {
+  const { service, requests, reconnects, advance, connect } = harness({
+    leaseCadenceMs: 20, requestTimeoutMs: 100,
+  });
+  connect();
+  service.handleMessage({
+    type: 'ephemeralResyncRequired',
+    ephemeralResyncRequired: { databaseId: 'alpha', epoch: 'epoch-1', revision: 2 },
+  });
+  await tick();
+  advance(20);
+  await tick();
+  expect(requests[1].url).toContain('/ephemeral/lease');
+  requests[1].accept();
+  await tick();
+  expect(service.getSnapshot().authoritative.freshness.status).toBe('resyncing');
+  advance(20);
+  await tick();
+  expect(requests[2].url).toContain('/ephemeral/lease');
+  requests[2].reject('authority lost');
+  await tick();
+  expect(requests[0].init.signal.aborted).toBe(true);
+  expect(service.getSnapshot().authoritative.freshness.status).toBe('error');
+  expect(reconnects).toEqual([40]);
+  service.dispose();
+});
+
 test('lease renewal is independent, reauthenticates, and rejection ends live state', async () => {
   let headerCalls = 0;
   const { service, requests, reconnects, advance, connect } = harness({

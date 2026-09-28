@@ -102,16 +102,36 @@ pub struct PatchResult {
 impl Contract {
     pub fn from_context(context: &typecheck::Context) -> Result<Self, ValidationError> {
         let mut contract = Self {
-            connection: None,
-            shared: None,
+            connection: context
+                .states
+                .get("Connection")
+                .map(resolve_state)
+                .transpose()?,
+            shared: context
+                .states
+                .get("Shared")
+                .map(resolve_state)
+                .transpose()?,
             types: BTreeMap::new(),
         };
 
-        for (name, (definition, type_)) in &context.types {
+        let mut pending = Vec::new();
+        for state in contract.connection.iter().chain(contract.shared.iter()) {
+            for field in state.fields.values() {
+                collect_custom_types(&field.schema, &mut pending);
+            }
+        }
+        while let Some(name) = pending.pop() {
+            if contract.types.contains_key(&name) {
+                continue;
+            }
+            let Some((definition, type_)) = context.types.get(&name) else {
+                continue;
+            };
             let (DefInfo::Def(_), typecheck::Type::OneOf { variants }) = (definition, type_) else {
                 continue;
             };
-            let variants = variants
+            let variants: BTreeMap<String, BTreeMap<String, ValueSchema>> = variants
                 .iter()
                 .map(|variant| {
                     let fields = variant
@@ -133,21 +153,14 @@ impl Contract {
                     (variant.name.clone(), fields)
                 })
                 .collect();
-            contract
-                .types
-                .insert(name.clone(), TaggedUnion { variants });
+            for fields in variants.values() {
+                for schema in fields.values() {
+                    collect_custom_types(schema, &mut pending);
+                }
+            }
+            contract.types.insert(name, TaggedUnion { variants });
         }
 
-        contract.connection = context
-            .states
-            .get("Connection")
-            .map(resolve_state)
-            .transpose()?;
-        contract.shared = context
-            .states
-            .get("Shared")
-            .map(resolve_state)
-            .transpose()?;
         Ok(contract)
     }
 
@@ -339,6 +352,17 @@ impl Contract {
         } else {
             Err(errors)
         }
+    }
+}
+
+fn collect_custom_types(schema: &ValueSchema, pending: &mut Vec<String>) {
+    match &schema.type_ {
+        ValueType::Custom { name } => pending.push(name.clone()),
+        ValueType::TypedJson { value } | ValueType::Dict { value } => {
+            collect_custom_types(value, pending);
+        }
+        ValueType::List { item } => collect_custom_types(item, pending),
+        _ => {}
     }
 }
 

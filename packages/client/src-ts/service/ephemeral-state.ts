@@ -373,7 +373,8 @@ export class EphemeralStateService<
       ...this.authority,
       freshness: { status: 'live', stale: false },
     };
-    this.scheduleLease();
+    // Recovery changes the delivery boundary, not the server's lease deadline.
+    if (!recovery) this.scheduleLease();
     this.emit();
 
     if (!recovery && this.config.ephemeralWrite && Object.keys(this.channels.connection.desired).length > 0) {
@@ -598,7 +599,7 @@ export class EphemeralStateService<
 
   private scheduleLease(): void {
     if (this.leaseTimer) this.clearTimer(this.leaseTimer);
-    if (!this.isLive()) return;
+    if (!this.canRenewLease()) return;
     const generation = this.generation;
     this.leaseTimer = this.setTimer(() => {
       this.leaseTimer = null;
@@ -607,7 +608,7 @@ export class EphemeralStateService<
   }
 
   private async renewLease(generation: number): Promise<void> {
-    if (generation !== this.generation || !this.isLive()) return;
+    if (generation !== this.generation || !this.canRenewLease()) return;
     const result = await this.request('leaseRefresh', this.config.endpoints.lease, undefined, generation);
     if (generation !== this.generation || this.disposed) return;
     if (result.status === 'accepted') {
@@ -678,6 +679,11 @@ export class EphemeralStateService<
 
   private isLive(): boolean {
     return this.authority.freshness.status === 'live' && this.identity() !== null;
+  }
+
+  private canRenewLease(): boolean {
+    return (this.authority.freshness.status === 'live'
+      || this.authority.freshness.status === 'resyncing') && this.identity() !== null;
   }
 
   private versionsAreCurrent(channel: Channel, versions: Record<string, number>): boolean {
