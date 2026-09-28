@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod color;
 pub mod db;
+pub mod ephemeral;
 pub mod error;
 pub mod ext;
 pub mod filesystem;

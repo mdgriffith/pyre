@@ -139,6 +139,7 @@ fn to_string_definition(definition: &ast::Definition) -> String {
         ast::Definition::Comment { .. } => "".to_string(),
         ast::Definition::SyncMode(_) => "".to_string(),
         ast::Definition::Session(_) => "".to_string(),
+        ast::Definition::State { .. } => "".to_string(),
         ast::Definition::Tagged { name, variants, .. } => {
             let mut result = format!("type {} =", name);
 
@@ -286,6 +287,7 @@ fn to_decoder_definition(definition: &ast::Definition) -> String {
         ast::Definition::Comment { .. } => "".to_string(),
         ast::Definition::SyncMode(_) => "".to_string(),
         ast::Definition::Session(_) => "".to_string(),
+        ast::Definition::State { .. } => "".to_string(),
         ast::Definition::Tagged { name, variants, .. } => {
             // Use the shared generate_tagged_union function for consistency
             common::generate_tagged_union(name, variants, false)

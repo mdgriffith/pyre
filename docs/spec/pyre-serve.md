@@ -55,6 +55,11 @@ pyre serve <database>
   --page-size <N>
   --allow-unsafe-dev-session
   --allow-unsafe-unsigned-session
+  --participant-shared-writes
+  --ephemeral-max-participants <N>
+  --ephemeral-max-delivery-bytes <BYTES>
+  --ephemeral-max-pending-entries <N>
+  --ephemeral-max-pending-bytes <BYTES>
 ```
 
 Defaults:
@@ -65,9 +70,17 @@ Defaults:
 --generated pyre/generated
 --database-id default
 --page-size 1000
+--ephemeral-max-participants 256
+--ephemeral-max-delivery-bytes 262144
+--ephemeral-max-pending-entries 256
+--ephemeral-max-pending-bytes 8388608
 ```
 
 `--page-size` is capped by the server runtime's maximum page size.
+
+Ephemeral delivery bytes and pending entries are bounded per subscriber. Pending
+bytes are bounded in aggregate across the database runtime. Exceeding a pending
+bound transitions the affected subscriber to explicit resnapshot recovery.
 
 `--auth` is database authentication, such as a Turso/libSQL auth token. It is not end-user authentication.
 
@@ -266,7 +279,8 @@ Payload before encoding:
     "userId": 123,
     "role": "member"
   },
-  "exp": 1730000000
+  "exp": 1730000000,
+  "sessionKey": "opaque-stable-login-id"
 }
 ```
 
@@ -282,6 +296,12 @@ Rules:
 - `exp` is required for signed headers.
 - Expired headers are rejected.
 - The session object inside `session` is validated against the Pyre session schema.
+- `sessionKey` is an opaque, stable identifier chosen by the authenticated upstream.
+  It is required when the generated schema declares ephemeral state, and must remain
+  the same when a token is refreshed. Pyre hashes it for owner fencing and never
+  returns it to clients. A changed key represents a different ephemeral owner.
+- For backward compatibility, durable-only servers accept signed payloads without
+  `sessionKey` and derive request ownership from the complete credential instead.
 
 Key rotation is out of scope for v1. A later version may support multiple secrets or `kid` headers.
 

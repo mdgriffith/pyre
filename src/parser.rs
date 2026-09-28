@@ -217,9 +217,140 @@ fn parse_definition(input: Text) -> ParseResult<ast::Definition> {
         parse_lines,
         parse_tagged,
         parse_syncable_directive,
+        parse_state,
         parse_record,
         parse_session,
     ))(input)
+}
+
+fn parse_state(input: Text) -> ParseResult<ast::Definition> {
+    let (input, _) = multispace0(input)?;
+    let (input, start_pos) = position(input)?;
+    if start_pos.get_column() != 1 {
+        return Err(nom::Err::Error(VerboseError {
+            errors: vec![(
+                start_pos,
+                VerboseErrorKind::Context(
+                    "state definitions must start at the beginning of a line (column 1)",
+                ),
+            )],
+        }));
+    }
+    let (input, _) = tag("state")(input)?;
+    let (input, _) = cut(space1)(input)?;
+    let (input, start_name_pos) = position(input)?;
+    let (input, name) = cut(parse_typename)(input)?;
+    let (input, end_name_pos) = position(input)?;
+    let (input, _) = cut(multispace0)(input)?;
+    let (input, fields) = cut(with_braces(parse_state_field))(input)?;
+    let (input, end_pos) = position(input)?;
+    let (input, _) = hspace0(input)?;
+    let (input, _) = alt((line_ending, eof))(input)?;
+    let (input, _) = multispace0(input)?;
+
+    Ok((
+        input,
+        ast::Definition::State {
+            name: name.to_string(),
+            fields,
+            start: Some(to_location(&start_pos)),
+            end: Some(to_location(&end_pos)),
+            start_name: Some(to_location(&start_name_pos)),
+            end_name: Some(to_location(&end_name_pos)),
+        },
+    ))
+}
+
+fn parse_state_field(input: Text) -> ParseResult<ast::StateField> {
+    let (input, _) = multispace0(input)?;
+    alt((
+        |input| {
+            let (input, field) = parse_field_comment(input)?;
+            match field {
+                ast::Field::ColumnComment { text } => {
+                    Ok((input, ast::StateField::Comment { text }))
+                }
+                _ => unreachable!(),
+            }
+        },
+        |input| {
+            let (input, field) = parse_table_directive(input)?;
+            match field {
+                ast::Field::FieldDirective(directive) => {
+                    Ok((input, ast::StateField::Directive(directive)))
+                }
+                _ => unreachable!(),
+            }
+        },
+        parse_derived_state_field,
+        |input| {
+            let (input, field) = parse_column(input)?;
+            match field {
+                ast::Field::Column(column) => Ok((input, ast::StateField::Writable(column))),
+                ast::Field::FieldDirective(directive) => {
+                    Ok((input, ast::StateField::Directive(directive)))
+                }
+                _ => unreachable!(),
+            }
+        },
+        |input| {
+            let (input, field) = parse_column_lines(input)?;
+            match field {
+                ast::Field::ColumnLines { count } => Ok((input, ast::StateField::Lines { count })),
+                _ => unreachable!(),
+            }
+        },
+    ))(input)
+}
+
+fn parse_derived_state_field(input: Text) -> ParseResult<ast::StateField> {
+    let (input, start_pos) = position(input)?;
+    let (input, name) = parse_fieldname(input)?;
+    let (input, end_name_pos) = position(input)?;
+    let (input, _) = hspace0(input)?;
+    let (input, _) = opt(tag(":"))(input)?;
+    let (input, _) = space0(input)?;
+    let (input, start_type_pos) = position(input)?;
+    let (input, type_) = parse_type_expr_without_top_nullable(input)?;
+    let (input, end_type_pos) = position(input)?;
+    let (input, nullable) = parse_nullable(input)?;
+    let (input, _) = space0(input)?;
+    let (input, _) = tag("=")(input)?;
+    let (input, _) = space0(input)?;
+    let (input, source_start) = position(input)?;
+    let (input, root) = parse_typename(input)?;
+    let (input, path) = many1(preceded(tag("."), parse_fieldname))(input)?;
+    let (input, source_end) = position(input)?;
+    let (input, _) = space0(input)?;
+    let (input, inline_comment) = parse_optional_inline_comment(input)?;
+    let (input, end_pos) = position(input)?;
+    let (input, _) = line_ending(input)?;
+    let (input, _) = space0(input)?;
+
+    Ok((
+        input,
+        ast::StateField::Derived {
+            column: ast::Column {
+                name: name.to_string(),
+                type_,
+                nullable,
+                directives: vec![],
+                start: Some(to_location(&start_pos)),
+                end: Some(to_location(&end_pos)),
+                start_name: Some(to_location(&start_pos)),
+                end_name: Some(to_location(&end_name_pos)),
+                start_typename: Some(to_location(&start_type_pos)),
+                end_typename: Some(to_location(&end_type_pos)),
+                inline_comment,
+            },
+            source: ast::StateSource {
+                root: root.to_string(),
+                path: path.into_iter().map(str::to_string).collect(),
+                start: Some(to_location(&source_start)),
+                end: Some(to_location(&source_end)),
+            },
+        },
+    ))
 }
 
 fn parse_syncable_directive(input: Text) -> ParseResult<ast::Definition> {

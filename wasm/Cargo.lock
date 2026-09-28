@@ -377,6 +377,7 @@ name = "pyre-wasm"
 version = "0.2.0"
 dependencies = [
  "console_log",
+ "getrandom",
  "js-sys",
  "log",
  "pyre",

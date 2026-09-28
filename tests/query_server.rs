@@ -3682,6 +3682,7 @@ fn manifest_load_reads_generated_manifest_file() -> Result<(), Box<dyn std::erro
         version: 1,
         session_schema: Default::default(),
         queries: Default::default(),
+        ephemeral: None,
     };
     let dir = tempfile::TempDir::new()?;
     let path = dir.path().join("manifest.json");

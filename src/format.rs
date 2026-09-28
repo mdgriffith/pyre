@@ -279,6 +279,7 @@ fn format_definition(
             *count = std::cmp::max(1, std::cmp::min(*count, 2));
         }
         ast::Definition::Session(_) => (),
+        ast::Definition::State { .. } => (),
         ast::Definition::Comment { .. } => (),
         ast::Definition::SyncMode(_) => (),
         ast::Definition::Tagged { .. } => (),

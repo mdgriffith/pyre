@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::io::{self, IsTerminal};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 mod command;
@@ -166,6 +167,26 @@ enum Commands {
         /// Allow unsigned trusted session headers on non-loopback bind addresses.
         #[arg(long, default_value_t = false)]
         allow_unsafe_unsigned_session: bool,
+
+        /// Allow authenticated participants to patch Shared ephemeral state.
+        #[arg(long, default_value_t = false)]
+        participant_shared_writes: bool,
+
+        /// Maximum joined participants and standalone subscribers.
+        #[arg(long)]
+        ephemeral_max_participants: Option<NonZeroUsize>,
+
+        /// Maximum serialized bytes in one ephemeral delivery.
+        #[arg(long)]
+        ephemeral_max_delivery_bytes: Option<NonZeroUsize>,
+
+        /// Maximum changed entries retained for one subscriber.
+        #[arg(long)]
+        ephemeral_max_pending_entries: Option<NonZeroUsize>,
+
+        /// Maximum serialized pending bytes retained across all subscribers.
+        #[arg(long)]
+        ephemeral_max_pending_bytes: Option<NonZeroUsize>,
     },
 
     /// Start the Pyre MCP server over stdio.
@@ -265,6 +286,11 @@ async fn run() -> io::Result<()> {
             page_size,
             allow_unsafe_dev_session,
             allow_unsafe_unsigned_session,
+            participant_shared_writes,
+            ephemeral_max_participants,
+            ephemeral_max_delivery_bytes,
+            ephemeral_max_pending_entries,
+            ephemeral_max_pending_bytes,
         } => {
             command::serve(
                 &options,
@@ -282,6 +308,13 @@ async fn run() -> io::Result<()> {
                     page_size: *page_size,
                     allow_unsafe_dev_session: *allow_unsafe_dev_session,
                     allow_unsafe_unsigned_session: *allow_unsafe_unsigned_session,
+                    participant_shared_writes: *participant_shared_writes,
+                    ephemeral_max_participants: ephemeral_max_participants.map(NonZeroUsize::get),
+                    ephemeral_max_delivery_bytes: ephemeral_max_delivery_bytes
+                        .map(NonZeroUsize::get),
+                    ephemeral_max_pending_entries: ephemeral_max_pending_entries
+                        .map(NonZeroUsize::get),
+                    ephemeral_max_pending_bytes: ephemeral_max_pending_bytes.map(NonZeroUsize::get),
                 },
             )
             .await?;
@@ -297,4 +330,53 @@ async fn run() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_ephemeral_capacity_limits() {
+        let cli = Cli::try_parse_from([
+            "pyre",
+            "serve",
+            "app.db",
+            "--ephemeral-max-participants",
+            "12",
+            "--ephemeral-max-delivery-bytes",
+            "4096",
+            "--ephemeral-max-pending-entries",
+            "20",
+            "--ephemeral-max-pending-bytes",
+            "65536",
+        ])
+        .unwrap();
+        let Commands::Serve {
+            ephemeral_max_participants,
+            ephemeral_max_delivery_bytes,
+            ephemeral_max_pending_entries,
+            ephemeral_max_pending_bytes,
+            ..
+        } = cli.command
+        else {
+            panic!("serve command");
+        };
+        assert_eq!(ephemeral_max_participants.unwrap().get(), 12);
+        assert_eq!(ephemeral_max_delivery_bytes.unwrap().get(), 4096);
+        assert_eq!(ephemeral_max_pending_entries.unwrap().get(), 20);
+        assert_eq!(ephemeral_max_pending_bytes.unwrap().get(), 65536);
+    }
+
+    #[test]
+    fn serve_rejects_zero_ephemeral_capacity_limits() {
+        assert!(Cli::try_parse_from([
+            "pyre",
+            "serve",
+            "app.db",
+            "--ephemeral-max-pending-bytes",
+            "0",
+        ])
+        .is_err());
+    }
 }

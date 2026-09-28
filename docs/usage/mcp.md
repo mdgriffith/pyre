@@ -106,6 +106,7 @@ Examples:
 
 - `pyre_docs` with topic `getting-started`
 - `pyre_docs` with topic `sync` for the primary client/server integration workflow
+- `pyre_docs` with topic `ephemeral-state` for transient Connection/Shared state and lifecycle
 - `pyre_docs` with topic `elm-sync` for optional Elm UI and port bridge integration
 - `pyre_docs` with topic `multi-database-upgrade` to extend sync to multiple source databases
 - `pyre_docs` with topic `server-contexts` for the optional server-side session caching API and invalidation
@@ -120,6 +121,7 @@ Examples:
 - `pyre://project/schema`
 - `pyre://guides/query`
 - `pyre://guides/sync`
+- `pyre://guides/ephemeral-state`
 - `pyre://guides/elm-sync`
 - `pyre://guides/multi-database-upgrade`
 - `pyre://guides/server-contexts`

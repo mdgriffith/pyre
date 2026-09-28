@@ -98,6 +98,14 @@ pub enum Definition {
     },
     SyncMode(SyncMode),
     Session(SessionDetails),
+    State {
+        name: String,
+        fields: Vec<StateField>,
+        start: Option<Location>,
+        end: Option<Location>,
+        start_name: Option<Location>,
+        end_name: Option<Location>,
+    },
     Record {
         name: String,
         fields: Vec<Field>,
@@ -107,6 +115,23 @@ pub enum Definition {
         start_name: Option<Location>,
         end_name: Option<Location>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StateField {
+    Writable(Column),
+    Derived { column: Column, source: StateSource },
+    Lines { count: usize },
+    Comment { text: String },
+    Directive(FieldDirective),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateSource {
+    pub root: String,
+    pub path: Vec<String>,
+    pub start: Option<Location>,
+    pub end: Option<Location>,
 }
 pub fn get_permissions(record: &RecordDetails, operation: &QueryOperation) -> Option<WhereArg> {
     let mut all_matching_wheres = Vec::new();

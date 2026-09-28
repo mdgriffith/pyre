@@ -36,6 +36,7 @@ Useful CLI docs commands:
 pyre docs
 pyre docs getting-started
 pyre docs sync
+pyre docs ephemeral-state
 pyre docs elm-sync
 pyre docs schema
 pyre docs query
@@ -51,7 +52,7 @@ Recommended reading order:
 2. [Sync](docs/usage/sync.md): connect your app and server, select databases, and query local data.
 3. [Elm integration](docs/usage/elm-sync.md), if your UI uses Elm.
 
-Keep the [query](docs/usage/query.md) and [schema](docs/usage/schema.md) references handy as you build. For additional workflows, see [migrations](docs/usage/migrations.md), the [built-in server](docs/usage/pyre-serve.md), and [multi-database integration](docs/usage/multi-database-upgrade.md). [Server contexts](docs/usage/server-contexts.md) is an optional server-side session caching API, not a prerequisite for sync.
+Keep the [query](docs/usage/query.md) and [schema](docs/usage/schema.md) references handy as you build. For additional workflows, see [ephemeral state](docs/usage/ephemeral-state.md), [migrations](docs/usage/migrations.md), the [built-in server](docs/usage/pyre-serve.md), and [multi-database integration](docs/usage/multi-database-upgrade.md). [Server contexts](docs/usage/server-contexts.md) is an optional server-side session caching API, not a prerequisite for sync.
 
 ## Examples
 

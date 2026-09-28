@@ -10,6 +10,7 @@ module.exports = grammar({
 
     _declaration: $ => choice(
       $.record_declaration,
+      $.state_declaration,
       $.session_declaration,
       $.type_declaration,
       $.operation_declaration,
@@ -17,6 +18,7 @@ module.exports = grammar({
     ),
 
     record_declaration: $ => seq("record", field("name", $.type_identifier), $.block),
+    state_declaration: $ => seq("state", field("name", $.type_identifier), $.block),
     session_declaration: $ => seq("session", $.block),
     type_declaration: $ => seq(
       "type",
@@ -64,6 +66,7 @@ module.exports = grammar({
       optional(":"),
       field("type", $.type_expression),
       repeat($.directive),
+      optional(seq("=", field("derived_value", $.expression))),
     )),
     selection: $ => prec.right(seq(
       optional(seq(field("alias", $.identifier), ":")),

@@ -106,6 +106,10 @@ GET  /health
 POST /sync
 GET  /sync/events
 POST /db/:queryId
+PATCH /ephemeral/connection
+PATCH /ephemeral/shared
+POST /ephemeral/lease
+POST /ephemeral/resnapshot
 ```
 
 These are the default endpoints expected by `@pyre/client`.
@@ -113,6 +117,27 @@ These are the default endpoints expected by `@pyre/client`.
 `POST /db/$batch` accepts an ordered JSON array of `{ queryId, input }` descriptors for compiled operations. Generated TS `client.submit` and Elm `Db.Edit.submit` use this route; a client sends identifiers and values, not SQL. Execution is atomic under the authenticated request session. Generated writes require exactly one affected row and generated UUID creates require UUIDv7. See [Query Guide](./query.md#generated-crud-and-composed-operations).
 
 For synced requests (`sync=true`), the server allocates revisions in the write transaction and returns permission-filtered HTTP authority even without an SSE connection. The server creates its own logical response origin: a supplied `connectionId` cannot choose response permissions or suppress a peer's broadcast. Real live connections receive their own authorized rows/removals, and the worker handles duplicate HTTP/SSE delivery by revision. Unknown commit outcomes return HTTP 500 rather than a definite rejection; do not automatically retry.
+
+When the generated manifest declares ephemeral state, `/sync/events` also sends
+`ephemeralSnapshot`, `ephemeralChanges`, and `ephemeralResyncRequired` envelopes.
+Ephemeral requests carry the server-issued connection identity and ephemeral epoch;
+they do not use the durable database epoch. `Shared` is server-writable only by
+default. Pass `--participant-shared-writes` only when authenticated participants
+should be allowed to patch it.
+
+`GET /sync/events?ephemeralWrite=false` creates an explicitly read-only ephemeral
+participant; the default is writable intent. A writable intent is still subject to
+the server's Shared-write policy, owner fencing, and lease. Signed sessions use a
+payload shaped as `{ "session": {...}, "exp": ..., "sessionKey": "..." }`.
+`sessionKey` is required when ephemeral state is declared and must be stable across
+token refreshes; it is hashed and never exposed. Durable-only serving remains
+compatible with older signed payloads that omit it. Unsigned session JSON changes
+cannot preserve ephemeral ownership when the credential itself changes.
+
+Use the public client and generated state types rather than constructing these
+request envelopes directly. The [Ephemeral State guide](./ephemeral-state.md)
+covers application APIs, authoritative versus desired state, reconnect behavior,
+runtime lifetime, non-persistence, and the one-owner deployment requirement.
 
 ## Options
 
@@ -130,11 +155,24 @@ pyre serve <database>
   --page-size <N>                     default: 1000
   --allow-unsafe-dev-session
   --allow-unsafe-unsigned-session
+  --participant-shared-writes
+  --ephemeral-max-participants <N>       default: 256
+  --ephemeral-max-delivery-bytes <BYTES> default: 262144
+  --ephemeral-max-pending-entries <N>    default: 256
+  --ephemeral-max-pending-bytes <BYTES>  default: 8388608
 ```
+
+The delivery and entry limits apply to each subscriber. The pending-byte limit is
+the aggregate serialized size retained by the runtime across all subscribers.
+When a slow subscriber would exceed any pending limit, the server sends
+`ephemeralResyncRequired` instead of retaining another copy of the update. Choose
+application-specific values based on expected state size and concurrent
+participants; these limits do not replace authentication or upstream request
+rate limits.
 
 ## Limits
 
 - One database per server process.
-- SSE only for live sync.
+- SSE for durable live sync and declared ephemeral state.
 - No built-in login or user/session store.
 - Generated artifacts must already exist. Run `pyre generate` before `pyre serve`.

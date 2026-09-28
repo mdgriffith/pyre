@@ -288,6 +288,8 @@ pub struct Context {
 
     pub types: HashMap<String, (DefInfo, Type)>,
     pub tables: HashMap<String, Table>,
+    /// Typechecked ephemeral state declarations, kept separate from SQL tables.
+    pub states: HashMap<String, State>,
 
     // All variants by type name + variant name.
     // Used to check if there are multiple variants with the same name in a type.
@@ -303,6 +305,14 @@ pub struct Table {
     /// Tables in cycles get the same layer number.
     pub sync_layer: usize,
     /// Filepath of the schema file where this record is defined
+    pub filepath: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct State {
+    pub name: String,
+    pub schema: String,
+    pub fields: Vec<ast::StateField>,
     pub filepath: String,
 }
 
@@ -331,6 +341,7 @@ pub fn empty_context() -> Context {
         funcs: fns,
         types: HashMap::new(),
         tables: HashMap::new(),
+        states: HashMap::new(),
         variants: HashMap::new(),
     };
     context
@@ -446,33 +457,153 @@ fn allowed_defaults_for_column_type(column: &ast::Column) -> Vec<String> {
     allowed
 }
 
-fn is_supported_default_for_column(column: &ast::Column, value: &ast::DefaultValue) -> bool {
+fn is_supported_default_for_column(
+    context: &Context,
+    column: &ast::Column,
+    value: &ast::DefaultValue,
+    allow_structured: bool,
+) -> bool {
     match value {
         ast::DefaultValue::Now => matches!(column.type_, ast::ColumnType::DateTime),
-        ast::DefaultValue::Value(query_value) => match query_value {
-            ast::QueryValue::String(_) => matches!(
-                column.type_,
-                ast::ColumnType::String
-                    | ast::ColumnType::Date
-                    | ast::ColumnType::IdUuid { .. }
-                    | ast::ColumnType::ForeignKey { .. }
-            ),
-            ast::QueryValue::Int(_) => matches!(
-                column.type_,
-                ast::ColumnType::Int
-                    | ast::ColumnType::Float
-                    | ast::ColumnType::DateTime
-                    | ast::ColumnType::ForeignKey { .. }
-            ),
-            ast::QueryValue::Float(_) => {
-                matches!(column.type_, ast::ColumnType::Float)
+        ast::DefaultValue::Value(ast::QueryValue::Null(_)) => {
+            column.nullable && !column.type_.is_json_like()
+        }
+        ast::DefaultValue::Value(query_value) => {
+            default_value_matches_type(context, &column.type_, query_value, allow_structured)
+        }
+    }
+}
+
+fn default_value_matches_type(
+    context: &Context,
+    type_: &ast::ColumnType,
+    value: &ast::QueryValue,
+    allow_structured: bool,
+) -> bool {
+    match type_ {
+        ast::ColumnType::String => matches!(value, ast::QueryValue::String(_)),
+        ast::ColumnType::Date => match value {
+            ast::QueryValue::String((_, value)) if allow_structured => {
+                chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
             }
-            ast::QueryValue::Bool(_) => matches!(column.type_, ast::ColumnType::Bool),
-            ast::QueryValue::Null(_) => column.nullable && !column.type_.is_json_like(),
-            ast::QueryValue::Fn(_) => false,
-            ast::QueryValue::Variable(_) => false,
-            ast::QueryValue::LiteralTypeValue(_) => false,
+            ast::QueryValue::String(_) => true,
+            _ => false,
         },
+        ast::ColumnType::Int | ast::ColumnType::DateTime => {
+            matches!(value, ast::QueryValue::Int(_))
+        }
+        ast::ColumnType::IdInt { .. } if allow_structured => {
+            matches!(value, ast::QueryValue::Int(_))
+        }
+        ast::ColumnType::IdUuid { .. } if allow_structured => {
+            matches!(value, ast::QueryValue::String(_))
+        }
+        ast::ColumnType::Float => {
+            matches!(value, ast::QueryValue::Int(_) | ast::QueryValue::Float(_))
+        }
+        ast::ColumnType::Bool => matches!(value, ast::QueryValue::Bool(_)),
+        ast::ColumnType::ForeignKey {
+            schema,
+            table,
+            field,
+            serialization_type,
+        } => {
+            if !allow_structured {
+                return matches!(value, ast::QueryValue::String(_) | ast::QueryValue::Int(_));
+            }
+            if let Some(target) = context.tables.values().find_map(|candidate| {
+                (candidate.record.name == *table
+                    && schema
+                        .as_ref()
+                        .map(|schema| candidate.schema == *schema)
+                        .unwrap_or(true))
+                .then(|| {
+                    candidate
+                        .record
+                        .fields
+                        .iter()
+                        .find_map(|field_| match field_ {
+                            ast::Field::Column(column) if column.name == *field => Some(column),
+                            _ => None,
+                        })
+                })
+                .flatten()
+            }) {
+                return default_value_matches_type(context, &target.type_, value, allow_structured);
+            }
+            match serialization_type {
+                Some(
+                    ast::ConcreteSerializationType::Text | ast::ConcreteSerializationType::IdUuid,
+                ) => matches!(value, ast::QueryValue::String(_)),
+                Some(
+                    ast::ConcreteSerializationType::Integer | ast::ConcreteSerializationType::IdInt,
+                ) => matches!(value, ast::QueryValue::Int(_)),
+                Some(ast::ConcreteSerializationType::Real) => {
+                    matches!(value, ast::QueryValue::Int(_) | ast::QueryValue::Float(_))
+                }
+                Some(ast::ConcreteSerializationType::Date) => {
+                    matches!(value, ast::QueryValue::String(_))
+                }
+                Some(ast::ConcreteSerializationType::DateTime) => {
+                    matches!(value, ast::QueryValue::Int(_))
+                }
+                Some(
+                    ast::ConcreteSerializationType::Blob
+                    | ast::ConcreteSerializationType::JsonB
+                    | ast::ConcreteSerializationType::VectorBlob { .. },
+                )
+                | None => false,
+            }
+        }
+        ast::ColumnType::Nullable(inner) => {
+            matches!(value, ast::QueryValue::Null(_))
+                || default_value_matches_type(context, inner, value, allow_structured)
+        }
+        ast::ColumnType::Custom(type_name) if allow_structured => {
+            let ast::QueryValue::LiteralTypeValue((_, literal)) = value else {
+                return false;
+            };
+            let Some((_, Type::OneOf { variants })) = context.types.get(type_name) else {
+                return false;
+            };
+            let Some(variant) = variants.iter().find(|variant| variant.name == literal.name) else {
+                return false;
+            };
+
+            match (&variant.fields, &literal.fields) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => {
+                    let expected = ast::collect_columns(expected);
+                    expected.len() == actual.len()
+                        && expected.iter().all(|column| {
+                            actual.iter().any(|(name, value)| {
+                                name == &column.name
+                                    && if matches!(value, ast::QueryValue::Null(_)) {
+                                        column.nullable
+                                    } else {
+                                        default_value_matches_type(
+                                            context,
+                                            &column.type_,
+                                            value,
+                                            allow_structured,
+                                        )
+                                    }
+                            })
+                        })
+                }
+                _ => false,
+            }
+        }
+        ast::ColumnType::JsonTyped(inner) if allow_structured => {
+            default_value_matches_type(context, inner, value, allow_structured)
+        }
+        ast::ColumnType::Json
+        | ast::ColumnType::JsonTyped(_)
+        | ast::ColumnType::List(_)
+        | ast::ColumnType::Dict(_)
+        | ast::ColumnType::Custom(_)
+        | ast::ColumnType::IdInt { .. }
+        | ast::ColumnType::IdUuid { .. } => false,
     }
 }
 
@@ -637,6 +768,117 @@ fn validate_type_expr(
     }
 }
 
+fn validate_state_foreign_keys(
+    context: &Context,
+    current_schema: &str,
+    filepath: &str,
+    contexts: Vec<Range>,
+    primary: Vec<Range>,
+    type_: &ast::ColumnType,
+    errors: &mut Vec<Error>,
+) {
+    validate_state_foreign_keys_inner(
+        context,
+        current_schema,
+        filepath,
+        contexts,
+        primary,
+        type_,
+        &mut HashSet::new(),
+        errors,
+    );
+}
+
+fn validate_state_foreign_keys_inner(
+    context: &Context,
+    current_schema: &str,
+    filepath: &str,
+    contexts: Vec<Range>,
+    primary: Vec<Range>,
+    type_: &ast::ColumnType,
+    visiting: &mut HashSet<String>,
+    errors: &mut Vec<Error>,
+) {
+    match type_ {
+        ast::ColumnType::ForeignKey {
+            schema,
+            table,
+            field,
+            ..
+        } => {
+            let target_schema = schema.as_deref().unwrap_or(current_schema);
+            let target = context
+                .tables
+                .values()
+                .find(|candidate| {
+                    candidate.schema == target_schema && candidate.record.name == *table
+                })
+                .and_then(|table| {
+                    table
+                        .record
+                        .fields
+                        .iter()
+                        .find_map(|candidate| match candidate {
+                            ast::Field::Column(column) if column.name == *field => Some(column),
+                            _ => None,
+                        })
+                });
+            if !target.is_some_and(|column| column.type_.is_id_type()) {
+                errors.push(invalid_type_usage_error(
+                    filepath,
+                    format!(
+                        "State foreign key '{}.{}' must reference an existing ID field.",
+                        table, field
+                    ),
+                    contexts,
+                    primary,
+                ));
+            }
+        }
+        ast::ColumnType::JsonTyped(inner)
+        | ast::ColumnType::List(inner)
+        | ast::ColumnType::Dict(inner)
+        | ast::ColumnType::Nullable(inner) => validate_state_foreign_keys_inner(
+            context,
+            current_schema,
+            filepath,
+            contexts,
+            primary,
+            inner,
+            visiting,
+            errors,
+        ),
+        ast::ColumnType::Custom(name) => {
+            if !visiting.insert(name.clone()) {
+                return;
+            }
+            if let Some((_, Type::OneOf { variants })) = context.types.get(name) {
+                for variant in variants {
+                    for column in variant
+                        .fields
+                        .as_ref()
+                        .map(ast::collect_columns)
+                        .unwrap_or_default()
+                    {
+                        validate_state_foreign_keys_inner(
+                            context,
+                            current_schema,
+                            filepath,
+                            contexts.clone(),
+                            primary.clone(),
+                            &column.type_,
+                            visiting,
+                            errors,
+                        );
+                    }
+                }
+            }
+            visiting.remove(name);
+        }
+        _ => {}
+    }
+}
+
 fn validate_variant_field_type_collisions(
     filepath: &str,
     variants: &Vec<ast::Variant>,
@@ -714,6 +956,96 @@ fn validate_variant_field_type_collisions(
             }
         }
     }
+}
+
+fn state_type_reaches_record(
+    context: &Context,
+    type_: &ast::ColumnType,
+    visiting: &mut HashSet<String>,
+) -> Option<String> {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner)
+        | ast::ColumnType::List(inner)
+        | ast::ColumnType::Dict(inner)
+        | ast::ColumnType::Nullable(inner) => state_type_reaches_record(context, inner, visiting),
+        ast::ColumnType::Custom(name) => {
+            let Some((_, definition)) = context.types.get(name) else {
+                return None;
+            };
+            match definition {
+                Type::Record(_) => Some(name.clone()),
+                Type::OneOf { variants } if visiting.insert(name.clone()) => {
+                    let record = variants.iter().find_map(|variant| {
+                        variant.fields.as_ref().and_then(|fields| {
+                            ast::collect_columns(fields).into_iter().find_map(|column| {
+                                state_type_reaches_record(context, &column.type_, visiting)
+                            })
+                        })
+                    });
+                    visiting.remove(name);
+                    record
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn directly_sized_union_references(context: &Context, type_: &ast::ColumnType) -> Vec<String> {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner) | ast::ColumnType::Nullable(inner) => {
+            directly_sized_union_references(context, inner)
+        }
+        ast::ColumnType::Custom(name)
+            if matches!(context.types.get(name), Some((_, Type::OneOf { .. }))) =>
+        {
+            vec![name.clone()]
+        }
+        ast::ColumnType::List(_) | ast::ColumnType::Dict(_) => Vec::new(),
+        _ => Vec::new(),
+    }
+}
+
+fn directly_sized_union_cycle(context: &Context, root: &str) -> Option<Vec<String>> {
+    fn visit(
+        context: &Context,
+        root: &str,
+        current: &str,
+        visiting: &mut HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        let Some((_, Type::OneOf { variants })) = context.types.get(current) else {
+            return None;
+        };
+
+        for column in variants
+            .iter()
+            .filter_map(|variant| variant.fields.as_ref())
+            .flat_map(|fields| ast::collect_columns(fields))
+        {
+            for next in directly_sized_union_references(context, &column.type_) {
+                if next == root {
+                    let mut cycle = path.clone();
+                    cycle.push(next);
+                    return Some(cycle);
+                }
+                if visiting.insert(next.clone()) {
+                    path.push(next.clone());
+                    if let Some(cycle) = visit(context, root, &next, visiting, path) {
+                        return Some(cycle);
+                    }
+                    path.pop();
+                    visiting.remove(&next);
+                }
+            }
+        }
+        None
+    }
+
+    let mut visiting = HashSet::from([root.to_string()]);
+    let mut path = vec![root.to_string()];
+    visit(context, root, root, &mut visiting, &mut path)
 }
 
 pub fn check_schema(db: &ast::Database) -> Result<Context, Vec<Error>> {
@@ -1125,6 +1457,14 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
         for file in &schema.files {
             for definition in &file.definitions {
                 match definition {
+                    ast::Definition::State { name, fields, .. } => {
+                        context.states.entry(name.clone()).or_insert_with(|| State {
+                            name: name.clone(),
+                            schema: schema.namespace.clone(),
+                            fields: fields.clone(),
+                            filepath: file.path.clone(),
+                        });
+                    }
                     ast::Definition::Record {
                         name,
                         fields,
@@ -1906,6 +2246,18 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
         }
     }
 
+    for state in context.states.values_mut() {
+        for field in &mut state.fields {
+            let column = match field {
+                ast::StateField::Writable(column) | ast::StateField::Derived { column, .. } => {
+                    column
+                }
+                _ => continue,
+            };
+            resolve_type(&mut column.type_, Some(&state.schema), &foreign_key_types);
+        }
+    }
+
     for (_, type_) in context.types.values_mut() {
         let Type::OneOf { variants } = type_ else {
             continue;
@@ -1925,6 +2277,24 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
 
 // Check for duplicate variants
 fn check_schema_definitions(context: &Context, database: &ast::Database, errors: &mut Vec<Error>) {
+    const STATE_GENERATED_TYPESCRIPT_NAMES: &[&str] = &[
+        "Connection",
+        "ConnectionPatch",
+        "Shared",
+        "SharedPatch",
+        "StateTypes",
+        "StateName",
+        "PatchField",
+        "StateMetadata",
+    ];
+    const STATE_GENERATED_RUST_NAMES: &[&str] = &[
+        "Connection",
+        "ConnectionPatch",
+        "Shared",
+        "SharedPatch",
+        "PatchField",
+        "StateMetadata",
+    ];
     let vars = context.variants.clone();
     for (_variant_name, (maybe_type_range, mut instances)) in vars {
         if instances.len() > 1 {
@@ -1964,13 +2334,71 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
         }
     }
 
+    let has_state = database.schemas.iter().any(|schema| {
+        schema.files.iter().any(|file| {
+            file.definitions
+                .iter()
+                .any(|definition| matches!(definition, ast::Definition::State { .. }))
+        })
+    });
     let mut session_found = false;
+    let mut state_definitions = HashSet::new();
+    let mut generated_rust_type_names: HashMap<String, String> = HashMap::new();
+    let mut reported_recursive_types = HashSet::new();
 
     // Check definitions
     for schema in database.schemas.iter() {
         for file in schema.files.iter() {
             for definition in &file.definitions {
                 match definition {
+                    ast::Definition::Tagged {
+                        name, start, end, ..
+                    } if has_state => {
+                        let rust_name = generated_rust_type_name(name);
+                        let fixed_collision = STATE_GENERATED_TYPESCRIPT_NAMES
+                            .contains(&name.as_str())
+                            || STATE_GENERATED_RUST_NAMES.contains(&rust_name.as_str());
+                        let custom_collision = generated_rust_type_names
+                            .get(&rust_name)
+                            .filter(|existing| *existing != name);
+                        if fixed_collision {
+                            errors.push(invalid_type_usage_error(
+                                &file.path,
+                                format!(
+                                    "Type '{name}' emits the generated identifier '{rust_name}', which conflicts with an ephemeral state declaration."
+                                ),
+                                to_range(start, end),
+                                to_range(start, end),
+                            ));
+                        } else if let Some(existing) = custom_collision {
+                            errors.push(invalid_type_usage_error(
+                                &file.path,
+                                format!(
+                                    "Types '{existing}' and '{name}' both emit the generated Rust identifier '{rust_name}'."
+                                ),
+                                to_range(start, end),
+                                to_range(start, end),
+                            ));
+                        } else {
+                            generated_rust_type_names.insert(rust_name, name.clone());
+                        }
+
+                        if !reported_recursive_types.contains(name) {
+                            if let Some(cycle) = directly_sized_union_cycle(context, name) {
+                                reported_recursive_types.extend(cycle.iter().cloned());
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "Tagged union '{}' has a directly sized recursive cycle ({}). Recursive references must pass through List or Dict.",
+                                        name,
+                                        cycle.join(" -> ")
+                                    ),
+                                    to_range(start, end),
+                                    to_range(start, end),
+                                ));
+                            }
+                        }
+                    }
                     ast::Definition::Session(session) => {
                         if session_found {
                             errors.push(Error {
@@ -2013,6 +2441,273 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                                         primary: to_range(&column.start, &column.end),
                                     }],
                                 });
+                            }
+                        }
+                    }
+                    ast::Definition::State {
+                        name,
+                        fields,
+                        start,
+                        end,
+                        start_name,
+                        end_name,
+                    } => {
+                        let state_context = to_range(start, end);
+                        if name != "Connection" && name != "Shared" {
+                            errors.push(invalid_type_usage_error(
+                                &file.path,
+                                format!(
+                                    "Unknown state '{}'. Only Connection and Shared are supported.",
+                                    name
+                                ),
+                                state_context.clone(),
+                                to_range(start_name, end_name),
+                            ));
+                        } else if !state_definitions.insert(name.clone()) {
+                            errors.push(invalid_type_usage_error(
+                                &file.path,
+                                format!("There may be at most one state {} declaration.", name),
+                                state_context.clone(),
+                                to_range(start_name, end_name),
+                            ));
+                        }
+
+                        let mut field_names: HashMap<String, Option<Range>> = HashMap::new();
+                        let mut rust_field_names: HashMap<String, (String, Option<Range>)> =
+                            HashMap::new();
+                        for field in fields {
+                            let (column, derived) = match field {
+                                ast::StateField::Writable(column) => (column, None),
+                                ast::StateField::Derived { column, source } => {
+                                    (column, Some(source))
+                                }
+                                ast::StateField::Directive(directive) => {
+                                    let message = if matches!(
+                                        directive,
+                                        ast::FieldDirective::Link(_)
+                                    ) {
+                                        "Links are not allowed in state declarations."
+                                    } else {
+                                        "Record persistence directives are not allowed in state declarations."
+                                    };
+                                    errors.push(invalid_type_usage_error(
+                                        &file.path,
+                                        message.to_string(),
+                                        state_context.clone(),
+                                        state_context.clone(),
+                                    ));
+                                    continue;
+                                }
+                                ast::StateField::Lines { .. } | ast::StateField::Comment { .. } => {
+                                    continue
+                                }
+                            };
+
+                            validate_type_expr(
+                                context,
+                                &file.path,
+                                state_context.clone(),
+                                to_range(&column.start_typename, &column.end_typename),
+                                &column.type_,
+                                true,
+                                &mut HashSet::new(),
+                                errors,
+                            );
+                            validate_state_foreign_keys(
+                                context,
+                                &schema.namespace,
+                                &file.path,
+                                state_context.clone(),
+                                to_range(&column.start_typename, &column.end_typename),
+                                &column.type_,
+                                errors,
+                            );
+
+                            if let Some(record) = state_type_reaches_record(
+                                context,
+                                &column.type_,
+                                &mut HashSet::new(),
+                            ) {
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "State field '{}' cannot use record type '{}', directly or through tagged unions or containers.",
+                                        column.name, record
+                                    ),
+                                    state_context.clone(),
+                                    to_range(&column.start_typename, &column.end_typename),
+                                ));
+                            }
+
+                            if let Some(previous) = field_names.insert(
+                                column.name.clone(),
+                                to_single_range(&column.start_name, &column.end_name),
+                            ) {
+                                let mut primary = previous.into_iter().collect::<Vec<_>>();
+                                primary.extend(to_range(&column.start_name, &column.end_name));
+                                errors.push(Error {
+                                    filepath: file.path.clone(),
+                                    error_type: ErrorType::DuplicateField {
+                                        record: format!("state {}", name),
+                                        field: column.name.clone(),
+                                    },
+                                    locations: vec![Location {
+                                        contexts: state_context.clone(),
+                                        primary,
+                                    }],
+                                });
+                            }
+
+                            let rust_name =
+                                crate::generate::server::rust::to_field_name(&column.name);
+                            if matches!(
+                                rust_name.as_str(),
+                                "r#self" | "r#Self" | "r#crate" | "r#super"
+                            ) {
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "State field '{}' emits the Rust special identifier '{}', which cannot be used as a field name.",
+                                        column.name,
+                                        rust_name.trim_start_matches("r#")
+                                    ),
+                                    state_context.clone(),
+                                    to_range(&column.start_name, &column.end_name),
+                                ));
+                            } else if let Some((previous_name, previous_range)) = rust_field_names
+                                .insert(
+                                    rust_name.clone(),
+                                    (
+                                        column.name.clone(),
+                                        to_single_range(&column.start_name, &column.end_name),
+                                    ),
+                                )
+                            {
+                                let mut primary = previous_range.into_iter().collect::<Vec<_>>();
+                                primary.extend(to_range(&column.start_name, &column.end_name));
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "State fields '{}' and '{}' both emit the generated Rust field identifier '{}'.",
+                                        previous_name, column.name, rust_name
+                                    ),
+                                    state_context.clone(),
+                                    primary,
+                                ));
+                            }
+
+                            if let Some(source) = derived {
+                                if name != "Connection" {
+                                    errors.push(invalid_type_usage_error(
+                                        &file.path,
+                                        "Derived state fields are only allowed in state Connection."
+                                            .to_string(),
+                                        state_context.clone(),
+                                        to_range(&column.start, &column.end),
+                                    ));
+                                }
+                                if source.root != "Session" || source.path.len() != 1 {
+                                    errors.push(invalid_type_usage_error(
+                                        &file.path,
+                                        "State derivations must directly reference one Session field."
+                                            .to_string(),
+                                        state_context.clone(),
+                                        to_range(&source.start, &source.end),
+                                    ));
+                                } else {
+                                    let session_column =
+                                        context.session.as_ref().and_then(|session| {
+                                            session.fields.iter().find_map(|field| match field {
+                                                ast::Field::Column(candidate)
+                                                    if candidate.name == source.path[0] =>
+                                                {
+                                                    Some(candidate)
+                                                }
+                                                _ => None,
+                                            })
+                                        });
+                                    match session_column {
+                                        None => errors.push(invalid_type_usage_error(
+                                            &file.path,
+                                            format!(
+                                                "Session has no field named '{}'.",
+                                                source.path[0]
+                                            ),
+                                            state_context.clone(),
+                                            to_range(&source.start, &source.end),
+                                        )),
+                                        Some(session_column)
+                                            if column.type_.to_string()
+                                                != session_column.type_.to_string()
+                                                || column.nullable != session_column.nullable =>
+                                        {
+                                            errors.push(invalid_type_usage_error(
+                                                &file.path,
+                                                format!(
+                                                    "Derived field '{}' must have the same type and nullability as Session.{}.",
+                                                    column.name, source.path[0]
+                                                ),
+                                                state_context.clone(),
+                                                to_range(
+                                                    &column.start_typename,
+                                                    &column.end_typename,
+                                                ),
+                                            ));
+                                        }
+                                        Some(_) => {}
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if !column.nullable && !ast::has_default_value(column) {
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "Writable state field '{}' must be nullable or have an explicit default.",
+                                        column.name
+                                    ),
+                                    state_context.clone(),
+                                    to_range(&column.start, &column.end),
+                                ));
+                            }
+
+                            for directive in &column.directives {
+                                match directive {
+                                    ast::ColumnDirective::Default {
+                                        value,
+                                        start: default_start,
+                                        end: default_end,
+                                        ..
+                                    } => {
+                                        if !is_supported_default_for_column(
+                                            context, column, value, true,
+                                        ) {
+                                            errors.push(Error {
+                                                filepath: file.path.clone(),
+                                                error_type: ErrorType::InvalidColumnDefault {
+                                                    field_name: column.name.clone(),
+                                                    field_type: column.type_.to_string(),
+                                                    default_value: default_value_display(value),
+                                                    expected: allowed_defaults_for_column_type(
+                                                        column,
+                                                    ),
+                                                },
+                                                locations: vec![Location {
+                                                    contexts: state_context.clone(),
+                                                    primary: to_range(default_start, default_end),
+                                                }],
+                                            });
+                                        }
+                                    }
+                                    _ => errors.push(invalid_type_usage_error(
+                                        &file.path,
+                                        "Record persistence directives are not allowed on state fields."
+                                            .to_string(),
+                                        state_context.clone(),
+                                        to_range(&column.start, &column.end),
+                                    )),
+                                }
                             }
                         }
                     }
@@ -2111,7 +2806,9 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                                             to_range(&column.start, &column.end)
                                         };
 
-                                    if !is_supported_default_for_column(&column, value) {
+                                    if !is_supported_default_for_column(
+                                        context, &column, value, false,
+                                    ) {
                                         errors.push(Error {
                                             filepath: file.path.clone(),
                                             error_type: ErrorType::InvalidColumnDefault {
@@ -2236,6 +2933,24 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
             }
         }
     }
+}
+
+fn generated_rust_type_name(name: &str) -> String {
+    let mut result = String::new();
+    let mut capitalize_next = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if capitalize_next {
+                result.push(ch.to_ascii_uppercase());
+                capitalize_next = false;
+            } else {
+                result.push(ch);
+            }
+        } else {
+            capitalize_next = true;
+        }
+    }
+    result
 }
 
 pub fn check_queries<'a>(
