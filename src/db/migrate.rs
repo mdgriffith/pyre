@@ -24,8 +24,60 @@ pub const CREATE_MIGRATION_TABLE: &str = "create table if not exists _pyre_migra
     finished_at integer,
     error text,
     sql text not null,
-    schema text
+    schema text,
+    schema_namespace text
 )";
+
+pub const CREATE_EXTERNAL_IDENTITIES_TABLE: &str =
+    "create table if not exists _pyre_external_identities (
+    namespace text not null,
+    record_name text not null,
+    field_name text not null,
+    identity_kind text not null check (identity_kind in ('Id.Int', 'Id.Uuid')),
+    primary key (namespace, record_name, field_name)
+)";
+
+/// Upsert required identities and prune obsolete entries in the schema transaction.
+pub fn external_identity_sql(identities: &[ast::ExternalIdentity]) -> Vec<SqlAndParams> {
+    let mut sql = vec![SqlAndParams::Sql(CREATE_EXTERNAL_IDENTITIES_TABLE.into())];
+    for identity in identities {
+        sql.push(SqlAndParams::SqlWithParams {
+            sql: "insert into _pyre_external_identities (namespace, record_name, field_name, identity_kind) values (?, ?, ?, ?) on conflict (namespace, record_name, field_name) do update set identity_kind = excluded.identity_kind where identity_kind != excluded.identity_kind".into(),
+            args: vec![identity.namespace.clone(), identity.record.clone(), identity.field.clone(),
+                match identity.kind { ast::IdentityKind::Int => "Id.Int", ast::IdentityKind::Uuid => "Id.Uuid" }.into()],
+        });
+    }
+    // One transient JSON parameter avoids SQLite's bind-variable limit. The
+    // persisted representation remains one relational row per identity.
+    sql.push(SqlAndParams::SqlWithParams {
+        sql: "delete from _pyre_external_identities where (namespace, record_name, field_name) not in (select json_extract(value, '$.namespace'), json_extract(value, '$.record'), json_extract(value, '$.field') from json_each(?))".into(),
+        args: vec![serde_json::to_string(identities).expect("identity definitions serialize")],
+    });
+    sql
+}
+
+/// Upgrade internal storage without changing user tables. Call inside a transaction.
+#[cfg(feature = "database")]
+pub async fn ensure_metadata_storage(conn: &libsql::Connection) -> Result<(), libsql::Error> {
+    conn.execute(CREATE_MIGRATION_TABLE, ()).await?;
+    let mut columns = conn.query("select name from pragma_table_info('_pyre_migrations') where name = 'schema_namespace'", ()).await?;
+    if columns.next().await?.is_none() {
+        conn.execute(
+            "alter table _pyre_migrations add column schema_namespace text",
+            (),
+        )
+        .await?;
+    }
+    conn.execute(CREATE_EXTERNAL_IDENTITIES_TABLE, ()).await?;
+    Ok(())
+}
+
+pub fn record_namespace_sql(namespace: &str) -> SqlAndParams {
+    SqlAndParams::SqlWithParams {
+        sql: "update _pyre_migrations set schema_namespace = ? where id = (select id from _pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1)".into(),
+        args: vec![namespace.into()],
+    }
+}
 
 pub const CREATE_SYNC_TABLE: &str = "create table if not exists _pyre_sync (
     id integer not null primary key check (id = 1),
@@ -48,6 +100,7 @@ pub const INSERT_MIGRATION_SUCCESS_WITH_SCHEMA: &str =
 pub fn internal_setup_sql() -> Vec<SqlAndParams> {
     vec![
         SqlAndParams::Sql(CREATE_MIGRATION_TABLE.to_string()),
+        SqlAndParams::Sql(CREATE_EXTERNAL_IDENTITIES_TABLE.to_string()),
         SqlAndParams::Sql(CREATE_SYNC_TABLE.to_string()),
         SqlAndParams::Sql(INSERT_SYNC_STATE_ROW.to_string()),
     ]
@@ -78,6 +131,7 @@ pub struct MigrationSql {
     pub sql: Vec<SqlAndParams>,
     pub mark_success: SqlAndParams,
     pub mark_failure: SqlAndParams,
+    pub external_identities: Vec<ast::ExternalIdentity>,
 }
 
 /// Dynamic migration approach - generates SQL from schema source without file operations.
@@ -107,6 +161,27 @@ pub(crate) fn migrate_dynamic_for_schema(
     schema_filepath: &str,
     schema_name: &str,
 ) -> Result<MigrationSql, Vec<error::Error>> {
+    migrate_dynamic_with_external_identities(
+        name,
+        introspection,
+        new_schema_source,
+        schema_filepath,
+        schema_name,
+        &[],
+    )
+}
+
+/// Plan a physical migration using separately supplied identity definitions.
+/// The caller must persist those definitions and the namespace atomically with
+/// the schema-bearing success record (see `external_identity_sql`).
+pub fn migrate_dynamic_with_external_identities(
+    name: String,
+    introspection: &introspect::Introspection,
+    new_schema_source: &str,
+    schema_filepath: &str,
+    schema_name: &str,
+    identities: &[ast::ExternalIdentity],
+) -> Result<MigrationSql, Vec<error::Error>> {
     // Parse the schema source into a Schema
     let mut new_schema = ast::Schema {
         namespace: schema_name.to_string(),
@@ -125,15 +200,17 @@ pub(crate) fn migrate_dynamic_for_schema(
             }]),
         };
     }
-    let new_schema_clone = new_schema.clone();
-
     // Create a Database from the parsed Schema
-    let new_database = ast::Database {
+    let mut new_database = ast::Database {
         schemas: vec![new_schema],
     };
+    ast::resolve_id_brands(&mut new_database);
+    let new_schema_clone = new_database.schemas[0].clone();
 
     // Typecheck the new schema
-    let new_context = typecheck::check_schema(&new_database)?;
+    let new_context = typecheck::check_schema_with_external_identities(&new_database, identities)?;
+    let (_, required_identities) =
+        crate::generate::to_string::standalone_schema(&new_context, &new_schema_clone);
 
     // Get the recorded schema from introspection
     let (db_recorded_schema, _db_recorded_context) = match &introspection.schema {
@@ -147,7 +224,7 @@ pub(crate) fn migrate_dynamic_for_schema(
     };
 
     // Diff the schemas and check for errors
-    let schema_diff = diff::diff_schema(&db_recorded_schema, &new_schema_clone);
+    let schema_diff = diff_stored_schema(&new_context, db_recorded_schema, &new_schema_clone);
 
     let errors = diff::to_errors(schema_diff);
     if !errors.is_empty() {
@@ -159,9 +236,9 @@ pub(crate) fn migrate_dynamic_for_schema(
 
     let primary_key_errors: Vec<_> = db_diff.modified_records.iter().flat_map(|record| {
         record.changes.iter().filter_map(move |change| match change {
-            db_diff::RecordChange::ModifiedField { name, changes } if changes.primary_key_changed.is_some() => Some(error::Error {
+            db_diff::RecordChange::ModifiedField { name, changes } if changes.primary_key_changed.is_some() || changes.type_changed.is_some() => Some(error::Error {
                 error_type: error::ErrorType::InvalidTypeUsage {
-                    message: format!("The physical primary key of {}.{} differs from the schema. Changing SQLite primary keys requires an explicit table-rebuild migration; preserve the UUID identity and existing sequence values.", record.name, name),
+                    message: format!("The physical primary key or column type of {}.{} differs from the schema. This requires an explicit table-rebuild migration; preserve identity and existing sequence values.", record.name, name),
                 },
                 filepath: schema_filepath.to_string(),
                 locations: vec![],
@@ -175,6 +252,7 @@ pub(crate) fn migrate_dynamic_for_schema(
 
     if db_diff::is_empty(&db_diff) {
         return Ok(MigrationSql {
+            external_identities: required_identities,
             sql: vec![],
             mark_success: SqlAndParams::SqlWithParams {
                 sql: INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
@@ -199,6 +277,7 @@ pub(crate) fn migrate_dynamic_for_schema(
     sql.splice(0..0, internal_setup_sql());
 
     Ok(MigrationSql {
+        external_identities: required_identities,
         sql,
         mark_success: SqlAndParams::SqlWithParams {
             sql: INSERT_MIGRATION_SUCCESS_WITH_SCHEMA.to_string(),
@@ -235,61 +314,77 @@ pub struct FileBasedMigrationPlan {
     pub schema_string: String,
 }
 
-/// Serialize the selected physical schema so it can be reloaded without sibling namespaces.
+/// Serialize schema text for one namespace. External identity definitions must
+/// be stored separately; `standalone_schema` returns both artifacts.
 pub fn schema_to_storage_string(context: &typecheck::Context, schema: &ast::Schema) -> String {
-    let mut stored_schema = schema.clone();
+    crate::generate::to_string::standalone_schema_to_string(context, schema)
+}
 
-    for file in &mut stored_schema.files {
-        for definition in &mut file.definitions {
-            let ast::Definition::Record { fields, .. } = definition else {
+/// Older snapshots stored external foreign keys as their SQLite scalar type.
+/// Restore that lost annotation for the logical diff only; callers must still
+/// validate the physical database diff before applying an automatic migration.
+pub fn diff_stored_schema(
+    context: &typecheck::Context,
+    stored: &ast::Schema,
+    current: &ast::Schema,
+) -> diff::SchemaDiff {
+    let mut stored = stored.clone();
+    for definition in stored
+        .files
+        .iter_mut()
+        .flat_map(|file| &mut file.definitions)
+    {
+        let ast::Definition::Record { name, fields, .. } = definition else {
+            continue;
+        };
+        let Some(record) = context
+            .tables
+            .values()
+            .find(|table| table.schema == current.namespace && table.record.name == *name)
+        else {
+            continue;
+        };
+        for field in fields {
+            let ast::Field::Column(old) = field else {
                 continue;
             };
-
-            for field in fields {
-                let ast::Field::Column(column) = field else {
-                    continue;
-                };
-                let ast::ColumnType::ForeignKey {
-                    schema: Some(target_schema),
-                    serialization_type,
-                    ..
-                } = &column.type_
-                else {
-                    continue;
-                };
-
-                if *target_schema == stored_schema.namespace {
-                    if let ast::ColumnType::ForeignKey { schema, .. } = &mut column.type_ {
-                        *schema = None;
-                    }
-                    continue;
-                }
-
-                // The attached database is not available when this physical schema is reloaded.
-                // Persist the already-resolved SQLite storage type instead of an external lookup.
-                let stored_type = match serialization_type {
-                    Some(ast::ConcreteSerializationType::IdUuid)
-                    | Some(ast::ConcreteSerializationType::Text) => Some(ast::ColumnType::String),
-                    Some(ast::ConcreteSerializationType::Real) => Some(ast::ColumnType::Float),
-                    Some(ast::ConcreteSerializationType::DateTime) => {
-                        Some(ast::ColumnType::DateTime)
-                    }
-                    Some(ast::ConcreteSerializationType::Date) => Some(ast::ColumnType::Date),
-                    Some(ast::ConcreteSerializationType::JsonB) => Some(ast::ColumnType::Json),
-                    Some(ast::ConcreteSerializationType::Integer)
-                    | Some(ast::ConcreteSerializationType::IdInt) => Some(ast::ColumnType::Int),
-                    Some(ast::ConcreteSerializationType::Blob)
-                    | Some(ast::ConcreteSerializationType::VectorBlob { .. })
-                    | None => None,
-                };
-                if let Some(stored_type) = stored_type {
-                    column.type_ = stored_type;
-                }
+            let Some(new) = ast::collect_columns(&record.record.fields)
+                .into_iter()
+                .find(|column| column.name == old.name)
+            else {
+                continue;
+            };
+            let ast::ColumnType::ForeignKey {
+                schema,
+                table,
+                field,
+                ..
+            } = &new.type_
+            else {
+                continue;
+            };
+            let external =
+                context.tables.values().any(|target| {
+                    target.record.name == *table
+                        && target.schema != current.namespace
+                        && schema
+                            .as_ref()
+                            .map_or(true, |schema| target.schema == *schema)
+                }) || typecheck::external_identity(context, schema.as_deref(), table, field)
+                    .is_some();
+            let resolved = typecheck::resolve_query_param_column_type(context, &new.type_);
+            if external
+                && matches!(
+                    (&old.type_, resolved),
+                    (ast::ColumnType::String, ast::ColumnType::IdUuid { .. })
+                        | (ast::ColumnType::Int, ast::ColumnType::IdInt { .. })
+                )
+            {
+                old.type_ = new.type_.clone();
             }
         }
     }
-
-    crate::generate::to_string::standalone_schema_to_string(context, &stored_schema)
+    diff::diff_schema(&stored, current)
 }
 
 /// Plan file-based migrations by determining which migration files need to be executed.
@@ -402,6 +497,8 @@ record Member {
         let context = typecheck::check_schema(&database).expect("source schema should typecheck");
         let source = schema_to_storage_string(&context, &database.schemas[0]);
         let introspection = introspect::from_raw(introspect::IntrospectionRaw {
+            schema_namespace: Some(database.schemas[0].namespace.clone()),
+            external_identities: vec![],
             tables: vec![],
             migration_state: introspect::MigrationState::MigrationTable { migrations: vec![] },
             schema_source: source.clone(),
@@ -417,7 +514,7 @@ record Member {
     }
 
     #[test]
-    fn stored_schema_uses_resolved_type_for_external_foreign_key() {
+    fn stored_schema_preserves_external_identity_reference_and_metadata() {
         let mut app = ast::Schema {
             namespace: "App".to_string(),
             ..ast::Schema::default()
@@ -448,17 +545,31 @@ record Member {
             crate::typecheck::check_schema(&database).expect("project schema should typecheck");
 
         let source = schema_to_storage_string(&context, &database.schemas[0]);
-        assert!(source.contains("userId String"), "stored schema: {source}");
-        assert!(!source.contains("Auth.User.id"));
+        assert!(
+            source.contains("userId Auth.User.id"),
+            "stored schema: {source}"
+        );
+        assert!(!source.contains("@schemaSnapshot"));
+        let (_, identities) =
+            crate::generate::to_string::standalone_schema(&context, &database.schemas[0]);
 
         let introspection = introspect::from_raw(introspect::IntrospectionRaw {
+            schema_namespace: Some("App".into()),
+            external_identities: identities,
             tables: vec![],
             migration_state: introspect::MigrationState::MigrationTable { migrations: vec![] },
             schema_source: source,
             links: vec![],
         });
         match introspection.schema {
-            introspect::SchemaResult::Success { .. } => {}
+            introspect::SchemaResult::Success { schema, context } => {
+                assert_eq!(schema.namespace, "App");
+                assert_eq!(context.tables.len(), 1);
+                assert_eq!(
+                    typecheck::resolve_query_param_type(&context, "Auth.User.id"),
+                    "Id.Uuid<User>"
+                );
+            }
             other => panic!("stored schema should typecheck: {other:?}"),
         }
     }

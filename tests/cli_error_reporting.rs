@@ -120,10 +120,11 @@ fn migration_sql_failure_identifies_file() {
         .args(["migrate", "test.db"])
         .assert()
         .failure()
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains(
             "202601010000_broken/migration.sql",
         ))
-        .stdout(predicate::str::contains("syntax error"));
+        .stderr(predicate::str::contains("syntax error"))
+        .stderr(predicate::str::contains("rolled back"));
 }
 
 #[test]
@@ -171,6 +172,147 @@ fn migration_generation_accepts_missing_migration_directory() {
     );
 }
 
+#[tokio::test]
+async fn destructive_push_requires_force_and_preserves_unrelated_rows() {
+    let dir = workspace();
+    let path = dir.path().join("pyre/schema.pyre");
+    let keep = "record Keep {\n    id Int @id\n    name String\n    @public\n}\n";
+    let initial = format!("@syncable(false)\nrecord User {{\n    id Int @id\n    name String\n    @public\n}}\nrecord Message {{\n    id Int @id\n    body String\n    @public\n}}\n{keep}");
+    std::fs::write(&path, &initial).unwrap();
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migrate", "test.db", "--push"])
+        .assert()
+        .success();
+
+    let db = libsql::Builder::new_local(dir.path().join("test.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = std::mem::ManuallyDrop::new(db.connect().unwrap());
+    conn.execute_batch("INSERT INTO keeps (id, name) VALUES (1, 'retained'); INSERT INTO users (id, name) VALUES (1, 'old');").await.unwrap();
+    std::fs::write(&path, format!("@syncable(false)\n{keep}")).unwrap();
+
+    // Piped input must not silently authorize a destructive push.
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migrate", "test.db", "--push"])
+        .write_stdin("y\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "The following tables will be dropped:\n  - messages\n  - users",
+        ))
+        .stderr(predicate::str::contains("This is a destructive change!"))
+        .stderr(predicate::str::contains("--force"));
+    let mut rows = conn.query("SELECT count(*) FROM users", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1
+    );
+    drop(rows);
+    let mut rows = conn
+        .query(pyre::db::introspect::GET_SCHEMA, ())
+        .await
+        .unwrap();
+    assert!(rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap()
+        .contains("record User"));
+    drop(rows);
+
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migrate", "test.db", "--push", "--force"])
+        .assert()
+        .success();
+    let mut rows = conn
+        .query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'messages')",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(rows.next().await.unwrap().is_none());
+    drop(rows);
+    let mut rows = conn
+        .query("SELECT name FROM keeps WHERE id=1", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        "retained"
+    );
+    drop(rows);
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migrate", "test.db", "--push"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn force_does_not_bypass_unsupported_column_changes() {
+    let dir = workspace();
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migrate", "test.db", "--push"])
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join("pyre/schema.pyre"),
+        "@syncable(false)\nrecord User {\n    id Int @id\n    name Int\n    @public\n}\n",
+    )
+    .unwrap();
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migrate", "test.db", "--push", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Column User.name needs an explicit SQL migration",
+        ))
+        .stderr(predicate::str::contains("Type: String -> Int"))
+        .stderr(predicate::str::contains("No migration SQL was executed"));
+}
+
+#[test]
+fn missing_recorded_schema_identifies_schema_and_database() {
+    let dir = workspace();
+    let database = dir.path().join("empty.db");
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .env("PYRE_SCHEMA_DATABASE", &database)
+        .args(["serve", "$PYRE_SCHEMA_DATABASE"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "Schema: {}",
+            pyre::ast::DEFAULT_SCHEMANAME
+        )))
+        .stderr(predicate::str::contains(format!(
+            "Database: {}",
+            database.display()
+        )))
+        .stderr(predicate::str::contains("No recorded schema found"));
+}
+
 #[cfg(unix)]
 #[test]
 fn migration_generation_propagates_directory_read_errors() {
@@ -193,7 +335,11 @@ fn migration_generation_propagates_directory_read_errors() {
         .unwrap();
     std::fs::set_permissions(&migrations, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("Failed to read migrations in pyre/migrations"));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("pyre/migrations"), "{diagnostic}");
+    assert!(
+        diagnostic.to_lowercase().contains("permission denied"),
+        "{diagnostic}"
+    );
     assert_eq!(std::fs::read_dir(&migrations).unwrap().count(), 0);
 }

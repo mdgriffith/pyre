@@ -123,7 +123,12 @@ const queryMap = {
 };
 
 const schemaDb = {
+  transaction: mock(async () => ({
+    execute: schemaDb.execute,
+    commit: async () => {}, rollback: async () => {}, close() {}, closed: false,
+  })),
   execute: mock(async (sql: string) => {
+    if (sql.startsWith("pragma table_info") || sql.startsWith("select name from sqlite_master")) return { rows: [] };
     if (sql.includes("is_initialized")) {
       return { rows: [{ is_initialized: 1 }] };
     }

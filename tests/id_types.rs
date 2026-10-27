@@ -149,6 +149,8 @@ record User {
         tables: vec![],
         migration_state: introspect::MigrationState::MigrationTable { migrations: vec![] },
         schema_source: roundtripped_schema_source,
+        schema_namespace: None,
+        external_identities: vec![],
         links: vec![],
     });
 
@@ -540,6 +542,8 @@ record Post {
         tables: vec![],
         migration_state: introspect::MigrationState::MigrationTable { migrations: vec![] },
         schema_source: schema_source.to_string(),
+        schema_namespace: None,
+        external_identities: vec![],
         links: vec![],
     });
 
@@ -608,6 +612,8 @@ record Post {
         tables: vec![],
         migration_state: introspect::MigrationState::MigrationTable { migrations: vec![] },
         schema_source: schema_source.to_string(),
+        schema_namespace: None,
+        external_identities: vec![],
         links: vec![],
     });
 

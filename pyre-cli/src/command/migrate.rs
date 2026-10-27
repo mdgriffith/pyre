@@ -1,5 +1,5 @@
 use libsql;
-use std::io;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use super::shared::{check_namespace_requirements, parse_database_schemas, Options};
@@ -10,19 +10,49 @@ use pyre::error;
 use pyre::generate::sql::to_sql::SqlAndParams;
 use pyre::typecheck;
 
-fn display_database_target(database: &str) -> String {
-    let without_query = database
-        .split(|character| character == '?' || character == '#')
-        .next()
-        .unwrap_or(database);
-
-    match without_query.split_once("://") {
-        Some((scheme, target)) => {
-            let target_without_userinfo = target.rsplit_once('@').map_or(target, |(_, host)| host);
-            format!("{}://{}", scheme, target_without_userinfo)
-        }
-        None => without_query.to_string(),
+fn confirm_table_removals(
+    database: &str,
+    namespace: &str,
+    tables: &[String],
+    force: bool,
+) -> io::Result<()> {
+    if tables.is_empty() || force {
+        return Ok(());
     }
+    let summary = format!(
+        "{} · {}\n\nThe following tables will be dropped:\n{}\n\nThis is a destructive change!",
+        namespace,
+        db::error::database_location(database),
+        tables
+            .iter()
+            .map(|name| format!("  - {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(io::Error::other(format!(
+            "{summary}\n\nRerun with --force to apply this change without confirmation.\nNo migration SQL was executed."
+        )));
+    }
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "{summary}\n")?;
+    if !read_confirmation(&mut io::stdin().lock(), &mut stderr)? {
+        return Err(io::Error::other(
+            "Push cancelled. No migration SQL was executed.",
+        ));
+    }
+    Ok(())
+}
+
+fn read_confirmation(reader: &mut impl BufRead, writer: &mut impl Write) -> io::Result<bool> {
+    write!(writer, "Continue? [y/N] ")?;
+    writer.flush()?;
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    Ok(matches!(
+        response.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn report_stored_schema_errors(
@@ -35,7 +65,7 @@ fn report_stored_schema_errors(
 ) -> io::Error {
     eprintln!(
         "Stored schema in database '{}' for namespace '{}' failed to {}:",
-        display_database_target(database),
+        db::error::database_location(database),
         namespace,
         failure
     );
@@ -45,6 +75,7 @@ fn report_stored_schema_errors(
             error::format_error(source, &schema_error, enable_color)
         );
     }
+    eprintln!("Correct the errors above in the complete project schemas, then retry.");
     io::Error::new(io::ErrorKind::InvalidData, "Stored schema is invalid")
 }
 
@@ -110,14 +141,16 @@ pub async fn migrate<'a>(
                             println!("{}", outcome.status_line());
                         }
                         Err(migration_error) => {
-                            println!("{}", migration_error.format_error());
-                            return Err(io::Error::other("Migration failed"));
+                            return Err(io::Error::other(format!(
+                                "{}\n\n{}",
+                                db::error::context(database, real_namespace),
+                                migration_error.format_error()
+                            )));
                         }
                     }
                 }
                 Err(err) => {
-                    eprintln!("{}", err.format_error());
-                    return Err(io::Error::other("Failed to connect to database"));
+                    return Err(io::Error::other(err.format_error()));
                 }
             }
         }
@@ -137,6 +170,7 @@ pub async fn push<'a>(
     auth: &Option<String>,
 
     namespace: &Option<String>,
+    force: bool,
 ) -> io::Result<()> {
     check_namespace_requirements(&namespace, &options);
 
@@ -172,11 +206,31 @@ pub async fn push<'a>(
             let connection_result = db::connect(&database.to_string(), auth).await;
             match connection_result {
                 Err(err) => {
-                    eprintln!("{}", err.format_error());
-                    return Err(io::Error::other("Failed to connect to database"));
+                    return Err(io::Error::other(err.format_error()));
                 }
                 Ok(conn) => {
-                    let introspection_result = crate::db::introspect::introspect(&conn).await;
+                    let failure = |operation: &str, error: &libsql::Error| {
+                        io::Error::other(db::error::operation_error(
+                            database,
+                            real_namespace,
+                            operation,
+                            error,
+                        ))
+                    };
+                    let connected_conn =
+                        db::ProcessConnection::connect(&conn).map_err(|error| {
+                            failure("Could not open the database connection.", &error)
+                        })?;
+                    let tx = connected_conn
+                        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                        .await
+                        .map_err(|error| failure("Could not start the migration transaction. No migration SQL was executed.", &error))?;
+                    let introspection_result = crate::db::introspect::introspect_for_project(
+                        &tx,
+                        &current_context,
+                        real_namespace,
+                    )
+                    .await;
                     match introspection_result {
                         Ok(introspection) => {
                             match &introspection.schema {
@@ -184,18 +238,37 @@ pub async fn push<'a>(
                                     schema: db_recorded_schema,
                                     ..
                                 } => {
-                                    let schema_diff =
-                                        diff::diff_schema(db_recorded_schema, &current_schema);
+                                    let schema_diff = pyre::db::migrate::diff_stored_schema(
+                                        &current_context,
+                                        db_recorded_schema,
+                                        current_schema,
+                                    );
 
                                     // We diff the two schemas and report errors.
 
-                                    let errors = diff::to_errors(schema_diff);
+                                    // Table removals are supported by the SQL generator. Confirm
+                                    // the physical table names below; retain unsupported changes.
+                                    let errors = diff::to_errors(schema_diff)
+                                        .into_iter()
+                                        .filter(|error| {
+                                            !matches!(
+                                                error.error_type,
+                                                error::ErrorType::MigrationTableDropped { .. }
+                                            )
+                                        })
+                                        .collect::<Vec<_>>();
                                     if !errors.is_empty() {
-                                        error::report_and_exit(
-                                            errors,
-                                            &paths,
-                                            options.enable_color,
-                                        );
+                                        let messages = errors
+                                            .iter()
+                                            .map(|error| {
+                                                error::format_error("", error, options.enable_color)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n\n");
+                                        return Err(io::Error::other(format!(
+                                            "{}\n\n{messages}\n\nNo migration SQL was executed.",
+                                            db::error::context(database, real_namespace)
+                                        )));
                                     }
 
                                     // If there are no errors, we can now generate sql.
@@ -205,6 +278,31 @@ pub async fn push<'a>(
                                         &current_schema,
                                         &introspection,
                                     );
+
+                                    // Physical drift can require a rebuild even when the
+                                    // recorded and authored schemas agree.
+                                    let unsupported = db_diff.modified_records.iter().flat_map(|record| {
+                                        record.changes.iter().filter_map(|change| match change {
+                                            pyre::db::diff::RecordChange::ModifiedField { name, changes } => Some(db::column_change_description(&record.name, name, changes)),
+                                            _ => None,
+                                        })
+                                    }).collect::<Vec<_>>();
+                                    if !unsupported.is_empty() {
+                                        return Err(io::Error::other(format!("{}\n\nThese column changes require a table-rebuild SQL migration:\n  - {}\n\nNo migration SQL was executed.", db::error::context(database, real_namespace), unsupported.join("\n  - "))));
+                                    }
+
+                                    let mut removed_tables = db_diff
+                                        .removed
+                                        .iter()
+                                        .map(|table| table.name.clone())
+                                        .collect::<Vec<_>>();
+                                    removed_tables.sort();
+                                    confirm_table_removals(
+                                        database,
+                                        real_namespace,
+                                        &removed_tables,
+                                        force,
+                                    )?;
 
                                     // Generate sql
                                     let mut sql = pyre::db::diff::to_sql::to_sql(&db_diff);
@@ -225,101 +323,73 @@ pub async fn push<'a>(
                                             schema_source,
                                         ],
                                     });
+                                    let (_, identities) =
+                                        pyre::generate::to_string::standalone_schema(
+                                            &current_context,
+                                            current_schema,
+                                        );
+                                    sql.extend(pyre::db::migrate::external_identity_sql(
+                                        &identities,
+                                    ));
+                                    sql.push(pyre::db::migrate::record_namespace_sql(
+                                        real_namespace,
+                                    ));
 
-                                    match db::ProcessConnection::connect(&conn) {
-                                        Ok(connected_conn) => {
-                                            match connected_conn
-                                                .transaction_with_behavior(
-                                                    libsql::TransactionBehavior::Immediate,
-                                                )
-                                                .await
-                                            {
-                                                Ok(tx) => {
-                                                    let mut has_error = false;
-                                                    for sql_statement in sql {
-                                                        match sql_statement {
-                                                            SqlAndParams::Sql(sql_string) => {
-                                                                if let Err(e) = tx
-                                                                    .execute(
-                                                                        &sql_string,
-                                                                        libsql::params_from_iter::<
-                                                                            Vec<libsql::Value>,
-                                                                        >(
-                                                                            vec![]
-                                                                        ),
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    eprintln!(
-                                                                        "Error executing SQL: {:?}",
-                                                                        e
-                                                                    );
-                                                                    eprintln!(
-                                                                        "SQL statement: {}",
-                                                                        sql_string
-                                                                    );
-                                                                    has_error = true;
-                                                                    break;
-                                                                }
-                                                            }
-                                                            SqlAndParams::SqlWithParams {
-                                                                sql,
-                                                                args,
-                                                            } => {
-                                                                if let Err(e) = tx
-                                                                    .execute(
-                                                                        &sql,
-                                                                        libsql::params_from_iter(
-                                                                            args,
-                                                                        ),
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    eprintln!(
-                                                                        "Error executing SQL: {:?}",
-                                                                        e
-                                                                    );
-                                                                    eprintln!(
-                                                                        "SQL statement: {}",
-                                                                        sql
-                                                                    );
-                                                                    has_error = true;
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-
-                                                    if has_error {
-                                                        eprintln!("Migration failed due to SQL execution errors. Database may be in an inconsistent state.");
-                                                        std::process::exit(1);
-                                                    }
-
-                                                    if let Err(e) = tx.commit().await {
-                                                        eprintln!(
-                                                            "Error committing transaction: {:?}",
-                                                            e
-                                                        );
-                                                        eprintln!("Migration failed. Database may be in an inconsistent state.");
-                                                        std::process::exit(1);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "Error creating transaction: {:?}",
-                                                        e
-                                                    );
-                                                    eprintln!("Migration failed. Database may be in an inconsistent state.");
-                                                    std::process::exit(1);
-                                                }
+                                    if let Err(error) =
+                                        pyre::db::migrate::ensure_metadata_storage(&tx).await
+                                    {
+                                        return Err(rollback_failure(
+                                            tx,
+                                            db::error::operation_error(
+                                                database,
+                                                real_namespace,
+                                                "Could not prepare Pyre's migration metadata.",
+                                                &error,
+                                            ),
+                                        )
+                                        .await);
+                                    }
+                                    for (index, statement) in sql.into_iter().enumerate() {
+                                        let sql_text = match &statement {
+                                            SqlAndParams::Sql(sql)
+                                            | SqlAndParams::SqlWithParams { sql, .. } => {
+                                                sql.clone()
                                             }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Error connecting to database: {:?}", e);
-                                            eprintln!("Migration failed. Could not establish database connection.");
-                                            std::process::exit(1);
+                                        };
+                                        let result = match statement {
+                                            SqlAndParams::Sql(sql) => tx.execute(&sql, ()).await,
+                                            SqlAndParams::SqlWithParams { sql, args } => {
+                                                tx.execute(&sql, libsql::params_from_iter(args))
+                                                    .await
+                                            }
+                                        };
+                                        if let Err(error) = result {
+                                            let message = db::error::operation_error(database, real_namespace, &format!("Could not apply schema change (SQL statement {}).\nSQL: {sql_text}", index + 1), &error);
+                                            return Err(rollback_failure(tx, message).await);
                                         }
                                     }
+                                    let updated = match crate::db::introspect::introspect_for_project(
+                                        &tx,
+                                        &current_context,
+                                        real_namespace,
+                                    )
+                                    .await {
+                                        Ok(updated) => updated,
+                                        Err(error) => return Err(rollback_failure(tx, db::error::operation_error(database, real_namespace, "Could not verify the schema after applying changes.", &error)).await),
+                                    };
+                                    let remaining = pyre::db::diff::diff(
+                                        &current_context,
+                                        current_schema,
+                                        &updated,
+                                    );
+                                    if !pyre::db::diff::is_empty(&remaining) {
+                                        let changes = db::migration_validation_changes(&remaining)
+                                            .join("\n  - ");
+                                        let message = format!("{}\n\nThe database still differs from your schema:\n  - {changes}\n\nApply an explicit SQL migration for these changes.", db::error::context(database, real_namespace));
+                                        return Err(rollback_failure(tx, message).await);
+                                    }
+                                    tx.commit().await.map_err(|error| failure("Could not confirm that the migration committed. The transaction outcome is unknown; check the database's migration state before retrying.", &error))?;
+                                    println!("Schema pushed successfully.");
                                 }
                                 pyre::db::introspect::SchemaResult::FailedToParse {
                                     source,
@@ -351,8 +421,10 @@ pub async fn push<'a>(
                             }
                         }
                         Err(err) => {
-                            eprintln!("{}", db::error::format_libsql_error(&err));
-                            return Err(io::Error::other("Failed to introspect database"));
+                            return Err(failure(
+                                "Failed to introspect database before applying schema changes.",
+                                &err,
+                            ));
                         }
                     }
                 }
@@ -360,4 +432,37 @@ pub async fn push<'a>(
         }
     }
     Ok(())
+}
+
+async fn rollback_failure(tx: libsql::Transaction, message: String) -> io::Error {
+    let outcome = match tx.rollback().await {
+        Ok(()) => "Changes from this push were rolled back.".to_string(),
+        Err(error) => format!(
+            "Could not confirm rollback: {}\nCheck the database's migration state before retrying.",
+            db::error::format_libsql_error(&error)
+        ),
+    };
+    io::Error::other(format!("{message}\n\n{outcome}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_defaults_to_no_and_requires_an_affirmative_answer() {
+        for (input, expected) in [
+            ("", false),
+            ("\n", false),
+            ("no\n", false),
+            ("maybe\n", false),
+            ("y\n", true),
+            ("YES\n", true),
+        ] {
+            assert_eq!(
+                read_confirmation(&mut input.as_bytes(), &mut Vec::new()).unwrap(),
+                expected
+            );
+        }
+    }
 }

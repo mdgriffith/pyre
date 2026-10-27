@@ -18,7 +18,7 @@ pub fn get() -> Option<Arc<introspect::Introspection>> {
     })
 }
 
-pub fn set_schema(introspection: JsValue) -> () {
+pub fn set_schema(introspection: JsValue) -> Result<(), JsValue> {
     CACHED_SCHEMA.with(|cache| {
         let mut cache = cache.lock().unwrap();
 
@@ -26,15 +26,20 @@ pub fn set_schema(introspection: JsValue) -> () {
         match serde_wasm_bindgen::from_value::<introspect::IntrospectionRaw>(introspection) {
             Ok(introspection_raw) => {
                 let introspection = introspect::from_raw(introspection_raw);
+                match &introspection.schema {
+                    introspect::SchemaResult::Success { .. } => {},
+                    introspect::SchemaResult::FailedToParse { errors, .. }
+                    | introspect::SchemaResult::FailedToTypecheck { errors, .. } => {
+                        return Err(JsValue::from_str(&format!("Stored schema is invalid: {errors:?}. Run pyre migrate with the complete project schemas to upsert missing external identities.")));
+                    }
+                }
                 // Cache the result
                 *cache = Some(Arc::new(introspection));
             }
-            Err(_e) => {
-                // Silently fail - error handling can be done at JS level if needed
-            }
+            Err(error) => return Err(JsValue::from_str(&format!("Invalid schema metadata: {error}"))),
         }
 
-        ()
+        Ok(())
     })
 }
 
@@ -48,7 +53,10 @@ pub fn process_introspection(introspection: JsValue) -> Result<JsValue, JsValue>
                 use pyre::parser;
 
                 let mut schema = ast::Schema {
-                    namespace: ast::DEFAULT_SCHEMANAME.to_string(),
+                    namespace: introspection_raw
+                        .schema_namespace
+                        .clone()
+                        .unwrap_or_else(|| ast::DEFAULT_SCHEMANAME.to_string()),
                     sync_mode: ast::SyncMode::Synced,
                     session: None,
                     files: vec![],

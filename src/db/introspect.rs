@@ -35,7 +35,7 @@ WITH RECURSIVE
     SELECT name 
     FROM sqlite_master 
     WHERE type='table' 
-    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync')
+    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync', '_pyre_external_identities')
   ),
   -- Get table info for each table
   table_info AS (
@@ -185,7 +185,7 @@ WITH RECURSIVE
     SELECT name 
     FROM sqlite_master 
     WHERE type='table' 
-    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync')
+    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync', '_pyre_external_identities')
   ),
   -- Get table info for each table
   table_info AS (
@@ -359,6 +359,107 @@ pub struct IntrospectionRaw {
     pub migration_state: MigrationState,
     pub schema_source: String,
     pub links: Vec<Link>,
+    #[serde(default)]
+    pub schema_namespace: Option<String>,
+    #[serde(default)]
+    pub external_identities: Vec<ast::ExternalIdentity>,
+}
+
+/// Read optional internal storage structures explicitly. Absence supplies no
+/// identity definitions: unresolved references still fail typechecking.
+#[cfg(feature = "database")]
+pub async fn load_metadata(
+    conn: &libsql::Connection,
+    raw: &mut IntrospectionRaw,
+) -> Result<(), libsql::Error> {
+    let mut tables = conn.query("select name from sqlite_master where type = 'table' and name = '_pyre_external_identities'", ()).await?;
+    if tables.next().await?.is_some() {
+        let mut rows = conn.query("select namespace, record_name, field_name, identity_kind from _pyre_external_identities order by namespace, record_name, field_name", ()).await?;
+        while let Some(row) = rows.next().await? {
+            let kind: String = row.get(3)?;
+            let kind = match kind.as_str() {
+                "Id.Int" => ast::IdentityKind::Int,
+                "Id.Uuid" => ast::IdentityKind::Uuid,
+                _ => return Err(libsql::Error::ToSqlConversionFailure(format!("Unsupported external identity kind {kind}; use a compatible Pyre runtime and run pyre migrate with the complete project schemas").into())),
+            };
+            raw.external_identities.push(ast::ExternalIdentity {
+                namespace: row.get(0)?,
+                record: row.get(1)?,
+                field: row.get(2)?,
+                kind,
+            });
+        }
+    }
+    load_namespace(conn, raw).await
+}
+
+#[cfg(feature = "database")]
+pub async fn load_namespace(
+    conn: &libsql::Connection,
+    raw: &mut IntrospectionRaw,
+) -> Result<(), libsql::Error> {
+    let mut columns = conn.query("select name from pragma_table_info('_pyre_migrations') where name = 'schema_namespace'", ()).await?;
+    if columns.next().await?.is_some() {
+        let mut rows = conn.query("select schema_namespace from _pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1", ()).await?;
+        if let Some(row) = rows.next().await? {
+            raw.schema_namespace = row.get(0)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a historical schema using current definitions where available.
+/// Retired records or fields may still be referenced by the old snapshot, so
+/// retain their stored identities in memory until migration replaces it. New schemas
+/// must be checked separately using only the current project definitions.
+pub fn from_raw_with_project(
+    mut raw: IntrospectionRaw,
+    namespace: &str,
+    identities: &[ast::ExternalIdentity],
+) -> Introspection {
+    if raw
+        .schema_namespace
+        .as_deref()
+        .is_some_and(|stored| stored != namespace)
+    {
+        return Introspection {
+            tables: raw.tables, migration_state: raw.migration_state,
+            schema: SchemaResult::FailedToTypecheck {
+                source: raw.schema_source, schema: ast::Schema::default(),
+                errors: vec![error::Error {
+                    filepath: "schema.pyre".into(), locations: vec![],
+                    error_type: error::ErrorType::InvalidTypeUsage {
+                        message: format!("Stored schema namespace {:?} does not match requested namespace {namespace}", raw.schema_namespace),
+                    },
+                }],
+            },
+        };
+    }
+    raw.schema_namespace = Some(namespace.into());
+    let mut historical_identities = identities.to_vec();
+    for identity in &raw.external_identities {
+        // Current definitions win for the same identity key. Retain renamed
+        // fields for resolving the old snapshot only. Ignore obsolete entries
+        // for the local namespace, which must resolve from the physical schema.
+        if identity.namespace != namespace
+            && !identities.iter().any(|current| {
+                current.namespace == identity.namespace
+                    && current.record == identity.record
+                    && current.field == identity.field
+            })
+        {
+            historical_identities.push(identity.clone());
+        }
+    }
+    raw.external_identities = historical_identities;
+    let mut introspection = from_raw(raw);
+    if let SchemaResult::Success { schema, context } = &mut introspection.schema {
+        // Persist only references actually present in the stored schema, not
+        // every candidate from the complete project.
+        let (_, required) = crate::generate::to_string::standalone_schema(context, schema);
+        context.external_identities = required;
+    }
+    introspection
 }
 
 #[derive(Debug)]
@@ -605,7 +706,10 @@ pub fn from_raw(mut raw: IntrospectionRaw) -> Introspection {
     }
 
     let mut schema = ast::Schema {
-        namespace: ast::DEFAULT_SCHEMANAME.to_string(),
+        namespace: raw
+            .schema_namespace
+            .clone()
+            .unwrap_or_else(|| ast::DEFAULT_SCHEMANAME.to_string()),
         sync_mode: ast::SyncMode::Synced,
         session: None,
         files: vec![],
@@ -614,19 +718,24 @@ pub fn from_raw(mut raw: IntrospectionRaw) -> Introspection {
     // Attempt to parse the schema source
     let schema_result = match parser::run("schema.pyre", &raw.schema_source, &mut schema) {
         Ok(()) => {
-            if schema.namespace == ast::DEFAULT_SCHEMANAME {
+            if raw.schema_namespace.is_none() {
                 if let Some(namespace) = infer_stored_schema_namespace(&schema) {
                     schema.namespace = namespace;
                 }
             }
 
             // Create a Database from the schema
-            let database = ast::Database {
+            let mut database = ast::Database {
                 schemas: vec![schema.clone()],
             };
+            ast::resolve_id_brands(&mut database);
+            schema = database.schemas[0].clone();
 
             // Typecheck the schema
-            match typecheck::check_schema(&database) {
+            match typecheck::check_schema_with_external_identities(
+                &database,
+                &raw.external_identities,
+            ) {
                 Ok(context) => {
                     // Extract links from parsed schema
                     raw.links = extract_links(&schema, &raw.tables);
@@ -697,6 +806,8 @@ mod tests {
     #[test]
     fn from_raw_infers_namespace_from_self_qualified_stored_links() {
         let introspection = from_raw(IntrospectionRaw {
+            schema_namespace: None,
+            external_identities: vec![],
             tables: vec![],
             migration_state: MigrationState::NoMigrationTable,
             schema_source: r#"

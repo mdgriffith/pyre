@@ -452,6 +452,9 @@ fn run_migrate(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonValue
     if bool_arg(arguments, "push").unwrap_or(false) {
         args.push("--push".to_string());
     }
+    if bool_arg(arguments, "force").unwrap_or(false) {
+        args.push("--force".to_string());
+    }
     run_cli(
         options,
         arguments,
@@ -518,7 +521,11 @@ fn redact_command_args(command_args: &[&str]) -> Vec<String> {
             continue;
         }
 
-        redacted.push((*arg).to_string());
+        redacted.push(if arg.contains("://") {
+            db::error::database_location(arg)
+        } else {
+            (*arg).to_string()
+        });
         if *arg == "--auth" {
             redact_next = true;
         }
@@ -551,10 +558,24 @@ async fn db_status(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonV
             }))
         }
     };
-    let conn = db.connect().map_err(|error| error.to_string())?;
+    let conn = db.connect().map_err(|error| {
+        db::error::operation_error(
+            &database,
+            &namespace,
+            "Could not open the database connection.",
+            &error,
+        )
+    })?;
     let introspection = crate::db::introspect::introspect_connection(&conn)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            db::error::operation_error(
+                &database,
+                &namespace,
+                "Failed to introspect database.",
+                &error,
+            )
+        })?;
 
     let migration_files = match db::read_migration_items(&namespace_migration_dir) {
         Ok(files) => files,
@@ -663,7 +684,13 @@ async fn dynamic_query(options: &Options<'_>, arguments: &JsonValue) -> Result<J
     let db = db::connect(&database, &auth)
         .await
         .map_err(|error| error.format_error())?;
-    let conn = db.connect().map_err(|error| error.to_string())?;
+    let conn = db.connect().map_err(|error| {
+        format!(
+            "Could not open database {}: {}",
+            db::error::database_location(&database),
+            db::error::format_libsql_error(&error)
+        )
+    })?;
     let session = PyreSession::new(session_value, &manifest.session_schema)
         .map_err(|error| error.to_string())?;
 
@@ -681,7 +708,12 @@ async fn dynamic_query(options: &Options<'_>, arguments: &JsonValue) -> Result<J
             {
                 Ok(result) => result,
                 Err(error) => {
-                    let error = format!("query '{}': {}", query.name, error);
+                    let error = format!(
+                        "Query: {}\nDatabase: {}\n\n{}",
+                        query.name,
+                        db::error::database_location(&database),
+                        error
+                    );
                     if results.is_empty() {
                         return Err(error);
                     }
@@ -763,7 +795,13 @@ async fn explain_dynamic_query(
     let db = db::connect(&database, &auth)
         .await
         .map_err(|error| error.format_error())?;
-    let conn = db.connect().map_err(|error| error.to_string())?;
+    let conn = db.connect().map_err(|error| {
+        format!(
+            "Could not open database {}: {}",
+            db::error::database_location(&database),
+            db::error::format_libsql_error(&error)
+        )
+    })?;
     let session = PyreSession::new(session_value, &manifest.session_schema)
         .map_err(|error| error.to_string())?;
 
@@ -1331,7 +1369,7 @@ fn tools() -> Vec<JsonValue> {
         tool("pyre_format", "Format Pyre files. This may write files unless to_stdout is true.", json!({"type":"object","properties":{"dir":{"type":"string"},"files":{"type":"array","items":{"type":"string"}},"to_stdout":{"type":"boolean"}}})),
         tool("pyre_generate", "Generate Pyre artifacts.", json!({"type":"object","properties":{"dir":{"type":"string"},"out":{"type":"string"}}})),
         tool("pyre_generate_migration", "Generate a Pyre migration against a database.", json!({"type":"object","required":["name","database"],"properties":{"dir":{"type":"string"},"name":{"type":"string"},"database":{"type":"string"},"auth":{"type":"string"},"namespace":{"type":"string"},"migration_dir":{"type":"string"}}})),
-        tool("pyre_migrate", "Apply Pyre migrations to a database. This can modify the database.", json!({"type":"object","required":["database"],"properties":{"dir":{"type":"string"},"database":{"type":"string"},"auth":{"type":"string"},"namespace":{"type":"string"},"migration_dir":{"type":"string"},"push":{"type":"boolean"}}})),
+        tool("pyre_migrate", "Apply Pyre migrations to a database. With push, table removals require force because MCP cannot prompt for confirmation.", json!({"type":"object","required":["database"],"properties":{"dir":{"type":"string"},"database":{"type":"string"},"auth":{"type":"string"},"namespace":{"type":"string"},"migration_dir":{"type":"string"},"push":{"type":"boolean"},"force":{"type":"boolean","description":"With push, apply destructive changes without confirmation."}}})),
         tool("pyre_introspect", "Introspect a database and generate a Pyre schema file.", json!({"type":"object","required":["database"],"properties":{"dir":{"type":"string"},"database":{"type":"string","description":"A local path, URL, or $ENV_VAR database reference."},"auth":{"type":"string","description":"Optional auth token for remote libSQL/Turso databases."},"namespace":{"type":"string","description":"Optional namespace for the generated schema."}}})),
         tool("pyre_db_status", "Check database connectivity and current schema/migration status.", json!({"type":"object","required":["database"],"properties":{"dir":{"type":"string"},"database":{"type":"string"},"auth":{"type":"string"},"namespace":{"type":"string"},"migration_dir":{"type":"string"}}})),
         tool("pyre_preview_query", "Typecheck raw dynamic Pyre query text and return generated SQL, input schema, and session requirements without connecting to a database or executing it.", json!({"type":"object","required":["query"],"properties":{"dir":{"type":"string"},"query":{"type":"string"}}})),

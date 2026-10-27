@@ -4,6 +4,14 @@ use nom::ToUsize;
 use std::collections::HashSet;
 
 pub fn standalone_schema_to_string(context: &typecheck::Context, schema: &ast::Schema) -> String {
+    standalone_schema(context, schema).0
+}
+
+/// Produce ordinary schema text and the separate resolved external identities.
+pub fn standalone_schema(
+    context: &typecheck::Context,
+    schema: &ast::Schema,
+) -> (String, Vec<ast::ExternalIdentity>) {
     let mut standalone = schema.clone();
     standalone.session = context.session.clone();
 
@@ -73,7 +81,128 @@ pub fn standalone_schema_to_string(context: &typecheck::Context, schema: &ast::S
         );
     }
 
-    schema_to_string("", &standalone)
+    // Keep authored references intact and carry their resolved external identity
+    // declarations separately from the physical records in this namespace.
+    let mut identities = std::collections::BTreeMap::new();
+    if let Some(session) = &standalone.session {
+        collect_external_identities(
+            context,
+            &standalone.namespace,
+            &session.fields,
+            &mut identities,
+        );
+    }
+    for file in &mut standalone.files {
+        for definition in &mut file.definitions {
+            match definition {
+                ast::Definition::Session(session) => {
+                    if let Some(resolved) = &standalone.session {
+                        *session = resolved.clone();
+                    }
+                }
+                ast::Definition::Record { fields, .. } => {
+                    collect_external_identities(
+                        context,
+                        &standalone.namespace,
+                        fields,
+                        &mut identities,
+                    );
+                }
+                ast::Definition::Tagged { variants, .. } => {
+                    for variant in variants {
+                        if let Some(fields) = &variant.fields {
+                            collect_external_identities(
+                                context,
+                                &standalone.namespace,
+                                fields,
+                                &mut identities,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    (
+        schema_to_string("", &standalone),
+        identities.into_values().collect(),
+    )
+}
+
+fn collect_external_identities(
+    context: &typecheck::Context,
+    namespace: &str,
+    fields: &[ast::Field],
+    identities: &mut std::collections::BTreeMap<(String, String, String), ast::ExternalIdentity>,
+) {
+    for field in fields {
+        if let ast::Field::Column(column) = field {
+            collect_external_identity_type(context, namespace, &column.type_, identities);
+        }
+    }
+}
+
+fn collect_external_identity_type(
+    context: &typecheck::Context,
+    namespace: &str,
+    type_: &ast::ColumnType,
+    identities: &mut std::collections::BTreeMap<(String, String, String), ast::ExternalIdentity>,
+) {
+    match type_ {
+        ast::ColumnType::JsonTyped(inner)
+        | ast::ColumnType::List(inner)
+        | ast::ColumnType::Dict(inner)
+        | ast::ColumnType::Nullable(inner) => {
+            collect_external_identity_type(context, namespace, inner, identities);
+        }
+        ast::ColumnType::ForeignKey {
+            schema,
+            table,
+            field,
+            ..
+        } => {
+            let identity = if let Some(target) = context.tables.values().find(|candidate| {
+                candidate.record.name == *table
+                    && schema
+                        .as_ref()
+                        .map_or(true, |schema| candidate.schema == *schema)
+            }) {
+                if target.schema == namespace {
+                    return;
+                }
+                let column = ast::collect_columns(&target.record.fields)
+                    .into_iter()
+                    .find(|column| column.name == *field)
+                    .expect("typechecked reference has a target field");
+                let kind = match column.type_ {
+                    ast::ColumnType::IdUuid { .. } => ast::IdentityKind::Uuid,
+                    ast::ColumnType::IdInt { .. } => ast::IdentityKind::Int,
+                    _ => unreachable!("typechecked schema references target identities"),
+                };
+                ast::ExternalIdentity {
+                    namespace: target.schema.clone(),
+                    record: table.clone(),
+                    field: field.clone(),
+                    kind,
+                }
+            } else {
+                typecheck::external_identity(context, schema.as_deref(), table, field)
+                    .expect("typechecked external reference has identity metadata")
+                    .clone()
+            };
+            identities.insert(
+                (
+                    identity.namespace.clone(),
+                    identity.record.clone(),
+                    identity.field.clone(),
+                ),
+                identity,
+            );
+        }
+        _ => {}
+    }
 }
 
 fn collect_field_type_names(fields: &[ast::Field], names: &mut Vec<String>) {
@@ -622,7 +751,7 @@ fn to_string_directives(directives: &Vec<ast::ColumnDirective>) -> String {
     result
 }
 
-fn to_string_directive(directive: &ast::ColumnDirective) -> String {
+pub fn to_string_directive(directive: &ast::ColumnDirective) -> String {
     match directive {
         ast::ColumnDirective::PrimaryKey => "@id".to_string(),
         ast::ColumnDirective::Unique => "@unique".to_string(),

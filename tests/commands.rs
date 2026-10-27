@@ -2096,7 +2096,7 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
     std::fs::create_dir_all(ctx.workspace_path.join("pyre/schema/Clocktower")).unwrap();
     std::fs::write(
         ctx.workspace_path.join("pyre/session.pyre"),
-        "session {\n    memberRole MemberRole?\n}\n",
+        "session {\n    memberRole MemberRole?\n    memberId Member.id?\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -2140,12 +2140,112 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
     let schema_source: String = row.get(0).unwrap();
 
     assert!(schema_source.contains("type MemberRole\n   = GM\n   | GamePlayer\n   | Observer"));
-    assert!(schema_source.contains("memberId String"));
-    assert!(!schema_source.contains("Main.Member.id"));
+    assert!(schema_source.contains("memberId Main.Member.id"));
+    assert!(!schema_source.contains("@schemaSnapshot"));
+    let mut identities = conn.query("select identity_kind from _pyre_external_identities where namespace = 'Main' and record_name = 'Member' and field_name = 'id'", ()).await.unwrap();
+    assert_eq!(
+        identities
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        "Id.Uuid"
+    );
+    assert!(schema_source.contains("Member.id?"));
 
     pyre::server::schema::load_schema_from_database(&conn)
         .await
         .expect("stored Clocktower schema should reload and typecheck independently");
+    conn.execute("delete from _pyre_external_identities", ())
+        .await
+        .unwrap();
+    assert!(pyre::server::schema::load_schema_from_database(&conn)
+        .await
+        .is_err());
+    drop(identities);
+    drop(rows);
+    drop(row);
+    // Maintenance works without migration files or physical table changes.
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .assert()
+        .success();
+    pyre::server::schema::load_schema_from_database(&conn)
+        .await
+        .expect("migrate restores metadata without SQL changes");
+    conn.execute("delete from _pyre_external_identities", ())
+        .await
+        .unwrap();
+    ctx.run_command("migration")
+        .arg("metadata-check")
+        .arg("--db")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .assert()
+        .success();
+    assert!(
+        pyre::server::schema::load_schema_from_database(&conn)
+            .await
+            .is_err(),
+        "generating a migration is read-only for stored metadata"
+    );
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .assert()
+        .success();
+    pyre::server::schema::load_schema_from_database(&conn)
+        .await
+        .expect("normal migration restores loading");
+    conn.execute(
+        "update _pyre_external_identities set identity_kind = 'Id.Int'",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "insert into _pyre_external_identities values ('Obsolete', 'Removed', 'id', 'Id.Uuid')",
+        (),
+    )
+    .await
+    .unwrap();
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .assert()
+        .success();
+    let mut metadata = conn
+        .query(
+            "select namespace, identity_kind from _pyre_external_identities",
+            (),
+        )
+        .await
+        .unwrap();
+    let entry = metadata.next().await.unwrap().unwrap();
+    assert_eq!(entry.get::<String>(0).unwrap(), "Main");
+    assert_eq!(entry.get::<String>(1).unwrap(), "Id.Uuid");
+    assert!(metadata.next().await.unwrap().is_none());
+    drop(metadata);
+    conn.execute("delete from _pyre_external_identities", ())
+        .await
+        .unwrap();
+    ctx.run_command("migrate")
+        .arg(".yak/clocktower.db")
+        .arg("--namespace")
+        .arg("Clocktower")
+        .arg("--push")
+        .assert()
+        .success();
+    pyre::server::schema::load_schema_from_database(&conn)
+        .await
+        .expect("push also restores metadata");
 }
 
 #[test]
@@ -2157,8 +2257,8 @@ fn test_migrate_without_migrations_shows_targeted_error() {
         .arg(".yak/yak.db")
         .assert()
         .failure()
-        .stdout(predicate::str::contains("No Migrations Found"))
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains("No Migrations Found"))
+        .stderr(predicate::str::contains(
             "pyre migration --db <database> init",
         ));
 }
@@ -2207,8 +2307,8 @@ fn test_migrate_validates_instead_of_reconciling_missing_migration_sql() {
         .arg(".yak/yak.db")
         .assert()
         .failure()
-        .stdout(predicate::str::contains("Migration Validation Failed"))
-        .stdout(predicate::str::contains("missing table users"));
+        .stderr(predicate::str::contains("Migration Validation Failed"))
+        .stderr(predicate::str::contains("missing table users"));
 }
 
 #[test]
@@ -2244,8 +2344,8 @@ record User {
         .arg(".yak/yak.db")
         .assert()
         .failure()
-        .stdout(predicate::str::contains("Migration Validation Failed"))
-        .stdout(predicate::str::contains("unexpected column users.name"));
+        .stderr(predicate::str::contains("Migration Validation Failed"))
+        .stderr(predicate::str::contains("unexpected column users.name"));
 }
 
 #[test]
@@ -2274,8 +2374,8 @@ fn test_migrate_refuses_changed_applied_migration_sql() {
         .arg(".yak/yak.db")
         .assert()
         .failure()
-        .stdout(predicate::str::contains("Applied Migration Changed"))
-        .stdout(predicate::str::contains("Create a new migration"));
+        .stderr(predicate::str::contains("Applied Migration Changed"))
+        .stderr(predicate::str::contains("Create a new migration"));
 }
 
 #[tokio::test]
@@ -2299,10 +2399,10 @@ async fn test_migrate_fails_on_non_pyre_database_with_guidance() {
         .arg(".yak/yak.db")
         .assert()
         .failure()
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains(
             "Non-Pyre or Incompatible Database",
         ))
-        .stdout(predicate::str::contains("Guidance"));
+        .stderr(predicate::str::contains("Guidance"));
 }
 
 #[test]
@@ -2332,11 +2432,11 @@ fn test_migrate_fails_when_requested_namespace_is_missing_in_db_metadata() {
         .arg("Auth")
         .assert()
         .failure()
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains(
             "Namespace Missing In Database Metadata",
         ))
-        .stdout(predicate::str::contains("Requested namespace: Auth"))
-        .stdout(predicate::str::contains("Namespaces found: App"));
+        .stderr(predicate::str::contains("Requested namespace: Auth"))
+        .stderr(predicate::str::contains("Namespaces found: App"));
 }
 
 #[test]

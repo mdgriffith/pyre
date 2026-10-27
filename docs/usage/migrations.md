@@ -137,6 +137,15 @@ pyre migrate db/app.db --namespace Billing
 pyre migrate db/app.db --namespace Billing --push
 ```
 
+Run migrations with the complete project schemas available so references between
+namespaces can resolve. `migrate` refreshes the definitions needed to load each
+database independently, even when no SQL migrations are pending.
+
+If serving or loading a database reports missing type definitions, run
+`pyre migrate <database> --namespace <namespace>` from the project containing those
+schemas. Correct invalid project references first; changes to existing column
+types still require an explicit SQL migration.
+
 ## Upgrading Synced Identities And Clients
 
 Synced namespaces require exactly one non-null `Id.Uuid @id` field per record. To keep integer or plain-string keys in a server-only database, declare `@syncable(false)` at namespace scope. That is a query-only execution choice, not compatibility with the UUID-based sync worker.

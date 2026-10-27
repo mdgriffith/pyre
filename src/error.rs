@@ -360,6 +360,9 @@ I don't recognize this type. Is it one of these?
 */
 
 pub fn format_error(file_contents: &str, error: &Error, enable_color: bool) -> String {
+    if error.filepath.is_empty() && error.locations.is_empty() {
+        return to_error_description(error, enable_color);
+    }
     let filepath = &error.filepath;
     let path_length = filepath.len();
     let separator = "-".repeat(50usize.saturating_sub(path_length));
@@ -1566,7 +1569,7 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
         }
         ErrorType::MigrationTableDropped { table_name } => {
             format!(
-                "The table {} has been dropped. This might be causing issues in your query.",
+                "This schema change would remove table {} and its rows. Use `pyre migrate <database> --push` to confirm the removal, or apply a SQL migration.",
                 yellow_if(in_color, table_name)
             )
         }
@@ -1575,20 +1578,33 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
             column_name,
             ..
         } => {
-            format!("The column {} has been dropped from the table {}. This might be causing issues in your query. Consider adding the column back or updating your query to use the new column format.", yellow_if(in_color, column_name), yellow_if(in_color, table_name))
+            format!("Cannot automatically remove column {}.{}. Restore the field, or generate a SQL migration with `pyre migration <name> --db <database>` and review how its existing values should be handled.", yellow_if(in_color, table_name), yellow_if(in_color, column_name))
         }
         ErrorType::MigrationColumnModified {
             table_name,
             column_name,
-            ..
+            changes,
         } => {
-            format!("The column {} has been modified in the table {}. This might be causing issues in your query. Consider updating your query to use the new column format.", yellow_if(in_color, column_name), yellow_if(in_color, table_name))
+            let mut details = Vec::new();
+            if let Some((old, new)) = &changes.type_changed {
+                details.push(format!("Type: {} -> {}", old, new));
+            }
+            if let Some((old, new)) = &changes.nullable_changed {
+                details.push(format!("Allows null: {} -> {}", old, new));
+            }
+            for directive in &changes.added_directives {
+                details.push(format!("Added directive: {}", crate::generate::to_string::to_string_directive(directive)));
+            }
+            for directive in &changes.removed_directives {
+                details.push(format!("Removed directive: {}", crate::generate::to_string::to_string_directive(directive)));
+            }
+            format!("Column {}.{} needs an explicit SQL migration.\n{}\n\nGenerate one with `pyre migration <name> --db <database>` and edit migration.sql to convert the column and its existing values.", yellow_if(in_color, table_name), yellow_if(in_color, column_name), details.join("\n"))
         }
         ErrorType::MigrationVariantRemoved {
             tagged_name,
             variant_name,
         } => {
-            format!("The variant {} has been removed from the tagged type {}. This might be causing issues in your query. Consider updating your query to use the new variant format.", yellow_if(in_color, variant_name), yellow_if(in_color, tagged_name))
+            format!("Cannot automatically remove variant {}.{}. Existing rows may still use it. Restore the variant, or apply a SQL migration that converts those rows before removing it.", yellow_if(in_color, tagged_name), yellow_if(in_color, variant_name))
         }
         ErrorType::InvalidColumnDefault {
             field_name,
@@ -1619,15 +1635,15 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
         }
         ErrorType::MigrationSchemaNotFound { namespace } => match namespace {
             Some(name) => format!(
-                "A migration was attempted for the schema named {}, but it was not found.",
+                "Cannot find schema {} to migrate. Check --namespace and use --in to select the directory containing your schema.",
                 yellow_if(in_color, &name)
             ),
             None => {
-                format!("A migration was attempted for the default schema, but it was not found.")
+                format!("Cannot find the default schema {} to migrate. Use --in to select its schema directory.", ast::DEFAULT_SCHEMANAME)
             }
         },
         ErrorType::MigrationMissingSchema => {
-            format!("There is no schema recorded in the database.")
+            format!("No Pyre schema is recorded in this database. Check the database location and schema name; for a new database, apply its initial migration.")
         }
     }
 }

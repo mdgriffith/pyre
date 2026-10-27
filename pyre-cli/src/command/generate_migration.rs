@@ -8,7 +8,6 @@ use crate::db;
 use pyre::ast;
 use pyre::db::introspect::MigrationState;
 use pyre::error;
-use pyre::filesystem;
 use pyre::typecheck;
 
 pub async fn generate_migration<'a>(
@@ -20,6 +19,10 @@ pub async fn generate_migration<'a>(
     namespace: &Option<String>,
 ) -> io::Result<()> {
     check_namespace_requirements(&namespace, &options);
+    let paths = crate::filesystem::collect_filepaths(&options.in_dir)?;
+    let current_db = parse_database_schemas(&paths, options.enable_color)?;
+    let context = typecheck::check_schema(&current_db)
+        .unwrap_or_else(|errors| error::report_and_exit(errors, &paths, options.enable_color));
 
     let target_namespace = namespace
         .clone()
@@ -35,13 +38,36 @@ pub async fn generate_migration<'a>(
     let connection_result = db::connect(&db.to_string(), auth).await;
     match connection_result {
         Err(e) => {
-            eprintln!("{}", e.format_error());
-            return Err(io::Error::other("Failed to connect to database"));
+            return Err(io::Error::other(e.format_error()));
         }
         Ok(conn) => {
-            let introspection_result = db::introspect::introspect(&conn).await;
+            let connected = db::ProcessConnection::connect(&conn).map_err(|error| {
+                io::Error::other(db::error::operation_error(
+                    db,
+                    &target_namespace,
+                    "Could not open the database connection.",
+                    &error,
+                ))
+            })?;
+            let introspection_result =
+                db::introspect::introspect_for_project(&connected, &context, &target_namespace)
+                    .await;
             match introspection_result {
                 Ok(introspection) => {
+                    if let pyre::db::introspect::SchemaResult::FailedToParse { source, errors }
+                    | pyre::db::introspect::SchemaResult::FailedToTypecheck {
+                        source,
+                        errors,
+                        ..
+                    } = &introspection.schema
+                    {
+                        for err in errors {
+                            eprintln!("{}", error::format_error(source, err, options.enable_color));
+                        }
+                        return Err(io::Error::other(
+                            "Stored schema cannot resolve against the complete project schemas",
+                        ));
+                    }
                     let existing_migrations = match db::read_migration_items(target_namespace_dir) {
                         Ok(items) => items,
                         Err(err) if err.kind() == io::ErrorKind::NotFound => vec![],
@@ -79,80 +105,62 @@ pub async fn generate_migration<'a>(
                         ));
                     }
 
-                    let paths = crate::filesystem::collect_filepaths(&options.in_dir)?;
-                    let current_db = parse_database_schemas(&paths, options.enable_color)?;
+                    {
+                        let current_schema = current_db
+                            .schemas
+                            .iter()
+                            .find(|s| s.namespace == target_namespace)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    format!("No schema found for namespace '{}'", target_namespace),
+                                )
+                            })?;
 
-                    match typecheck::check_schema(&current_db) {
-                        Ok(context) => {
-                            let current_schema = current_db
-                                .schemas
-                                .iter()
-                                .find(|s| s.namespace == target_namespace)
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::NotFound,
-                                        format!(
-                                            "No schema found for namespace '{}'",
-                                            target_namespace
-                                        ),
-                                    )
-                                })?;
+                        let db_diff =
+                            pyre::db::diff::diff(&context, &current_schema, &introspection);
 
-                            let db_diff =
-                                pyre::db::diff::diff(&context, &current_schema, &introspection);
+                        let current_date = chrono::Utc::now().format("%Y%m%d%H%M").to_string();
+                        let migration_folder =
+                            target_namespace_dir.join(format!("{}_{}", current_date, name));
+                        crate::filesystem::create_dir_if_not_exists(&migration_folder)?;
 
-                            println!("DB Diff: {:#?}", db_diff);
+                        let migration_file = migration_folder.join("migration.sql");
+                        let diff_file = migration_folder.join("schema.diff");
 
-                            let current_date = chrono::Utc::now().format("%Y%m%d%H%M").to_string();
-                            let migration_folder =
-                                target_namespace_dir.join(format!("{}_{}", current_date, name));
-                            crate::filesystem::create_dir_if_not_exists(&migration_folder)?;
+                        let sql = pyre::db::diff::to_sql::to_sql(&db_diff);
 
-                            let migration_file = migration_folder.join("migration.sql");
-                            let diff_file = migration_folder.join("schema.diff");
-
-                            let sql = pyre::db::diff::to_sql::to_sql(&db_diff);
-
-                            let mut all_sql_as_string = String::new();
-                            for sql_statement in sql {
-                                match sql_statement {
-                                    pyre::generate::sql::to_sql::SqlAndParams::Sql(sql_string) => {
-                                        all_sql_as_string.push_str(&sql_string.clone());
-                                        all_sql_as_string.push_str(";\n");
-                                    }
-                                    pyre::generate::sql::to_sql::SqlAndParams::SqlWithParams {
-                                        sql,
-                                        args: _args,
-                                    } => {
-                                        all_sql_as_string.push_str(&sql);
-                                        // for arg in args {
-                                        //     all_sql_as_string.push_str(&arg);
-                                        // }
-                                        all_sql_as_string.push_str(";\n");
-                                    }
+                        let mut all_sql_as_string = String::new();
+                        for sql_statement in sql {
+                            match sql_statement {
+                                pyre::generate::sql::to_sql::SqlAndParams::Sql(sql_string) => {
+                                    all_sql_as_string.push_str(&sql_string.clone());
+                                    all_sql_as_string.push_str(";\n");
+                                }
+                                pyre::generate::sql::to_sql::SqlAndParams::SqlWithParams {
+                                    sql,
+                                    args: _args,
+                                } => {
+                                    all_sql_as_string.push_str(&sql);
+                                    // for arg in args {
+                                    //     all_sql_as_string.push_str(&arg);
+                                    // }
+                                    all_sql_as_string.push_str(";\n");
                                 }
                             }
-                            fs::write(&migration_file, all_sql_as_string)?;
-                            let json_diff = serde_json::to_string(&db_diff)?;
-                            fs::write(&diff_file, json_diff)?;
                         }
-                        Err(error_list) => {
-                            for err in error_list {
-                                let schema_source =
-                                    filesystem::get_schema_source(&err.filepath, &paths)
-                                        .unwrap_or("");
-
-                                let formatted_error =
-                                    error::format_error(&schema_source, &err, options.enable_color);
-                                eprintln!("{}", &formatted_error);
-                            }
-                            std::process::exit(1);
-                        }
+                        fs::write(&migration_file, all_sql_as_string)?;
+                        let json_diff = serde_json::to_string(&db_diff)?;
+                        fs::write(&diff_file, json_diff)?;
                     }
                 }
                 Err(err) => {
-                    eprintln!("{}", db::error::format_libsql_error(&err));
-                    return Err(io::Error::other("Failed to introspect database"));
+                    return Err(io::Error::other(db::error::operation_error(
+                        db,
+                        &target_namespace,
+                        "Failed to introspect database before generating a migration.",
+                        &err,
+                    )));
                 }
             }
         }

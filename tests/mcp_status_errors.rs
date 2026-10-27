@@ -80,6 +80,27 @@ fn missing_migration_directory_is_allowed() {
 }
 
 #[test]
+fn destructive_push_exposes_force_through_mcp() {
+    let dir = workspace();
+    let run = |arguments| {
+        let response = call(&dir, "pyre_migrate", arguments);
+        serde_json::from_str::<Value>(response["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap()
+    };
+    assert_eq!(run(json!({"database":"test.db", "push":true}))["ok"], true);
+    std::fs::write(
+        dir.path().join("pyre/schema.pyre"),
+        SCHEMA.replace("record User", "record Other"),
+    )
+    .unwrap();
+    let rejected = run(json!({"database":"test.db", "push":true}));
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    assert!(rejected["stderr"].as_str().unwrap().contains("--force"));
+    let accepted = run(json!({"database":"test.db", "push":true, "force":true}));
+    assert_eq!(accepted["ok"], true, "{accepted}");
+}
+
+#[test]
 fn migration_directory_errors_include_operation_and_path() {
     let dir = workspace();
     std::fs::write(dir.path().join("pyre/migrations"), "not a directory").unwrap();

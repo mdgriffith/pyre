@@ -81,6 +81,44 @@ pub struct SchemaFile {
     pub definitions: Vec<Definition>,
 }
 
+/// Resolved identity information stored separately from a physical schema.
+/// These are type declarations, not physical records or relationship targets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalIdentity {
+    pub namespace: String,
+    pub record: String,
+    pub field: String,
+    pub kind: IdentityKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentityKind {
+    #[serde(rename = "Id.Int")]
+    Int,
+    #[serde(rename = "Id.Uuid")]
+    Uuid,
+}
+
+impl IdentityKind {
+    pub fn column_type(self, record: &str) -> ColumnType {
+        match self {
+            Self::Int => ColumnType::IdInt {
+                table: record.to_string(),
+            },
+            Self::Uuid => ColumnType::IdUuid {
+                table: record.to_string(),
+            },
+        }
+    }
+
+    pub fn serialization_type(self) -> ConcreteSerializationType {
+        match self {
+            Self::Int => ConcreteSerializationType::IdInt,
+            Self::Uuid => ConcreteSerializationType::IdUuid,
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Definition {

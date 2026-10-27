@@ -1711,7 +1711,7 @@ async fn load_schema_from_uninitialized_database_fails_clearly(
         Err(err) => err,
     };
 
-    assert_eq!(err.to_string(), "database does not contain a Pyre schema");
+    assert!(err.to_string().contains("No recorded schema found"));
 
     Ok(())
 }

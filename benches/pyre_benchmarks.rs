@@ -6,6 +6,7 @@ use pyre::parser;
 use pyre::typecheck;
 
 const TEST_SCHEMA: &str = r#"
+@syncable(false)
 record User {
     accounts      @link(Account.userId)
     posts         @link(Post.authorUserId)

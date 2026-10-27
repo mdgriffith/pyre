@@ -683,9 +683,18 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Database(error) => write!(f, "database error: {}", error),
+            Error::Database(error) => write!(
+                f,
+                "Could not seed the database: {}",
+                crate::db::diagnostic::database_error(error)
+            ),
             Error::DatabaseAt { path, error } => {
-                write!(f, "database error at {}: {}", path, error)
+                write!(
+                    f,
+                    "Could not seed {}: {}",
+                    path,
+                    crate::db::diagnostic::database_error(error)
+                )
             }
             Error::InvalidInput(message) => write!(f, "invalid seed input: {}", message),
             Error::Json(error) => write!(f, "json error: {}", error),

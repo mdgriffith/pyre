@@ -63,11 +63,36 @@ impl std::error::Error for IntrospectionDecodeError {
     }
 }
 
+#[cfg(test)]
 fn decode_introspection(source: &str) -> Result<Introspection, libsql::Error> {
     let raw = serde_json::from_str(source).map_err(|error| {
         libsql::Error::ToSqlConversionFailure(Box::new(IntrospectionDecodeError(error)))
     })?;
     Ok(pyre::db::introspect::from_raw(raw))
+}
+
+async fn decode_with_metadata(
+    conn: &libsql::Connection,
+    source: &str,
+    project: Option<(&pyre::typecheck::Context, &str)>,
+) -> Result<Introspection, libsql::Error> {
+    let mut raw = serde_json::from_str(source).map_err(|error| {
+        libsql::Error::ToSqlConversionFailure(Box::new(IntrospectionDecodeError(error)))
+    })?;
+    if let Some((context, namespace)) = project {
+        // Current definitions take precedence; historical identities are only
+        // retained for records retired by the new project.
+        pyre::db::introspect::load_metadata(conn, &mut raw).await?;
+        let identities = pyre::typecheck::project_external_identities(context, namespace);
+        Ok(pyre::db::introspect::from_raw_with_project(
+            raw,
+            namespace,
+            &identities,
+        ))
+    } else {
+        pyre::db::introspect::load_metadata(conn, &mut raw).await?;
+        Ok(pyre::db::introspect::from_raw(raw))
+    }
 }
 
 #[cfg(test)]
@@ -172,62 +197,43 @@ where
 }
 
 pub async fn introspect(db: &libsql::Database) -> Result<Introspection, libsql::Error> {
-    match super::ProcessConnection::connect(db) {
-        Err(e) => {
-            println!("Error: {}", e);
-            Err(e)
-        }
-        Ok(conn) => {
-            let args: Vec<String> = vec![];
-            let is_initialized_result =
-                conn.query(pyre::db::introspect::IS_INITIALIZED, args).await;
-
-            match is_initialized_result {
-                Ok(mut is_initialized_rows) => {
-                    if let Some(row) = is_initialized_rows.next().await? {
-                        let is_initialized = libsql::de::from_row::<IsInitialized>(&row).unwrap();
-                        if is_initialized.is_initialized {
-                            let args: Vec<String> = vec![];
-                            let introspection_result =
-                                conn.query(pyre::db::introspect::INTROSPECT_SQL, args).await;
-
-                            match introspection_result {
-                                Ok(mut introspection_rows) => {
-                                    if let Some(row) = introspection_rows.next().await? {
-                                        let introspection =
-                                            libsql::de::from_row::<IntrospectionRow>(&row).unwrap();
-
-                                        return decode_introspection(&introspection.result);
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("Error: {}", e);
-                                    return Err(e);
-                                }
-                            }
-                        }
-                    }
-                    // This is likely not correct
-                    Ok(Introspection {
-                        tables: vec![],
-                        migration_state: MigrationState::NoMigrationTable,
-                        schema: pyre::db::introspect::SchemaResult::Success {
-                            schema: pyre::ast::Schema::default(),
-                            context: pyre::typecheck::empty_context(),
-                        },
-                    })
-                }
-                Err(e) => {
-                    println!("Error: {}", e);
-                    Err(e)
-                }
-            }
-        }
-    }
+    let conn = super::ProcessConnection::connect(db)?;
+    introspect_connection(&conn).await
 }
 
 pub async fn introspect_connection(
     conn: &libsql::Connection,
+) -> Result<Introspection, libsql::Error> {
+    introspect_snapshot(conn, None).await
+}
+
+pub async fn introspect_for_project(
+    conn: &libsql::Connection,
+    context: &pyre::typecheck::Context,
+    namespace: &str,
+) -> Result<Introspection, libsql::Error> {
+    introspect_snapshot(conn, Some((context, namespace))).await
+}
+
+async fn introspect_snapshot(
+    conn: &libsql::Connection,
+    project: Option<(&pyre::typecheck::Context, &str)>,
+) -> Result<Introspection, libsql::Error> {
+    if conn.is_autocommit() {
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
+            .await?;
+        let result = introspect_inner(&tx, project).await?;
+        tx.commit().await?;
+        Ok(result)
+    } else {
+        introspect_inner(conn, project).await
+    }
+}
+
+async fn introspect_inner(
+    conn: &libsql::Connection,
+    project: Option<(&pyre::typecheck::Context, &str)>,
 ) -> Result<Introspection, libsql::Error> {
     let args: Vec<String> = vec![];
     let mut is_initialized_rows = conn
@@ -244,7 +250,7 @@ pub async fn introspect_connection(
 
             if let Some(row) = introspection_rows.next().await? {
                 let introspection = libsql::de::from_row::<IntrospectionRow>(&row).unwrap();
-                return decode_introspection(&introspection.result);
+                return decode_with_metadata(conn, &introspection.result, project).await;
             }
         }
     }

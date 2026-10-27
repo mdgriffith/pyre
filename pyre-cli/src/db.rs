@@ -18,26 +18,26 @@ pub mod introspect;
 
 #[derive(Debug)]
 pub enum DbError {
-    AuthTokenRequired,
+    AuthTokenRequired(String),
     EnvVarNotFound(String),
-    DatabaseError(libsql::Error),
+    DatabaseError { database: String, cause: String },
     LocalFilesystemError(std::io::Error, PathBuf),
 }
 
 impl DbError {
     pub fn format_error(&self) -> String {
         match self {
-            DbError::AuthTokenRequired => pyre::error::format_custom_error(
+            DbError::AuthTokenRequired(database) => pyre::error::format_custom_error(
                 "Authentication Error",
-                "Authentication token is required",
+                &format!("Cannot connect to remote database {} without an authentication token.\nPass --auth <token> or --auth '$VARIABLE'.", error::database_location(database)),
             ),
             DbError::EnvVarNotFound(var) => pyre::error::format_custom_error(
                 "Unknown Environment Variable",
-                &format!("Environment variable {} not found", var),
+                &format!("Environment variable {} is not set. Set it in the environment running this command, then retry.", var),
             ),
-            DbError::DatabaseError(e) => pyre::error::format_custom_error(
-                "Database Error",
-                &format!("Database error: {:?}", e),
+            DbError::DatabaseError { database, cause } => pyre::error::format_custom_error(
+                "Cannot Connect To Database",
+                &format!("Database: {}\n\n{}", error::database_location(database), cause),
             ),
             DbError::LocalFilesystemError(e, path) => pyre::error::format_custom_error(
                 "Local Database Path Error",
@@ -90,19 +90,29 @@ pub async fn connect(
     maybe_auth_token: &Option<String>,
 ) -> Result<libsql::Database, DbError> {
     let db_value = parse_arg_or_env(&db)?;
+    let database_location = error::database_location(&db_value);
 
     if is_remote(&db_value)? {
         // Remote database
         match maybe_auth_token {
-            None => return Err(DbError::AuthTokenRequired),
+            None => return Err(DbError::AuthTokenRequired(database_location)),
             Some(token) => {
                 let token_value = parse_arg_or_env(&token)?;
-                let connected_result = libsql::Builder::new_remote(db_value, token_value)
+                let connected_result = libsql::Builder::new_remote(db_value, token_value.clone())
                     .build()
                     .await;
                 match connected_result {
                     Ok(connected) => return Ok(connected),
-                    Err(e) => return Err(DbError::DatabaseError(e)),
+                    Err(e) => {
+                        return Err(DbError::DatabaseError {
+                            database: database_location,
+                            cause: if token_value.is_empty() {
+                                error::format_libsql_error(&e)
+                            } else {
+                                error::format_libsql_error(&e).replace(&token_value, "<redacted>")
+                            },
+                        })
+                    }
                 }
             }
         }
@@ -112,7 +122,12 @@ pub async fn connect(
         let connected_result = libsql::Builder::new_local(db_value).build().await;
         match connected_result {
             Ok(connected) => return Ok(connected),
-            Err(e) => return Err(DbError::DatabaseError(e)),
+            Err(e) => {
+                return Err(DbError::DatabaseError {
+                    database: database_location,
+                    cause: error::format_libsql_error(&e),
+                })
+            }
         }
     }
 }
@@ -144,6 +159,15 @@ impl Deref for ProcessConnection {
 #[derive(Debug)]
 pub enum MigrationError {
     SqlError(libsql::Error),
+    OperationFailed {
+        operation: &'static str,
+        source: libsql::Error,
+    },
+    CommitFailed(libsql::Error),
+    RolledBack {
+        cause: Box<MigrationError>,
+        rollback_error: Option<libsql::Error>,
+    },
     MigrationSqlError(libsql::Error, PathBuf),
     MigrationReadIoError(std::io::Error, PathBuf),
     NoMigrationsFound(PathBuf),
@@ -162,12 +186,29 @@ pub enum MigrationError {
     MigrationValidationFailed {
         changes: Vec<String>,
     },
+    StoredSchemaInvalid {
+        source: String,
+        errors: Vec<pyre::error::Error>,
+    },
 }
 
 impl MigrationError {
     pub fn format_error(&self) -> String {
         match self {
             MigrationError::SqlError(sql_error) => error::format_libsql_error(sql_error),
+            MigrationError::OperationFailed { operation, source } => format!("{operation}\n\n{}", error::format_libsql_error(source)),
+            MigrationError::CommitFailed(source) => format!("Could not confirm that the migration committed: {}\nThe transaction outcome is unknown; check the database's migration state before retrying.", error::format_libsql_error(source)),
+            MigrationError::RolledBack { cause, rollback_error } => {
+                let outcome = match rollback_error {
+                    None => "The migration transaction was rolled back.".to_string(),
+                    Some(error) => format!("Could not confirm rollback: {}\nCheck the database's migration state before retrying.", self::error::format_libsql_error(error)),
+                };
+                format!("{}\n\n{outcome}", cause.format_error())
+            }
+            MigrationError::StoredSchemaInvalid { source, errors } => format!(
+                "The recorded schema failed validation:\n\n{}\n\nCorrect these errors in the complete project schemas, then retry.",
+                errors.iter().map(|error| pyre::error::format_error(source, error, false)).collect::<Vec<_>>().join("\n")
+            ),
             MigrationError::MigrationSqlError(sql_error, path) => format!(
                 "Failed to execute migration {}:\n{}",
                 path.display(),
@@ -177,8 +218,8 @@ impl MigrationError {
                 pyre::error::format_custom_error(
                     "Migration Read Error",
                     &format!(
-                    "I was looking for migrations in {},\nbut ran into the following issue:\n\n{}",
-                    pyre::error::yellow_if(true, &path.display().to_string()),
+                    "Could not read migrations from {}:\n\n{}",
+                    path.display(),
                     io_error
                 ),
                 )
@@ -187,14 +228,14 @@ impl MigrationError {
                 "No Migrations Found",
                 &format!(
                     "No migrations were found in {}.\n\nRun `pyre migration --db <database> init` to generate your first migration.",
-                    pyre::error::yellow_if(true, &path.display().to_string())
+                    path.display()
                 ),
             ),
             MigrationError::IncompatibleDatabase { db_path, tables } => pyre::error::format_custom_error(
                 "Non-Pyre or Incompatible Database",
                 &format!(
                     "The database at {} has existing tables but no compatible Pyre metadata.\n\nTables found:\n{}\n\nGuidance:\n- If this should be managed by Pyre, migrate from a fresh database or reseed.\n- If this database is already in use by another tool, use a separate database for Pyre.\n- You can run `pyre init` and then `pyre migration --db <database> init` for a new Pyre-managed setup.",
-                    db_path,
+                    error::database_location(db_path),
                     if tables.is_empty() {
                         "  (none)".to_string()
                     } else {
@@ -220,7 +261,7 @@ impl MigrationError {
                     } else {
                         found_namespaces.join(", ")
                     },
-                    db_path
+                    error::database_location(db_path)
                 ),
             ),
             MigrationError::AppliedMigrationChanged { name } => pyre::error::format_custom_error(
@@ -233,7 +274,7 @@ impl MigrationError {
             MigrationError::MigrationValidationFailed { changes } => pyre::error::format_custom_error(
                 "Migration Validation Failed",
                 &format!(
-                    "After applying pending migration files, the database still does not match the current schema:\n\n{}\n\nGenerate or edit a migration.sql file so the migration explicitly performs these changes.",
+                    "Migration files do not bring the database into agreement with your schema:\n\n{}\n\nThe migration transaction was rolled back. Generate or edit a migration.sql file to perform these changes.",
                     changes
                         .iter()
                         .map(|change| format!("  - {}", change))
@@ -284,7 +325,7 @@ fn verify_applied_migration_sql_unchanged(
     Ok(())
 }
 
-fn migration_validation_changes(db_diff: &diff::Diff) -> Vec<String> {
+pub fn migration_validation_changes(db_diff: &diff::Diff) -> Vec<String> {
     let mut changes = Vec::new();
 
     for table in &db_diff.added {
@@ -310,8 +351,11 @@ fn migration_validation_changes(db_diff: &diff::Diff) -> Vec<String> {
                         record_diff.name, column.name
                     ));
                 }
-                diff::RecordChange::ModifiedField { name, .. } => {
-                    changes.push(format!("modified column {}.{}", record_diff.name, name));
+                diff::RecordChange::ModifiedField {
+                    name,
+                    changes: column,
+                } => {
+                    changes.push(column_change_description(&record_diff.name, name, column));
                 }
                 diff::RecordChange::AddedIndex(index) => {
                     changes.push(format!("missing index {}", index.name));
@@ -324,6 +368,21 @@ fn migration_validation_changes(db_diff: &diff::Diff) -> Vec<String> {
     }
 
     changes
+}
+
+pub fn column_change_description(table: &str, name: &str, column: &diff::ColumnDiff) -> String {
+    let mut details = Vec::new();
+    if let Some((old, new)) = &column.type_changed {
+        details.push(format!("type {old} -> {new}"));
+    }
+    if let Some((old, new)) = &column.nullable_changed {
+        // The physical diff stores SQLite's notnull flag.
+        details.push(format!("allows null {} -> {}", !old, !new));
+    }
+    if let Some((old, new)) = &column.primary_key_changed {
+        details.push(format!("primary key {old} -> {new}"));
+    }
+    format!("column {table}.{name}: {}", details.join(", "))
 }
 
 #[derive(Debug)]
@@ -417,6 +476,7 @@ async fn preflight_database_compatibility(
         .filter(|name| {
             name.as_str() != pyre::db::migrate::MIGRATION_TABLE
                 && name.as_str() != pyre::db::migrate::SYNC_TABLE
+                && name.as_str() != "_pyre_external_identities"
         })
         .cloned()
         .collect();
@@ -476,45 +536,69 @@ pub async fn migrate(
     let migration_files = match read_migration_folder(migration_folder) {
         Err(err) => {
             if err.kind() == std::io::ErrorKind::NotFound {
-                return Err(MigrationError::NoMigrationsFound(
+                Migrations {
+                    file_contents: vec![],
+                }
+            } else {
+                return Err(MigrationError::MigrationReadIoError(
+                    err,
                     migration_folder.to_path_buf(),
                 ));
             }
-
-            return Err(MigrationError::MigrationReadIoError(
-                err,
-                migration_folder.to_path_buf(),
-            ));
         }
         Ok(files) => files,
     };
 
-    if migration_files.file_contents.is_empty() {
-        return Err(MigrationError::NoMigrationsFound(
-            migration_folder.to_path_buf(),
-        ));
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .map_err(|source| MigrationError::OperationFailed {
+            operation: "Could not start the migration transaction. No migration SQL was executed.",
+            source,
+        })?;
+    let stored = introspect::introspect_for_project(&tx, options.context, &schema.namespace)
+        .await
+        .map_err(|source| MigrationError::OperationFailed {
+            operation: "Failed to introspect database before applying migrations.",
+            source,
+        })?;
+    match &stored.schema {
+        pyre::db::introspect::SchemaResult::Success { context, .. } => {
+            if migration_files.file_contents.is_empty() && context.tables.is_empty() {
+                return Err(MigrationError::NoMigrationsFound(
+                    migration_folder.to_path_buf(),
+                ));
+            }
+        }
+        pyre::db::introspect::SchemaResult::FailedToParse { source, errors }
+        | pyre::db::introspect::SchemaResult::FailedToTypecheck { source, errors, .. } => {
+            return Err(MigrationError::StoredSchemaInvalid {
+                source: source.clone(),
+                errors: errors.clone(),
+            });
+        }
     }
 
     for statement in pyre::db::migrate::quoted_internal_setup_sql() {
         match statement {
             SqlAndParams::Sql(sql) => {
-                conn.execute_batch(&sql)
+                tx.execute_batch(&sql)
                     .await
                     .map_err(MigrationError::SqlError)?;
             }
             SqlAndParams::SqlWithParams { sql, args } => {
-                conn.execute(&sql, libsql::params_from_iter(args))
+                tx.execute(&sql, libsql::params_from_iter(args))
                     .await
                     .map_err(MigrationError::SqlError)?;
             }
         }
     }
 
-    let migration_state = introspect::get_migration_state(&conn)
+    let migration_state = introspect::get_migration_state(&tx)
         .await
         .map_err(MigrationError::SqlError)?;
 
-    let applied_sql = get_applied_migration_sql(&conn).await?;
+    let applied_sql = get_applied_migration_sql(&tx).await?;
     verify_applied_migration_sql_unchanged(&migration_files.file_contents, &applied_sql)?;
 
     // Use centralized migration planning logic
@@ -527,23 +611,26 @@ pub async fn migrate(
 
     let migrations_applied = migration_plan.migrations_to_run.len();
 
-    let tx = conn
-        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+    // Execute migrations that need to be run
+    pyre::db::migrate::ensure_metadata_storage(&tx)
         .await
         .map_err(MigrationError::SqlError)?;
-
-    // Execute migrations that need to be run
     for (index, (migration_filename, migration_contents)) in
         migration_plan.migrations_to_run.iter().enumerate()
     {
-        tx.execute_batch(migration_contents).await.map_err(|err| {
-            MigrationError::MigrationSqlError(
-                err,
+        if let Err(error) = tx.execute_batch(migration_contents).await {
+            let cause = MigrationError::MigrationSqlError(
+                error,
                 migration_folder
                     .join(migration_filename)
                     .join("migration.sql"),
-            )
-        })?;
+            );
+            let rollback_error = tx.rollback().await.err();
+            return Err(MigrationError::RolledBack {
+                cause: Box::new(cause),
+                rollback_error,
+            });
+        }
 
         // Record migration using centralized constant
         // INSERT_MIGRATION_SUCCESS requires (name, sql, finished_at)
@@ -575,17 +662,65 @@ pub async fn migrate(
             .map_err(MigrationError::SqlError)?;
     }
 
-    let introspection = introspect::introspect_connection(&tx)
+    let introspection = introspect::introspect_for_project(&tx, options.context, &schema.namespace)
         .await
         .map_err(MigrationError::SqlError)?;
+    match &introspection.schema {
+        pyre::db::introspect::SchemaResult::Success { .. } => {}
+        pyre::db::introspect::SchemaResult::FailedToParse { source, errors }
+        | pyre::db::introspect::SchemaResult::FailedToTypecheck { source, errors, .. } => {
+            return Err(MigrationError::StoredSchemaInvalid {
+                source: source.clone(),
+                errors: errors.clone(),
+            })
+        }
+    }
     let validation_diff = diff::diff(options.context, schema, &introspection);
     if !diff::is_empty(&validation_diff) {
         let changes = migration_validation_changes(&validation_diff);
         tx.rollback().await.map_err(MigrationError::SqlError)?;
         return Err(MigrationError::MigrationValidationFailed { changes });
     }
+    if migrations_applied == 0 {
+        // A schema-only refresh must not bypass explicit migrations for logical
+        // type changes just because both identities use the same SQLite type.
+        if let pyre::db::introspect::SchemaResult::Success { schema: stored, .. } = &stored.schema {
+            let errors = pyre::ast::diff::to_errors(pyre::db::migrate::diff_stored_schema(
+                options.context,
+                stored,
+                schema,
+            ));
+            if !errors.is_empty() {
+                let changes = errors
+                    .iter()
+                    .map(|error| pyre::error::to_error_description(error, false))
+                    .collect();
+                tx.rollback().await.map_err(MigrationError::SqlError)?;
+                return Err(MigrationError::MigrationValidationFailed { changes });
+            }
+        }
+        // Keep the applied migration's name and SQL intact for checksum
+        // validation, while refreshing its independently loadable snapshot.
+        tx.execute(
+            "update _pyre_migrations set schema = ? where id = (select id from _pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1) and schema != ?",
+            libsql::params![migration_plan.schema_string.clone(), migration_plan.schema_string],
+        ).await.map_err(MigrationError::SqlError)?;
+    }
+    let (_, identities) = pyre::generate::to_string::standalone_schema(options.context, schema);
+    for statement in pyre::db::migrate::external_identity_sql(&identities)
+        .into_iter()
+        .chain([pyre::db::migrate::record_namespace_sql(&schema.namespace)])
+    {
+        match statement {
+            pyre::generate::sql::to_sql::SqlAndParams::Sql(sql) => tx.execute(&sql, ()).await,
+            pyre::generate::sql::to_sql::SqlAndParams::SqlWithParams { sql, args } => {
+                tx.execute(&sql, libsql::params_from_iter(args)).await
+            }
+        }
+        .map_err(MigrationError::SqlError)?;
+    }
 
-    tx.commit().await.map_err(MigrationError::SqlError)?;
+    tx.commit().await.map_err(MigrationError::CommitFailed)?;
 
     Ok(MigrateOutcome {
         migrations_applied,

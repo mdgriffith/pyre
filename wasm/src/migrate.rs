@@ -45,12 +45,35 @@ pub fn migrate_with_introspection_wasm(
     schema_source: String,
     introspection: wasm_bindgen::JsValue,
 ) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
-    let raw = serde_wasm_bindgen::from_value::<introspect::IntrospectionRaw>(introspection)
-        .map_err(|error| {
-            wasm_bindgen::JsValue::from_str(&format!("Invalid database introspection: {error}"))
-        })?;
-    let introspection = introspect::from_raw(raw);
-    let result = migrate(name, &introspection, &schema_source);
+    #[derive(serde::Deserialize)]
+    struct Input {
+        #[serde(flatten)]
+        raw: introspect::IntrospectionRaw,
+        #[serde(default)]
+        target_schema_namespace: Option<String>,
+        #[serde(default)]
+        target_external_identities: Vec<pyre::ast::ExternalIdentity>,
+    }
+    let input = serde_wasm_bindgen::from_value::<Input>(introspection).map_err(|error| {
+        wasm_bindgen::JsValue::from_str(&format!("Invalid database introspection: {error}"))
+    })?;
+    let namespace = input
+        .target_schema_namespace
+        .as_deref()
+        .unwrap_or(pyre::ast::DEFAULT_SCHEMANAME);
+    let introspection =
+        introspect::from_raw_with_project(input.raw, namespace, &input.target_external_identities);
+    let result = migrate::migrate_dynamic_with_external_identities(
+        name,
+        &introspection,
+        &schema_source,
+        FILEPATH,
+        input
+            .target_schema_namespace
+            .as_deref()
+            .unwrap_or(pyre::ast::DEFAULT_SCHEMANAME),
+        &input.target_external_identities,
+    );
 
     serde_wasm_bindgen::to_value(&result).map_err(|error| {
         wasm_bindgen::JsValue::from_str(&format!("Failed to serialize migration plan: {error}"))

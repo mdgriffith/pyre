@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use tempfile;
 
 const TEST_SCHEMA: &str = r#"
+@syncable(false)
 record User {
     accounts      @link(Account.userId)
     posts         @link(Post.authorUserId)

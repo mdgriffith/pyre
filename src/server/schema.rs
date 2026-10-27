@@ -24,6 +24,20 @@ impl LoadedSchema {
 
 /// Load and typecheck the Pyre schema stored in a migrated database.
 pub async fn load_schema_from_database(conn: &libsql::Connection) -> Result<LoadedSchema, Error> {
+    if conn.is_autocommit() {
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
+            .await
+            .map_err(Error::Database)?;
+        let loaded = load_schema_in_transaction(&tx).await?;
+        tx.commit().await.map_err(Error::Database)?;
+        Ok(loaded)
+    } else {
+        load_schema_in_transaction(conn).await
+    }
+}
+
+async fn load_schema_in_transaction(conn: &libsql::Connection) -> Result<LoadedSchema, Error> {
     let is_initialized = is_initialized(conn).await?;
     let sql = if is_initialized {
         introspect::INTROSPECT_SQL
@@ -54,6 +68,15 @@ pub async fn ensure_database(
     schema_name: &str,
     schema_source: &str,
 ) -> Result<EnsureDatabaseOutcome, EnsureDatabaseError> {
+    ensure_database_with_external_identities(conn, schema_name, schema_source, &[]).await
+}
+
+pub async fn ensure_database_with_external_identities(
+    conn: &libsql::Connection,
+    schema_name: &str,
+    schema_source: &str,
+    identities: &[ast::ExternalIdentity],
+) -> Result<EnsureDatabaseOutcome, EnsureDatabaseError> {
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
@@ -61,34 +84,49 @@ pub async fn ensure_database(
     let initialized = is_initialized(&tx)
         .await
         .map_err(EnsureDatabaseError::Introspection)?;
-    let introspection = introspect_connection(&tx, initialized)
-        .await
-        .map_err(EnsureDatabaseError::Introspection)?;
+    let (introspection, stored_identities, same_namespace) =
+        introspect_connection(&tx, initialized, schema_name, identities)
+            .await
+            .map_err(EnsureDatabaseError::Introspection)?;
 
     if !initialized && !introspection.tables.is_empty() {
         return Err(EnsureDatabaseError::UnmanagedDatabase);
     }
 
     let migration_name = format!("ensure:{schema_name}");
-    let plan = migrate::migrate_dynamic_for_schema(
+    let plan = migrate::migrate_dynamic_with_external_identities(
         migration_name,
         &introspection,
         schema_source,
         "generated-schema.pyre",
         schema_name,
+        identities,
     )
     .map_err(EnsureDatabaseError::Migration)?;
+    let same_metadata = same_namespace
+        && stored_identities.len() == plan.external_identities.len()
+        && plan
+            .external_identities
+            .iter()
+            .all(|identity| stored_identities.contains(identity));
 
     let recorded_schema = if initialized {
         Some(query_recorded_schema(&tx).await?)
     } else {
         None
     };
-    if initialized && plan.sql.is_empty() && recorded_schema.as_deref() == Some(schema_source) {
+    if initialized
+        && plan.sql.is_empty()
+        && recorded_schema.as_deref() == Some(schema_source)
+        && same_metadata
+    {
         tx.rollback().await.map_err(EnsureDatabaseError::Database)?;
         return Ok(EnsureDatabaseOutcome::UpToDate);
     }
 
+    migrate::ensure_metadata_storage(&tx)
+        .await
+        .map_err(EnsureDatabaseError::Database)?;
     if !initialized && plan.sql.is_empty() {
         for statement in migrate::internal_setup_sql() {
             execute_statement(&tx, statement).await?;
@@ -98,6 +136,10 @@ pub async fn ensure_database(
         execute_statement(&tx, statement).await?;
     }
     execute_statement(&tx, plan.mark_success).await?;
+    execute_statement(&tx, migrate::record_namespace_sql(schema_name)).await?;
+    for statement in migrate::external_identity_sql(&plan.external_identities) {
+        execute_statement(&tx, statement).await?;
+    }
     tx.commit().await.map_err(EnsureDatabaseError::Database)?;
 
     Ok(if initialized {
@@ -127,14 +169,22 @@ async fn query_recorded_schema(conn: &libsql::Connection) -> Result<String, Ensu
 async fn introspect_connection(
     conn: &libsql::Connection,
     initialized: bool,
-) -> Result<introspect::Introspection, Error> {
+    namespace: &str,
+    identities: &[ast::ExternalIdentity],
+) -> Result<(introspect::Introspection, Vec<ast::ExternalIdentity>, bool), Error> {
     let sql = if initialized {
         introspect::INTROSPECT_SQL
     } else {
         introspect::INTROSPECT_UNINITIALIZED_SQL
     };
     let raw = query_introspection(conn, sql).await?;
-    Ok(introspect::from_raw(raw))
+    let same_namespace = raw.schema_namespace.as_deref() == Some(namespace);
+    let stored_identities = raw.external_identities.clone();
+    Ok((
+        introspect::from_raw_with_project(raw, namespace, identities),
+        stored_identities,
+        same_namespace,
+    ))
 }
 
 async fn execute_statement(
@@ -174,16 +224,22 @@ async fn query_introspection(
     })?;
     let raw = row.get::<String>(0).map_err(Error::Database)?;
 
-    serde_json::from_str(&raw).map_err(Error::Json)
+    let mut raw = serde_json::from_str(&raw).map_err(Error::Json)?;
+    introspect::load_metadata(conn, &mut raw)
+        .await
+        .map_err(Error::Database)?;
+    Ok(raw)
 }
 
 fn context_from_introspection(
     introspection: &introspect::Introspection,
 ) -> Result<&typecheck::Context, Error> {
     match &introspection.schema {
-        introspect::SchemaResult::Success { context, .. } => {
+        introspect::SchemaResult::Success { context, schema } => {
             if context.tables.is_empty() {
-                return Err(Error::MissingSchema);
+                return Err(Error::MissingSchema {
+                    schema: schema.namespace.clone(),
+                });
             }
 
             Ok(context)
@@ -192,9 +248,12 @@ fn context_from_introspection(
             source: source.clone(),
             errors: errors.clone(),
         }),
-        introspect::SchemaResult::FailedToTypecheck { errors, .. } => Err(Error::SchemaTypecheck {
-            errors: errors.clone(),
-        }),
+        introspect::SchemaResult::FailedToTypecheck { source, errors, .. } => {
+            Err(Error::SchemaTypecheck {
+                source: source.clone(),
+                errors: errors.clone(),
+            })
+        }
     }
 }
 
@@ -207,9 +266,12 @@ fn schema_from_introspection(
             source: source.clone(),
             errors: errors.clone(),
         }),
-        introspect::SchemaResult::FailedToTypecheck { errors, .. } => Err(Error::SchemaTypecheck {
-            errors: errors.clone(),
-        }),
+        introspect::SchemaResult::FailedToTypecheck { source, errors, .. } => {
+            Err(Error::SchemaTypecheck {
+                source: source.clone(),
+                errors: errors.clone(),
+            })
+        }
     }
 }
 
@@ -218,12 +280,15 @@ pub enum Error {
     Database(libsql::Error),
     InvalidIntrospection(String),
     Json(serde_json::Error),
-    MissingSchema,
+    MissingSchema {
+        schema: String,
+    },
     SchemaParse {
         source: String,
         errors: Vec<crate::error::Error>,
     },
     SchemaTypecheck {
+        source: String,
         errors: Vec<crate::error::Error>,
     },
 }
@@ -231,25 +296,42 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Database(error) => write!(f, "database error: {}", error),
+            Error::Database(error) => write!(f, "Could not read the recorded schema: {}", crate::db::diagnostic::database_error(error)),
             Error::InvalidIntrospection(message) => write!(f, "invalid introspection: {}", message),
             Error::Json(error) => write!(f, "json error: {}", error),
-            Error::MissingSchema => write!(f, "database does not contain a Pyre schema"),
-            Error::SchemaParse { errors, .. } => {
-                write!(f, "schema failed to parse with {} error(s)", errors.len())
+            Error::MissingSchema { schema } => write!(f, "No recorded schema found for {schema}. Check the database location and schema name; for a new database, apply its initial migration."),
+            Error::SchemaParse { errors, source } => {
+                writeln!(f, "The recorded schema could not be parsed:")?;
+                for error in errors {
+                    write!(f, "\n{}", crate::error::format_error(source, error, false))?;
+                }
+                Ok(())
             }
-            Error::SchemaTypecheck { errors } => {
-                write!(
-                    f,
-                    "schema failed to typecheck with {} error(s)",
-                    errors.len()
-                )
+            Error::SchemaTypecheck { source, errors } => {
+                writeln!(f, "The recorded schema failed validation:")?;
+                for error in errors {
+                    write!(f, "\n{}", crate::error::format_error(source, error, false))?;
+                }
+                write!(f, "\nCorrect these errors in the complete project schemas, then run `pyre migrate`.")
             }
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// Attach the database location at the boundary that owns the connection.
+    pub fn with_database(&self, database: &str) -> String {
+        let location = crate::db::diagnostic::database_location(database);
+        match self {
+            Self::MissingSchema { schema } => {
+                format!("Schema: {schema}\nDatabase: {location}\n\n{self}")
+            }
+            _ => format!("Database: {location}\n\n{self}"),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum EnsureDatabaseError {
@@ -262,10 +344,18 @@ pub enum EnsureDatabaseError {
 impl std::fmt::Display for EnsureDatabaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Database(error) => write!(f, "database error: {error}"),
+            Self::Database(error) => write!(
+                f,
+                "Could not initialize or migrate the database: {}",
+                crate::db::diagnostic::database_error(error)
+            ),
             Self::Introspection(error) => write!(f, "{error}"),
             Self::Migration(errors) => {
-                write!(f, "schema migration failed with {} error(s)", errors.len())
+                writeln!(f, "Cannot automatically apply these schema changes:")?;
+                for error in errors {
+                    writeln!(f, "\n{}", crate::error::to_error_description(error, false))?;
+                }
+                Ok(())
             }
             Self::UnmanagedDatabase => write!(
                 f,

@@ -148,11 +148,15 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.format_error()))?;
     let conn = db.connect().map_err(|error| {
-        io::Error::new(io::ErrorKind::Other, format!("database error: {}", error))
+        io::Error::other(format!(
+            "Could not open database {}: {}",
+            db::error::database_location(options.database),
+            db::error::format_libsql_error(&error)
+        ))
     })?;
     let loaded_schema = load_schema_from_database(&conn)
         .await
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        .map_err(|error| io::Error::other(error.with_database(options.database)))?;
     let manifest_path = PathBuf::from(options.generated).join("manifest.json");
     let manifest = Manifest::load(&manifest_path).map_err(|error| {
         io::Error::new(

@@ -48,7 +48,7 @@ let getSyncStatusSqlMock = () => "select 1";
 let reshapeSyncTableGroupsMock = defaultReshapeSyncTableGroups;
 let introspectionResult = { schema_source: "" };
 let setSchemaCalls: unknown[] = [];
-let migrationResult: any = { Ok: { sql: [], mark_success: "record migration" } };
+let migrationResult: any = { Ok: { sql: [], mark_success: "record migration", external_identities: [] } };
 
 mock.module("./wasm/pyre_wasm.js", () => ({
   sql_is_initialized: () => "select 1 as is_initialized",
@@ -92,7 +92,7 @@ afterEach(() => {
   reshapeSyncTableGroupsMock = defaultReshapeSyncTableGroups;
   introspectionResult = { schema_source: "" };
   setSchemaCalls = [];
-  migrationResult = { Ok: { sql: [], mark_success: "record migration" } };
+  migrationResult = { Ok: { sql: [], mark_success: "record migration", external_identities: [] } };
 });
 
 function initializationDatabase(initialized: boolean, introspection: any) {
@@ -100,6 +100,10 @@ function initializationDatabase(initialized: boolean, introspection: any) {
   let closed = false;
   const tx = {
     execute: mock(async (sql: string) => {
+      if (typeof sql !== "string") return { rows: [] };
+      if (sql.startsWith("pragma table_info")) return { rows: [{ name: "schema_namespace" }] };
+      if (sql.startsWith("select name from sqlite_master")) return { rows: [] };
+      if (sql.startsWith("select schema_namespace")) return { rows: [{ schema_namespace: introspection.schema_namespace ?? null }] };
       if (sql.includes("is_initialized")) {
         return { rows: [{ is_initialized: initialized ? 1 : 0 }] };
       }
@@ -126,6 +130,7 @@ test("ensureDatabase creates a database in one write transaction", async () => {
     Ok: {
       sql: ["create table notes (id integer primary key)"],
       mark_success: "record migration",
+      external_identities: [],
     },
   };
   const database = initializationDatabase(false, {
@@ -141,8 +146,9 @@ test("ensureDatabase creates a database in one write transaction", async () => {
   expect(database.db.transaction).toHaveBeenCalledWith("write");
   expect(database.batches).toEqual([[
     "create table notes (id integer primary key)",
-    "record migration",
   ]]);
+  expect(database.tx.execute).toHaveBeenCalledWith("record migration");
+  expect(database.tx.execute.mock.calls.some(([statement]) => typeof statement === "object" && statement.sql.startsWith("delete from _pyre_external_identities"))).toBe(true);
   expect(database.tx.commit).toHaveBeenCalledTimes(1);
 });
 
@@ -151,6 +157,7 @@ test("ensureDatabase reuses an unchanged database", async () => {
     tables: [{ name: "notes" }],
     migration_state: { MigrationTable: { migrations: [] } },
     schema_source: "record Note {}",
+    schema_namespace: "Campaign",
     links: [],
   });
 
@@ -180,7 +187,12 @@ test("catchup activates the schema loaded for its databaseId", async () => {
   const mainIntrospection = { schema_source: "main schema" };
   const campaignIntrospection = { schema_source: "campaign schema" };
   const schemaDb = {
+    transaction: mock(async () => ({
+      execute: schemaDb.execute,
+      commit: async () => {}, rollback: async () => {}, close() {}, closed: false,
+    })),
     execute: mock(async (sql: string) => {
+      if (sql.startsWith("pragma table_info") || sql.startsWith("select name from sqlite_master")) return { rows: [] };
       if (sql.includes("is_initialized")) {
         return { rows: [{ is_initialized: 1 }] };
       }
@@ -200,7 +212,7 @@ test("catchup activates the schema loaded for its databaseId", async () => {
 
   await catchup(db as any, { tables: {} }, {}, 1000, "main");
 
-  expect(setSchemaCalls.at(-1)).toEqual(mainIntrospection);
+  expect(setSchemaCalls.at(-1)).toEqual({ ...mainIntrospection, external_identities: [] });
 });
 
 test("catchup reshapes flattened custom types before returning sync rows", async () => {
@@ -263,7 +275,12 @@ test("catchup reshapes flattened custom types before returning sync rows", async
 test("catchup stamps response with databaseId when provided", async () => {
   getSyncSqlMock = () => ({ tables: [] });
   const schemaDb = {
+    transaction: mock(async () => ({
+      execute: schemaDb.execute,
+      commit: async () => {}, rollback: async () => {}, close() {}, closed: false,
+    })),
     execute: mock(async (sql: string) => {
+      if (sql.startsWith("pragma table_info") || sql.startsWith("select name from sqlite_master")) return { rows: [] };
       if (sql.includes("is_initialized")) {
         return { rows: [{ is_initialized: 1 }] };
       }

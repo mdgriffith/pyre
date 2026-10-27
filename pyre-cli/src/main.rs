@@ -89,6 +89,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         push: bool,
 
+        /// Apply destructive push changes without confirmation.
+        #[arg(long, requires = "push", default_value_t = false)]
+        force: bool,
+
         /// Directory where migration files are stored.
         #[arg(long, default_value = "pyre/migrations")]
         migration_dir: String,
@@ -225,11 +229,12 @@ async fn run() -> io::Result<()> {
             database,
             auth,
             push,
+            force,
             migration_dir,
             namespace,
         } => {
             if *push {
-                command::push(&options, database, auth, namespace).await?;
+                command::push(&options, database, auth, namespace, *force).await?;
             } else {
                 command::migrate(&options, database, auth, migration_dir, namespace).await?;
             }

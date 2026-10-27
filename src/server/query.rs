@@ -748,9 +748,13 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::OutcomeUnknown(error) => {
-                write!(f, "commit transaction: database error: {}; outcome unknown; do not automatically replay", error)
+                write!(f, "Could not confirm that the transaction committed: {}. The outcome is unknown; check the operation's result before retrying.", crate::db::diagnostic::database_error(error))
             }
-            Error::Database(error) => write!(f, "database error: {}", error),
+            Error::Database(error) => write!(
+                f,
+                "Database operation failed: {}",
+                crate::db::diagnostic::database_error(error)
+            ),
             Error::Execution {
                 stage,
                 statement_index,

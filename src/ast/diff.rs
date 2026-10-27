@@ -136,7 +136,7 @@ pub fn diff_schema(old_schema: &crate::ast::Schema, new_schema: &crate::ast::Sch
         for def in &file.definitions {
             match def {
                 crate::ast::Definition::Tagged { .. } | crate::ast::Definition::Record { .. } => {
-                    old_defs.push(def.clone());
+                    old_defs.push(canonical_definition(def, &old_schema.namespace));
                 }
                 _ => continue,
             }
@@ -148,7 +148,7 @@ pub fn diff_schema(old_schema: &crate::ast::Schema, new_schema: &crate::ast::Sch
         for new_def in &new_file.definitions {
             match new_def {
                 crate::ast::Definition::Tagged { .. } | crate::ast::Definition::Record { .. } => {
-                    new_defs.push(new_def.clone());
+                    new_defs.push(canonical_definition(new_def, &new_schema.namespace));
                 }
                 _ => continue,
             }
@@ -333,6 +333,47 @@ fn directives_equal(old: &crate::ast::ColumnDirective, new: &crate::ast::ColumnD
     }
 }
 
+// Local identity references have one comparison form regardless of whether the
+// author (or an older snapshot serializer) included the local namespace.
+fn canonical_definition(definition: &ast::Definition, namespace: &str) -> ast::Definition {
+    fn canonical_type(type_: &mut ast::ColumnType, namespace: &str) {
+        match type_ {
+            ast::ColumnType::ForeignKey { schema, .. } => {
+                if schema.as_deref() == Some(namespace) {
+                    *schema = None;
+                }
+            }
+            ast::ColumnType::JsonTyped(inner)
+            | ast::ColumnType::List(inner)
+            | ast::ColumnType::Dict(inner)
+            | ast::ColumnType::Nullable(inner) => canonical_type(inner, namespace),
+            _ => {}
+        }
+    }
+
+    fn canonical_fields(fields: &mut [ast::Field], namespace: &str) {
+        for field in fields {
+            if let ast::Field::Column(column) = field {
+                canonical_type(&mut column.type_, namespace);
+            }
+        }
+    }
+
+    let mut definition = definition.clone();
+    match &mut definition {
+        ast::Definition::Record { fields, .. } => canonical_fields(fields, namespace),
+        ast::Definition::Tagged { variants, .. } => {
+            for variant in variants {
+                if let Some(fields) = &mut variant.fields {
+                    canonical_fields(fields, namespace);
+                }
+            }
+        }
+        _ => {}
+    }
+    definition
+}
+
 fn diff_column(old: &crate::ast::Column, new: &crate::ast::Column) -> Option<ColumnDiff> {
     let mut has_changes = false;
     let mut diff = ColumnDiff {
@@ -341,6 +382,26 @@ fn diff_column(old: &crate::ast::Column, new: &crate::ast::Column) -> Option<Col
         added_directives: Vec::new(),
         removed_directives: Vec::new(),
     };
+
+    // Stored primary keys may omit the identity brand inferred by typechecking.
+    let same_primary_identity = ast::is_primary_key(old)
+        && ast::is_primary_key(new)
+        && matches!(
+            (&old.type_, &new.type_),
+            (ast::ColumnType::IdInt { .. }, ast::ColumnType::IdInt { .. })
+                | (
+                    ast::ColumnType::IdUuid { .. },
+                    ast::ColumnType::IdUuid { .. }
+                )
+        );
+    if !same_primary_identity && old.type_.to_string() != new.type_.to_string() {
+        diff.type_changed = Some((old.type_.to_string(), new.type_.to_string()));
+        has_changes = true;
+    }
+    if old.nullable != new.nullable {
+        diff.nullable_changed = Some((old.nullable, new.nullable));
+        has_changes = true;
+    }
 
     // Create HashMaps with directive keys
     let mut old_directives = std::collections::HashMap::new();

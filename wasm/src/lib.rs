@@ -17,8 +17,7 @@ pub fn start() {
 
 #[wasm_bindgen]
 pub fn set_schema(introspection: JsValue) -> Result<(), JsValue> {
-    cache::set_schema(introspection);
-    Ok(())
+    cache::set_schema(introspection)
 }
 
 #[wasm_bindgen]

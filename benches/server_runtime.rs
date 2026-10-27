@@ -10,6 +10,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 const SCHEMA: &str = r#"
+@syncable(false)
 session {
     userId Int
     role String

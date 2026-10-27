@@ -101,10 +101,9 @@ pub fn calculate_sync_deltas_wasm(
             let connected_sessions_rust = connected_sessions_map
                 .into_iter()
                 .map(|(session_id, data)| {
-                    let session = pyre::session::prepare_session(context, &data.session)
-                        .map_err(|error| {
-                            format!("Failed to prepare session '{}': {}", session_id, error)
-                        })?;
+                    let session = pyre::session::prepare_session(context, &data.session).map_err(
+                        |error| format!("Failed to prepare session '{}': {}", session_id, error),
+                    )?;
                     Ok::<_, String>((session_id, session))
                 })
                 .collect::<Result<HashMap<_, _>, _>>()?;

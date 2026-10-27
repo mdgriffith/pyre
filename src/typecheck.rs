@@ -288,6 +288,7 @@ pub struct Context {
 
     pub types: HashMap<String, (DefInfo, Type)>,
     pub tables: HashMap<String, Table>,
+    pub external_identities: Vec<ast::ExternalIdentity>,
 
     // All variants by type name + variant name.
     // Used to check if there are multiple variants with the same name in a type.
@@ -331,6 +332,7 @@ pub fn empty_context() -> Context {
         funcs: fns,
         types: HashMap::new(),
         tables: HashMap::new(),
+        external_identities: Vec::new(),
         variants: HashMap::new(),
     };
     context
@@ -717,7 +719,14 @@ fn validate_variant_field_type_collisions(
 }
 
 pub fn check_schema(db: &ast::Database) -> Result<Context, Vec<Error>> {
-    let mut context = populate_context(db)?;
+    check_schema_with_external_identities(db, &[])
+}
+
+pub fn check_schema_with_external_identities(
+    db: &ast::Database,
+    identities: &[ast::ExternalIdentity],
+) -> Result<Context, Vec<Error>> {
+    let mut context = populate_context_with_external_identities(db, identities)?;
 
     let mut errors: Vec<Error> = Vec::new();
 
@@ -739,6 +748,30 @@ pub fn check_schema(db: &ast::Database) -> Result<Context, Vec<Error>> {
     }
 
     check_schema_definitions(&context, db, &mut errors);
+
+    // Shared project sessions may be attached to Schema.session rather than
+    // appear as an inline definition in any namespace's files.
+    if !db
+        .schemas
+        .iter()
+        .flat_map(|schema| &schema.files)
+        .flat_map(|file| &file.definitions)
+        .any(|definition| matches!(definition, ast::Definition::Session(_)))
+    {
+        if let Some(session) = &context.session {
+            for column in ast::collect_columns(&session.fields) {
+                validate_reference_type(
+                    &context,
+                    "session.pyre",
+                    to_range(&session.start, &session.end),
+                    to_range(&column.start_typename, &column.end_typename),
+                    &column.type_,
+                    true,
+                    &mut errors,
+                );
+            }
+        }
+    }
 
     if !errors.is_empty() {
         return Err(errors);
@@ -1094,12 +1127,68 @@ pub fn resolve_query_param_column_type(
                     _ => None,
                 })
         })
+        .or_else(|| {
+            external_identity(context, schema.as_deref(), table, field)
+                .map(|identity| identity.kind.column_type(&identity.record))
+        })
         .unwrap_or_else(|| type_.clone())
+}
+
+pub fn external_identity<'a>(
+    context: &'a Context,
+    namespace: Option<&str>,
+    record: &str,
+    field: &str,
+) -> Option<&'a ast::ExternalIdentity> {
+    context.external_identities.iter().find(|identity| {
+        identity.record == record
+            && identity.field == field
+            && namespace.map_or(true, |namespace| identity.namespace == namespace)
+    })
+}
+
+/// Authoritative candidates for resolving another namespace's stored schema.
+/// Call only with a successfully checked project context.
+pub fn project_external_identities(
+    context: &Context,
+    namespace: &str,
+) -> Vec<ast::ExternalIdentity> {
+    let mut identities = context.external_identities.clone();
+    for table in context
+        .tables
+        .values()
+        .filter(|table| table.schema != namespace)
+    {
+        for column in ast::collect_columns(&table.record.fields) {
+            let kind = match column.type_ {
+                ast::ColumnType::IdInt { .. } => ast::IdentityKind::Int,
+                ast::ColumnType::IdUuid { .. } => ast::IdentityKind::Uuid,
+                _ => continue,
+            };
+            identities.push(ast::ExternalIdentity {
+                namespace: table.schema.clone(),
+                record: table.record.name.clone(),
+                field: column.name.clone(),
+                kind,
+            });
+        }
+    }
+    identities.sort_by(|a, b| {
+        (&a.namespace, &a.record, &a.field).cmp(&(&b.namespace, &b.record, &b.field))
+    });
+    identities
 }
 
 /// Gathers information for a context.
 /// Also checks for a number of errors
 pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>> {
+    populate_context_with_external_identities(database, &[])
+}
+
+fn populate_context_with_external_identities(
+    database: &ast::Database,
+    identities: &[ast::ExternalIdentity],
+) -> Result<Context, Vec<Error>> {
     let mut context = empty_context();
     let mut errors = Vec::new();
     context.valid_namespaces = database
@@ -1282,6 +1371,31 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
         }
     }
 
+    // External identities participate in type resolution only, never as tables.
+    for identity in identities {
+        let duplicate = context.external_identities.iter().any(|existing| {
+            existing.record == identity.record
+                && (existing.namespace != identity.namespace || existing.field == identity.field)
+        });
+        let conflicts_with_table = context
+            .tables
+            .values()
+            .any(|table| table.record.name == identity.record);
+        if database
+            .schemas
+            .iter()
+            .any(|schema| schema.namespace == identity.namespace)
+            || duplicate
+            || conflicts_with_table
+        {
+            errors.push(invalid_type_usage_error("_pyre_external_identities",
+                            format!("External identity {}.{}.{} duplicates or conflicts with an existing identity or physical record.", identity.namespace, identity.record, identity.field),
+                            vec![], vec![]));
+        } else {
+            context.external_identities.push(identity.clone());
+        }
+    }
+
     // Check for duplicate fields
     // Check for duplicate tablenames
     //
@@ -1390,6 +1504,13 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                                 && table.record.name == *ref_table
                                         });
 
+                                        let external = external_identity(
+                                            &context,
+                                            Some(target_schema),
+                                            ref_table,
+                                            ref_field,
+                                        );
+
                                         match foreign_table {
                                             Some(foreign_table) => {
                                                 // Check if the referenced field exists
@@ -1471,6 +1592,7 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
                                                     }
                                                 }
                                             }
+                                            None if external.is_some() => {}
                                             None => {
                                                 // Table doesn't exist
                                                 let existing_tables: Vec<String> = context
@@ -1829,7 +1951,7 @@ pub fn populate_context(database: &ast::Database) -> Result<Context, Vec<Error>>
 }
 
 fn resolve_foreign_key_serialization_types(context: &mut Context) {
-    let foreign_key_types: HashMap<
+    let mut foreign_key_types: HashMap<
         (String, String),
         HashMap<String, ast::ConcreteSerializationType>,
     > = context
@@ -1852,6 +1974,13 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
             ((table.schema.clone(), table.record.name.clone()), columns)
         })
         .collect();
+
+    for identity in &context.external_identities {
+        foreign_key_types
+            .entry((identity.namespace.clone(), identity.record.clone()))
+            .or_default()
+            .insert(identity.field.clone(), identity.kind.serialization_type());
+    }
 
     fn resolve_type(
         type_: &mut ast::ColumnType,
@@ -2577,6 +2706,11 @@ fn validate_reference_type(
                         .map(|schema| candidate.schema == *schema)
                         .unwrap_or(true)
             });
+            if target.is_none()
+                && external_identity(context, schema.as_deref(), table, field).is_some()
+            {
+                return;
+            }
             let error_type = match target {
                 None => Some(ErrorType::ForeignKeyToUnknownTable {
                     field_name: type_.to_string(),

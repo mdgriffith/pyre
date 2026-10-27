@@ -92,8 +92,10 @@ async fn committed_results_survive_later_database_failure() {
     assert!(value["results"][0].get("response").is_some());
     assert!(value["results"][0].get("affectedRows").is_some());
     let error = value["error"].as_str().unwrap();
+    assert!(error.contains("Query: Duplicate"), "{error}");
+    assert!(error.contains("Database: test.db"), "{error}");
     assert!(
-        error.contains("query 'Duplicate': execute SQL statement"),
+        error.contains("execute SQL statement 1 (1-based)"),
         "{error}"
     );
     assert!(error.contains("UNIQUE constraint failed"), "{error}");
@@ -152,7 +154,9 @@ async fn first_failure_keeps_json_rpc_error_and_does_not_expose_values() {
         assert!(response.get("result").is_none(), "{response}");
         assert_eq!(response["error"]["code"], -32603);
         let error = response["error"]["message"].as_str().unwrap();
-        assert!(error.contains("query 'Failed': execute SQL statement"), "{error}");
+        assert!(error.contains("Query: Failed"), "{error}");
+        assert!(error.contains("Database: test.db"), "{error}");
+        assert!(error.contains("execute SQL statement 1 (1-based)"), "{error}");
         for secret in ["private-parameter-value", "private-auth-token", "private-session-value"] {
             assert!(!error.contains(secret), "{error}");
         }
@@ -202,7 +206,7 @@ async fn runtime_reports_statement_index_and_transaction_stages() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("begin transaction: database error"),
+        error.contains("begin transaction: Database operation failed"),
         "{error}"
     );
     tx.rollback().await.unwrap();
@@ -222,7 +226,8 @@ async fn runtime_reports_statement_index_and_transaction_stages() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("commit transaction: database error"),
+        error.contains("Could not confirm that the transaction committed"),
         "{error}"
     );
+    assert!(error.contains("outcome is unknown"), "{error}");
 }

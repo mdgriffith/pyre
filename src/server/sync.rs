@@ -774,7 +774,11 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Database(error) => write!(f, "database error: {}", error),
+            Error::Database(error) => write!(
+                f,
+                "Could not synchronize database changes: {}",
+                crate::db::diagnostic::database_error(error)
+            ),
             Error::DatabaseId(error) => write!(f, "database id error: {}", error),
             Error::InvalidPageSize => write!(f, "page_size must be greater than zero"),
             Error::Json(error) => write!(f, "json error: {}", error),

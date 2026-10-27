@@ -19,6 +19,7 @@ pub fn generate_schema(
     for schema in &database.schemas {
         let module = unique_name(&to_snake_name(&schema.namespace), &mut used_modules);
         let source = crate::generate::to_string::standalone_schema_to_string(context, schema);
+        let identities = crate::typecheck::project_external_identities(context, &schema.namespace);
         result.push_str(&format!("pub mod {module} {{\n"));
         result.push_str(&format!(
             "    pub const NAME: &str = {:?};\n",
@@ -31,9 +32,12 @@ pub fn generate_schema(
         result.push_str("    pub async fn ensure_database(\n");
         result.push_str("        conn: &libsql::Connection,\n");
         result.push_str("    ) -> Result<pyre::server::schema::EnsureDatabaseOutcome, pyre::server::schema::EnsureDatabaseError> {\n");
-        result.push_str(
-            "        pyre::server::schema::ensure_database(conn, NAME, SCHEMA_SOURCE).await\n",
-        );
+        result.push_str("        let identities = vec![\n");
+        for identity in identities {
+            result.push_str(&format!("            pyre::ast::ExternalIdentity {{ namespace: {:?}.into(), record: {:?}.into(), field: {:?}.into(), kind: pyre::ast::IdentityKind::{:?} }},\n", identity.namespace, identity.record, identity.field, identity.kind));
+        }
+        result.push_str("        ];\n");
+        result.push_str("        pyre::server::schema::ensure_database_with_external_identities(conn, NAME, SCHEMA_SOURCE, &identities).await\n");
         result.push_str("    }\n");
         result.push_str("}\n\n");
     }

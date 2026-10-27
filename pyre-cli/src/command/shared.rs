@@ -97,7 +97,7 @@ pub fn check_namespace_requirements(namespace: &Option<String>, options: &Option
                     "{}",
                     error::format_custom_error(
                         "Schema Not Found",
-                        "I was trying to find the schema, but it's not available."
+                        &format!("No Pyre schema found in {}. Use --in <directory> to select an existing schema directory, or run `pyre init` to create one.", options.in_dir.display())
                     )
                 );
                 std::process::exit(1);
