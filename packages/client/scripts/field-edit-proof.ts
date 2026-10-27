@@ -14,7 +14,8 @@ import { catchup } from '../../server/sync';
 await init({ module_or_path: await Bun.file(new URL('../../server/wasm/pyre_wasm_bg.wasm', import.meta.url)).arrayBuffer() });
 const directory = await mkdtemp(`${tmpdir()}/pyre-field-proof-`);
 const db = createClient({ url: `file:${directory}/proof.db` });
-await ensureDatabase(db, 'proof', `
+// Schema namespaces are capitalized; the sync database ID below is 'proof'.
+await ensureDatabase(db, 'Proof', `
 session {
   admin Bool
 }
