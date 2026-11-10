@@ -10,6 +10,55 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
 }
 
 #[test]
+fn generated_elm_rows_include_expanded_timestamps() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+record Note {
+    @public
+    @timestamps
+    id Id.Uuid @id
+    body String
+}
+
+record Plain {
+    @public
+    id Id.Uuid @id
+}
+"#,
+        &mut schema,
+    )
+    .expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let mut files = Vec::new();
+    pyre::generate::generate_schema(&context, &mut files);
+    let file = |suffix: &str| {
+        &files
+            .iter()
+            .find(|file| path_ends_with(&file.path, suffix))
+            .unwrap_or_else(|| panic!("missing generated {suffix}"))
+            .contents
+    };
+
+    let note = file("client/elm/Db/Table/Notes.elm");
+    for field in ["createdAt", "updatedAt"] {
+        assert!(note.contains(&format!("{field} : Time.Posix")), "{note}");
+        assert!(
+            note.contains(&format!(
+                "Db.Decode.andField \"{field}\" Db.Decode.dateTime"
+            )),
+            "{note}"
+        );
+    }
+    // Implicit sync columns must use the same expanded schema, too.
+    assert!(file("client/elm/Db/Table/Plains.elm").contains("updatedAt : Time.Posix"));
+}
+
+#[test]
 fn generated_elm_update_groups_list_input_types() {
     let schema_source = r#"
 record MapEntityTrail {

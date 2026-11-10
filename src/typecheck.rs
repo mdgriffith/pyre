@@ -279,6 +279,8 @@ fn field_to_sql_column(
 
 #[derive(Debug)]
 pub struct Context {
+    /// Expanded schema shared by validation and all code generators.
+    pub database: ast::Database,
     pub current_filepath: String,
 
     pub valid_namespaces: HashSet<String>,
@@ -325,6 +327,9 @@ pub fn empty_context() -> Context {
     platform::add_builtin(&mut fns);
 
     let mut context = Context {
+        database: ast::Database {
+            schemas: Vec::new(),
+        },
         current_filepath: "".to_string(),
         valid_namespaces: HashSet::new(),
         namespace_sync_modes: HashMap::new(),
@@ -727,6 +732,7 @@ pub fn check_schema_with_external_identities(
     identities: &[ast::ExternalIdentity],
 ) -> Result<Context, Vec<Error>> {
     let mut context = populate_context_with_external_identities(db, identities)?;
+    let db = &context.database;
 
     let mut errors: Vec<Error> = Vec::new();
 
@@ -1189,6 +1195,7 @@ fn populate_context_with_external_identities(
     database: &ast::Database,
     identities: &[ast::ExternalIdentity],
 ) -> Result<Context, Vec<Error>> {
+    let database = database.expanded();
     let mut context = empty_context();
     let mut errors = Vec::new();
     context.valid_namespaces = database
@@ -1253,13 +1260,9 @@ fn populate_context_with_external_identities(
                                 });
                             }
                         }
-                        let mut fields_with_updated_at = ast::with_timestamps_fields(fields);
-                        // Ensure updatedAt field exists
-                        ast::ensure_updated_at_field(&mut fields_with_updated_at);
-
                         let record_details = ast::RecordDetails {
                             name: name.clone(),
-                            fields: fields_with_updated_at.clone(),
+                            fields: fields.clone(),
                             start: start.clone(),
                             end: end.clone(),
                             start_name: start_name.clone(),
@@ -1417,8 +1420,7 @@ fn populate_context_with_external_identities(
                         let mut permission_directives: Vec<(ast::PermissionDetails, Range)> =
                             Vec::new();
 
-                        let fields = ast::with_timestamps_fields(fields);
-                        for field in &fields {
+                        for field in fields {
                             match field {
                                 ast::Field::Column(column) => {
                                     if field_names.contains(&column.name) {
@@ -1945,6 +1947,7 @@ fn populate_context_with_external_identities(
     if errors.len() > 0 {
         return Err(errors);
     } else {
+        context.database = database;
         resolve_foreign_key_serialization_types(&mut context);
         return Ok(context);
     }
@@ -2154,7 +2157,6 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                         end_name: _end_name,
                     } => {
                         let mut field_names: HashMap<String, Option<Range>> = HashMap::new();
-                        let fields = ast::with_timestamps_fields(fields);
                         let sequence_columns: Vec<_> = fields
                             .iter()
                             .filter_map(|field| match field {

@@ -3,9 +3,31 @@ use serde::{Deserialize, Serialize};
 
 pub mod diff;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Database {
     pub schemas: Vec<Schema>,
+}
+
+impl Database {
+    /// Lower record shorthand and implicit fields before validation and generation.
+    /// Keep the source AST separate so formatting preserves the user's directives.
+    pub fn expanded(&self) -> Self {
+        let mut database = self.clone();
+        for schema in &mut database.schemas {
+            for file in &mut schema.files {
+                for definition in &mut file.definitions {
+                    if let Definition::Record { fields, .. } = definition {
+                        *fields = with_timestamps_fields(fields);
+                        fields.retain(|field| {
+                            !matches!(field, Field::FieldDirective(FieldDirective::Timestamps))
+                        });
+                        ensure_updated_at_field(fields);
+                    }
+                }
+            }
+        }
+        database
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
@@ -619,7 +641,7 @@ pub fn is_singleton(fields: &[Field]) -> bool {
         .any(|field| matches!(field, Field::FieldDirective(FieldDirective::Singleton)))
 }
 
-pub fn with_timestamps_fields(fields: &Vec<Field>) -> Vec<Field> {
+fn with_timestamps_fields(fields: &Vec<Field>) -> Vec<Field> {
     let mut result = fields.clone();
     if !fields
         .iter()

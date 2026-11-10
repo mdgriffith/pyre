@@ -190,6 +190,54 @@ record Note {
 }
 
 #[test]
+fn schema_expansion_preserves_source_and_is_idempotent() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        "record Note {\n    @public\n    @timestamps\n    id Id.Uuid @id\n}\n",
+        &mut schema,
+    )
+    .expect("schema parses");
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let source = database.schemas.clone();
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    assert_eq!(database.schemas, source);
+    assert_eq!(
+        context.database.schemas,
+        context.database.expanded().schemas
+    );
+    let checked_again =
+        typecheck::check_schema(&context.database).expect("expanded schema typechecks");
+    assert_eq!(
+        context.tables["note"].record.fields,
+        checked_again.tables["note"].record.fields
+    );
+}
+
+#[test]
+fn timestamps_reject_conflicting_explicit_columns() {
+    for name in ["createdAt", "updatedAt"] {
+        let mut schema = ast::Schema::default();
+        parser::run(
+            "schema.pyre",
+            &format!("record Note {{\n    @public\n    @timestamps\n    id Id.Uuid @id\n    {name} DateTime\n}}\n"),
+            &mut schema,
+        )
+        .expect("schema parses");
+        let errors = typecheck::check_schema(&ast::Database {
+            schemas: vec![schema],
+        })
+        .expect_err("timestamp shorthand must not hide conflicting columns");
+        assert!(errors.iter().any(|error| matches!(
+            &error.error_type,
+            ErrorType::DuplicateField { field, .. } if field == name
+        )));
+    }
+}
+
+#[test]
 fn managed_fields_and_integer_ids_cannot_be_set_in_insert_mutations() {
     let context = checked_context(
         r#"

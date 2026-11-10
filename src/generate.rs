@@ -16,9 +16,9 @@ pub mod typescript;
 
 pub fn generate_schema(
     context: &typecheck::Context,
-    database: &ast::Database,
     files: &mut Vec<crate::filesystem::GeneratedFile<String>>,
 ) {
+    let database = &context.database;
     write_client_schema(database, files);
     let typescript_core_dir = Path::new("typescript/core");
     let typescript_dir = Path::new("typescript");

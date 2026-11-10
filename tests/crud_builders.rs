@@ -58,7 +58,7 @@ transaction Mixed($title: String) {
     .unwrap();
     let info = typecheck::check_queries(&queries, &context).unwrap();
     let mut files = vec![];
-    generate::generate_schema(&context, &database, &mut files);
+    generate::generate_schema(&context, &mut files);
     generate::write_queries(&context, &queries, &info, &mut files);
     let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
     for file in files {
@@ -193,7 +193,7 @@ fn elm_edit_builders_preserve_schema_names() {
     generated_queries::append_generated_crud_queries(&mut queries, &context);
     let info = typecheck::check_queries(&queries, &context).unwrap();
     let mut files = vec![];
-    generate::generate_schema(&context, &database, &mut files);
+    generate::generate_schema(&context, &mut files);
     generate::write_queries(&context, &queries, &info, &mut files);
     let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
     for file in files {
@@ -304,7 +304,7 @@ record Document {
     generated_queries::append_generated_crud_queries(&mut queries, &context);
     let info = typecheck::check_queries(&queries, &context).unwrap();
     let mut files = vec![];
-    generate::generate_schema(&context, &database, &mut files);
+    generate::generate_schema(&context, &mut files);
     generate::write_queries(&context, &queries, &info, &mut files);
     let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
     for file in files {
@@ -436,7 +436,7 @@ record Note {
     generated_queries::append_generated_crud_queries(&mut queries, &context);
     let info = typecheck::check_queries(&queries, &context).unwrap();
     let mut files = vec![];
-    generate::generate_schema(&context, &database, &mut files);
+    generate::generate_schema(&context, &mut files);
     generate::write_queries(&context, &queries, &info, &mut files);
     let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
     for file in files {

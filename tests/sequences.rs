@@ -108,7 +108,7 @@ fn sequence_types_preserve_logical_identity_and_exclude_write_inputs() {
     assert!(manifest.queries[&ids["EventDelete"]]
         .input_schema
         .contains_key("key"));
-    pyre::generate::generate_schema(&context, &database, &mut files);
+    pyre::generate::generate_schema(&context, &mut files);
     let rust = &files
         .iter()
         .find(|file| file.path.ends_with("rust/server.rs"))
