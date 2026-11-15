@@ -17,11 +17,7 @@ impl Database {
             for file in &mut schema.files {
                 for definition in &mut file.definitions {
                     if let Definition::Record { fields, .. } = definition {
-                        *fields = with_timestamps_fields(fields);
-                        fields.retain(|field| {
-                            !matches!(field, Field::FieldDirective(FieldDirective::Timestamps))
-                        });
-                        ensure_updated_at_field(fields);
+                        expand_record_fields(fields);
                     }
                 }
             }
@@ -639,6 +635,13 @@ pub fn is_singleton(fields: &[Field]) -> bool {
     fields
         .iter()
         .any(|field| matches!(field, Field::FieldDirective(FieldDirective::Singleton)))
+}
+
+/// Use the same record representation for validation, generation, and schema diffs.
+pub(crate) fn expand_record_fields(fields: &mut Vec<Field>) {
+    *fields = with_timestamps_fields(fields);
+    fields.retain(|field| !matches!(field, Field::FieldDirective(FieldDirective::Timestamps)));
+    ensure_updated_at_field(fields);
 }
 
 fn with_timestamps_fields(fields: &Vec<Field>) -> Vec<Field> {

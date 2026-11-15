@@ -333,8 +333,8 @@ fn directives_equal(old: &crate::ast::ColumnDirective, new: &crate::ast::ColumnD
     }
 }
 
-// Local identity references have one comparison form regardless of whether the
-// author (or an older snapshot serializer) included the local namespace.
+// Compare shorthand and implicit fields in their expanded form, and normalize
+// local identity references regardless of the snapshot's namespace spelling.
 fn canonical_definition(definition: &ast::Definition, namespace: &str) -> ast::Definition {
     fn canonical_type(type_: &mut ast::ColumnType, namespace: &str) {
         match type_ {
@@ -361,7 +361,10 @@ fn canonical_definition(definition: &ast::Definition, namespace: &str) -> ast::D
 
     let mut definition = definition.clone();
     match &mut definition {
-        ast::Definition::Record { fields, .. } => canonical_fields(fields, namespace),
+        ast::Definition::Record { fields, .. } => {
+            ast::expand_record_fields(fields);
+            canonical_fields(fields, namespace);
+        }
         ast::Definition::Tagged { variants, .. } => {
             for variant in variants {
                 if let Some(fields) = &mut variant.fields {

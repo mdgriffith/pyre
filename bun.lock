@@ -11,16 +11,16 @@
     },
     "packages/cli": {
       "name": "pyre",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "bin": {
         "pyre": "./bin/pyre.js",
       },
     },
     "packages/client": {
       "name": "@pyre/client",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
-        "@pyre/core": "0.3.1",
+        "@pyre/core": "0.3.2",
       },
       "devDependencies": {
         "typescript": "^5.0.0",
@@ -28,7 +28,7 @@
     },
     "packages/core": {
       "name": "@pyre/core",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/editor-vscode": {
       "name": "pyre-vscode",
@@ -41,11 +41,11 @@
     },
     "packages/server": {
       "name": "@pyre/server",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@libsql/client": "^0.14.0",
-        "@pyre/client": "0.3.1",
-        "@pyre/core": "0.3.1",
+        "@pyre/client": "0.3.2",
+        "@pyre/core": "0.3.2",
       },
       "devDependencies": {
         "zod": "4.3.6",

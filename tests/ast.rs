@@ -127,6 +127,50 @@ fn serialized_defaults_do_not_produce_migration_errors() {
 }
 
 #[test]
+fn timestamp_shorthand_and_explicit_fields_have_no_schema_diff() {
+    let shorthand = parse_schema("record Note {\n    id Id.Uuid @id\n    @timestamps\n}\n");
+    let explicit = parse_schema(
+        "record Note {\n    id Id.Uuid @id\n    createdAt DateTime @createdAt\n    updatedAt DateTime @updatedAt\n}\n",
+    );
+    for (old, new) in [(&explicit, &shorthand), (&shorthand, &explicit)] {
+        let diff = ast::diff::diff_schema(old, new);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.modified_records.is_empty(), "{diff:?}");
+    }
+}
+
+#[test]
+fn implicit_updated_at_has_no_schema_diff() {
+    let implicit = parse_schema("record Note {\n    id Id.Uuid @id\n}\n");
+    let explicit = parse_schema(
+        "record Note {\n    id Id.Uuid @id\n    updatedAt DateTime @default(now)\n}\n",
+    );
+    for (old, new) in [(&explicit, &implicit), (&implicit, &explicit)] {
+        let diff = ast::diff::diff_schema(old, new);
+        assert!(diff.modified_records.is_empty(), "{diff:?}");
+    }
+}
+
+#[test]
+fn removing_timestamp_shorthand_still_reports_created_at_removal() {
+    let old = parse_schema("record Note {\n    id Id.Uuid @id\n    @timestamps\n}\n");
+    let new = parse_schema("record Note {\n    id Id.Uuid @id\n}\n");
+    let errors = ast::diff::to_errors(ast::diff::diff_schema(&old, &new));
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors.iter().any(|error| matches!(
+        &error.error_type,
+        pyre::error::ErrorType::MigrationColumnDropped { column_name, .. }
+            if column_name == "createdAt"
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        &error.error_type,
+        pyre::error::ErrorType::MigrationColumnModified { column_name, .. }
+            if column_name == "updatedAt"
+    )));
+}
+
+#[test]
 fn changed_default_produces_a_modified_column_error() {
     let old = parse_schema(
         r#"record Example {

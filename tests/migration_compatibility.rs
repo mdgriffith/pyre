@@ -43,6 +43,94 @@ fn migrate(root: &Path, mode: &str) {
 }
 
 #[tokio::test]
+async fn timestamp_representations_are_equivalent_across_migration_modes() {
+    let explicit = "    createdAt DateTime @createdAt\n    updatedAt DateTime @updatedAt\n";
+    let shorthand = "    @timestamps\n";
+    let implicit = "    updatedAt DateTime @default(now)\n";
+    for (old_fields, new_fields, mode) in [
+        (explicit, shorthand),
+        (shorthand, explicit),
+        (shorthand, shorthand),
+        (implicit, ""),
+    ]
+    .into_iter()
+    .flat_map(|(old, new)| ["runtime", "push", "files"].map(|mode| (old, new, mode)))
+    {
+        let root = tempfile::tempdir().unwrap();
+        let db = libsql::Builder::new_local(root.path().join("app.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let old = format!("record Note {{\n    @public\n    id Id.Uuid @id\n{old_fields}}}\n");
+        schema::ensure_database(&conn, "App", &old).await.unwrap();
+        // The implicit-only case has no createdAt column.
+        let created_at = if old_fields == implicit {
+            ""
+        } else {
+            ", createdAt"
+        };
+        let created_at_value = if old_fields == implicit { "" } else { ", 100" };
+        conn.execute(
+            &format!("insert into notes (id, updatedAt{created_at}) values ('01900000-0000-7000-8000-000000000001', 200{created_at_value})"),
+            (),
+        )
+        .await
+        .unwrap();
+        let current = format!(
+            "record Note {{\n    @public\n    id Id.Uuid @id\n{new_fields}    title String?\n}}\n"
+        );
+        let current = current.as_str();
+        if mode == "runtime" {
+            schema::ensure_database(&conn, "App", current)
+                .await
+                .unwrap();
+        } else {
+            project(
+                root.path(),
+                current,
+                "record User {\n    @public\n    id Id.Uuid @id\n}\n",
+                None,
+            );
+            migrate(root.path(), mode);
+        }
+        let row = conn
+            .query("select updatedAt, title from notes", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 200, "{mode}");
+        assert_eq!(row.get_value(1).unwrap(), libsql::Value::Null);
+        if old_fields != implicit {
+            let row = conn
+                .query("select createdAt from notes", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i64>(0).unwrap(), 100, "{mode}");
+        }
+        // CLI snapshots include project formatting/session metadata. Refresh
+        // that metadata to the runtime source before checking idempotence.
+        schema::ensure_database(&conn, "App", current)
+            .await
+            .unwrap();
+        assert_eq!(
+            schema::ensure_database(&conn, "App", current)
+                .await
+                .unwrap(),
+            EnsureDatabaseOutcome::UpToDate,
+            "{mode}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn legacy_external_scalar_snapshots_upgrade_without_rebuilding_columns() {
     for (kind, scalar, value) in [
         (
