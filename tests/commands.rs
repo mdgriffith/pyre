@@ -3415,7 +3415,9 @@ async fn test_generated_typescript_runner_matches_nullable_typed_json_null() {
 import { createClient } from "@libsql/client";
 import { seed } from "./pyre/generated/typescript/seed.ts";
 import { EndLifecycle, GetLifecycles, GetNullLifecycles } from "./pyre/generated/typescript/run.ts";
+import { init } from "@pyre/server/wasm";
 
+await init();
 const db = createClient({ url: "file:.yak/yak.db" });
 const id = "7f4d3a18-8b6c-4e2f-a901-5c7d9e3b2f60";
 
