@@ -230,6 +230,8 @@ const result = await seed(db, data, { namespace: "Main" }); // namespace check i
 
 The legacy `(db, schemaMetadata, data, validators?, options?)` signature still works; supplied metadata and validators no longer control ingestion. `batchSize` has no effect, and `transactionMode: "batch"` or `"none"` is rejected. Seed requires interactive write transactions and a file-backed database for local libSQL clients. For 64-bit integer keys outside JavaScript’s safe integer range, configure the client with `intMode: "bigint"`; the JSON-compatible response still uses JavaScript numbers. Treat an `OutcomeUnknown` result as requiring inspection before retrying.
 
+TypeScript seeds flat tables in the fixture object's key order. Put referenced rows first, or use nested links so the fixture engine can derive the keys and insert rows in dependency order. Typed JSON is validated recursively against the installed schema, including tagged payloads and elements of lists and dictionaries.
+
 ## CLI
 
 ```bash
@@ -241,6 +243,8 @@ The command prints the inserted rows as JSON. It only reads the specified fixtur
 ## Database Policy
 
 Policy belongs to the physical database. `pyre db policy ./app.db` reads it without writing; an unmarked database is preserved. Use `pyre db policy ./app.db --set disposable` to opt an existing database into disposable workflows without changing application rows or installing a schema. An unreadable or malformed marker never authorizes a destructive operation.
+
+The TypeScript policy APIs require a file-backed local database or a remote libSQL target.
 
 When copying or restoring a database, establish the destination policy explicitly before use. A copied marker reflects the source's policy and is not a decision about the destination. If your copy tool preserves internal tables, verify the destination policy before any lifecycle operation and avoid carrying the source's disposable marker into a preserved destination.
 

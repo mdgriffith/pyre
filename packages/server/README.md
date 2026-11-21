@@ -52,12 +52,14 @@ that do not already contain Pyre migration metadata.
 
 ## Seed Data
 
-Generated server output includes a schema-bound `seed` helper for server-side fixtures and imports:
+Generated server output includes a schema-bound `seed` helper for server-side fixtures and imports. Initialize WASM once and connect to an already initialized, file-backed local or remote database:
 
 ```ts
 import { createClient } from "@libsql/client";
+import { init } from "@pyre/server/wasm";
 import { seed } from "./pyre/generated/typescript/seed";
 
+await init();
 const db = createClient({ url: "file:test.db" });
 
 const result = await seed(db, {
@@ -73,9 +75,9 @@ const result = await seed(db, {
 });
 ```
 
-Top-level keys are table names. Nested keys must be links declared on the parent table; Pyre derives foreign keys from the link metadata. You can also seed flattened layers by setting foreign key columns directly.
+Top-level keys are table names. Nested keys must be links declared on the parent table; Pyre derives foreign keys from the link metadata. You can also seed flattened layers by setting foreign key columns directly and listing referenced tables first.
 
-The seed call is atomic: if any row fails validation or insertion, Pyre rolls back the transaction. The returned data contains the full inserted rows, including nested rows.
+The seed call is atomic: if any row fails validation or insertion, Pyre rolls back the transaction. The returned data contains the full inserted rows, including nested rows. If commit or rollback cannot be confirmed, inspect the target before retrying.
 
 Seed currently bypasses Pyre query permissions and does not update Pyre sync metadata. Use it for setup/import workflows before synced clients rely on live deltas.
 

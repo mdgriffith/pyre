@@ -25,6 +25,58 @@ async fn seed_matches_wasm_conformance_fixture() -> Result<(), Box<dyn std::erro
 }
 
 #[tokio::test]
+async fn seed_rejects_invalid_typed_json_and_rolls_back() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = TestDatabase::new(include_str!("fixtures/seed/typed-json.pyre")).await?;
+    let conn = db.db.connect()?;
+    let valid = json!({
+        "payload": {"_type": "Payload", "count": 1},
+        "groups": {"group": [null, {"_type": "Payload", "count": 2}]}
+    });
+    for (invalid, path) in [
+        (
+            json!({"payload": {"_type": "Payload", "count": "wrong"}, "groups": {}}),
+            "entries[1].payload.count",
+        ),
+        (
+            json!({"payload": valid["payload"], "groups": {"group": [{"_type": "Payload", "count": false}]}}),
+            "entries[1].groups[\"group\"][0].count",
+        ),
+    ] {
+        let error = seed::seed(&conn, json!({"entries": [valid, invalid]}))
+            .await
+            .expect_err("invalid nested value should fail");
+        assert!(matches!(error, seed::Error::InvalidInput(message) if message.contains(path)));
+        let mut rows = conn.query("SELECT id FROM entries", ()).await?;
+        assert!(rows.next().await?.is_none());
+    }
+    let response = seed::seed(&conn, json!({"entries": [valid]}))
+        .await?
+        .response;
+    assert_eq!(response["entries"][0]["groups"], valid["groups"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn seed_uses_main_tables_and_metadata_despite_temp_shadows(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(include_str!("fixtures/seed/schema.pyre")).await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch("CREATE TEMP TABLE users (id INTEGER PRIMARY KEY, decoy TEXT); CREATE TEMP TABLE _pyre_migrations (decoy TEXT);").await?;
+    seed::seed_for_namespace(
+        &conn,
+        Some("_default"),
+        json!({"users": [{"name": "Main"}]}),
+    )
+    .await?;
+    let mut main = conn.query("SELECT name FROM main.users", ()).await?;
+    assert_eq!(main.next().await?.unwrap().get::<String>(0)?, "Main");
+    let mut temp = conn.query("SELECT id FROM temp.users", ()).await?;
+    assert!(temp.next().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn seed_inserts_nested_rows_and_serializes_values() -> Result<(), Box<dyn std::error::Error>>
 {
     let db = TestDatabase::new(

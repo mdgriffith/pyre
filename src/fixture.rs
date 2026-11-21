@@ -31,7 +31,7 @@ pub async fn ingest<F, Fut, E>(
     context: &typecheck::Context,
     namespace: &str,
     input: JsonValue,
-    mut execute: F,
+    execute: F,
 ) -> Result<JsonValue, E>
 where
     F: FnMut(Insert) -> Fut,
@@ -41,6 +41,21 @@ where
     let JsonValue::Object(input) = input else {
         return Err(Error::InvalidInput("seed input must be an object".to_string()).into());
     };
+    ingest_entries(context, namespace, input, execute).await
+}
+
+/// Like [`ingest`], but preserve the host's top-level entry order.
+pub async fn ingest_entries<F, Fut, E>(
+    context: &typecheck::Context,
+    namespace: &str,
+    input: impl IntoIterator<Item = (String, JsonValue)>,
+    mut execute: F,
+) -> Result<JsonValue, E>
+where
+    F: FnMut(Insert) -> Fut,
+    Fut: Future<Output = Result<ReturnedRow, E>>,
+    E: From<Error>,
+{
     let tables: HashMap<_, _> = context
         .tables
         .values()
@@ -388,7 +403,9 @@ fn serialize_value(
                 .ok_or_else(|| invalid_type(path, "a string"))?
                 .to_string(),
         ),
-        ColumnType::Json | ColumnType::JsonTyped(_) | ColumnType::List(_) | ColumnType::Dict(_) => {
+        ColumnType::Json => SqlValue::Text(value.to_string()),
+        ColumnType::JsonTyped(_) | ColumnType::List(_) | ColumnType::Dict(_) => {
+            validate_json(context, type_, value, path)?;
             SqlValue::Text(value.to_string())
         }
         ColumnType::Custom(type_name) => {
@@ -402,14 +419,62 @@ fn serialize_value(
     Ok(())
 }
 
-fn serialize_constructed(
+fn validate_json(
     context: &typecheck::Context,
-    type_name: &str,
-    physical_name: &str,
+    type_: &ast::ColumnType,
     value: &JsonValue,
     path: &str,
-    output: &mut Vec<(String, SqlValue)>,
 ) -> Result<(), Error> {
+    use ast::ColumnType;
+    match type_ {
+        ColumnType::Json => Ok(()),
+        ColumnType::JsonTyped(inner) => validate_json(context, inner, value, path),
+        ColumnType::Nullable(_) if value.is_null() => Ok(()),
+        ColumnType::Nullable(inner) => validate_json(context, inner, value, path),
+        ColumnType::List(inner) => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| invalid_type(path, "an array"))?;
+            for (index, item) in values.iter().enumerate() {
+                validate_json(context, inner, item, &format!("{path}[{index}]"))?;
+            }
+            Ok(())
+        }
+        ColumnType::Dict(inner) => {
+            let values = value
+                .as_object()
+                .ok_or_else(|| invalid_type(path, "an object"))?;
+            for (key, item) in values {
+                validate_json(context, inner, item, &format!("{path}[{key:?}]"))?;
+            }
+            Ok(())
+        }
+        ColumnType::Custom(type_name) => {
+            let (_, fields) = constructed_fields(context, type_name, value, path, true)?;
+            for (column, item) in fields {
+                if !(column.nullable && item.is_null()) {
+                    validate_json(
+                        context,
+                        &column.type_,
+                        item,
+                        &format!("{path}.{}", column.name),
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        // Reuse fixture scalar validation without changing the JSON representation.
+        scalar => serialize_value(context, scalar, "", value, path, &mut Vec::new()),
+    }
+}
+
+fn constructed_fields<'a>(
+    context: &'a typecheck::Context,
+    type_name: &str,
+    value: &'a JsonValue,
+    path: &str,
+    stored_in_json: bool,
+) -> Result<(&'a str, Vec<(&'a ast::Column, &'a JsonValue)>), Error> {
     let (tag, object) = match value {
         JsonValue::String(tag) => (tag.as_str(), None),
         JsonValue::Object(object) => {
@@ -439,7 +504,12 @@ fn serialize_constructed(
         .iter()
         .find(|variant| variant.name == tag)
         .ok_or_else(|| Error::InvalidInput(format!("{} has unknown variant '{}'", path, tag)))?;
-    output.push((physical_name.to_string(), SqlValue::Text(tag.to_string())));
+    // Only pure enums decode from a bare string inside JSON.
+    if stored_in_json && object.is_none() && variants.iter().any(|variant| variant.fields.is_some())
+    {
+        return Err(invalid_type(path, "an object with a '_type' discriminator"));
+    }
+    let mut values = Vec::new();
     if let Some(fields) = &variant.fields {
         let object = object.ok_or_else(|| {
             Error::InvalidInput(format!("{} variant '{}' requires fields", path, tag))
@@ -457,14 +527,7 @@ fn serialize_constructed(
                 }
                 continue;
             };
-            serialize_column(
-                context,
-                column,
-                &format!("{}__{}", physical_name, column.name),
-                value,
-                &format!("{}.{}", path, column.name),
-                output,
-            )?;
+            values.push((column, value));
         }
     } else if let Some(object) = object {
         if let Some(key) = object.keys().find(|key| key.as_str() != "_type") {
@@ -488,6 +551,29 @@ fn serialize_constructed(
                 }
             }
         }
+    }
+    Ok((tag, values))
+}
+
+fn serialize_constructed(
+    context: &typecheck::Context,
+    type_name: &str,
+    physical_name: &str,
+    value: &JsonValue,
+    path: &str,
+    output: &mut Vec<(String, SqlValue)>,
+) -> Result<(), Error> {
+    let (tag, fields) = constructed_fields(context, type_name, value, path, false)?;
+    output.push((physical_name.to_string(), SqlValue::Text(tag.to_string())));
+    for (column, value) in fields {
+        serialize_column(
+            context,
+            column,
+            &format!("{physical_name}__{}", column.name),
+            value,
+            &format!("{path}.{}", column.name),
+            output,
+        )?;
     }
     Ok(())
 }
@@ -540,8 +626,9 @@ fn serialize_uuid(value: &JsonValue, path: &str) -> Result<SqlValue, Error> {
 }
 
 fn insert_statement(table: &str, values: Vec<(String, SqlValue)>, path: String) -> Insert {
+    let table = quote(table);
     let sql = if values.is_empty() {
-        format!("INSERT INTO {} DEFAULT VALUES RETURNING *", quote(table))
+        format!("INSERT INTO main.{table} DEFAULT VALUES RETURNING *")
     } else {
         let columns = values
             .iter()
@@ -552,12 +639,7 @@ fn insert_statement(table: &str, values: Vec<(String, SqlValue)>, path: String) 
             .take(values.len())
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
-            "INSERT INTO {} ({}) VALUES ({}) RETURNING *",
-            quote(table),
-            columns,
-            placeholders
-        )
+        format!("INSERT INTO main.{table} ({columns}) VALUES ({placeholders}) RETURNING *")
     };
     Insert {
         sql,

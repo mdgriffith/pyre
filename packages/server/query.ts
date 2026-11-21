@@ -571,7 +571,7 @@ export async function seed(
     const fail = (errorType: NonNullable<SeedResult["error"]>["errorType"], cause: unknown): SeedResult => ({
         kind: "error", error: { errorType, message: seedErrorMessage(cause) },
     });
-    let value: unknown;
+    let entries: [string, unknown][];
     let options: SeedOptions;
     try {
         const legacy = inputOrSchema != null && typeof inputOrSchema === "object" && "queryFieldToTable" in inputOrSchema
@@ -581,7 +581,12 @@ export async function seed(
         if (options.transactionMode !== undefined && options.transactionMode !== "manual") {
             return fail("InvalidInput", "Seed requires one write transaction; batch and none modes are unsupported");
         }
-        value = fixtureValue(input);
+        const value = fixtureValue(input);
+        if (value === null || typeof value !== "object" || Array.isArray(value)) {
+            return fail("InvalidInput", "seed input must be an object");
+        }
+        // A JSON map in Rust sorts its keys. Send pairs to keep JS table order.
+        entries = Object.entries(value);
     } catch (error) {
         return fail("InvalidInput", error);
     }
@@ -604,7 +609,7 @@ export async function seed(
         if (!initialized || !introspection.schema_source) {
             throw new Error("Database does not contain an initialized Pyre schema");
         }
-        const response = await wasm.ingest_fixture(introspection, value, async ({ sql, args, path }: {
+        const response = await wasm.ingest_fixture(introspection, entries, async ({ sql, args, path }: {
             sql: string; args: SeedBind[]; path: string;
         }) => {
             try {

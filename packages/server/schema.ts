@@ -69,6 +69,7 @@ async function readPolicy(tx: Transaction, sql: PolicySql, namespace?: string): 
 
 /** Read the policy without creating metadata. Initialize server WASM before use. */
 export async function inspectDatabasePolicy(db: Client, namespace?: string): Promise<DatabasePolicy> {
+    await requireFileBackedLocalDatabase(db, "Database policy operations");
     const sql = wasm.database_policy_sql() as PolicySql;
     const tx = await db.transaction("read");
     try {
@@ -80,6 +81,7 @@ export async function inspectDatabasePolicy(db: Client, namespace?: string): Pro
 
 /** Persist explicit opt-in on the existing database. Initialize server WASM before use. */
 export async function setDatabaseDisposable(db: Client, namespace?: string): Promise<DatabasePolicy> {
+    await requireFileBackedLocalDatabase(db, "Database policy operations");
     const sql = wasm.database_policy_sql() as PolicySql;
     return databaseWrite<DatabasePolicy>(db, "Database policy", async tx => {
         const { marked } = await readPolicy(tx, sql, namespace);
@@ -169,13 +171,18 @@ export async function reseedDatabase(
     throw new ReseedError(error.errorType === "OutcomeUnknown" ? "seed-outcome-unknown" : "fresh-without-fixtures", error.message, error);
 }
 
-async function runDisposableDatabase(db: Client, reset: boolean, namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
+async function requireFileBackedLocalDatabase(db: Client, operation: string): Promise<void> {
+    // The local adapter detaches the connection when starting an interactive transaction.
     if (db.protocol === "file") {
         const databases = await db.execute("pragma database_list");
         if (!databases.rows.some(row => row.name === "main" && typeof row.file === "string" && row.file.length > 0)) {
-            throw new Error("Database lifecycle operations require a file-backed local database");
+            throw new Error(`${operation} require a file-backed local database`);
         }
     }
+}
+
+async function runDisposableDatabase(db: Client, reset: boolean, namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
+    await requireFileBackedLocalDatabase(db, "Database lifecycle operations");
     return databaseWrite(db, reset ? "Database reset" : "Database initialization", async tx => {
         if (reset && (await readPolicy(tx, wasm.database_policy_sql() as PolicySql, namespace)).policy !== "disposable") {
             throw new Error("Reset requires an existing disposable database");
@@ -286,17 +293,17 @@ async function upsertExternalIdentities(tx: Transaction, identities: ExternalIde
 }
 
 async function loadMetadata(db: Client | Transaction, introspection: any): Promise<any> {
-    const tables = await db.execute("select name from sqlite_master where type = 'table' and name = '_pyre_external_identities'");
+    const tables = await db.execute("select name from main.sqlite_master where type = 'table' and name = '_pyre_external_identities'");
     introspection.external_identities = [];
     if (tables.rows.length > 0) {
-        const identities = await db.execute("select namespace, record_name, field_name, identity_kind from _pyre_external_identities order by namespace, record_name, field_name");
+        const identities = await db.execute("select namespace, record_name, field_name, identity_kind from main._pyre_external_identities order by namespace, record_name, field_name");
         introspection.external_identities = identities.rows.map(row => ({
             namespace: row.namespace, record: row.record_name, field: row.field_name, kind: row.identity_kind,
         }));
     }
-    const columns = await db.execute("pragma table_info('_pyre_migrations')");
+    const columns = await db.execute("pragma main.table_info('_pyre_migrations')");
     if (columns.rows.some(row => row.name === "schema_namespace")) {
-        const namespaces = await db.execute("select schema_namespace from _pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1");
+        const namespaces = await db.execute("select schema_namespace from main._pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1");
         introspection.schema_namespace = namespaces.rows[0]?.schema_namespace ?? null;
     }
     return introspection;

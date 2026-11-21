@@ -17,7 +17,7 @@ impl From<fixture::Error> for IngestError {
 #[wasm_bindgen]
 pub async fn ingest_fixture(
     introspection: JsValue,
-    input: JsValue,
+    entries: JsValue,
     execute: js_sys::Function,
     expected_namespace: Option<String>,
 ) -> Result<JsValue, JsValue> {
@@ -39,8 +39,8 @@ pub async fn ingest_fixture(
             )));
         }
     }
-    let input = serde_wasm_bindgen::from_value(input)?;
-    let response = fixture::ingest(context, &schema.namespace, input, |insert| {
+    let entries: Vec<(String, serde_json::Value)> = serde_wasm_bindgen::from_value(entries)?;
+    let response = fixture::ingest_entries(context, &schema.namespace, entries, |insert| {
         let execute = &execute;
         async move {
             let serializer =

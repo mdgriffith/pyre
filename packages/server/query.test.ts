@@ -7,7 +7,7 @@ import { buildArgs, toSqlStatements } from "./runtime/sql";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureDatabase, getIntrospectionJson, initDisposableDatabase, loadSchemaFromDatabase, reseedDatabase, setDatabaseDisposable } from "./schema";
+import { ensureDatabase, getIntrospectionJson, initDisposableDatabase, inspectDatabasePolicy, loadSchemaFromDatabase, reseedDatabase, setDatabaseDisposable } from "./schema";
 import { catchup } from "./sync";
 import { initSync } from "./wasm/pyre_wasm.js";
 
@@ -49,6 +49,49 @@ test("seed rejects an uninitialized target and rolls back late validation errors
     const result = await seed(db, { users: [{ name: "Discard", posts: [{ title: null }] }] });
     expect(result).toMatchObject({ kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("users[0].posts[0].title") } });
     expect((await db.execute("select count(*) as n from users")).rows[0].n).toBe(0);
+  } finally { close(); }
+});
+
+test("policy calls reject an in-memory client without detaching its database", async () => {
+  const db = createClient({ url: ":memory:" });
+  try {
+    await db.execute("create table keep (value text)");
+    await db.execute("insert into keep values ('still here')");
+    for (const policy of [inspectDatabasePolicy, setDatabaseDisposable]) {
+      await expect(policy(db)).rejects.toThrow("require a file-backed local database");
+      expect((await db.execute("select value from keep")).rows[0].value).toBe("still here");
+    }
+  } finally { db.close(); }
+});
+
+test("WASM seed preserves caller table order and ignores TEMP shadows", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    await db.execute("create temp table users (id integer primary key, decoy text)");
+    await db.execute("create temp table _pyre_migrations (decoy text)");
+    await db.execute(`create trigger require_author before insert on posts
+      when not exists (select 1 from users where id = new.authorId)
+      begin select raise(abort, 'author must be inserted first'); end`);
+    expect(await seed(db, {
+      users: [{ id: 42, name: "Parent" }],
+      posts: [{ authorId: 42, title: "Child", metadata: {}, status: "Draft" }],
+    }, { namespace: "Fixtures" })).toMatchObject({ kind: "success" });
+    expect((await db.execute("select name from main.users where id = 42")).rows[0].name).toBe("Parent");
+    expect((await db.execute("select title from main.posts where authorId = 42")).rows[0].title).toBe("Child");
+  } finally { close(); }
+});
+
+test("WASM seed rolls back earlier rows for a late typed JSON error", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await ensureDatabase(db, "Fixtures", fixtureFile("typed-json.pyre"));
+    const payload = { _type: "Payload", count: 7 };
+    const valid = { payload, groups: { group: [null, payload] } };
+    expect(await seed(db, { entries: [valid, { payload, groups: { group: [{ ...payload, count: "wrong" }] } }] }))
+      .toMatchObject({ kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining('entries[1].groups["group"][0].count') } });
+    expect((await db.execute("select id from entries")).rows).toHaveLength(0);
+    expect(await seed(db, { entries: [valid] })).toMatchObject({ kind: "success", response: { entries: [valid] } });
   } finally { close(); }
 });
 

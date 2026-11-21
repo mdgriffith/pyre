@@ -50,6 +50,7 @@ writeFileSync(
       type: "module",
       dependencies: {
         ...localPackages,
+        "@libsql/client": "^0.14.0",
         zod: "^4.1.12",
       },
       // Transitive dependencies must also use the unpublished local tarballs.
@@ -72,20 +73,32 @@ if (install.exitCode !== 0) {
 
 writeFileSync(
   join(smokeDir, "verify.mjs"),
-  [
-    "import * as core from '@pyre/core';",
-    "import * as server from '@pyre/server';",
-    "import * as client from '@pyre/client';",
-    "import { init } from '@pyre/server/wasm';",
-    "",
-    "if (!core || !server || !client) {",
-    "  throw new Error('Failed to import one or more @pyre packages');",
-    "}",
-    "",
-    "await init();",
-    "",
-    "console.log('Smoke imports OK:', Object.keys({ core, server, client }).join(', '));",
-  ].join("\n")
+  `import assert from 'node:assert/strict';
+import * as core from '@pyre/core';
+import { initDisposableDatabase, seed } from '@pyre/server';
+import * as client from '@pyre/client';
+import { init } from '@pyre/server/wasm';
+import { createClient } from '@libsql/client';
+
+assert.ok(core && client, 'Failed to import @pyre/core or @pyre/client');
+await init();
+
+const db = createClient({ url: 'file:smoke.db' });
+try {
+  await initDisposableDatabase(db, 'Smoke', \`@syncable(false)
+record Note {
+    id Id.Int @id
+    body String
+    @public
+}\n\`);
+  const result = await seed(db, { notes: [{ body: 'packed fixture' }] }, { namespace: 'Smoke' });
+  assert.equal(result.kind, 'success', JSON.stringify(result));
+  assert.equal(result.response.notes[0].body, 'packed fixture');
+  assert.equal((await db.execute('select body from notes')).rows[0].body, 'packed fixture');
+} finally {
+  db.close();
+}
+`,
 );
 
 const verify = Bun.spawnSync(["bun", "run", "verify.mjs"], {
@@ -95,7 +108,7 @@ const verify = Bun.spawnSync(["bun", "run", "verify.mjs"], {
 });
 
 if (verify.exitCode !== 0) {
-  throw new Error("Smoke import verification failed");
+  throw new Error("Installed package verification failed");
 }
 
 console.log("Smoke install passed in .artifacts/smoke-install");
