@@ -244,19 +244,40 @@ Policy belongs to the physical database. `pyre db policy ./app.db` reads it with
 
 When copying or restoring a database, establish the destination policy explicitly before use. A copied marker reflects the source's policy and is not a decision about the destination. If your copy tool preserves internal tables, verify the destination policy before any lifecycle operation and avoid carrying the source's disposable marker into a preserved destination.
 
-### Disposable Setup and Reset
+Use checked-in [migrations](./migrations.md) for preserved databases whose rows must survive schema changes. Plain `seed` adds rows to an existing initialized database of either policy. Use disposable targets for repeatable local, demo, and CI data. Treat fixture and lifecycle APIs as trusted setup: call them with a server-owned connection and reviewed fixture input, outside ordinary request handlers.
+
+### Disposable Setup, Reset, and Reseed
 
 ```bash
 pyre db init ./demo.db --disposable
 pyre db seed ./demo.db --fixtures ./fixtures.json
 pyre db reset ./demo.db
+pyre db reseed ./demo.db --fixtures ./fixtures.json
 ```
 
 Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. Reset rejects FK cycles when the connection enforces foreign keys and cannot safely drop the tables in dependency order. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
 
-Drain application traffic and connections before reset. After success, load fresh schema and authorization contexts before admitting clients. Old clients see the new epoch on reconnect and must replace their cached authority; this does not update their client code. If the transaction outcome is unknown, keep the target out of service until you inspect its state.
+Reseed commits the same reset before opening or parsing the fixture file, then inserts the fixtures in a separate write transaction. It prints the inserted rows as JSON only after both commits. If reading, parsing, validation, or insertion fails and Pyre confirms no fixture writes committed, the target has the fresh schema and no fixture rows. Fix the failure and rerun reseed from the beginning. If reset fails, fixture loading never starts. If either transaction's outcome is unknown, keep the target out of service and inspect it before retrying. Reseed never restores the discarded database.
+
+The application or CI owns the maintenance window: stop access, drain in-flight work and old connections or subscriptions, and prevent stale work from reaching the target. After success, load fresh schema and authorization contexts before admitting clients. Old clients see the new epoch on reconnect and replace their cached data; this does not update their client code. To make several [fixture facets](#composing-fixture-facets) part of one seed transaction, compose them into one fixture value or file.
 
 Rust exposes `pyre::db::lifecycle::{init_disposable, reset}`; TypeScript exposes `initDisposableDatabase` and `resetDatabase` from `@pyre/server/schema` after WASM initialization. Both take a database connection, the namespace and current standalone schema, and any external identities required by that schema.
+
+```ts
+import { reseedDatabase } from "@pyre/server/schema";
+
+const rows = await reseedDatabase(db, "Main", source, fixtures, identities);
+// Pass () => readFixtures() instead to defer file loading/parsing until after reset.
+```
+
+```rust
+use pyre::db::lifecycle;
+
+let seeded = lifecycle::reseed(&conn, "Main", source, &identities, fixtures).await?;
+// Use reseed_with(..., || read_fixtures()) to defer loading or parsing.
+```
+
+Both APIs use the shared fixture engine and return the inserted rows on success. Rust's `ReseedError` variants and TypeScript's `ReseedError.kind` distinguish `ResetFailed` (`reset-failed`), `ResetOutcomeUnknown` (`reset-outcome-unknown`), `FreshWithoutFixtures` (`fresh-without-fixtures`), and `SeedOutcomeUnknown` (`seed-outcome-unknown`).
 
 ## Rust API
 

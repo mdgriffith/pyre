@@ -238,6 +238,18 @@ enum DatabaseCommand {
         #[arg(long)]
         fixtures: std::path::PathBuf,
     },
+    /// Reset an existing disposable database, then seed it in a separate transaction.
+    Reseed {
+        /// An existing local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        /// JSON fixture file, read only after reset commits.
+        #[arg(long)]
+        fixtures: std::path::PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -277,8 +289,14 @@ async fn run() -> io::Result<()> {
                 if !disposable {
                     return Err(io::Error::other("Preserved initialization requires finalized migration history and is not yet supported"));
                 }
-                command::prepare_disposable_database(&options, database, auth, namespace, false)
-                    .await?;
+                command::prepare_disposable_database(
+                    &options,
+                    database,
+                    auth,
+                    namespace,
+                    command::DisposableOperation::Init,
+                )
+                .await?;
                 println!("Initialized disposable database");
             }
             DatabaseCommand::Reset {
@@ -286,8 +304,14 @@ async fn run() -> io::Result<()> {
                 auth,
                 namespace,
             } => {
-                command::prepare_disposable_database(&options, database, auth, namespace, true)
-                    .await?;
+                command::prepare_disposable_database(
+                    &options,
+                    database,
+                    auth,
+                    namespace,
+                    command::DisposableOperation::Reset,
+                )
+                .await?;
                 println!("Reset disposable database");
             }
             DatabaseCommand::Policy {
@@ -305,6 +329,21 @@ async fn run() -> io::Result<()> {
                 fixtures,
             } => {
                 command::seed_database(&options, database, auth, namespace, fixtures).await?;
+            }
+            DatabaseCommand::Reseed {
+                database,
+                auth,
+                namespace,
+                fixtures,
+            } => {
+                command::prepare_disposable_database(
+                    &options,
+                    database,
+                    auth,
+                    namespace,
+                    command::DisposableOperation::Reseed(fixtures),
+                )
+                .await?;
             }
         },
         Commands::Init { multidb, session } => {

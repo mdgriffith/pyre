@@ -99,6 +99,15 @@ authority while old entries can remain valid. Propagate invalidation across serv
 instances or explicitly accept the configured TTL as the cache freshness bound.
 TTL does not replace authentication or membership-change handling.
 
+Before a disposable [reset or reseed](./seeding.md#disposable-setup-reset-and-reseed),
+gate the database in every serving instance, drain in-flight work and retire old
+connections and subscriptions. Invalidate database-wide authorization contexts
+and reload the installed schema after success, then reopen access so sessions
+resolve against the new data. Keep the target gated after a failed reseed; a
+confirmed fixture failure leaves an initialized but unseeded database, and an
+uncertain outcome needs inspection. The new sync epoch tells reconnecting clients
+to rebuild their database cache.
+
 `stale_context` (Rust `RunError::Stale`) means the operation was not invoked.
 `stale_execution` (Rust `RunError::StaleExecution`) means authority expired or was
 invalidated after invocation: the outcome is unknown and a mutation may have

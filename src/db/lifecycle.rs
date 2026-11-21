@@ -91,12 +91,15 @@ pub fn plan_disposable(
 }
 
 #[cfg(feature = "database")]
-pub use native::{init_disposable, reset, Error};
+pub use native::{init_disposable, reseed, reseed_with, reset, Error, ReseedError};
 
 #[cfg(feature = "database")]
 mod native {
     use super::*;
+    use crate::server::seed;
     use libsql::{Connection, TransactionBehavior};
+    use serde::Serialize;
+    use std::convert::Infallible;
     use std::fmt;
 
     #[derive(Debug)]
@@ -158,6 +161,79 @@ mod native {
         identities: &[ast::ExternalIdentity],
     ) -> Result<(), Error> {
         run(conn, true, namespace, source, identities).await
+    }
+
+    #[derive(Debug)]
+    pub enum ReseedError {
+        ResetFailed(Error),
+        ResetOutcomeUnknown(Error),
+        FreshWithoutFixtures(String),
+        SeedOutcomeUnknown(seed::Error),
+    }
+
+    impl fmt::Display for ReseedError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::ResetFailed(cause) => write!(f, "Reseed stopped during reset: {cause}"),
+                Self::ResetOutcomeUnknown(cause) => write!(
+                    f,
+                    "Reseed reset outcome unknown. Inspect the target before retrying: {cause}"
+                ),
+                Self::FreshWithoutFixtures(cause) => write!(
+                    f,
+                    "Reset committed: the database has a fresh initialized schema and no fixture rows. Fix the failure and rerun reseed from the beginning: {cause}"
+                ),
+                Self::SeedOutcomeUnknown(cause) => write!(
+                    f,
+                    "Reset committed, but reseed fixture outcome is unknown. Inspect the target before retrying: {cause}"
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for ReseedError {}
+
+    /// Commit a reset, then serialize and insert fixtures in a separate seed operation.
+    /// The caller must keep application traffic stopped until the database is ready.
+    pub async fn reseed<T: Serialize>(
+        conn: &Connection,
+        namespace: &str,
+        source: &str,
+        identities: &[ast::ExternalIdentity],
+        input: T,
+    ) -> Result<seed::SeedResult, ReseedError> {
+        reseed_with(conn, namespace, source, identities, || {
+            Ok::<_, Infallible>(input)
+        })
+        .await
+    }
+
+    /// Like [`reseed`], but load the fixture input only after reset commits.
+    pub async fn reseed_with<T: Serialize, E: fmt::Display>(
+        conn: &Connection,
+        namespace: &str,
+        source: &str,
+        identities: &[ast::ExternalIdentity],
+        load_fixtures: impl FnOnce() -> Result<T, E>,
+    ) -> Result<seed::SeedResult, ReseedError> {
+        reset(conn, namespace, source, identities)
+            .await
+            .map_err(|error| match error {
+                Error::CommitUnknown(_) | Error::RollbackUnknown { .. } => {
+                    ReseedError::ResetOutcomeUnknown(error)
+                }
+                _ => ReseedError::ResetFailed(error),
+            })?;
+        let input = load_fixtures()
+            .map_err(|error| ReseedError::FreshWithoutFixtures(error.to_string()))?;
+        seed::seed_for_namespace(conn, Some(namespace), input)
+            .await
+            .map_err(|error| match error {
+                seed::Error::CommitUnknown(_) | seed::Error::RollbackUnknown { .. } => {
+                    ReseedError::SeedOutcomeUnknown(error)
+                }
+                _ => ReseedError::FreshWithoutFixtures(error.to_string()),
+            })
     }
 
     async fn run(

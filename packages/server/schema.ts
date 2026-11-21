@@ -1,6 +1,7 @@
 import type { Client, InStatement, Transaction } from "@libsql/client";
 import * as wasm from "./wasm/pyre_wasm.js";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
+import { seed, type SeedInput } from "./query";
 
 const DEFAULT_SCHEMA_KEY = "__default__";
 const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities", "_pyre_database_policy"]);
@@ -120,6 +121,52 @@ export function initDisposableDatabase(db: Client, namespace: string, source: st
 /** Replace the schema and lineage of a disposable database in place. */
 export function resetDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[] = []): Promise<void> {
     return runDisposableDatabase(db, true, namespace, source, identities);
+}
+
+export class ReseedError extends Error {
+    constructor(
+        readonly kind: "reset-failed" | "reset-outcome-unknown" | "fresh-without-fixtures" | "seed-outcome-unknown",
+        detail: string,
+        cause: unknown,
+    ) {
+        const summary = {
+            "reset-failed": "Reseed stopped during reset",
+            "reset-outcome-unknown": "Reseed reset outcome unknown. Inspect the target before retrying",
+            "fresh-without-fixtures": "Reset committed: the database has a fresh initialized schema and no fixture rows. Fix the failure and rerun reseed from the beginning",
+            "seed-outcome-unknown": "Reset committed, but reseed fixture outcome is unknown. Inspect the target before retrying",
+        }[kind];
+        super(`${summary}: ${detail}`, { cause });
+    }
+}
+
+/**
+ * Commit a reset, then seed separately. Keep application traffic stopped until success.
+ * Pass a loader to defer reading and parsing input until after reset.
+ */
+export async function reseedDatabase(
+    db: Client,
+    namespace: string,
+    source: string,
+    fixtures: SeedInput | (() => SeedInput | Promise<SeedInput>),
+    identities: ExternalIdentity[] = [],
+): Promise<Record<string, unknown[]>> {
+    const describe = (error: unknown) => error instanceof Error ? error.message : String(error);
+    try {
+        await resetDatabase(db, namespace, source, identities);
+    } catch (error) {
+        throw new ReseedError(error instanceof DatabaseOutcomeUnknown ? "reset-outcome-unknown" : "reset-failed", describe(error), error);
+    }
+
+    let input: SeedInput;
+    try {
+        input = typeof fixtures === "function" ? await fixtures() : fixtures;
+    } catch (error) {
+        throw new ReseedError("fresh-without-fixtures", describe(error), error);
+    }
+    const result = await seed(db, input, { namespace });
+    if (result.kind === "success") return result.response;
+    const error = result.error;
+    throw new ReseedError(error.errorType === "OutcomeUnknown" ? "seed-outcome-unknown" : "fresh-without-fixtures", error.message, error);
 }
 
 async function runDisposableDatabase(db: Client, reset: boolean, namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {

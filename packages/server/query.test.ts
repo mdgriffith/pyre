@@ -7,7 +7,8 @@ import { buildArgs, toSqlStatements } from "./runtime/sql";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureDatabase } from "./schema";
+import { ensureDatabase, getIntrospectionJson, initDisposableDatabase, loadSchemaFromDatabase, reseedDatabase, setDatabaseDisposable } from "./schema";
+import { catchup } from "./sync";
 import { initSync } from "./wasm/pyre_wasm.js";
 
 const fixtureFile = (name: string) => readFileSync(new URL(`../../tests/fixtures/seed/${name}`, import.meta.url), "utf8");
@@ -99,6 +100,87 @@ test("seed reports uncertain commit and rollback and rejects non-atomic transact
     });
     for (const transactionMode of ["batch", "none"] as const) {
       expect(await seed(db, {}, { transactionMode })).toMatchObject({ kind: "error", error: { errorType: "InvalidInput" } });
+    }
+  } finally { close(); }
+});
+
+test("reseed commits a fresh schema before loading fixtures and before admitting clients", async () => {
+  const { db, close } = seedDatabase();
+  const namespace = "Fixtures";
+  const epoch = async () => (await db.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch;
+  const counts = async () => ({ ...(await db.execute("select (select count(*) from users) as users, (select count(*) from posts) as posts")).rows[0] });
+  try {
+    await ensureDatabase(db, namespace, "record Obsolete {\n id Id.Uuid @id\n @public\n}\n");
+    await loadSchemaFromDatabase("reseed-test", db);
+    const oldEpoch = await epoch();
+    const loader = mock(() => JSON.parse("{"));
+    await expect(reseedDatabase(db, namespace, fixtureSchema, loader)).rejects.toMatchObject({ kind: "reset-failed" });
+    expect(loader).not.toHaveBeenCalled();
+    expect(await epoch()).toBe(oldEpoch);
+
+    await setDatabaseDisposable(db, namespace);
+    await expect(reseedDatabase(db, namespace, fixtureSchema, async () => {
+      expect(await epoch()).not.toBe(oldEpoch);
+      expect(await counts()).toEqual({ users: 0, posts: 0 });
+      return loader();
+    })).rejects.toMatchObject({ kind: "fresh-without-fixtures", cause: expect.any(SyntaxError) });
+    const emptyEpoch = await epoch();
+    await expect(reseedDatabase(db, namespace, fixtureSchema, { users: [{ id: 1 }, { id: 1 }] })).rejects.toMatchObject({
+      kind: "fresh-without-fixtures", message: expect.stringContaining("users[1]"),
+    });
+    expect(await counts()).toEqual({ users: 0, posts: 0 });
+    expect(await epoch()).not.toBe(emptyEpoch);
+
+    const rolledBackEpoch = await epoch();
+    expect(await reseedDatabase(db, namespace, fixtureSchema, JSON.parse(fixtureFile("input.json"))))
+      .toEqual(JSON.parse(fixtureFile("expected.json")));
+    const currentEpoch = await epoch();
+    expect(currentEpoch).not.toBe(rolledBackEpoch);
+    expect(await counts()).toEqual({ users: 2, posts: 2 });
+    await loadSchemaFromDatabase("reseed-test", db);
+    expect((await getIntrospectionJson(db)).tables.map(({ name }: { name: string }) => name)).toEqual(["posts", "users"]);
+    expect(await catchup(db, { tables: {} }, {}, 100, "reseed-test", String(oldEpoch))).toEqual({
+      type: "reset", databaseId: "reseed-test", databaseEpoch: currentEpoch,
+      operation: "replace", scope: "database", reason: "database_epoch_changed",
+    });
+  } finally { close(); }
+});
+
+test("reseed reports lost commit or rollback confirmation for the correct phase", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await initDisposableDatabase(db, "Fixtures", fixtureSchema);
+    for (const phase of ["reset", "seed"] as const) {
+      for (const operation of ["commit", "rollback"] as const) {
+        let transactions = 0;
+        const uncertain = {
+          protocol: "http",
+          async transaction() {
+            const tx = await db.transaction("write");
+            const fault = ++transactions === (phase === "reset" ? 1 : 2);
+            return {
+              get closed() { return tx.closed; },
+              close: tx.close.bind(tx),
+              execute: tx.execute.bind(tx),
+              async commit() {
+                await tx.commit();
+                if (fault && operation === "commit") throw new Error("Lost commit response");
+              },
+              async rollback() {
+                await tx.rollback();
+                if (fault && operation === "rollback") throw new Error("Lost rollback response");
+              },
+            };
+          },
+        } as unknown as typeof db;
+        const source = phase === "reset" && operation === "rollback" ? "not a schema" : fixtureSchema;
+        const load = mock(() => ({ users: operation === "rollback" ? [{ id: 1 }, { id: 1 }] : [{ id: 1 }] }));
+        await expect(reseedDatabase(uncertain, "Fixtures", source, load)).rejects.toMatchObject({
+          kind: `${phase}-outcome-unknown`, message: expect.stringContaining(`${operation} outcome unknown`),
+        });
+        expect(transactions).toBe(phase === "reset" ? 1 : 2);
+        expect(load).toHaveBeenCalledTimes(phase === "reset" ? 0 : 1);
+      }
     }
   } finally { close(); }
 });

@@ -131,14 +131,18 @@ export interface SeedOptions {
     transactionMode?: "manual" | "batch" | "none";
 }
 
-export interface SeedResult {
-    kind: "success" | "error";
-    response?: Record<string, unknown[]>;
-    error?: {
+export type SeedResult = {
+    kind: "success";
+    response: Record<string, unknown[]>;
+    error?: never;
+} | {
+    kind: "error";
+    response?: never;
+    error: {
         errorType: "InvalidInput" | "DatabaseError" | "OutcomeUnknown";
         message: string;
     };
-}
+};
 
 function extractAffectedRowGroups(sql: SqlInfo[], resultSets: any[]): any[] {
     const groups: unknown[] = [];
@@ -564,19 +568,19 @@ export async function seed(
     _validators?: SeedValidators,
     legacyOptions?: SeedOptions,
 ): Promise<SeedResult> {
-    const legacy = inputOrSchema != null && typeof inputOrSchema === "object" && "queryFieldToTable" in inputOrSchema
-        && !Array.isArray(inputOrSchema.queryFieldToTable) && "tables" in inputOrSchema;
-    const input = (legacy ? optionsOrInput : inputOrSchema) as SeedInput;
-    const options = (legacy ? legacyOptions : optionsOrInput as SeedOptions | undefined) ?? {};
     const fail = (errorType: NonNullable<SeedResult["error"]>["errorType"], cause: unknown): SeedResult => ({
         kind: "error", error: { errorType, message: seedErrorMessage(cause) },
     });
-    if (options.transactionMode !== undefined && options.transactionMode !== "manual") {
-        return fail("InvalidInput", "Seed requires one write transaction; batch and none modes are unsupported");
-    }
-
     let value: unknown;
+    let options: SeedOptions;
     try {
+        const legacy = inputOrSchema != null && typeof inputOrSchema === "object" && "queryFieldToTable" in inputOrSchema
+            && !Array.isArray(inputOrSchema.queryFieldToTable) && "tables" in inputOrSchema;
+        const input = (legacy ? optionsOrInput : inputOrSchema) as SeedInput;
+        options = (legacy ? legacyOptions : optionsOrInput as SeedOptions | undefined) ?? {};
+        if (options.transactionMode !== undefined && options.transactionMode !== "manual") {
+            return fail("InvalidInput", "Seed requires one write transaction; batch and none modes are unsupported");
+        }
         value = fixtureValue(input);
     } catch (error) {
         return fail("InvalidInput", error);

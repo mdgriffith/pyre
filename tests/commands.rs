@@ -433,6 +433,213 @@ console.log('disposable-reset-ok');
     assert_eq!(rows.get::<String>(0).unwrap(), "disposable:working");
 }
 
+async fn reseed_state(conn: &libsql::Connection) -> (String, i64, i64, i64) {
+    let row = conn
+        .query(
+            "select database_epoch, server_revision, (select count(*) from users), (select count(*) from posts) from _pyre_sync",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        row.get(0).unwrap(),
+        row.get(1).unwrap(),
+        row.get(2).unwrap(),
+        row.get(3).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn db_reseed_cli_commits_reset_before_reading_fixtures_and_rolls_back_seed() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        include_str!("fixtures/seed/schema.pyre"),
+    )
+    .unwrap();
+    let fixtures = ctx.workspace_path.join("fixtures.json");
+    let reseed = |name: &str| {
+        let mut cmd = ctx.run_command("db");
+        cmd.args(["reseed", name, "--fixtures", "fixtures.json"]);
+        cmd
+    };
+    reseed("missing.db").assert().failure();
+    assert!(!ctx.workspace_path.join("missing.db").exists());
+    ctx.run_command("migrate")
+        .args(["app.db", "--push"])
+        .assert()
+        .success();
+
+    let db = libsql::Builder::new_local(ctx.workspace_path.join("app.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch("insert into users (name) values ('Keep until reset'); update _pyre_sync set server_revision = 9;").await.unwrap();
+    let old = reseed_state(&conn).await;
+    reseed("app.db")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "Reset requires an existing disposable database",
+        ))
+        .stderr(predicate::str::contains("Could not read fixtures").not());
+    assert_eq!(reseed_state(&conn).await, old);
+    ctx.run_command("db")
+        .args(["policy", "app.db", "--set", "disposable"])
+        .assert()
+        .success();
+
+    std::fs::write(&fixtures, "{").unwrap();
+    reseed("app.db")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("Invalid fixture JSON"))
+        .stderr(predicate::str::contains(
+            "fresh initialized schema and no fixture rows",
+        ))
+        .stderr(predicate::str::contains("rerun reseed from the beginning"));
+    let empty = reseed_state(&conn).await;
+    assert_ne!(empty.0, old.0);
+    assert_eq!((empty.1, empty.2, empty.3), (0, 0, 0));
+
+    std::fs::write(&fixtures, r#"{"users":[{"id":1},{"id":1}]}"#).unwrap();
+    reseed("app.db")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("users[1]"))
+        .stderr(predicate::str::contains(
+            "fresh initialized schema and no fixture rows",
+        ));
+    let rolled_back = reseed_state(&conn).await;
+    assert_ne!(rolled_back.0, empty.0);
+    assert_eq!((rolled_back.1, rolled_back.2, rolled_back.3), (0, 0, 0));
+
+    std::fs::write(&fixtures, include_str!("fixtures/seed/input.json")).unwrap();
+    let success = reseed("app.db").assert().success();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&success.get_output().stdout).unwrap(),
+        serde_json::from_str::<serde_json::Value>(include_str!("fixtures/seed/expected.json"))
+            .unwrap()
+    );
+    let ready = reseed_state(&conn).await;
+    assert_ne!(ready.0, rolled_back.0);
+    assert_eq!((ready.1, ready.2, ready.3), (0, 2, 2));
+}
+
+#[tokio::test]
+async fn db_reseed_native_stops_on_reset_failures_and_loads_the_fresh_schema() {
+    use pyre::db::lifecycle::{self, ReseedError};
+    use pyre::server::schema::load_schema_from_database;
+    use serde_json::{json, Value};
+
+    let ctx = TestContext::new();
+    let db = libsql::Builder::new_local(ctx.workspace_path.join("app.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let schema = include_str!("fixtures/seed/schema.pyre");
+    let obsolete = "record Obsolete {\n id Id.Uuid @id\n @public\n}\n";
+    let unused = || -> Result<Value, std::convert::Infallible> {
+        panic!("fixture loader ran before reset committed")
+    };
+    assert!(matches!(
+        lifecycle::reseed_with(&conn, "Fixtures", schema, &[], unused).await,
+        Err(ReseedError::ResetFailed(
+            lifecycle::Error::RequiresDisposable
+        ))
+    ));
+    lifecycle::init_disposable(&conn, "Fixtures", obsolete, &[])
+        .await
+        .unwrap();
+    let before = load_schema_from_database(&conn).await.unwrap();
+
+    // A reader holding a shared lock in rollback journal mode blocks COMMIT,
+    // after the writer has already executed reset statements.
+    conn.execute_batch("pragma journal_mode=delete; pragma busy_timeout=0;")
+        .await
+        .unwrap();
+    let reader = db.connect().unwrap();
+    let read_tx = reader.transaction().await.unwrap();
+    assert!(read_tx
+        .query("select * from obsoletes", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        lifecycle::reseed_with(&conn, "Fixtures", schema, &[], unused).await,
+        Err(ReseedError::ResetOutcomeUnknown(
+            lifecycle::Error::CommitUnknown(_)
+        ))
+    ));
+    read_tx.rollback().await.unwrap();
+    // Inspect and reopen the connection after an unconfirmed outcome before retrying.
+    drop(conn);
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        load_schema_from_database(&conn)
+            .await
+            .unwrap()
+            .schema()
+            .unwrap()
+            .namespace,
+        "Fixtures"
+    );
+
+    let malformed = lifecycle::reseed_with(&conn, "Fixtures", schema, &[], || {
+        serde_json::from_str::<Value>("{")
+    })
+    .await;
+    assert!(matches!(
+        malformed,
+        Err(ReseedError::FreshWithoutFixtures(_))
+    ));
+    let empty = reseed_state(&conn).await;
+    assert_eq!((empty.1, empty.2, empty.3), (0, 0, 0));
+    let late = lifecycle::reseed(
+        &conn,
+        "Fixtures",
+        schema,
+        &[],
+        json!({"users": [{"id":1}, {"id": 1}]}),
+    )
+    .await;
+    assert!(
+        matches!(late, Err(ReseedError::FreshWithoutFixtures(message)) if message.contains("users[1]"))
+    );
+    assert_eq!(reseed_state(&conn).await.2, 0);
+
+    let result = lifecycle::reseed(
+        &conn,
+        "Fixtures",
+        schema,
+        &[],
+        serde_json::from_str::<Value>(include_str!("fixtures/seed/input.json")).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.response,
+        serde_json::from_str::<Value>(include_str!("fixtures/seed/expected.json")).unwrap()
+    );
+    assert_ne!(reseed_state(&conn).await.0, empty.0);
+    let after = load_schema_from_database(&conn).await.unwrap();
+    assert!(before.context().unwrap().tables.contains_key("obsolete"));
+    assert!(!after.context().unwrap().tables.contains_key("obsolete"));
+    assert!(after.context().unwrap().tables.contains_key("user"));
+}
+
 #[test]
 fn docs_prints_requested_topic() {
     let ctx = TestContext::new();
