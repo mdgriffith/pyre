@@ -291,6 +291,15 @@ async fn db_disposable_init_and_reset_replace_lineage_atomically() {
         create trigger stale_trigger after insert on "Z-child" begin select 1; end;
         insert into "A""stale" default values;
         insert into "Z-child" values (1);
+        create table self_ref (id integer primary key, parent integer references self_ref(id) on delete restrict);
+        insert into self_ref values (1, null), (2, 1);
+        create table cycle_0_parent (id integer primary key);
+        create table cycle_a (id integer primary key, b integer references cycle_b(id) on delete restrict);
+        create table cycle_b (id integer primary key, a integer references cycle_a(id) on delete cascade, parent integer references cycle_0_parent(id) on delete restrict);
+        insert into cycle_0_parent values (1);
+        insert into cycle_a values (1, null);
+        insert into cycle_b values (1, 1, 1);
+        update cycle_a set b = 1;
     "#,
     )
     .await
@@ -333,9 +342,20 @@ async fn db_disposable_init_and_reset_replace_lineage_atomically() {
     let fresh = state(conn.clone()).await;
     assert_ne!(old.0, fresh.0);
     assert_eq!(fresh.1, 0);
-    let row = conn.query("select count(*) from main.sqlite_schema where name in ('A\"stale', 'Z-child', 'stale_idx', 'stale_view', 'stale_trigger')", ()).await.unwrap().next().await.unwrap().unwrap();
+    let row = conn.query("select count(*) from main.sqlite_schema where name in ('A\"stale', 'Z-child', 'stale_idx', 'stale_view', 'stale_trigger', 'self_ref', 'cycle_0_parent', 'cycle_a', 'cycle_b')", ()).await.unwrap().next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
     drop(row);
+    for (pragma, expected) in [("foreign_keys", 1), ("defer_foreign_keys", 0)] {
+        let row = conn
+            .query(&format!("pragma {pragma}"), ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), expected);
+    }
 
     let preserved = libsql::Builder::new_local(ctx.workspace_path.join("preserved.db"))
         .build()
@@ -1708,6 +1728,9 @@ record Post {
     summary String?
     status Status
     attrs Json<PostAttrs>
+    jsonStatus Json<Status>?
+    groupedStatus Json<Dict<List<Status?>>>?
+    color Json<Color>?
     position Sequence.Int
     author @link(authorId, User.id)
     @public
@@ -1716,6 +1739,8 @@ record Post {
 type Status
    = Draft
    | Published { publishedAt DateTime }
+
+type Color = Red | Blue
 
 type PostAttrs
    = PostAttrs { tags List<String?> }
@@ -1908,6 +1933,26 @@ console.log('authored-fixture-ok');
         "generated Rust/TypeScript and raw JSON conformance",
     );
 
+    std::fs::write(
+        ctx.workspace_path.join("check-fixture-types.ts"),
+        r#"
+import type { SeedInput } from './pyre/generated/typescript/seed';
+
+({ written_posts: [{
+  status: 'Draft',
+  jsonStatus: { _type: 'Draft' },
+  groupedStatus: { group: [null, 'Draft', { _type: 'Draft' }] },
+  color: 'Red',
+}, {
+  status: { _type: 'Draft' },
+  jsonStatus: 'Draft',
+  color: { _type: 'Red' },
+}] }) satisfies SeedInput;
+// @ts-expect-error A variant with a payload cannot use string shorthand.
+({ written_posts: [{ jsonStatus: 'Published' }] }) satisfies SeedInput;
+"#,
+    )
+    .unwrap();
     let output = StdCommand::new("node_modules/.bin/tsc")
         .args([
             "--noEmit",
@@ -1919,7 +1964,7 @@ console.log('authored-fixture-ok');
             "bundler",
             "--target",
             "es2022",
-            "pyre/generated/typescript/seed.ts",
+            "check-fixture-types.ts",
         ])
         .current_dir(&ctx.workspace_path)
         .output()

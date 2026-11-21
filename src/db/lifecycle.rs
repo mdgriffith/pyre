@@ -2,7 +2,7 @@ use super::{introspect, migrate, policy};
 use crate::ast;
 use crate::generate::sql::to_sql::SqlAndParams;
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashMap};
 
 // SQLite-owned objects are identified by the reserved prefix, not a LIKE
 // wildcard. Virtual-table shadow objects are managed by DROP of the virtual root.
@@ -312,48 +312,39 @@ fn drop_statements(catalog: Catalog) -> Result<Vec<SqlAndParams>, String> {
         }
     }
     statements.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
-    // Child-first ordering, taking the same FK setting as the write connection.
-    let mut children = BTreeMap::<String, usize>::new();
-    let mut dependencies = BTreeMap::new();
-    for (key, object) in &tables {
-        let parents: BTreeSet<_> = if catalog.foreign_keys == 0 {
-            BTreeSet::new()
-        } else {
-            object
-                .parents
-                .iter()
-                .map(|name| name.to_ascii_lowercase())
-                .filter(|name| name != key && tables.contains_key(name))
-                .collect()
-        };
-        for parent in &parents {
-            *children.entry(parent.clone()).or_default() += 1;
-        }
-        dependencies.insert(key.clone(), parents);
-    }
-    let mut ready: BTreeSet<_> = tables
-        .keys()
-        .filter(|key| !children.contains_key(*key))
-        .cloned()
-        .collect();
-    while let Some(key) = ready.pop_first() {
-        statements.push(tables.remove(&key).expect("known table"));
-        for parent in &dependencies[&key] {
-            let count = children.get_mut(parent).expect("known reference");
-            *count -= 1;
-            if *count == 0 {
-                ready.insert(parent.clone());
+    let mut sql = Vec::new();
+    if catalog.foreign_keys == 0 {
+        statements.extend(tables.into_values());
+    } else {
+        // DROP's implicit DELETE can trip even a single self-reference. Defer
+        // checks until the replacement is complete; SQLite restores this at
+        // transaction end. Keep each group of mutually referencing tables
+        // ahead of its parents so referential actions can still resolve them.
+        sql.push(SqlAndParams::Sql("pragma defer_foreign_keys = on".into()));
+        let dependencies: HashMap<_, _> = tables
+            .iter()
+            .map(|(key, object)| {
+                let parents = object
+                    .parents
+                    .iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .filter(|name| tables.contains_key(name))
+                    .collect();
+                (key.clone(), parents)
+            })
+            .collect();
+        let components =
+            crate::typecheck::find_strongly_connected_components(tables.keys(), &dependencies);
+        for mut component in components.into_iter().rev() {
+            component.sort_unstable();
+            for key in component {
+                statements.push(tables.remove(&key).expect("known table"));
             }
         }
     }
-    if !tables.is_empty() {
-        return Err("Cannot atomically reset tables with cyclic foreign keys while foreign keys are enforced".into());
-    }
-    Ok(statements
-        .into_iter()
-        .map(|object| {
-            let quoted = crate::ext::string::quote(&object.name);
-            SqlAndParams::Sql(format!("DROP {} main.{quoted}", object.kind))
-        })
-        .collect())
+    sql.extend(statements.into_iter().map(|object| {
+        let quoted = crate::ext::string::quote(&object.name);
+        SqlAndParams::Sql(format!("DROP {} main.{quoted}", object.kind))
+    }));
+    Ok(sql)
 }

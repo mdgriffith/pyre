@@ -3,6 +3,8 @@ type Status
     = Draft
     | Published { note String }
 
+type Color = Red | Blue
+
 record User {
     id Id.Int @id
     name String @default("Anonymous")
@@ -16,6 +18,10 @@ record Post {
     title String
     metadata Json
     status Status
+    jsonStatus Json<Status>?
+    groupedStatus Json<Dict<List<Status?>>>?
+    color Color?
+    jsonColor Json<Color>?
     publishedAt DateTime?
     author @link(authorId, User.id)
     @public

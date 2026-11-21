@@ -4,6 +4,10 @@
     "title": "First post",
     "metadata": {"labels": ["pdf"], "page": 1},
     "status": {"_type": "Published", "note": "reviewed"},
+    "jsonStatus": {"_type": "Published", "note": "reviewed"},
+    "groupedStatus": {"group": [null, "Draft", {"_type": "Draft"}]},
+    "color": "Red",
+    "jsonColor": {"_type": "Red"},
     "publishedAt": "2026-08-14T12:00:00Z",
     "updatedAt": 1,
     "author": {"updatedAt": 1}
@@ -11,6 +15,6 @@
   "users": [{
     "name": "Second author",
     "updatedAt": 1,
-    "posts": [{"title": "Second post", "metadata": [], "status": "Draft", "publishedAt": null, "updatedAt": 1}]
+    "posts": [{"title": "Second post", "metadata": [], "status": "Draft", "jsonStatus": "Draft", "groupedStatus": null, "color": {"_type": "Blue"}, "jsonColor": "Blue", "publishedAt": null, "updatedAt": 1}]
   }]
 }

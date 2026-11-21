@@ -117,12 +117,12 @@ async function databaseWrite<T>(db: Client, operation: string, work: (tx: Transa
 
 /** Install a working schema on an empty target and mark it disposable. */
 export function initDisposableDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[] = []): Promise<void> {
-    return runDisposableDatabase(db, false, namespace, source, identities);
+    return runDisposableDatabase(db, "init", namespace, source, identities);
 }
 
 /** Replace the schema and lineage of a disposable database in place. */
 export function resetDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[] = []): Promise<void> {
-    return runDisposableDatabase(db, true, namespace, source, identities);
+    return runDisposableDatabase(db, "reset", namespace, source, identities);
 }
 
 export class ReseedError extends Error {
@@ -154,7 +154,7 @@ export async function reseedDatabase(
 ): Promise<Record<string, unknown[]>> {
     const describe = (error: unknown) => error instanceof Error ? error.message : String(error);
     try {
-        await resetDatabase(db, namespace, source, identities);
+        await runDisposableDatabase(db, "reseed", namespace, source, identities);
     } catch (error) {
         throw new ReseedError(error instanceof DatabaseOutcomeUnknown ? "reset-outcome-unknown" : "reset-failed", describe(error), error);
     }
@@ -181,12 +181,23 @@ async function requireFileBackedLocalDatabase(db: Client, operation: string): Pr
     }
 }
 
-async function runDisposableDatabase(db: Client, reset: boolean, namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
+/** @internal libSQL does not expose the configured integer mode on Client. */
+export async function requireSeedIntegerMode(tx: Transaction): Promise<void> {
+    const { rows } = await tx.execute("select 1 as integer_mode_probe");
+    if (typeof rows[0]?.integer_mode_probe === "string") {
+        throw new Error('Seed does not support libSQL intMode "string"; use "number" or "bigint"');
+    }
+}
+
+async function runDisposableDatabase(db: Client, operation: "init" | "reset" | "reseed", namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
     await requireFileBackedLocalDatabase(db, "Database lifecycle operations");
+    const reset = operation !== "init";
     return databaseWrite(db, reset ? "Database reset" : "Database initialization", async tx => {
         if (reset && (await readPolicy(tx, wasm.database_policy_sql() as PolicySql, namespace)).policy !== "disposable") {
             throw new Error("Reset requires an existing disposable database");
         }
+        // Reject unsupported fixture connections before discarding any data.
+        if (operation === "reseed") await requireSeedIntegerMode(tx);
         const { rows } = await tx.execute(wasm.database_catalog_sql());
         const catalog = rows[0]?.catalog;
         if (typeof catalog !== "string") throw new Error("Could not read database object catalog");

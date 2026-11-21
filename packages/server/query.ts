@@ -594,7 +594,7 @@ export async function seed(
     let tx: Transaction | undefined;
     let committing = false;
     try {
-        const [{ introspectDatabase }, wasm] = await Promise.all([
+        const [{ introspectDatabase, requireSeedIntegerMode }, wasm] = await Promise.all([
             import("./schema"), import("./wasm/pyre_wasm.js"),
         ]);
         // The local libSQL adapter detaches the connection when opening a transaction.
@@ -605,6 +605,7 @@ export async function seed(
             }
         }
         const transaction = tx = await db.transaction("write");
+        await requireSeedIntegerMode(transaction);
         const { initialized, introspection } = await introspectDatabase(transaction);
         if (!initialized || !introspection.schema_source) {
             throw new Error("Database does not contain an initialized Pyre schema");

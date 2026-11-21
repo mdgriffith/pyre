@@ -405,8 +405,7 @@ fn serialize_value(
         ),
         ColumnType::Json => SqlValue::Text(value.to_string()),
         ColumnType::JsonTyped(_) | ColumnType::List(_) | ColumnType::Dict(_) => {
-            validate_json(context, type_, value, path)?;
-            SqlValue::Text(value.to_string())
+            SqlValue::Text(normalize_json(context, type_, value, path)?.to_string())
         }
         ColumnType::Custom(type_name) => {
             return serialize_constructed(context, type_name, physical_name, value, path, output)
@@ -419,53 +418,82 @@ fn serialize_value(
     Ok(())
 }
 
-fn validate_json(
+fn normalize_json(
     context: &typecheck::Context,
     type_: &ast::ColumnType,
     value: &JsonValue,
     path: &str,
-) -> Result<(), Error> {
+) -> Result<JsonValue, Error> {
     use ast::ColumnType;
     match type_ {
-        ColumnType::Json => Ok(()),
-        ColumnType::JsonTyped(inner) => validate_json(context, inner, value, path),
-        ColumnType::Nullable(_) if value.is_null() => Ok(()),
-        ColumnType::Nullable(inner) => validate_json(context, inner, value, path),
+        ColumnType::Json => Ok(value.clone()),
+        ColumnType::JsonTyped(inner) => normalize_json(context, inner, value, path),
+        ColumnType::Nullable(_) if value.is_null() => Ok(JsonValue::Null),
+        ColumnType::Nullable(inner) => normalize_json(context, inner, value, path),
         ColumnType::List(inner) => {
             let values = value
                 .as_array()
                 .ok_or_else(|| invalid_type(path, "an array"))?;
-            for (index, item) in values.iter().enumerate() {
-                validate_json(context, inner, item, &format!("{path}[{index}]"))?;
-            }
-            Ok(())
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    normalize_json(context, inner, item, &format!("{path}[{index}]"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(JsonValue::Array)
         }
         ColumnType::Dict(inner) => {
             let values = value
                 .as_object()
                 .ok_or_else(|| invalid_type(path, "an object"))?;
-            for (key, item) in values {
-                validate_json(context, inner, item, &format!("{path}[{key:?}]"))?;
-            }
-            Ok(())
+            values
+                .iter()
+                .map(|(key, item)| {
+                    normalize_json(context, inner, item, &format!("{path}[{key:?}]"))
+                        .map(|item| (key.clone(), item))
+                })
+                .collect::<Result<serde_json::Map<_, _>, _>>()
+                .map(JsonValue::Object)
         }
         ColumnType::Custom(type_name) => {
-            let (_, fields) = constructed_fields(context, type_name, value, path, true)?;
+            let Constructed {
+                tag,
+                fields,
+                is_enum,
+            } = constructed_fields(context, type_name, value, path)?;
+            if is_enum {
+                return Ok(JsonValue::String(tag.to_owned()));
+            }
+            let mut result = serde_json::Map::new();
+            result.insert("_type".to_owned(), JsonValue::String(tag.to_owned()));
             for (column, item) in fields {
-                if !(column.nullable && item.is_null()) {
-                    validate_json(
+                let normalized = if column.nullable && item.is_null() {
+                    JsonValue::Null
+                } else {
+                    normalize_json(
                         context,
                         &column.type_,
                         item,
                         &format!("{path}.{}", column.name),
-                    )?;
-                }
+                    )?
+                };
+                result.insert(column.name.clone(), normalized);
             }
-            Ok(())
+            Ok(JsonValue::Object(result))
         }
         // Reuse fixture scalar validation without changing the JSON representation.
-        scalar => serialize_value(context, scalar, "", value, path, &mut Vec::new()),
+        scalar => {
+            serialize_value(context, scalar, "", value, path, &mut Vec::new())?;
+            Ok(value.clone())
+        }
     }
+}
+
+struct Constructed<'a> {
+    tag: &'a str,
+    fields: Vec<(&'a ast::Column, &'a JsonValue)>,
+    is_enum: bool,
 }
 
 fn constructed_fields<'a>(
@@ -473,8 +501,7 @@ fn constructed_fields<'a>(
     type_name: &str,
     value: &'a JsonValue,
     path: &str,
-    stored_in_json: bool,
-) -> Result<(&'a str, Vec<(&'a ast::Column, &'a JsonValue)>), Error> {
+) -> Result<Constructed<'a>, Error> {
     let (tag, object) = match value {
         JsonValue::String(tag) => (tag.as_str(), None),
         JsonValue::Object(object) => {
@@ -504,11 +531,6 @@ fn constructed_fields<'a>(
         .iter()
         .find(|variant| variant.name == tag)
         .ok_or_else(|| Error::InvalidInput(format!("{} has unknown variant '{}'", path, tag)))?;
-    // Only pure enums decode from a bare string inside JSON.
-    if stored_in_json && object.is_none() && variants.iter().any(|variant| variant.fields.is_some())
-    {
-        return Err(invalid_type(path, "an object with a '_type' discriminator"));
-    }
     let mut values = Vec::new();
     if let Some(fields) = &variant.fields {
         let object = object.ok_or_else(|| {
@@ -552,7 +574,15 @@ fn constructed_fields<'a>(
             }
         }
     }
-    Ok((tag, values))
+    Ok(Constructed {
+        tag,
+        fields: values,
+        is_enum: is_pure_enum(variants),
+    })
+}
+
+fn is_pure_enum(variants: &[ast::Variant]) -> bool {
+    variants.iter().all(|variant| variant.fields.is_none())
 }
 
 fn serialize_constructed(
@@ -563,7 +593,7 @@ fn serialize_constructed(
     path: &str,
     output: &mut Vec<(String, SqlValue)>,
 ) -> Result<(), Error> {
-    let (tag, fields) = constructed_fields(context, type_name, value, path, false)?;
+    let Constructed { tag, fields, .. } = constructed_fields(context, type_name, value, path)?;
     output.push((physical_name.to_string(), SqlValue::Text(tag.to_string())));
     for (column, value) in fields {
         serialize_column(
@@ -711,12 +741,12 @@ fn reconstruct_constructed(
     let Some(variant) = variants.iter().find(|variant| variant.name == tag) else {
         return Ok(JsonValue::String(tag));
     };
-    let Some(fields) = &variant.fields else {
+    if is_pure_enum(variants) {
         return Ok(JsonValue::String(tag));
-    };
+    }
     let mut result = serde_json::Map::new();
     result.insert("_type".to_string(), JsonValue::String(tag));
-    for field in fields {
+    for field in variant.fields.iter().flatten() {
         let ast::Field::Column(column) = field else {
             continue;
         };

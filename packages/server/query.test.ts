@@ -14,7 +14,7 @@ import { initSync } from "./wasm/pyre_wasm.js";
 const fixtureFile = (name: string) => readFileSync(new URL(`../../tests/fixtures/seed/${name}`, import.meta.url), "utf8");
 const fixtureSchema = fixtureFile("schema.pyre");
 
-function seedDatabase(intMode: "number" | "bigint" = "number") {
+function seedDatabase(intMode: "number" | "bigint" | "string" = "number") {
   initSync({ module: readFileSync(new URL("./wasm/pyre_wasm_bg.wasm", import.meta.url)) });
   const directory = mkdtempSync(join(tmpdir(), "pyre-fixture-"));
   const db = createClient({ url: `file:${join(directory, "test.db")}`, intMode });
@@ -34,6 +34,15 @@ test("WASM seed matches the native fixture and persists both directions of neste
     });
     expect((await db.execute("select id, authorId from posts order by id")).rows.map(row => [row.id, row.authorId]))
       .toEqual([[4, 1], [5, 2]]);
+    expect((await db.execute(`select status, status__note as note,
+      json_extract(jsonStatus, '$._type') as jsonTag,
+      json_extract(jsonColor, '$') as jsonColor from posts where id = 5`)).rows[0])
+      .toEqual({ status: "Draft", note: null, jsonTag: "Draft", jsonColor: "Blue" });
+    expect(await seed(db, { posts: [{
+      authorId: 1, title: "Missing payload", metadata: {}, status: "Draft", jsonStatus: "Published",
+    }] })).toMatchObject({
+      kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("posts[0].jsonStatus variant 'Published' requires fields") },
+    });
     // Replaying the explicit post ID fails, including the to-one author inserted first.
     expect(await seed(db, input)).toMatchObject({ kind: "error", error: { errorType: "DatabaseError", message: expect.stringContaining("posts[0]") } });
     expect((await db.execute("select count(*) as n from users")).rows[0].n).toBe(2);
@@ -147,6 +156,25 @@ test("seed reports uncertain commit and rollback and rejects non-atomic transact
   } finally { close(); }
 });
 
+test('seed and reseed reject libSQL intMode "string" before changing data', async () => {
+  const { db, close } = seedDatabase("string");
+  try {
+    const namespace = "Fixtures";
+    await initDisposableDatabase(db, namespace, fixtureSchema);
+    await db.execute("insert into users (id, name) values (7, 'Keep')");
+    const epoch = async () => (await db.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch;
+    const oldEpoch = await epoch();
+    const message = expect.stringContaining('intMode "string"');
+    const loader = mock(() => ({ users: [{ name: "Overwrite" }] }));
+    expect(await seed(db, loader())).toMatchObject({ kind: "error", error: { message } });
+    loader.mockClear();
+    await expect(reseedDatabase(db, namespace, fixtureSchema, loader)).rejects.toMatchObject({ kind: "reset-failed", message });
+    expect(loader).not.toHaveBeenCalled();
+    expect(await epoch()).toBe(oldEpoch);
+    expect((await db.execute("select name from users")).rows).toEqual([{ name: "Keep" }]);
+  } finally { close(); }
+});
+
 test("reseed commits a fresh schema before loading fixtures and before admitting clients", async () => {
   const { db, close } = seedDatabase();
   const namespace = "Fixtures";
@@ -162,9 +190,19 @@ test("reseed commits a fresh schema before loading fixtures and before admitting
     expect(await epoch()).toBe(oldEpoch);
 
     await setDatabaseDisposable(db, namespace);
+    await db.executeMultiple(`
+      create table cycle_0_parent (id integer primary key);
+      create table cycle_a (id integer primary key, b integer references cycle_b(id) on delete restrict);
+      create table cycle_b (id integer primary key, a integer references cycle_a(id) on delete cascade, parent integer references cycle_0_parent(id) on delete restrict);
+      insert into cycle_0_parent values (1);
+      insert into cycle_a values (1, null);
+      insert into cycle_b values (1, 1, 1);
+      update cycle_a set b = 1;
+    `);
     await expect(reseedDatabase(db, namespace, fixtureSchema, async () => {
       expect(await epoch()).not.toBe(oldEpoch);
       expect(await counts()).toEqual({ users: 0, posts: 0 });
+      expect((await db.execute("select name from main.sqlite_schema where name in ('cycle_0_parent', 'cycle_a', 'cycle_b')")).rows).toHaveLength(0);
       return loader();
     })).rejects.toMatchObject({ kind: "fresh-without-fixtures", cause: expect.any(SyntaxError) });
     const emptyEpoch = await epoch();

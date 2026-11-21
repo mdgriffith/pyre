@@ -127,7 +127,7 @@ Rust uses the same approach: extend a table's `Vec` before a combined call, or a
 
 ## JSON And Custom Types
 
-Seed input should use the normal serialized JavaScript shape for JSON and custom type fields. Constructed Pyre values use an `_type` discriminator. Pyre serializes or flattens the value for SQLite internally.
+Seed accepts a fieldless variant as either `"Draft"` or `{ "_type": "Draft" }`, for both a direct custom column and a typed JSON value (including within lists and dictionaries). A variant with payload fields requires an object with `_type` and its payload. Pyre normalizes mixed unions to tagged objects in JSON and in seed responses; pure enums use strings in both. For a direct custom column, SQLite stores the tag in the main column and any payload in separate columns.
 
 For a JSON column:
 
@@ -228,7 +228,7 @@ await init();
 const result = await seed(db, data, { namespace: "Main" }); // namespace check is optional
 ```
 
-The legacy `(db, schemaMetadata, data, validators?, options?)` signature still works; supplied metadata and validators no longer control ingestion. `batchSize` has no effect, and `transactionMode: "batch"` or `"none"` is rejected. Seed requires interactive write transactions and a file-backed database for local libSQL clients. For 64-bit integer keys outside JavaScript’s safe integer range, configure the client with `intMode: "bigint"`; the JSON-compatible response still uses JavaScript numbers. Treat an `OutcomeUnknown` result as requiring inspection before retrying.
+The legacy `(db, schemaMetadata, data, validators?, options?)` signature still works; supplied metadata and validators no longer control ingestion. `batchSize` has no effect, and `transactionMode: "batch"` or `"none"` is rejected. Seed requires interactive write transactions and a file-backed database for local libSQL clients. Use `intMode: "number"` (the default) or `"bigint"` for seed and reseed; `"string"` is unsupported. Use `"bigint"` for 64-bit integer keys outside JavaScript’s safe integer range; the JSON-compatible response still uses JavaScript numbers. Treat an `OutcomeUnknown` result as requiring inspection before retrying.
 
 TypeScript seeds flat tables in the fixture object's key order. Put referenced rows first, or use nested links so the fixture engine can derive the keys and insert rows in dependency order. Typed JSON is validated recursively against the installed schema, including tagged payloads and elements of lists and dictionaries.
 
@@ -259,7 +259,7 @@ pyre db reset ./demo.db
 pyre db reseed ./demo.db --fixtures ./fixtures.json
 ```
 
-Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. Reset rejects FK cycles when the connection enforces foreign keys and cannot safely drop the tables in dependency order. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
+Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. Reset defers foreign-key checks within the transaction so it can remove mutually referencing tables. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
 
 Reseed commits the same reset before opening or parsing the fixture file, then inserts the fixtures in a separate write transaction. It prints the inserted rows as JSON only after both commits. If reading, parsing, validation, or insertion fails and Pyre confirms no fixture writes committed, the target has the fresh schema and no fixture rows. Fix the failure and rerun reseed from the beginning. If reset fails, fixture loading never starts. If either transaction's outcome is unknown, keep the target out of service and inspect it before retrying. Reseed never restores the discarded database.
 
