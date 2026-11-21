@@ -283,8 +283,9 @@ record Asset {
     .await?;
     let owner_id = result.response["assets"][0]["ownerId"]
         .as_str()
-        .expect("generated UUID should be returned")
+        .expect("explicit UUID should be returned")
         .to_string();
+    assert_eq!(owner_id, "00000000-0000-4000-8000-000000000001");
     assert_eq!(result.response["assets"][0]["owner"]["name"], "Unknown");
     assert!(result.response["assets"][0]["note"].is_null());
 
@@ -294,6 +295,50 @@ record Asset {
     )
     .await?;
     assert_eq!(flat.response["assets"][0]["note"], "flat");
+    Ok(())
+}
+
+#[tokio::test]
+async fn seed_generates_uuid_v7_and_leaves_sequences_to_sqlite(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+record Event {
+    eventId Id.Uuid @id
+    position Sequence.Int
+    active Bool?
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+
+    let fixture = json!({ "events": [{ "active": null }] });
+    let first = seed::seed(&conn, &fixture).await?;
+    let second = seed::seed(&conn, &fixture).await?;
+    let first = &first.response["events"][0];
+    let second = &second.response["events"][0];
+    let first_id = uuid::Uuid::parse_str(first["eventId"].as_str().unwrap())?;
+    let second_id = uuid::Uuid::parse_str(second["eventId"].as_str().unwrap())?;
+    assert_eq!(first_id.get_version_num(), 7);
+    assert_eq!(second_id.get_version_num(), 7);
+    assert_ne!(first_id, second_id);
+    assert_eq!(first["position"], 1);
+    assert_eq!(second["position"], 2);
+    assert!(second["active"].is_null());
+
+    let error = seed::seed(&conn, json!({ "events": [{}, { "position": 10 }] }))
+        .await
+        .expect_err("server-managed sequence cannot be supplied");
+    assert!(error.to_string().contains("events[1].position"));
+    let error = seed::seed(&conn, json!({ "events": [{ "eventId": "bad-id" }] }))
+        .await
+        .expect_err("invalid identity cannot be supplied");
+    assert!(error.to_string().contains("events[0].eventId"));
+
+    let next = seed::seed(&conn, &fixture).await?;
+    assert_eq!(next.response["events"][0]["position"], 3);
     Ok(())
 }
 

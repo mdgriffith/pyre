@@ -3,12 +3,15 @@ use js_sys;
 use log::Level;
 use wasm_bindgen::prelude::*;
 mod cache;
+mod fixture;
 mod migrate;
 mod query;
 mod seed;
 mod sync;
 mod sync_deltas;
 mod sync_shape;
+
+pub use fixture::ingest_fixture;
 
 #[wasm_bindgen(start)]
 pub fn start() {
