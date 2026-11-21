@@ -65,6 +65,19 @@ pub fn sql_introspect_uninitialized() -> String {
 }
 
 #[wasm_bindgen]
+pub fn database_policy_sql() -> JsValue {
+    use pyre::db::policy;
+    js_sys::JSON::parse(&serde_json::json!({
+        "create": policy::CREATE,
+        "find": policy::FIND,
+        "read": policy::READ,
+        "write": policy::WRITE,
+        "hasNamespace": policy::HAS_NAMESPACE,
+        "readNamespace": policy::READ_NAMESPACE,
+    }).to_string()).unwrap()
+}
+
+#[wasm_bindgen]
 pub fn calculate_permission_hash(table_name: String, session: JsValue) -> JsValue {
     let result = sync::calculate_permission_hash_wasm(table_name, session);
     match result {

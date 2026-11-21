@@ -129,6 +129,128 @@ fn db_seed_requires_existing_database_and_runs_the_conformance_fixture() {
         .stderr(predicate::str::contains("posts[0]"));
 }
 
+#[tokio::test]
+async fn db_policy_is_shared_and_independent_of_schema_changes() {
+    use pyre::db::policy::{self, Policy};
+    let ctx = TestContext::new();
+    write_clocktower_schema(&ctx, "record Note {\n id Id.Uuid @id\n @public\n}\n");
+    let other_schema = ctx.workspace_path.join("pyre/schema/Other");
+    std::fs::create_dir_all(&other_schema).unwrap();
+    std::fs::write(
+        other_schema.join("schema.pyre"),
+        "record Other {\n id Id.Uuid @id\n @public\n}\n",
+    )
+    .unwrap();
+    let command = |path: &str, namespace: &str| {
+        let mut cmd = ctx.run_command("db");
+        cmd.args(["policy", path, "--namespace", namespace]);
+        cmd
+    };
+    command("missing.db", "Clocktower").assert().failure();
+    assert!(!ctx.workspace_path.join("missing.db").exists());
+    ctx.run_command("migrate")
+        .args(["app.db", "--namespace", "Clocktower", "--push"])
+        .assert()
+        .success();
+    let open = |name| libsql::Builder::new_local(ctx.workspace_path.join(name));
+    let db = open("app.db").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "insert into notes (id) values ('00000000-0000-4000-8000-000000000001')",
+        (),
+    )
+    .await
+    .unwrap();
+
+    command("app.db", "Clocktower")
+        .assert()
+        .success()
+        .stdout("preserved\n");
+    assert!(conn
+        .query(policy::FIND, ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_none());
+    command("app.db", "Other")
+        .args(["--set", "disposable"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("found 'Clocktower'"));
+    command("app.db", "Clocktower")
+        .args(["--set", "disposable"])
+        .assert()
+        .success()
+        .stdout("disposable\n");
+    assert_eq!(
+        policy::inspect(&conn, Some("Clocktower")).await.unwrap(),
+        Policy::Disposable
+    );
+    let mut rows = conn.query("select count(*) from notes", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1
+    );
+    drop(rows);
+    let other = open("other.db").build().await.unwrap();
+    let other_conn = other.connect().unwrap();
+    other_conn
+        .execute("create table unrelated (id integer)", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        policy::inspect(&other_conn, None).await.unwrap(),
+        Policy::Preserved
+    );
+
+    ensure_workspace_node_modules(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "policy.ts",
+        r#"
+import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
+import { init } from '@pyre/server/wasm';
+import { inspectDatabasePolicy, setDatabaseDisposable } from '@pyre/server/schema';
+await init();
+const app = createClient({ url: 'file:app.db' });
+assert.equal(await inspectDatabasePolicy(app, 'Clocktower'), 'disposable');
+await assert.rejects(inspectDatabasePolicy(app, 'Other'), /found 'Clocktower'/);
+const other = createClient({ url: 'file:other.db' });
+assert.equal(await inspectDatabasePolicy(other), 'preserved');
+assert.equal(await setDatabaseDisposable(other), 'disposable');
+assert.equal((await other.execute('select name from sqlite_schema where type = \'table\' order by name')).rows.map(row => row.name).join(), '_pyre_database_policy,unrelated');
+await app.execute('delete from _pyre_database_policy');
+await assert.rejects(inspectDatabasePolicy(app), /Malformed database policy metadata/);
+console.log('database-policy-ok');
+"#,
+        "database-policy-ok",
+        "shared TypeScript database policy",
+    );
+
+    command("other.db", "Clocktower")
+        .assert()
+        .success()
+        .stdout("disposable\n");
+    command("app.db", "Clocktower")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Malformed database policy metadata",
+        ));
+    assert!(matches!(
+        policy::set_disposable(&conn, None).await,
+        Err(policy::Error::Malformed)
+    ));
+    conn.execute_batch("drop table _pyre_database_policy; create view _pyre_database_policy as select 1 as id, 'disposable' as policy;").await.unwrap();
+    assert!(matches!(
+        policy::inspect(&conn, None).await,
+        Err(policy::Error::Malformed)
+    ));
+}
+
 #[test]
 fn docs_prints_requested_topic() {
     let ctx = TestContext::new();

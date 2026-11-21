@@ -238,6 +238,12 @@ pyre db seed ./app.db --fixtures ./fixtures.json
 
 The command prints the inserted rows as JSON. It only reads the specified fixture file and only writes to an existing, initialized database. Use `--namespace` in a multi-schema project and `--auth` for a remote target; database and auth values can be supplied as quoted `$VARIABLE` references.
 
+## Database Policy
+
+Policy belongs to the physical database. `pyre db policy ./app.db` reads it without writing; an unmarked database is preserved. Use `pyre db policy ./app.db --set disposable` to opt an existing database into disposable workflows without changing application rows or installing a schema. An unreadable or malformed marker never authorizes a destructive operation.
+
+When copying or restoring a database, establish the destination policy explicitly before use. A copied marker reflects the source's policy and is not a decision about the destination. If your copy tool preserves internal tables, verify the destination policy before any lifecycle operation and avoid carrying the source's disposable marker into a preserved destination.
+
 ## Rust API
 
 `pyre generate` emits a fixed-schema Rust helper at `pyre/generated/rust/seed.rs`:

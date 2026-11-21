@@ -3,7 +3,7 @@ import * as wasm from "./wasm/pyre_wasm.js";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
 
 const DEFAULT_SCHEMA_KEY = "__default__";
-const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities"]);
+const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities", "_pyre_database_policy"]);
 const CREATE_EXTERNAL_IDENTITIES = `create table if not exists _pyre_external_identities (
     namespace text not null,
     record_name text not null,
@@ -39,6 +39,69 @@ const INTERNAL_SETUP_SQL: InStatement[] = [
 ];
 
 export type EnsureDatabaseOutcome = "created" | "migrated" | "up-to-date";
+
+export type DatabasePolicy = "preserved" | "disposable";
+
+type PolicySql = {
+    create: string; find: string; read: string; write: string;
+    hasNamespace: string; readNamespace: string;
+};
+
+async function readPolicy(tx: Transaction, sql: PolicySql, namespace?: string): Promise<{
+    policy: DatabasePolicy;
+    marked: boolean;
+}> {
+    if (namespace !== undefined && (await tx.execute(sql.hasNamespace)).rows.length !== 0) {
+        const actual = (await tx.execute(sql.readNamespace)).rows[0]?.schema_namespace;
+        if (actual != null && actual !== namespace) {
+            throw new Error(`Expected database namespace '${namespace}', found '${actual}'`);
+        }
+    }
+    const { rows } = await tx.execute(sql.find);
+    if (rows.length === 0) return { policy: "preserved", marked: false };
+    if (rows.length === 1 && rows[0].sql === sql.create) {
+        const policy = (await tx.execute(sql.read)).rows[0]?.policy;
+        if (policy === "preserved" || policy === "disposable") return { policy, marked: true };
+    }
+    throw new Error("Malformed database policy metadata");
+}
+
+/** Read the policy without creating metadata. Initialize server WASM before use. */
+export async function inspectDatabasePolicy(db: Client, namespace?: string): Promise<DatabasePolicy> {
+    const sql = wasm.database_policy_sql() as PolicySql;
+    const tx = await db.transaction("read");
+    try {
+        return (await readPolicy(tx, sql, namespace)).policy;
+    } finally {
+        try { await tx.rollback(); } finally { tx.close(); }
+    }
+}
+
+/** Persist explicit opt-in on the existing database. Initialize server WASM before use. */
+export async function setDatabaseDisposable(db: Client, namespace?: string): Promise<DatabasePolicy> {
+    const sql = wasm.database_policy_sql() as PolicySql;
+    const tx = await db.transaction("write");
+    let committing = false;
+    try {
+        const { marked } = await readPolicy(tx, sql, namespace);
+        if (!marked) await tx.execute(sql.create);
+        await tx.execute({ sql: sql.write, args: ["disposable"] });
+        committing = true;
+        await tx.commit();
+        return "disposable";
+    } catch (error) {
+        if (committing) throw new Error("Database policy commit outcome unknown", { cause: error });
+        try {
+            if (tx.closed) throw new Error("Transaction closed without confirming rollback");
+            await tx.rollback();
+        } catch (rollback) {
+            throw new Error("Database policy rollback outcome unknown", { cause: new AggregateError([error, rollback]) });
+        }
+        throw error;
+    } finally {
+        try { tx.close(); } catch { /* Commit or rollback determines the outcome. */ }
+    }
+}
 
 type MigrationPlan = {
     sql: InStatement[];

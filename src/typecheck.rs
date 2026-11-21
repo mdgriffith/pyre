@@ -1645,6 +1645,15 @@ fn populate_context_with_external_identities(
                                                 primary: vec![convert_range(tablename_range)],
                                             }],
                                         });
+                                    } else if tablename
+                                        .eq_ignore_ascii_case(crate::db::policy::TABLE)
+                                    {
+                                        errors.push(invalid_type_usage_error(
+                                            &file.path,
+                                            format!("Table name '{tablename}' is reserved for Pyre database policy metadata."),
+                                            to_range(&start, &end),
+                                            vec![convert_range(tablename_range)],
+                                        ));
                                     }
                                 }
 

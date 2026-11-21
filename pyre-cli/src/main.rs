@@ -192,6 +192,17 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DatabaseCommand {
+    /// Inspect or explicitly change the database's lifecycle policy.
+    Policy {
+        /// An existing local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, value_enum)]
+        set: Option<DatabasePolicyArg>,
+    },
     /// Add fixtures to an initialized database in one transaction.
     Seed {
         /// A local filename, URL, or environment variable prefixed with a $.
@@ -206,6 +217,12 @@ enum DatabaseCommand {
         #[arg(long)]
         fixtures: std::path::PathBuf,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DatabasePolicyArg {
+    Disposable,
+    Preserved,
 }
 
 #[tokio::main]
@@ -230,6 +247,14 @@ async fn run() -> io::Result<()> {
 
     match &cli.command {
         Commands::Db { command } => match command {
+            DatabaseCommand::Policy {
+                database,
+                auth,
+                namespace,
+                set,
+            } => {
+                command::database_policy(&options, database, auth, namespace, *set).await?;
+            }
             DatabaseCommand::Seed {
                 database,
                 auth,

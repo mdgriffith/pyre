@@ -496,6 +496,7 @@ async fn preflight_database_compatibility(
             name.as_str() != pyre::db::migrate::MIGRATION_TABLE
                 && name.as_str() != pyre::db::migrate::SYNC_TABLE
                 && name.as_str() != "_pyre_external_identities"
+                && name.as_str() != pyre::db::policy::TABLE
         })
         .cloned()
         .collect();
