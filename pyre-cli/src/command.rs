@@ -13,8 +13,8 @@ mod serve;
 mod shared;
 
 pub use check::check;
-pub(crate) use database::database_policy;
 pub use database::seed_database;
+pub(crate) use database::{database_policy, prepare_disposable_database};
 pub use docs::docs;
 pub use format::format;
 pub use generate::generate;

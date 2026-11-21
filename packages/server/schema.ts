@@ -80,27 +80,70 @@ export async function inspectDatabasePolicy(db: Client, namespace?: string): Pro
 /** Persist explicit opt-in on the existing database. Initialize server WASM before use. */
 export async function setDatabaseDisposable(db: Client, namespace?: string): Promise<DatabasePolicy> {
     const sql = wasm.database_policy_sql() as PolicySql;
-    const tx = await db.transaction("write");
-    let committing = false;
-    try {
+    return databaseWrite<DatabasePolicy>(db, "Database policy", async tx => {
         const { marked } = await readPolicy(tx, sql, namespace);
         if (!marked) await tx.execute(sql.create);
         await tx.execute({ sql: sql.write, args: ["disposable"] });
+        return "disposable";
+    });
+}
+
+export class DatabaseOutcomeUnknown extends Error {}
+
+async function databaseWrite<T>(db: Client, operation: string, work: (tx: Transaction) => Promise<T>): Promise<T> {
+    const tx = await db.transaction("write");
+    let committing = false;
+    try {
+        const result = await work(tx);
         committing = true;
         await tx.commit();
-        return "disposable";
+        return result;
     } catch (error) {
-        if (committing) throw new Error("Database policy commit outcome unknown", { cause: error });
+        if (committing) throw new DatabaseOutcomeUnknown(`${operation} commit outcome unknown`, { cause: error });
         try {
             if (tx.closed) throw new Error("Transaction closed without confirming rollback");
             await tx.rollback();
         } catch (rollback) {
-            throw new Error("Database policy rollback outcome unknown", { cause: new AggregateError([error, rollback]) });
+            throw new DatabaseOutcomeUnknown(`${operation} rollback outcome unknown`, { cause: new AggregateError([error, rollback]) });
         }
         throw error;
     } finally {
         try { tx.close(); } catch { /* Commit or rollback determines the outcome. */ }
     }
+}
+
+/** Install a working schema on an empty target and mark it disposable. */
+export function initDisposableDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[] = []): Promise<void> {
+    return runDisposableDatabase(db, false, namespace, source, identities);
+}
+
+/** Replace the schema and lineage of a disposable database in place. */
+export function resetDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[] = []): Promise<void> {
+    return runDisposableDatabase(db, true, namespace, source, identities);
+}
+
+async function runDisposableDatabase(db: Client, reset: boolean, namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
+    if (db.protocol === "file") {
+        const databases = await db.execute("pragma database_list");
+        if (!databases.rows.some(row => row.name === "main" && typeof row.file === "string" && row.file.length > 0)) {
+            throw new Error("Database lifecycle operations require a file-backed local database");
+        }
+    }
+    return databaseWrite(db, reset ? "Database reset" : "Database initialization", async tx => {
+        if (reset && (await readPolicy(tx, wasm.database_policy_sql() as PolicySql, namespace)).policy !== "disposable") {
+            throw new Error("Reset requires an existing disposable database");
+        }
+        const { rows } = await tx.execute(wasm.database_catalog_sql());
+        const catalog = rows[0]?.catalog;
+        if (typeof catalog !== "string") throw new Error("Could not read database object catalog");
+        let statements: InStatement[];
+        try {
+            statements = wasm.plan_disposable_database(catalog, reset, namespace, source, identities) as InStatement[];
+        } catch (error) {
+            throw new Error(String(error));
+        }
+        for (const statement of statements) await tx.execute(statement);
+    });
 }
 
 type MigrationPlan = {

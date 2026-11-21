@@ -86,7 +86,7 @@ pub fn is_remote(db: &str) -> Result<bool, DbError> {
 }
 
 pub async fn connect(
-    db: &String,
+    db: &str,
     maybe_auth_token: &Option<String>,
 ) -> Result<libsql::Database, DbError> {
     connect_with_creation(db, maybe_auth_token, true).await

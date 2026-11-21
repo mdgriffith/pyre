@@ -6,7 +6,7 @@
  */
 
 export { run, seed } from "./query";
-export { ensureDatabase, inspectDatabasePolicy, setDatabaseDisposable } from "./schema";
+export { DatabaseOutcomeUnknown, ensureDatabase, initDisposableDatabase, inspectDatabasePolicy, resetDatabase, setDatabaseDisposable } from "./schema";
 export { databaseIdFromUrl, requireDatabaseId, withDatabaseId } from "./database-id";
 
 export type { DatabaseId } from "./database-id";

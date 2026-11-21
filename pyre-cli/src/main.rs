@@ -192,6 +192,27 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DatabaseCommand {
+    /// Install a schema on an empty database.
+    Init {
+        /// A local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Use the working schema and opt in to disposable workflows.
+        #[arg(long)]
+        disposable: bool,
+    },
+    /// Replace a disposable database's schema in place and start a new lineage.
+    Reset {
+        /// An existing local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+    },
     /// Inspect or explicitly change the database's lifecycle policy.
     Policy {
         /// An existing local filename, URL, or environment variable prefixed with a $.
@@ -247,6 +268,28 @@ async fn run() -> io::Result<()> {
 
     match &cli.command {
         Commands::Db { command } => match command {
+            DatabaseCommand::Init {
+                database,
+                auth,
+                namespace,
+                disposable,
+            } => {
+                if !disposable {
+                    return Err(io::Error::other("Preserved initialization requires finalized migration history and is not yet supported"));
+                }
+                command::prepare_disposable_database(&options, database, auth, namespace, false)
+                    .await?;
+                println!("Initialized disposable database");
+            }
+            DatabaseCommand::Reset {
+                database,
+                auth,
+                namespace,
+            } => {
+                command::prepare_disposable_database(&options, database, auth, namespace, true)
+                    .await?;
+                println!("Reset disposable database");
+            }
             DatabaseCommand::Policy {
                 database,
                 auth,

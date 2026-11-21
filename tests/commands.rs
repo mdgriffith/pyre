@@ -251,6 +251,188 @@ console.log('database-policy-ok');
     ));
 }
 
+#[tokio::test]
+async fn db_disposable_init_and_reset_replace_lineage_atomically() {
+    use pyre::db::lifecycle;
+    let ctx = TestContext::new();
+    let source = "record Note {\n id Id.Uuid @id\n @public\n}\n";
+    let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
+    std::fs::write(&schema_path, source).unwrap();
+    let command = |operation: &str, path: &str| {
+        let mut cmd = ctx.run_command("db");
+        cmd.args([operation, path]);
+        cmd
+    };
+    command("reset", "missing.db").assert().failure();
+    assert!(!ctx.workspace_path.join("missing.db").exists());
+    command("init", "app.db")
+        .arg("--disposable")
+        .assert()
+        .success();
+    command("init", "app.db")
+        .arg("--disposable")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires an empty database"));
+    let db = libsql::Builder::new_local(ctx.workspace_path.join("app.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        r#"
+        pragma foreign_keys=on;
+        insert into notes (id) values ('00000000-0000-4000-8000-000000000001');
+        update _pyre_sync set server_revision = 17;
+        create table "A""stale" (id integer primary key autoincrement);
+        create table "Z-child" (ref integer not null references "A""stale"(id) on delete restrict);
+        create index stale_idx on "Z-child" (ref);
+        create view stale_view as select * from "Z-child";
+        create trigger stale_trigger after insert on "Z-child" begin select 1; end;
+        insert into "A""stale" default values;
+        insert into "Z-child" values (1);
+    "#,
+    )
+    .await
+    .unwrap();
+    let state = |conn: libsql::Connection| async move {
+        let row = conn
+            .query("select database_epoch, server_revision from _pyre_sync", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        (row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap())
+    };
+    let old = state(conn.clone()).await;
+    let invalid = source.replace(
+        "id Id.Uuid",
+        "@tablename(\"sqlite_reserved_example\")\n id Id.Uuid",
+    );
+    assert!(matches!(
+        lifecycle::reset(&conn, "_default", &invalid, &[]).await,
+        Err(lifecycle::Error::Database(_))
+    ));
+    assert_eq!(state(conn.clone()).await, old);
+    let row = conn
+        .query("select ref from stale_view", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    drop(row);
+
+    lifecycle::reset(&conn, "_default", source, &[])
+        .await
+        .unwrap();
+    let fresh = state(conn.clone()).await;
+    assert_ne!(old.0, fresh.0);
+    assert_eq!(fresh.1, 0);
+    let row = conn.query("select count(*) from main.sqlite_schema where name in ('A\"stale', 'Z-child', 'stale_idx', 'stale_view', 'stale_trigger')", ()).await.unwrap().next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+    drop(row);
+
+    let preserved = libsql::Builder::new_local(ctx.workspace_path.join("preserved.db"))
+        .build()
+        .await
+        .unwrap();
+    let pc = preserved.connect().unwrap();
+    pc.execute("create view keep_me as select 1", ())
+        .await
+        .unwrap();
+    command("reset", "preserved.db")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires an existing disposable database",
+        ));
+    command("init", "preserved.db")
+        .arg("--disposable")
+        .assert()
+        .failure();
+    assert!(pc
+        .query("select * from keep_me", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_some());
+
+    ensure_workspace_node_modules(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "reset.ts",
+        r#"
+import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
+import { init } from '@pyre/server/wasm';
+import { DatabaseOutcomeUnknown, initDisposableDatabase, inspectDatabasePolicy, loadSchemaFromDatabase, resetDatabase } from '@pyre/server/schema';
+import { catchup } from '@pyre/server/sync';
+await init();
+const source = await Bun.file('pyre/schema.pyre').text();
+const app = createClient({ url: 'file:app.db' });
+const stamp = async () => (await app.execute('select database_epoch, server_revision from _pyre_sync')).rows[0];
+const old = await stamp();
+await resetDatabase(app, '_default', source);
+const current = await stamp();
+assert.notEqual(old.database_epoch, current.database_epoch);
+assert.equal(current.server_revision, 0);
+assert.equal(await inspectDatabasePolicy(app), 'disposable');
+await loadSchemaFromDatabase('app', app);
+assert.deepEqual(await catchup(app, { tables: {} }, {}, 100, 'app', old.database_epoch), {
+  type: 'reset', databaseId: 'app', databaseEpoch: current.database_epoch,
+  operation: 'replace', scope: 'database', reason: 'database_epoch_changed',
+});
+const created = createClient({ url: 'file:ts-init.db' });
+await initDisposableDatabase(created, '_default', source);
+assert.equal(await inspectDatabasePolicy(created), 'disposable');
+for (const failedOperation of ['commit', 'rollback'] as const) {
+  const uncertain = {
+    protocol: 'http',
+    async transaction() {
+      const tx = await created.transaction('write');
+      return {
+        get closed() { return tx.closed; },
+        execute: tx.execute.bind(tx),
+        close: tx.close.bind(tx),
+        async commit() {
+          await tx.commit();
+          if (failedOperation === 'commit') throw new Error('Lost commit response');
+        },
+        async rollback() {
+          await tx.rollback();
+          if (failedOperation === 'rollback') throw new Error('Lost rollback response');
+        },
+      };
+    },
+  } as unknown as typeof created;
+  await assert.rejects(resetDatabase(uncertain, '_default', failedOperation === 'rollback' ? 'not a schema' : source),
+    error => error instanceof DatabaseOutcomeUnknown && error.message.includes(`${failedOperation} outcome unknown`));
+}
+console.log('disposable-reset-ok');
+"#,
+        "disposable-reset-ok",
+        "TypeScript disposable database lifecycle",
+    );
+    command("reset", "ts-init.db").assert().success();
+
+    let rows = conn
+        .query("select name from _pyre_migrations", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows.get::<String>(0).unwrap(), "disposable:working");
+}
+
 #[test]
 fn docs_prints_requested_topic() {
     let ctx = TestContext::new();
