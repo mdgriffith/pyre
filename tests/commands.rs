@@ -1107,6 +1107,35 @@ fn test_generate_embeds_namespaced_database_initializers() {
     assert!(campaign.contains("pub struct SeedEncountersRow"));
     assert!(!campaign.contains("SeedUsersRow"));
     assert!(!campaign.contains("pub user:"));
+    assert!(main.contains("Some(\"Main\")"));
+    assert!(campaign.contains("Some(\"Campaign\")"));
+
+    ctx.run_command("migrate")
+        .args(["main.db", "--namespace", "Main", "--push"])
+        .assert()
+        .success();
+    ensure_workspace_node_modules(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "namespaced-seed.ts",
+        r#"
+import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
+import { init } from '@pyre/server/wasm';
+import { fixtures, type SeedInput } from './pyre/generated/typescript/seed';
+await init();
+const db = createClient({ url: 'file:main.db' });
+const input: SeedInput<'Campaign'> = {};
+const wrong = await fixtures.Campaign.seed(db, input);
+assert.equal(wrong.kind, 'error');
+assert.match(wrong.error!.message, /expected database namespace 'Campaign', found 'Main'/);
+const result = await fixtures.Main.seed(db, { users: [{}] });
+assert.equal(result.kind, 'success');
+console.log('namespaced-seed-ok');
+"#,
+        "namespaced-seed-ok",
+        "namespaced generated seed verification",
+    );
 }
 
 #[test]
@@ -1153,19 +1182,22 @@ fn test_generated_seed_artifacts_include_typed_inputs() {
         r#"
 @syncable(false)
 record User {
+    @tablename("accounts")
     id Id.Int @id
-    name String
+    name String @default("Anonymous")
     posts @link(Post.authorId)
     @public
 }
 
 record Post {
-    id Int @id
+    @tablename("written_posts")
+    id Id.Uuid @id
     authorId User.id
     title String
     summary String?
     status Status
     attrs Json<PostAttrs>
+    position Sequence.Int
     author @link(authorId, User.id)
     @public
 }
@@ -1175,7 +1207,7 @@ type Status
    | Published { publishedAt DateTime }
 
 type PostAttrs
-   = PostAttrs { tags List<String> }
+   = PostAttrs { tags List<String?> }
 
 type Attribute
    = AttributeText { value String }
@@ -1190,7 +1222,32 @@ record Entity {
     )
     .unwrap();
 
-    ctx.run_command("generate").assert().success();
+    generate_runtime(&ctx);
+    for database in ["raw.db", "rust.db", "facets.db"] {
+        ctx.run_command("migrate")
+            .args([database, "--push"])
+            .assert()
+            .success();
+    }
+    std::fs::write(
+        ctx.workspace_path.join("fixture.json"),
+        r#"{"accounts":[{"id":41,"updatedAt":1,"posts":[{
+            "id":"00000000-0000-4000-8000-000000000051","title":"First","summary":null,"updatedAt":1,
+            "status":{"_type":"Published","publishedAt":1},
+            "attrs":{"_type":"PostAttrs","tags":["pdf",null]}
+        }]}]}"#,
+    )
+    .unwrap();
+    let raw = ctx
+        .run_command("db")
+        .args(["seed", "raw.db", "--fixtures", "fixture.json"])
+        .assert()
+        .success();
+    std::fs::write(
+        ctx.workspace_path.join("expected.json"),
+        &raw.get_output().stdout,
+    )
+    .unwrap();
 
     let server_ts = std::fs::read_to_string(
         ctx.workspace_path
@@ -1204,32 +1261,9 @@ record Entity {
         std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/rust/seed.rs")).unwrap();
 
     assert!(server_ts.contains("export * from './seed';"));
-    assert!(!server_ts.contains("seedValidators"));
-    assert!(!server_ts.contains("SeedConstructed"));
-    assert!(seed_ts.contains("import * as Db from './core/decode';"));
-    assert!(seed_ts.contains("const seedValidators: SeedValidators ="));
-    assert!(seed_ts.contains("type SeedConstructed<T>"));
-    assert!(seed_ts.contains("export type SeedUsersRow = {"));
-    assert!(seed_ts.contains("\"posts\"?: SeedPostsRow[];"));
-    assert!(seed_ts.contains("export type SeedPostsRow = {"));
-    assert!(seed_ts.contains("\"status\"?: SeedConstructed<Db.Status>;"));
-    assert!(seed_ts.contains("\"attrs\"?: SeedConstructed<Db.PostAttrs>;"));
-    assert!(seed_ts.contains("\"users\"?: SeedUsersRow[];"));
-    assert!(seed_ts.contains("\"posts\"?: SeedPostsRow[];"));
-    assert!(
-        seed_ts.contains("export const seed = (db: Client, input: SeedInput): Promise<SeedResult>")
-    );
-    assert!(seed_ts.contains("{ _type: K }"));
-    assert!(!seed_ts.contains("type?:"));
-    assert!(!seed_ts.contains("$?:"));
-    assert!(seed_rs.contains("pub struct SeedInput"));
-    assert!(seed_rs.contains("pub struct SeedUsersRow"));
-    assert!(seed_rs.contains("pub posts: Option<Vec<SeedPostsRow>>"));
-    assert!(seed_rs.contains("pub author: Option<Box<SeedUsersRow>>"));
-    assert!(seed_rs.contains("pub enum SeedStatus"));
-    assert!(seed_rs.contains("HashMap<String, SeedAttribute>"));
-    assert!(seed_rs.contains("#[serde(tag = \"_type\")]"));
-    assert!(seed_rs.contains("pub async fn seed("));
+    assert!(!seed_ts.contains("seedValidators"));
+    assert!(!seed_ts.contains("\"position\"?:"));
+    assert!(!seed_rs.contains("pub position:"));
 
     let compile_dir = ctx.workspace_path.join("seed-compile");
     std::fs::create_dir_all(compile_dir.join("src")).unwrap();
@@ -1248,6 +1282,7 @@ libsql = "0.9.11"
 pyre = {{ path = {:?} }}
 serde = {{ version = "1.0.203", features = ["derive"] }}
 serde_json = "1.0.117"
+tokio = {{ version = "1.38.0", features = ["macros", "rt-multi-thread"] }}
 "#,
             env!("CARGO_MANIFEST_DIR")
         ),
@@ -1263,16 +1298,21 @@ serde_json = "1.0.117"
         r#"
 mod seed;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let input = seed::SeedInput {
-        users: Some(vec![seed::SeedUsersRow {
-            name: Some("Imported".to_string()),
-            posts: Some(vec![seed::SeedPostsRow {
+        accounts: Some(vec![seed::SeedAccountsRow {
+            id: Some(41),
+            updated_at: Some(seed::DateTime::UnixSeconds(1)),
+            posts: Some(vec![seed::SeedWrittenPostsRow {
+                id: Some("00000000-0000-4000-8000-000000000051".into()),
+                title: Some("First".to_string()),
+                updated_at: Some(seed::DateTime::UnixSeconds(1)),
                 status: Some(seed::SeedStatus::Published {
                     published_at: seed::DateTime::UnixSeconds(1),
                 }),
                 attrs: Some(seed::SeedPostAttrs::PostAttrs {
-                    tags: vec!["pdf".to_string()],
+                    tags: vec![Some("pdf".to_string()), None],
                 }),
                 summary: seed::SeedField::Null,
                 ..Default::default()
@@ -1281,9 +1321,14 @@ fn main() {
         }]),
         ..Default::default()
     };
-    let value = serde_json::to_value(input).expect("seed input serializes");
-    assert_eq!(value["users"][0]["posts"][0]["status"]["_type"], "Published");
-    assert!(value["users"][0]["posts"][0]["summary"].is_null());
+    let read_json = |path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    assert_eq!(serde_json::to_value(&input).unwrap(), read_json("fixture.json"));
+    let db = libsql::Builder::new_local("rust.db").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let result = seed::seed(&conn, input).await.unwrap();
+    assert_eq!(result.response, read_json("expected.json"));
 }
 "#,
     )
@@ -1291,6 +1336,7 @@ fn main() {
     let output = StdCommand::new("cargo")
         .args(["run", "--offline", "--quiet", "--manifest-path"])
         .arg(compile_dir.join("Cargo.toml"))
+        .current_dir(&ctx.workspace_path)
         .output()
         .unwrap();
     assert!(
@@ -1298,6 +1344,80 @@ fn main() {
         "generated Rust seed failed to compile:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    run_bun_verification_script(
+        &ctx,
+        "verify-authored-fixture.ts",
+        r#"
+import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
+import { init } from '@pyre/server/wasm';
+import { seed, type SeedInput } from './pyre/generated/typescript/seed';
+
+await init();
+const authorId = 41;
+const foundation = { accounts: [{ id: authorId, updatedAt: 1, posts: [{
+  id: '00000000-0000-4000-8000-000000000051', title: 'First', summary: null, updatedAt: 1,
+  status: { _type: 'Published', publishedAt: 1 },
+  attrs: { _type: 'PostAttrs', tags: ['pdf', null] },
+}] }] } satisfies SeedInput;
+assert.deepEqual(JSON.parse(JSON.stringify(foundation)), await Bun.file('fixture.json').json());
+const db = createClient({ url: 'file:.yak/yak.db' });
+assert.deepEqual(await seed(db, foundation), {
+  kind: 'success', response: await Bun.file('expected.json').json(),
+});
+
+const facets = createClient({ url: 'file:facets.db' });
+const extension = {
+  accounts: [{ id: 42, name: 'Second' }, { id: authorId }],
+  written_posts: [{ authorId, title: 'Flat reference', status: { _type: 'Draft' },
+    attrs: { _type: 'PostAttrs', tags: [] } }],
+} satisfies SeedInput;
+const combined = { ...extension, accounts: [...foundation.accounts, ...extension.accounts] };
+const size = async (table: 'accounts' | 'written_posts') =>
+  (await facets.execute(`select count(*) as n from ${table}`)).rows[0].n;
+const combinedError = await seed(facets, combined);
+assert.equal(combinedError.kind, 'error');
+assert.match(combinedError.error!.message, /accounts\[2\]/);
+assert.equal(await size('accounts'), 0);
+assert.equal(await size('written_posts'), 0);
+
+assert.equal((await seed(facets, foundation)).kind, 'success');
+const separateError = await seed(facets, extension);
+assert.equal(separateError.kind, 'error');
+assert.match(separateError.error!.message, /accounts\[1\]/);
+assert.equal(await size('accounts'), 1);
+assert.equal(await size('written_posts'), 1);
+assert.equal((await seed(facets, { ...extension, accounts: extension.accounts.slice(0, 1) })).kind, 'success');
+assert.equal((await facets.execute('select authorId from written_posts where title = \'Flat reference\'')).rows[0].authorId, authorId);
+console.log('authored-fixture-ok');
+"#,
+        "authored-fixture-ok",
+        "generated Rust/TypeScript and raw JSON conformance",
+    );
+
+    let output = StdCommand::new("node_modules/.bin/tsc")
+        .args([
+            "--noEmit",
+            "--strict",
+            "--skipLibCheck",
+            "--module",
+            "preserve",
+            "--moduleResolution",
+            "bundler",
+            "--target",
+            "es2022",
+            "pyre/generated/typescript/seed.ts",
+        ])
+        .current_dir(&ctx.workspace_path)
+        .output()
+        .expect("typecheck generated fixture authoring module");
+    assert!(
+        output.status.success(),
+        "generated TypeScript seed failed to compile:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 

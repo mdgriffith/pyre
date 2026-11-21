@@ -64,7 +64,7 @@ fn to_seed_file(context: &typecheck::Context, database: &ast::Database) -> Strin
             .filter(|table| &table.schema == namespace)
             .collect::<Vec<_>>();
         tables.sort_by_key(|table| ast::get_tablename(&table.record.name, &table.record.fields));
-        result.push_str(&to_seed_scope(context, &tables));
+        result.push_str(&to_seed_scope(context, namespace, &tables));
         return result;
     }
 
@@ -78,7 +78,7 @@ fn to_seed_file(context: &typecheck::Context, database: &ast::Database) -> Strin
             .collect::<Vec<_>>();
         tables.sort_by_key(|table| ast::get_tablename(&table.record.name, &table.record.fields));
         result.push_str(&format!("pub mod {module} {{\n"));
-        for line in to_seed_scope(context, &tables).lines() {
+        for line in to_seed_scope(context, &schema.namespace, &tables).lines() {
             result.push_str("    ");
             result.push_str(line);
             result.push('\n');
@@ -89,7 +89,11 @@ fn to_seed_file(context: &typecheck::Context, database: &ast::Database) -> Strin
     result
 }
 
-fn to_seed_scope(context: &typecheck::Context, tables: &[&typecheck::Table]) -> String {
+fn to_seed_scope(
+    context: &typecheck::Context,
+    namespace: &str,
+    tables: &[&typecheck::Table],
+) -> String {
     let mut result = String::new();
     result.push_str("#[derive(Clone, Debug, serde::Serialize)]\n");
     result.push_str("#[serde(untagged)]\n");
@@ -135,7 +139,7 @@ fn to_seed_scope(context: &typecheck::Context, tables: &[&typecheck::Table]) -> 
                 result.push_str(&format!(
                     "    pub {}: SeedField<{}>,\n",
                     field_name,
-                    seed_rust_type(&column.type_)
+                    seed_rust_type(seed_non_null_type(&column.type_))
                 ));
             } else {
                 result.push_str(", skip_serializing_if = \"Option::is_none\")]\n");
@@ -197,13 +201,22 @@ fn to_seed_scope(context: &typecheck::Context, tables: &[&typecheck::Table]) -> 
     result.push_str("    conn: &libsql::Connection,\n");
     result.push_str("    input: SeedInput,\n");
     result.push_str(") -> Result<pyre::server::seed::SeedResult, pyre::server::seed::Error> {\n");
-    result.push_str("    pyre::server::seed::seed(conn, input).await\n");
+    result.push_str(&format!(
+        "    pyre::server::seed::seed_for_namespace(conn, Some({namespace:?}), input).await\n"
+    ));
     result.push_str("}\n");
     result
 }
 
 fn seed_row_name(table_name: &str) -> String {
     format!("Seed{}Row", to_pascal_name(table_name))
+}
+
+fn seed_non_null_type(type_: &ast::ColumnType) -> &ast::ColumnType {
+    match type_ {
+        ast::ColumnType::Nullable(inner) => inner,
+        _ => type_,
+    }
 }
 
 fn seed_rust_type(type_: &ast::ColumnType) -> String {
@@ -230,7 +243,7 @@ fn seed_rust_type(type_: &ast::ColumnType) -> String {
             "std::collections::HashMap<String, {}>",
             seed_rust_type(inner)
         ),
-        ast::ColumnType::Nullable(inner) => seed_rust_type(inner),
+        ast::ColumnType::Nullable(inner) => format!("Option<{}>", seed_rust_type(inner)),
         ast::ColumnType::Custom(name) => format!("Seed{}", to_pascal_name(name)),
     }
 }
@@ -287,7 +300,7 @@ fn seed_custom_types(context: &typecheck::Context) -> String {
                             result.push_str(&format!(
                                 "        {}: SeedField<{}>,\n",
                                 to_field_name(&column.name),
-                                seed_rust_type(&column.type_)
+                                seed_rust_type(seed_non_null_type(&column.type_))
                             ));
                         } else {
                             result.push_str(")]\n");

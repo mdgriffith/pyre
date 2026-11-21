@@ -42,8 +42,10 @@ Seed data is shaped like the database schema. Top-level keys are table names, an
 
 ```ts
 import { createClient } from "@libsql/client";
+import { init } from "@pyre/server/wasm";
 import { seed } from "./pyre/generated/typescript/seed";
 
+await init();
 const db = createClient({ url: "file:test.db" });
 
 const result = await seed(db, {
@@ -89,21 +91,39 @@ The returned shape follows the input shape and includes full inserted rows:
 }
 ```
 
-## Flat Foreign Keys
+## Composing Fixture Facets
 
-You can also seed in layers by setting foreign key columns directly:
+A facet is an ordinary fixture value that you define in code or JSON. For example, suppose `User` uses `@tablename("accounts")` and `Post` uses the physical table `posts`. A people facet can provide an explicit identity and a demo facet can refer to it directly in a foreign-key column:
 
 ```ts
-await seed(db, {
-  users: [{ id: 1, name: "Fred" }],
-});
+import { seed, type SeedInput } from "./pyre/generated/typescript/seed";
 
-await seed(db, {
-  posts: [{ authorId: 1, title: "example post", content: "My content!" }],
-});
+const authorId = 41;
+const people = { accounts: [{ id: authorId, name: "Fred" }] } satisfies SeedInput;
+const demo = {
+  accounts: [{ id: 42, name: "Mina" }],
+  posts: [{ authorId, title: "example post", content: "My content!" }],
+} satisfies SeedInput;
 ```
 
-This is useful when importing existing data or when deterministic ids are convenient.
+To insert both facets atomically, concatenate rows for every shared table key. A shallow spread alone would replace `people.accounts` with `demo.accounts`. If any row fails, such as when the second facet uses an ID already present in the first, the whole combined call rolls back on a confirmed failure.
+
+```ts
+const combined = { accounts: [...people.accounts, ...demo.accounts], posts: demo.posts };
+const result = await seed(db, combined);
+if (result.kind === "error") throw new Error(result.error?.message);
+```
+
+Alternatively, on a fresh target, call `seed` in dependency order. Each successful call commits independently. If `demo` fails, its own inserts roll back on a confirmed failure, and `people` stays committed.
+
+```ts
+const first = await seed(db, people);
+if (first.kind === "error") throw new Error(first.error?.message);
+const second = await seed(db, demo);
+if (second.kind === "error") throw new Error(second.error?.message);
+```
+
+Rust uses the same approach: extend a table's `Vec` before a combined call, or await each `seed(&conn, facet)` in order. Use an explicit UUID value for UUID-backed identities and copy it directly to the corresponding foreign-key fields. Pyre does not discover facets, resolve symbolic references, or automatically order inter-facet dependencies; use separate calls when the order of flat inserts matters. Nested links are inserted in the order required to propagate returned keys.
 
 ## JSON And Custom Types
 
@@ -186,7 +206,7 @@ Pyre writes the discriminator and flattened backing columns behind the scenes, a
 
 ## Runtime API
 
-Generated server output exposes the schema-bound helper:
+Generated server output binds the helper to a database namespace. Inputs are JSON-compatible values: use a string or Unix seconds for `DateTime`, omit fields to let defaults apply, and supply `null` explicitly for nullable fields.
 
 ```ts
 import { seed } from "./pyre/generated/typescript/seed";
@@ -195,6 +215,8 @@ await seed(db, data);
 ```
 
 `server.ts` also re-exports this helper for compatibility with existing imports.
+
+For a project with multiple schema namespaces, import `fixtures` and select the destination explicitly, for example `fixtures.Main.seed(mainDb, data)` with `SeedInput<"Main">`. The runtime checks the installed namespace before inserting. Cross-database references use explicit foreign-key values; generated inputs don't offer cross-database nested writes.
 
 The lower-level runtime helper reads the installed schema directly from the target. Initialize the server WASM runtime before calling it:
 
@@ -244,7 +266,7 @@ let input = generated_seed::SeedInput {
 let result = generated_seed::seed(&conn, input).await?;
 ```
 
-All columns are omittable so SQLite defaults and generated ids can apply. Nullable columns use `SeedField<T>` to distinguish `Omitted`, `Null`, and `Value(T)`.
+Writable columns are omittable so SQLite defaults and generated ids can apply. Server-managed sequences are excluded. Nullable columns use `SeedField<T>` to distinguish `Omitted`, `Null`, and `Value(T)`. `serde_json::to_value(&input)` produces the same fixture object accepted as a JSON file by the CLI, including physical table keys such as overrides from `@tablename`.
 
 The Rust runtime loads the Pyre schema recorded in the database and performs the complete seed call in one immediate transaction. As with the TypeScript API, it bypasses query permissions and does not update sync metadata.
 
