@@ -1,0 +1,14 @@
+{
+  "posts": [{
+    "id": 4, "title": "First post", "authorId": 1,
+    "metadata": {"labels": ["pdf"], "page": 1},
+    "status": {"_type": "Published", "note": "reviewed"},
+    "publishedAt": 1786708800,
+    "updatedAt": 1,
+    "author": {"id": 1, "name": "Anonymous", "updatedAt": 1}
+  }],
+  "users": [{
+    "id": 2, "name": "Second author", "updatedAt": 1,
+    "posts": [{"id": 5, "title": "Second post", "authorId": 2, "metadata": [], "status": "Draft", "publishedAt": null, "updatedAt": 1}]
+  }]
+}

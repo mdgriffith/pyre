@@ -1,0 +1,16 @@
+{
+  "posts": [{
+    "id": 4,
+    "title": "First post",
+    "metadata": {"labels": ["pdf"], "page": 1},
+    "status": {"_type": "Published", "note": "reviewed"},
+    "publishedAt": "2026-08-14T12:00:00Z",
+    "updatedAt": 1,
+    "author": {"updatedAt": 1}
+  }],
+  "users": [{
+    "name": "Second author",
+    "updatedAt": 1,
+    "posts": [{"title": "Second post", "metadata": [], "status": "Draft", "publishedAt": null, "updatedAt": 1}]
+  }]
+}

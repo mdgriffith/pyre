@@ -19,6 +19,7 @@ pub async fn ingest_fixture(
     introspection: JsValue,
     input: JsValue,
     execute: js_sys::Function,
+    expected_namespace: Option<String>,
 ) -> Result<JsValue, JsValue> {
     let raw: introspect::IntrospectionRaw = serde_wasm_bindgen::from_value(introspection)?;
     if raw.schema_source.is_empty() {
@@ -30,6 +31,14 @@ pub async fn ingest_fixture(
             "database contains an invalid Pyre schema",
         ));
     };
+    if let Some(expected) = expected_namespace {
+        if expected != schema.namespace {
+            return Err(JsValue::from_str(&format!(
+                "seed expected database namespace '{expected}', found '{}'",
+                schema.namespace
+            )));
+        }
+    }
     let input = serde_wasm_bindgen::from_value(input)?;
     let response = fixture::ingest(context, &schema.namespace, input, |insert| {
         let execute = &execute;

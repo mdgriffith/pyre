@@ -1,13 +1,107 @@
 import { expect, mock, test } from "bun:test";
-import type { SchemaMetadata } from "@pyre/core";
 import { createClient } from "@libsql/client";
 import { z } from "zod";
 import { run, seed } from "./query";
 import { toRunner } from "./runtime/runner";
 import { buildArgs, toSqlStatements } from "./runtime/sql";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ensureDatabase } from "./schema";
+import { initSync } from "./wasm/pyre_wasm.js";
+
+const fixtureFile = (name: string) => readFileSync(new URL(`../../tests/fixtures/seed/${name}`, import.meta.url), "utf8");
+const fixtureSchema = fixtureFile("schema.pyre");
+
+function seedDatabase(intMode: "number" | "bigint" = "number") {
+  initSync({ module: readFileSync(new URL("./wasm/pyre_wasm_bg.wasm", import.meta.url)) });
+  const directory = mkdtempSync(join(tmpdir(), "pyre-fixture-"));
+  const db = createClient({ url: `file:${join(directory, "test.db")}`, intMode });
+  return { db, close() { db.close(); rmSync(directory, { recursive: true, force: true }); } };
+}
+
+test("WASM seed matches the native fixture and persists both directions of nested links", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    const input = JSON.parse(fixtureFile("input.json"));
+    expect(await seed(db, input, { namespace: "Wrong" })).toMatchObject({
+      kind: "error", error: { message: expect.stringContaining("found 'Fixtures'") },
+    });
+    expect(await seed(db, input, { namespace: "Fixtures" })).toEqual({
+      kind: "success", response: JSON.parse(fixtureFile("expected.json")),
+    });
+    expect((await db.execute("select id, authorId from posts order by id")).rows.map(row => [row.id, row.authorId]))
+      .toEqual([[4, 1], [5, 2]]);
+    // Replaying the explicit post ID fails, including the to-one author inserted first.
+    expect(await seed(db, input)).toMatchObject({ kind: "error", error: { errorType: "DatabaseError", message: expect.stringContaining("posts[0]") } });
+    expect((await db.execute("select count(*) as n from users")).rows[0].n).toBe(2);
+  } finally { close(); }
+});
+
+test("seed rejects an uninitialized target and rolls back late validation errors", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    expect(await seed(db, {})).toMatchObject({ kind: "error", error: { message: expect.stringContaining("initialized") } });
+    expect((await db.execute("select name from sqlite_schema")).rows).toHaveLength(0);
+    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    const result = await seed(db, { users: [{ name: "Discard", posts: [{ title: null }] }] });
+    expect(result).toMatchObject({ kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("users[0].posts[0].title") } });
+    expect((await db.execute("select count(*) as n from users")).rows[0].n).toBe(0);
+  } finally { close(); }
+});
+
+test("WASM seed preserves exact returned integer keys and generates UUIDv7 without assigning sequences", async () => {
+  const { db, close } = seedDatabase("bigint");
+  try {
+    await ensureDatabase(db, "Fixtures", `${fixtureSchema}
+record Event {
+    key Id.Uuid @id
+    sequence Sequence.Int
+    payload String
+    @public
+}
+`);
+    await db.execute("insert into users (id, name) values (9007199254740992, 'Existing')");
+    expect(await seed(db, { users: [{ posts: [{ title: "Nested", metadata: {}, status: "Draft" }] }] })).toMatchObject({ kind: "success" });
+    expect((await db.execute("select authorId from posts")).rows[0].authorId).toBe(9007199254740993n);
+    const result = await seed(db, { events: [{ payload: "First" }] });
+    expect(result).toMatchObject({ kind: "success", response: { events: [{
+      key: expect.stringMatching(/^[\da-f]{8}-[\da-f]{4}-7[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/), sequence: 1,
+    }] } });
+    expect(await seed(db, { events: [{ payload: "Forged", sequence: 99 }] })).toMatchObject({
+      kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("events[0].sequence") },
+    });
+  } finally { close(); }
+});
+
+test("seed reports uncertain commit and rollback and rejects non-atomic transaction modes", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    const client = (failure: "commit" | "rollback") => ({
+      transaction: async () => {
+        const tx = await db.transaction("write");
+        return {
+          get closed() { return tx.closed; },
+          execute: tx.execute.bind(tx),
+          close: tx.close.bind(tx),
+          commit: failure === "commit" ? async () => { await tx.commit(); throw new Error("lost response"); } : tx.commit.bind(tx),
+          rollback: failure === "rollback" ? async () => { throw new Error("lost response"); } : tx.rollback.bind(tx),
+        };
+      },
+    }) as unknown as typeof db;
+    expect(await seed(client("commit"), { users: [{}] })).toMatchObject({
+      kind: "error", error: { errorType: "OutcomeUnknown", message: expect.stringContaining("commit outcome unknown") },
+    });
+    expect(await seed(client("rollback"), { users: [{}, { missing: 1 }] })).toMatchObject({
+      kind: "error", error: { errorType: "OutcomeUnknown", message: expect.stringContaining("rollback outcome unknown") },
+    });
+    for (const transactionMode of ["batch", "none"] as const) {
+      expect(await seed(db, {}, { transactionMode })).toMatchObject({ kind: "error", error: { errorType: "InvalidInput" } });
+    }
+  } finally { close(); }
+});
 
 test("composed operations commit once, retain indexed results, and publish only final row authority", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pyre-batch-"));
@@ -614,640 +708,3 @@ test("sync does not fan out when no affected rows are returned", async () => {
   expect(syncDeltas).not.toHaveBeenCalled();
   expect(sendToSession).not.toHaveBeenCalled();
 });
-
-test("seed inserts nested rows through schema links", async () => {
-  const executed: any[] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      executed.push(statement);
-      if (statement === "begin" || statement === "commit") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "name" },
-            { name: "authorId" },
-            { name: "title" },
-          ],
-        };
-      }
-      if (statement.sql.includes('"users"')) {
-        return { rows: [{ id: 10, name: statement.args.seed_0 }] };
-      }
-      if (statement.sql.includes('"posts"')) {
-        const values = Object.values(statement.args);
-        const authorId = values.find((value) => value === 10);
-        const title = values.find(
-          (value) => value === "First" || value === "Second",
-        );
-        return { rows: [{ id: title === "First" ? 20 : 21, authorId, title }] };
-      }
-      throw new Error("unexpected statement");
-    }),
-  };
-
-  const result = await seed(db as any, userPostSchema(), {
-    users: [
-      {
-        name: "Fred",
-        posts: [{ title: "First" }, { title: "Second" }],
-      },
-    ],
-  });
-
-  expect(result).toEqual({
-    kind: "success",
-    response: {
-      users: [
-        {
-          id: 10,
-          name: "Fred",
-          posts: [
-            { id: 20, authorId: 10, title: "First" },
-            { id: 21, authorId: 10, title: "Second" },
-          ],
-        },
-      ],
-    },
-  });
-  expect(executed[0]).toBe("begin");
-  expect(executed.at(-1)).toBe("commit");
-  const postInserts = executed.filter(
-    (statement) =>
-      typeof statement !== "string" && statement.sql.includes('"posts"'),
-  );
-  expect(Object.values(postInserts[0].args)).toContain(10);
-  expect(Object.values(postInserts[1].args)).toContain(10);
-});
-
-test("seed batches sibling inserts when batch is supported", async () => {
-  const executed: any[] = [];
-  const batched: any[][] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      executed.push(statement);
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "name" },
-            { name: "authorId" },
-            { name: "title" },
-          ],
-        };
-      }
-      throw new Error("unexpected execute");
-    }),
-    batch: mock(async (statements: any[]) => {
-      batched.push(statements);
-      return statements.map((statement) => {
-        if (statement.sql.includes('"users"')) {
-          return { rows: [{ id: 10, name: statement.args.seed_0 }] };
-        }
-
-        const values = Object.values(statement.args);
-        const authorId = values.find((value) => value === 10);
-        const title = values.find(
-          (value) => value === "First" || value === "Second",
-        );
-        return { rows: [{ id: title === "First" ? 20 : 21, authorId, title }] };
-      });
-    }),
-  };
-
-  const result = await seed(db as any, userPostSchema(), {
-    users: [
-      {
-        name: "Fred",
-        posts: [{ title: "First" }, { title: "Second" }],
-      },
-    ],
-  });
-
-  expect(result).toEqual({
-    kind: "success",
-    response: {
-      users: [
-        {
-          id: 10,
-          name: "Fred",
-          posts: [
-            { id: 20, authorId: 10, title: "First" },
-            { id: 21, authorId: 10, title: "Second" },
-          ],
-        },
-      ],
-    },
-  });
-  expect(
-    executed.every(
-      (statement) =>
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info"),
-    ),
-  ).toBe(true);
-  expect(executed).not.toContain("begin");
-  expect(executed).not.toContain("commit");
-  expect(batched).toHaveLength(2);
-  expect(batched[0]).toHaveLength(1);
-  expect(batched[1]).toHaveLength(2);
-});
-
-test("seed rejects nested foreign key conflicts", async () => {
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "rollback") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "name" },
-            { name: "authorId" },
-            { name: "title" },
-          ],
-        };
-      }
-      return { rows: [{ id: 10, name: "Fred" }] };
-    }),
-  };
-
-  const result = await seed(db as any, userPostSchema(), {
-    users: [
-      {
-        name: "Fred",
-        posts: [{ authorId: 999, title: "Wrong" }],
-      },
-    ],
-  });
-
-  expect(result.kind).toBe("error");
-  expect(result.error?.errorType).toBe("InvalidInput");
-  expect(result.error?.message).toContain("users[0].posts[0].authorId");
-  expect(db.execute).toHaveBeenCalledWith("rollback");
-});
-
-test("seed rolls back when an insert fails", async () => {
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "rollback") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "name" },
-            { name: "authorId" },
-            { name: "title" },
-          ],
-        };
-      }
-      if (statement === "commit") {
-        throw new Error("should not commit");
-      }
-      if (statement.sql.includes('"users"')) {
-        return { rows: [{ id: 10, name: "Fred" }] };
-      }
-      throw new Error("post insert failed");
-    }),
-  };
-
-  const result = await seed(db as any, userPostSchema(), {
-    users: [{ name: "Fred", posts: [{ title: "First" }] }],
-  });
-
-  expect(result.kind).toBe("error");
-  expect(result.error?.errorType).toBe("DatabaseError");
-  expect(result.error?.message).toContain("post insert failed");
-  expect(db.execute).toHaveBeenCalledWith("rollback");
-});
-
-test("seed serializes json columns and flattens constructed type columns", async () => {
-  const inserts: any[] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "commit") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "state" },
-            { name: "placement" },
-            { name: "placement__x" },
-            { name: "placement__y" },
-            { name: "placement__scale" },
-          ],
-        };
-      }
-      inserts.push(statement);
-      return {
-        rows: [
-          {
-            id: 1,
-            state: statement.args.seed_0,
-            placement: statement.args.seed_1,
-            placement__x: statement.args.seed_2,
-            placement__y: statement.args.seed_3,
-            placement__scale: statement.args.seed_4,
-          },
-        ],
-      };
-    }),
-  };
-
-  const result = await seed(db as any, jsonAndConstructedSchema(), {
-    tokens: [
-      {
-        state: {
-          groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
-          clocks: [],
-        },
-        placement: {
-          _type: "MapEntityWorldPlacement",
-          x: 10,
-          y: 20,
-          scale: 100,
-        },
-      },
-    ],
-  });
-
-  expect(inserts[0].args.seed_0).toBe(
-    JSON.stringify({
-      groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
-      clocks: [],
-    }),
-  );
-  expect(inserts[0].args.seed_1).toBe("MapEntityWorldPlacement");
-  expect(inserts[0].args.seed_2).toBe(10);
-  expect(inserts[0].args.seed_3).toBe(20);
-  expect(inserts[0].args.seed_4).toBe(100);
-  expect(result).toEqual({
-    kind: "success",
-    response: {
-      tokens: [
-        {
-          id: 1,
-          state: {
-            groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
-            clocks: [],
-          },
-          placement: {
-            _type: "MapEntityWorldPlacement",
-            scale: 100,
-            x: 10,
-            y: 20,
-          },
-        },
-      ],
-    },
-  });
-});
-
-test("seed rejects legacy constructed discriminators", async () => {
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "rollback") {
-        return { rows: [] };
-      }
-      throw new Error("should not insert");
-    }),
-  };
-
-  const result = await seed(db as any, jsonAndConstructedSchema(), {
-    tokens: [
-      {
-        placement: {
-          type: "MapEntityWorldPlacement",
-          x: 10,
-          y: 20,
-          scale: 100,
-        } as any,
-      },
-    ],
-  });
-
-  expect(result.kind).toBe("error");
-  expect(result.error?.errorType).toBe("InvalidInput");
-  expect(result.error?.message).toContain("use '_type'");
-  expect(db.execute).toHaveBeenCalledWith("rollback");
-});
-
-test("seed validates columns with generated validators when provided", async () => {
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "rollback") {
-        return { rows: [] };
-      }
-      throw new Error("should not insert");
-    }),
-  };
-
-  const result = await seed(
-    db as any,
-    jsonAndConstructedSchema(),
-    {
-      tokens: [
-        {
-          placement: {
-            _type: "MapEntityWorldPlacement",
-            x: "bad",
-            y: 20,
-            scale: 100,
-          } as any,
-        },
-      ],
-    },
-    {
-      tokens: {
-        placement: z.discriminatedUnion("_type", [
-          z.object({
-            _type: z.literal("MapEntityWorldPlacement"),
-            x: z.number(),
-            y: z.number(),
-            scale: z.number(),
-          }),
-        ]),
-      },
-    },
-  );
-
-  expect(result.kind).toBe("error");
-  expect(result.error?.errorType).toBe("InvalidInput");
-  expect(result.error?.message).toContain("tokens[0].placement");
-  expect(db.execute).toHaveBeenCalledWith("rollback");
-});
-
-test("seed uses transformed validator values", async () => {
-  const executed: any[] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      executed.push(statement);
-      if (statement === "begin" || statement === "commit") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return { rows: [{ name: "id" }, { name: "startedAt" }] };
-      }
-      return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
-    }),
-  };
-
-  const result = await seed(
-    db as any,
-    eventSchema(),
-    { events: [{ startedAt: "1783787812" }] },
-    {
-      events: {
-        startedAt: z
-          .string()
-          .transform((value) => new Date(Number(value) * 1000)),
-      },
-    },
-  );
-
-  expect(result.kind).toBe("success");
-  expect(executed).toContainEqual({
-    sql: 'insert into "events" ("startedAt") values ($seed_0) returning *',
-    args: { seed_0: 1783787812 },
-  });
-});
-
-test("seed serializes DateTime columns as unix seconds", async () => {
-  const executed: any[] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      executed.push(statement);
-      if (statement === "begin" || statement === "commit") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return { rows: [{ name: "id" }, { name: "startedAt" }] };
-      }
-      if (statement.sql.includes('"events"')) {
-        return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
-      }
-      throw new Error("unexpected statement");
-    }),
-  };
-
-  const result = await seed(db as any, eventSchema(), {
-    events: [{ startedAt: "2026-07-11T16:36:52.000Z" }],
-  });
-
-  expect(result.kind).toBe("success");
-  expect(executed).toContainEqual({
-    sql: 'insert into "events" ("startedAt") values ($seed_0) returning *',
-    args: { seed_0: 1783787812 },
-  });
-});
-
-test("seed accepts canonical DateTime forms and rejects noncanonical values", async () => {
-  const accepted = [
-    new Date("2026-07-11T16:36:52.999Z"),
-    1783787812,
-    "1783787812",
-    "2026-07-11T16:36:52.999Z",
-    "2026-07-11T18:36:52.999+02:00",
-  ];
-
-  for (const startedAt of accepted) {
-    const db = {
-      execute: mock(async (statement: any) => {
-        if (statement === "begin" || statement === "commit")
-          return { rows: [] };
-        if (
-          typeof statement === "string" &&
-          statement.startsWith("pragma table_info")
-        ) {
-          return { rows: [{ name: "id" }, { name: "startedAt" }] };
-        }
-        return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
-      }),
-    };
-    const result = await seed(db as any, eventSchema(), {
-      events: [{ startedAt }],
-    });
-    expect(result.kind).toBe("success");
-  }
-
-  for (const startedAt of [
-    1783787812.5,
-    "1783787812.5",
-    "2026-07-11",
-    "July 11, 2026",
-    "2026-02-30T00:00:00Z",
-  ]) {
-    const db = { execute: mock(async () => ({ rows: [] })) };
-    const result = await seed(db as any, eventSchema(), {
-      events: [{ startedAt }],
-    });
-    expect(result.kind).toBe("error");
-    expect(result.error?.errorType).toBe("InvalidInput");
-  }
-});
-
-function userPostSchema(): SchemaMetadata {
-  return {
-    tables: {
-      users: {
-        name: "users",
-        columns: [
-          {
-            name: "id",
-            type: "Int",
-            nullable: false,
-            primary: true,
-            unique: true,
-            indexed: true,
-          },
-          {
-            name: "name",
-            type: "String",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-        ],
-        links: {
-          posts: {
-            type: "one-to-many",
-            from: "id",
-            to: { table: "posts", column: "authorId" },
-          },
-        },
-        indices: [],
-      },
-      posts: {
-        name: "posts",
-        columns: [
-          {
-            name: "id",
-            type: "Int",
-            nullable: false,
-            primary: true,
-            unique: true,
-            indexed: true,
-          },
-          {
-            name: "authorId",
-            type: "Int",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-          {
-            name: "title",
-            type: "String",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-        ],
-        links: {},
-        indices: [],
-      },
-    },
-    queryFieldToTable: {},
-  };
-}
-
-function eventSchema(): SchemaMetadata {
-  return {
-    tables: {
-      events: {
-        name: "events",
-        columns: [
-          {
-            name: "id",
-            type: "Int",
-            nullable: false,
-            primary: true,
-            unique: true,
-            indexed: true,
-          },
-          {
-            name: "startedAt",
-            type: "DateTime",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-        ],
-        links: {},
-        indices: [],
-      },
-    },
-    queryFieldToTable: {},
-  };
-}
-
-function jsonAndConstructedSchema(): SchemaMetadata {
-  return {
-    tables: {
-      tokens: {
-        name: "tokens",
-        columns: [
-          {
-            name: "id",
-            type: "Int",
-            nullable: false,
-            primary: true,
-            unique: true,
-            indexed: true,
-          },
-          {
-            name: "state",
-            type: "Json<GameState>",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-          {
-            name: "placement",
-            type: "MapEntityPlacement",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-        ],
-        links: {},
-        indices: [],
-      },
-    },
-    queryFieldToTable: {},
-  };
-}

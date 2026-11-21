@@ -149,7 +149,7 @@ async function loadMetadata(db: Client | Transaction, introspection: any): Promi
     return introspection;
 }
 
-async function introspectDatabase(tx: Client | Transaction): Promise<{
+export async function introspectDatabase(tx: Client | Transaction): Promise<{
     initialized: boolean;
     introspection: any;
 }> {

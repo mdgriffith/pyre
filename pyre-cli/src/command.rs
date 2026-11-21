@@ -1,4 +1,5 @@
 mod check;
+mod database;
 mod docs;
 mod format;
 mod generate;
@@ -12,6 +13,7 @@ mod serve;
 mod shared;
 
 pub use check::check;
+pub use database::seed_database;
 pub use docs::docs;
 pub use format::format;
 pub use generate::generate;

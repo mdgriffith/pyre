@@ -93,6 +93,43 @@ fn docs_lists_topics() {
 }
 
 #[test]
+fn db_seed_requires_existing_database_and_runs_the_conformance_fixture() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        include_str!("fixtures/seed/schema.pyre"),
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("fixtures.json"),
+        include_str!("fixtures/seed/input.json"),
+    )
+    .unwrap();
+    let seed = || {
+        let mut cmd = ctx.run_command("db");
+        cmd.args(["seed", "$TEST_DB", "--fixtures", "fixtures.json"])
+            .env("TEST_DB", "fixture.db");
+        cmd
+    };
+    seed().assert().failure();
+    assert!(!ctx.workspace_path.join("fixture.db").exists());
+
+    ctx.run_command("migrate")
+        .args(["fixture.db", "--push"])
+        .assert()
+        .success();
+    let output = seed().assert().success();
+    let actual: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/seed/expected.json")).unwrap();
+    assert_eq!(actual, expected);
+    seed()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("posts[0]"));
+}
+
+#[test]
 fn docs_prints_requested_topic() {
     let ctx = TestContext::new();
 
@@ -2863,7 +2900,9 @@ query GetGames {
 import { createClient } from "@libsql/client";
 import { seed } from "./pyre/generated/typescript/server.ts";
 import { GetGames, GetTokens } from "./pyre/generated/typescript/run.ts";
+import { init } from "@pyre/server/wasm";
 
+await init();
 const db = createClient({ url: "file:.yak/yak.db" });
 
 const seeded = await seed(db, {

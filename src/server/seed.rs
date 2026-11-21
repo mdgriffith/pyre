@@ -9,6 +9,15 @@ pub struct SeedResult {
 
 /// Insert schema-shaped fixture or import data without applying query permissions or sync metadata.
 pub async fn seed<T: Serialize>(conn: &libsql::Connection, input: T) -> Result<SeedResult, Error> {
+    seed_for_namespace(conn, None, input).await
+}
+
+/// Seed an initialized target, optionally requiring its installed namespace to match.
+pub async fn seed_for_namespace<T: Serialize>(
+    conn: &libsql::Connection,
+    expected_namespace: Option<&str>,
+    input: T,
+) -> Result<SeedResult, Error> {
     let input = serde_json::to_value(input).map_err(Error::Json)?;
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
@@ -19,6 +28,13 @@ pub async fn seed<T: Serialize>(conn: &libsql::Connection, input: T) -> Result<S
             .await
             .map_err(Error::Schema)?;
         let namespace = &loaded.schema().map_err(Error::Schema)?.namespace;
+        if let Some(expected) = expected_namespace {
+            if expected != namespace {
+                return Err(Error::InvalidInput(format!(
+                    "seed expected database namespace '{expected}', found '{namespace}'"
+                )));
+            }
+        }
         let context = loaded.context().map_err(Error::Schema)?;
         let conn: &libsql::Connection = &tx;
         fixture::ingest(context, namespace, input, |insert| execute(conn, insert)).await

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "profile:sync": "bun run ./sync-lifecycle.profile.ts",
-    "test": "bun test",
+    "test": "bun test --isolate",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "main": "./index.ts",

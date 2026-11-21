@@ -6,6 +6,25 @@ use pyre::server::seed;
 use serde_json::json;
 
 #[tokio::test]
+async fn seed_matches_wasm_conformance_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(include_str!("fixtures/seed/schema.pyre")).await?;
+    let conn = db.db.connect()?;
+    let input: serde_json::Value = serde_json::from_str(include_str!("fixtures/seed/input.json"))?;
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/seed/expected.json"))?;
+    assert_eq!(seed::seed(&conn, input).await?.response, expected);
+    let mut rows = conn
+        .query("SELECT id, authorId FROM posts ORDER BY id", ())
+        .await?;
+    for (id, author_id) in [(4i64, 1i64), (5, 2)] {
+        let row = rows.next().await?.expect("seeded post");
+        assert_eq!((row.get::<i64>(0)?, row.get::<i64>(1)?), (id, author_id));
+    }
+    assert!(rows.next().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn seed_inserts_nested_rows_and_serializes_values() -> Result<(), Box<dyn std::error::Error>>
 {
     let db = TestDatabase::new(

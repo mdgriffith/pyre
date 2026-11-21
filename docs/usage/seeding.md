@@ -196,14 +196,25 @@ await seed(db, data);
 
 `server.ts` also re-exports this helper for compatibility with existing imports.
 
-The lower-level runtime helper is also available if you need to pass schema metadata explicitly:
+The lower-level runtime helper reads the installed schema directly from the target. Initialize the server WASM runtime before calling it:
 
 ```ts
 import { seed } from "@pyre/server/query";
-import { schemaMetadata } from "./pyre/generated/typescript/core/schema";
+import { init } from "@pyre/server/wasm";
 
-await seed(db, schemaMetadata, data);
+await init();
+const result = await seed(db, data, { namespace: "Main" }); // namespace check is optional
 ```
+
+The legacy `(db, schemaMetadata, data, validators?, options?)` signature still works; supplied metadata and validators no longer control ingestion. `batchSize` has no effect, and `transactionMode: "batch"` or `"none"` is rejected. Seed requires interactive write transactions and a file-backed database for local libSQL clients. For 64-bit integer keys outside JavaScript’s safe integer range, configure the client with `intMode: "bigint"`; the JSON-compatible response still uses JavaScript numbers. Treat an `OutcomeUnknown` result as requiring inspection before retrying.
+
+## CLI
+
+```bash
+pyre db seed ./app.db --fixtures ./fixtures.json
+```
+
+The command prints the inserted rows as JSON. It only reads the specified fixture file and only writes to an existing, initialized database. Use `--namespace` in a multi-schema project and `--auth` for a remote target; database and auth values can be supplied as quoted `$VARIABLE` references.
 
 ## Rust API
 

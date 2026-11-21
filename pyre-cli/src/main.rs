@@ -22,6 +22,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Operate on a physical Pyre database.
+    Db {
+        #[command(subcommand)]
+        command: DatabaseCommand,
+    },
     /// Get started using Pyre.  Generates a starter schema.
     Init {
         /// Generate a setup that has multiple database schemas.
@@ -185,6 +190,24 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum DatabaseCommand {
+    /// Add fixtures to an initialized database in one transaction.
+    Seed {
+        /// A local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        /// Database auth token or an environment variable prefixed with a $.
+        #[arg(long)]
+        auth: Option<String>,
+        /// Which project schema namespace the database must contain.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// JSON file containing fixture rows keyed by physical table name.
+        #[arg(long)]
+        fixtures: std::path::PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -206,6 +229,16 @@ async fn run() -> io::Result<()> {
     };
 
     match &cli.command {
+        Commands::Db { command } => match command {
+            DatabaseCommand::Seed {
+                database,
+                auth,
+                namespace,
+                fixtures,
+            } => {
+                command::seed_database(&options, database, auth, namespace, fixtures).await?;
+            }
+        },
         Commands::Init { multidb, session } => {
             command::init(&options, *multidb, session.as_deref())?;
         }

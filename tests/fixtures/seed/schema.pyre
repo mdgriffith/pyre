@@ -1,0 +1,22 @@
+@syncable(false)
+type Status
+    = Draft
+    | Published { note String }
+
+record User {
+    id Id.Int @id
+    name String @default("Anonymous")
+    posts @link(Post.authorId)
+    @public
+}
+
+record Post {
+    id Id.Int @id
+    authorId User.id
+    title String
+    metadata Json
+    status Status
+    publishedAt DateTime?
+    author @link(authorId, User.id)
+    @public
+}
