@@ -190,10 +190,6 @@ export async function requireSeedIntegerMode(tx: Transaction): Promise<void> {
 }
 
 async function openResetTransaction(db: Client): Promise<Transaction> {
-    // Remote clients open a different stream for an interactive transaction.
-    // The planner refuses FK-bearing schemas if enforcement is still on there.
-    if (db.protocol !== "file") return db.transaction("write");
-
     // Local libSQL transfers its current SQLite connection to the transaction;
     // later client calls get a new connection with the driver's defaults.
     const fkMode = async () => Number((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys);
@@ -217,24 +213,74 @@ async function openResetTransaction(db: Client): Promise<Transaction> {
     }
 }
 
+function planDisposable(catalog: string, reset: boolean, namespace: string, source: string, identities: ExternalIdentity[]): InStatement[] {
+    try {
+        return wasm.plan_disposable_database(catalog, reset, namespace, source, identities) as InStatement[];
+    } catch (error) {
+        throw new Error(String(error));
+    }
+}
+
+async function readCatalog(tx: Transaction): Promise<string> {
+    const catalog = (await tx.execute(wasm.database_catalog_sql())).rows[0]?.catalog;
+    if (typeof catalog !== "string") throw new Error("Could not read database object catalog");
+    return catalog;
+}
+
+async function resetRemoteDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[], reseed: boolean): Promise<void> {
+    // The remote client's migrate() puts PRAGMA foreign_keys=off before BEGIN
+    // on the same stream. It only accepts a static batch, so plan from a read
+    // snapshot and verify its reset preconditions again inside that batch.
+    const sql = wasm.database_policy_sql() as PolicySql;
+    const tx = await db.transaction("read");
+    let catalog: string;
+    let hasNamespace: boolean;
+    try {
+        if ((await readPolicy(tx, sql, namespace)).policy !== "disposable") {
+            throw new Error("Reset requires an existing disposable database");
+        }
+        if (reseed) await requireSeedIntegerMode(tx);
+        hasNamespace = (await tx.execute(sql.hasNamespace)).rows.length !== 0;
+        catalog = await readCatalog(tx);
+    } finally {
+        try { await tx.rollback(); } finally { tx.close(); }
+    }
+
+    const statements = planDisposable(JSON.stringify({ ...JSON.parse(catalog), foreign_keys: 0 }), true, namespace, source, identities);
+    // SQLite RAISE() is only available in triggers. Invalid JSON aborts the
+    // batch's first statement if any precondition is false or NULL.
+    const guard = {
+        sql: `with current_catalog as (${wasm.database_catalog_sql()}), policy_objects as (${sql.find})
+            select case when json_extract(catalog, '$.foreign_keys') = 0
+                and json_remove(catalog, '$.foreign_keys') = json_remove(?, '$.foreign_keys')
+                and (select count(*) = 1 and min(sql) = ? from policy_objects)
+                and (select policy from (${sql.read})) = 'disposable'
+                ${hasNamespace ? `and coalesce((${sql.readNamespace}) collate binary = ?, 1)` : ""}
+                then 1 else json('Pyre reset preconditions changed') end
+            from current_catalog`,
+        args: hasNamespace ? [catalog, sql.create, namespace] : [catalog, sql.create],
+    };
+    try {
+        await db.migrate([guard, ...statements]);
+    } catch (cause) {
+        // migrate() does not expose which step failed or confirm rollback.
+        throw new DatabaseOutcomeUnknown("Database reset batch outcome unknown", { cause });
+    }
+}
+
 async function runDisposableDatabase(db: Client, operation: "init" | "reset" | "reseed", namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
     await requireFileBackedLocalDatabase(db, "Database lifecycle operations");
     const reset = operation !== "init";
+    if (reset && db.protocol !== "file") {
+        return resetRemoteDatabase(db, namespace, source, identities, operation === "reseed");
+    }
     return databaseWrite(db, reset ? "Database reset" : "Database initialization", async tx => {
         if (reset && (await readPolicy(tx, wasm.database_policy_sql() as PolicySql, namespace)).policy !== "disposable") {
             throw new Error("Reset requires an existing disposable database");
         }
         // Reject unsupported fixture connections before discarding any data.
         if (operation === "reseed") await requireSeedIntegerMode(tx);
-        const { rows } = await tx.execute(wasm.database_catalog_sql());
-        const catalog = rows[0]?.catalog;
-        if (typeof catalog !== "string") throw new Error("Could not read database object catalog");
-        let statements: InStatement[];
-        try {
-            statements = wasm.plan_disposable_database(catalog, reset, namespace, source, identities) as InStatement[];
-        } catch (error) {
-            throw new Error(String(error));
-        }
+        const statements = planDisposable(await readCatalog(tx), reset, namespace, source, identities);
         for (const statement of statements) await tx.execute(statement);
     }, reset);
 }

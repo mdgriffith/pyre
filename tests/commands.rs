@@ -130,6 +130,113 @@ fn db_seed_requires_existing_database_and_runs_the_conformance_fixture() {
 }
 
 #[tokio::test]
+async fn db_remote_reset_and_reseed_through_hrana() {
+    let Ok(url) = std::env::var("PYRE_TEST_SQLD_URL") else {
+        return; // CI also runs this test against an isolated, empty libSQL server.
+    };
+    let ctx = TestContext::new();
+    let schema = include_str!("fixtures/seed/schema.pyre");
+    let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
+    std::fs::write(&schema_path, schema).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("fixtures.json"),
+        include_str!("fixtures/seed/input.json"),
+    )
+    .unwrap();
+    let cycles = include_str!("fixtures/seed/reset-cycles.sql");
+    std::fs::write(ctx.workspace_path.join("cycles.sql"), cycles).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("expected.json"),
+        include_str!("fixtures/seed/expected.json"),
+    )
+    .unwrap();
+
+    let command = |operation: &str| {
+        let mut cmd = ctx.run_command("db");
+        cmd.args([operation, &url, "--auth", ""]);
+        cmd
+    };
+    command("init").arg("--disposable").assert().success();
+    let db = libsql::Builder::new_remote(url.clone(), String::new())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let scalar = |sql: &'static str| {
+        let conn = conn.clone();
+        async move {
+            conn.query(sql, ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let epoch_sql = "select database_epoch from _pyre_sync";
+    let old_epoch: String = scalar(epoch_sql).await.get(0).unwrap();
+    conn.execute_batch(cycles).await.unwrap();
+    assert_eq!(
+        scalar("pragma foreign_keys").await.get::<i64>(0).unwrap(),
+        1
+    );
+    assert_eq!(
+        scalar("select count(*) from pragma_foreign_key_check")
+            .await
+            .get::<i64>(0)
+            .unwrap(),
+        0
+    );
+
+    std::fs::write(
+        &schema_path,
+        schema.replace(
+            "record User {",
+            "record User {\n    @tablename(\"sqlite_reserved_example\")",
+        ),
+    )
+    .unwrap();
+    command("reset")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reserved"));
+    assert_eq!(scalar(epoch_sql).await.get::<String>(0).unwrap(), old_epoch);
+    assert_eq!(
+        scalar("select count(*) from cycle_x")
+            .await
+            .get::<i64>(0)
+            .unwrap(),
+        1
+    );
+
+    std::fs::write(schema_path, schema).unwrap();
+    let seeded = command("reseed")
+        .args(["--fixtures", "fixtures.json"])
+        .assert()
+        .success();
+    let actual: serde_json::Value = serde_json::from_slice(&seeded.get_output().stdout).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/seed/expected.json")).unwrap();
+    assert_eq!(actual, expected);
+    assert_ne!(scalar(epoch_sql).await.get::<String>(0).unwrap(), old_epoch);
+    assert_eq!(scalar("select count(*) from main.sqlite_schema where name glob 'cycle_*' or name glob 'pragma_*' or name = 'self_ref'").await.get::<i64>(0).unwrap(), 0);
+    assert_eq!(
+        scalar("pragma foreign_keys").await.get::<i64>(0).unwrap(),
+        1
+    );
+
+    ensure_workspace_node_modules(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "remote-reset.ts",
+        include_str!("fixtures/seed/remote-reset.ts"),
+        "remote-reset-ok",
+        "remote TypeScript reset and reseed",
+    );
+}
+
+#[tokio::test]
 async fn db_policy_is_shared_and_independent_of_schema_changes() {
     use pyre::db::policy::{self, Policy};
     let ctx = TestContext::new();
@@ -344,7 +451,7 @@ async fn db_disposable_init_and_reset_replace_lineage_atomically() {
     let fresh = state(conn.clone()).await;
     assert_ne!(old.0, fresh.0);
     assert_eq!(fresh.1, 0);
-    let row = conn.query("select count(*) from main.sqlite_schema where name in ('A\"stale', 'Z-child', 'stale_idx', 'stale_view', 'stale_trigger', 'self_ref') or name glob 'cycle_*'", ()).await.unwrap().next().await.unwrap().unwrap();
+    let row = conn.query("select count(*) from main.sqlite_schema where name in ('A\"stale', 'Z-child', 'stale_idx', 'stale_view', 'stale_trigger', 'self_ref') or name glob 'cycle_*' or name glob 'pragma_*'", ()).await.unwrap().next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
     drop(row);
     for (pragma, expected) in [("foreign_keys", 1), ("defer_foreign_keys", 0)] {
@@ -416,7 +523,9 @@ await initDisposableDatabase(created, '_default', source);
 assert.equal(await inspectDatabasePolicy(created), 'disposable');
 for (const failedOperation of ['commit', 'rollback'] as const) {
   const uncertain = {
-    protocol: 'http',
+    protocol: 'file',
+    execute: created.execute.bind(created),
+    close: created.close.bind(created),
     async transaction() {
       const tx = await created.transaction('write');
       return {
@@ -1739,8 +1848,8 @@ record Post {
 }
 
 type Status
-   = Draft
-   | Published { publishedAt DateTime }
+   = Draft {}
+   | Published { publishedAt DateTime, type String }
 
 type Color = Red | Blue
 
@@ -1771,7 +1880,7 @@ record Entity {
         ctx.workspace_path.join("fixture.json"),
         r#"{"accounts":[{"id":41,"updatedAt":1,"posts":[{
             "id":"00000000-0000-4000-8000-000000000051","title":"First","summary":null,"updatedAt":1,
-            "status":{"_type":"Published","publishedAt":1},
+            "status":{"_type":"Published","publishedAt":1,"type":"release"},
             "attrs":{"_type":"PostAttrs","tags":["pdf",null]}
         }]}]}"#,
     )
@@ -1846,8 +1955,9 @@ async fn main() {
                 id: Some("00000000-0000-4000-8000-000000000051".into()),
                 title: Some("First".to_string()),
                 updated_at: Some(seed::DateTime::UnixSeconds(1)),
-                status: Some(seed::SeedStatus::Published {
-                    published_at: seed::DateTime::UnixSeconds(1),
+                 status: Some(seed::SeedStatus::Published {
+                     published_at: seed::DateTime::UnixSeconds(1),
+                     r#type: "release".into(),
                 }),
                 attrs: Some(seed::SeedPostAttrs::PostAttrs {
                     tags: vec![Some("pdf".to_string()), None],
@@ -1897,7 +2007,7 @@ await init();
 const authorId = 41;
 const foundation = { accounts: [{ id: authorId, updatedAt: 1, posts: [{
   id: '00000000-0000-4000-8000-000000000051', title: 'First', summary: null, updatedAt: 1,
-  status: { _type: 'Published', publishedAt: 1 },
+  status: { _type: 'Published', publishedAt: 1, type: 'release' },
   attrs: { _type: 'PostAttrs', tags: ['pdf', null] },
 }] }] } satisfies SeedInput;
 assert.deepEqual(JSON.parse(JSON.stringify(foundation)), await Bun.file('fixture.json').json());

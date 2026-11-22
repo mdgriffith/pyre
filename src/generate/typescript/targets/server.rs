@@ -163,19 +163,24 @@ fn seed_custom_types(context: &typecheck::Context) -> String {
         for variant in variants {
             let tag = string::quote(&variant.name);
             result.push_str(&format!("  | {{ _type: {tag}"));
-            if let Some(fields) = &variant.fields {
-                for column in ast::collect_columns(fields) {
-                    let optional = if seed_nullable(&column) { "?" } else { "" };
-                    result.push_str(&format!(
-                        "; {}{optional}: {}",
-                        string::quote(&column.name),
-                        seed_column_type(&column)
-                    ));
-                }
-                result.push_str(" }\n");
-            } else {
-                result.push_str(&format!(" }} | {tag}\n"));
+            let columns = variant
+                .fields
+                .as_ref()
+                .map(ast::collect_columns)
+                .unwrap_or_default();
+            for column in &columns {
+                let optional = if seed_nullable(column) { "?" } else { "" };
+                result.push_str(&format!(
+                    "; {}{optional}: {}",
+                    string::quote(&column.name),
+                    seed_column_type(column)
+                ));
             }
+            result.push_str(" }");
+            if columns.is_empty() {
+                result.push_str(&format!(" | {tag}"));
+            }
+            result.push('\n');
         }
         result.push_str("  ;\n\n");
     }

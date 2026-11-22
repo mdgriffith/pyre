@@ -1,7 +1,7 @@
 @syncable(false)
 type Status
-    = Draft
-    | Published { note String }
+    = Draft {}
+    | Published { type String }
 
 type Color = Red | Blue
 

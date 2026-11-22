@@ -127,7 +127,7 @@ Rust uses the same approach: extend a table's `Vec` before a combined call, or a
 
 ## JSON And Custom Types
 
-Seed accepts a fieldless variant as either `"Draft"` or `{ "_type": "Draft" }`, for both a direct custom column and a typed JSON value (including within lists and dictionaries). A variant with payload fields requires an object with `_type` and its payload. Pyre normalizes mixed unions to tagged objects in JSON and in seed responses; pure enums use strings in both. For a direct custom column, SQLite stores the tag in the main column and any payload in separate columns.
+Seed accepts a fieldless variant (`Draft` or `Draft {}` in the schema) as either `"Draft"` or `{ "_type": "Draft" }`, for both a direct custom column and a typed JSON value (including within lists and dictionaries). A variant with payload fields requires an object with `_type` and its declared payload; if a payload field is named `type`, include it alongside `_type`. Pyre normalizes mixed unions to tagged objects in JSON and in seed responses; pure enums declared without braces use strings in both. For a direct custom column, SQLite stores the tag in the main column and any payload in separate columns.
 
 For a JSON column:
 
@@ -259,7 +259,7 @@ pyre db reset ./demo.db
 pyre db reseed ./demo.db --fixtures ./fixtures.json
 ```
 
-Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. For local databases, reset disables foreign-key enforcement on the reset connection before opening the transaction, so deletes and cascades need not be unwound. If a remote driver starts a transaction with enforcement still enabled, reset rejects a target with foreign keys before dropping anything. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
+Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. Reset disables foreign-key enforcement on the reset session before beginning the transaction, so drops do not run referential actions. For remote libSQL, the TypeScript adapter uses a migration batch and checks the policy, namespace, catalog, and FK setting again inside the batch before dropping anything. A rejected remote batch is reported as an unknown outcome if the driver cannot confirm rollback. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
 
 Reseed commits the same reset before opening or parsing the fixture file, then inserts the fixtures in a separate write transaction. It prints the inserted rows as JSON only after both commits. If reading, parsing, validation, or insertion fails and Pyre confirms no fixture writes committed, the target has the fresh schema and no fixture rows. Fix the failure and rerun reseed from the beginning. If reset fails, fixture loading never starts. If either transaction's outcome is unknown, keep the target out of service and inspect it before retrying. Reseed never restores the discarded database.
 

@@ -449,6 +449,55 @@ record User {
 }
 
 #[tokio::test]
+async fn seed_aborts_instead_of_inheriting_schema_conflict_policies(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+@syncable(false)
+record Item {
+    id Id.Int @id
+    name String @default("original")
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    for conflict in ["REPLACE", "IGNORE", "FAIL", "ROLLBACK"] {
+        // SQLite migration files can declare a constraint's default conflict policy.
+        conn.execute_batch(&format!(
+            "DROP TABLE items;
+             CREATE TABLE items (id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE ON CONFLICT {conflict} DEFAULT 'original',
+                updatedAt INTEGER DEFAULT 0);
+             INSERT INTO items VALUES (1, 'original', 0);"
+        ))
+        .await?;
+        for colliding in [json!({"id": 3, "name": "original"}), json!({})] {
+            let error = seed::seed(
+                &conn,
+                json!({"items": [{"id": 2, "name": "rollback-me"}, colliding]}),
+            )
+            .await
+            .expect_err(conflict);
+            assert!(matches!(error, seed::Error::DatabaseAt { .. }), "{error}");
+            assert!(error.to_string().contains("items[1]"), "{error}");
+            let mut rows = conn
+                .query("SELECT id, name FROM items ORDER BY id", ())
+                .await?;
+            let original = rows.next().await?.expect("original row still exists");
+            assert_eq!(original.get::<i64>(0)?, 1);
+            assert_eq!(original.get::<String>(1)?, "original");
+            assert!(
+                rows.next().await?.is_none(),
+                "earlier fixture row rolled back"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn seed_rejects_unknown_fields_legacy_discriminators_and_link_conflicts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(
@@ -490,13 +539,22 @@ record Post {
         .to_string()
         .contains("unknown seed table 'missing'"));
 
-    let legacy = seed::seed(
-        &conn,
-        json!({ "users": [{ "status": { "type": "Active" } }] }),
-    )
-    .await
-    .expect_err("legacy discriminator should fail");
-    assert!(legacy.to_string().contains("must use '_type'"));
+    for key in ["type", "type_", "$"] {
+        let legacy = seed::seed(&conn, json!({ "users": [{ "status": { key: "Active" } }] }))
+            .await
+            .expect_err("legacy discriminator should fail");
+        assert!(legacy.to_string().contains("must use '_type'"));
+
+        let extra = seed::seed(
+            &conn,
+            json!({ "users": [{ "status": { "_type": "Active", key: "Active" } }] }),
+        )
+        .await
+        .expect_err("undeclared payload field should fail");
+        assert!(extra
+            .to_string()
+            .contains(&format!(".{key} is not a field")));
+    }
 
     let extra = seed::seed(
         &conn,

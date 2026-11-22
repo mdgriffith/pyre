@@ -2,9 +2,9 @@
   "posts": [{
     "id": 4, "title": "First post", "authorId": 1,
     "metadata": {"labels": ["pdf"], "page": 1},
-    "status": {"_type": "Published", "note": "reviewed"},
-    "jsonStatus": {"_type": "Published", "note": "reviewed"},
-    "groupedStatus": {"group": [null, {"_type": "Draft"}, {"_type": "Draft"}]},
+    "status": {"_type": "Published", "type": "reviewed"},
+    "jsonStatus": {"_type": "Published", "type": "reviewed"},
+    "groupedStatus": {"group": [null, {"_type": "Draft"}, {"_type": "Draft"}, {"_type": "Published", "type": "nested"}]},
     "color": "Red",
     "jsonColor": "Red",
     "publishedAt": 1786708800,

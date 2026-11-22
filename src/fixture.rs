@@ -505,18 +505,12 @@ fn constructed_fields<'a>(
     let (tag, object) = match value {
         JsonValue::String(tag) => (tag.as_str(), None),
         JsonValue::Object(object) => {
-            for legacy in ["type", "type_", "$"] {
-                if object.contains_key(legacy) {
-                    return Err(Error::InvalidInput(format!(
-                        "{} must use '_type' as its discriminator",
-                        path
-                    )));
-                }
-            }
             let tag = object
                 .get("_type")
                 .and_then(JsonValue::as_str)
-                .ok_or_else(|| Error::InvalidInput(format!("{} requires '_type'", path)))?;
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!("{} must use '_type' as its discriminator", path))
+                })?;
             (tag, Some(object))
         }
         _ => return Err(invalid_type(path, "a constructed value")),
@@ -532,14 +526,24 @@ fn constructed_fields<'a>(
         .find(|variant| variant.name == tag)
         .ok_or_else(|| Error::InvalidInput(format!("{} has unknown variant '{}'", path, tag)))?;
     let mut values = Vec::new();
-    if let Some(fields) = &variant.fields {
-        let object = object.ok_or_else(|| {
-            Error::InvalidInput(format!("{} variant '{}' requires fields", path, tag))
-        })?;
-        for field in fields {
-            let ast::Field::Column(column) = field else {
-                continue;
-            };
+    let columns = variant
+        .fields
+        .iter()
+        .flatten()
+        .filter_map(|field| match field {
+            ast::Field::Column(column) => Some(column),
+            _ => None,
+        });
+    if let Some(object) = object {
+        for key in object.keys().filter(|key| key.as_str() != "_type") {
+            if !columns.clone().any(|column| column.name == *key) {
+                return Err(Error::InvalidInput(format!(
+                    "{}.{} is not a field of variant '{}'",
+                    path, key, tag
+                )));
+            }
+        }
+        for column in columns {
             let Some(value) = object.get(&column.name) else {
                 if !column.nullable && !matches!(column.type_, ast::ColumnType::Nullable(_)) {
                     return Err(Error::InvalidInput(format!(
@@ -551,28 +555,11 @@ fn constructed_fields<'a>(
             };
             values.push((column, value));
         }
-    } else if let Some(object) = object {
-        if let Some(key) = object.keys().find(|key| key.as_str() != "_type") {
-            return Err(Error::InvalidInput(format!(
-                "{}.{} is not a field of variant '{}'",
-                path, key, tag
-            )));
-        }
-    }
-    if let Some(fields) = &variant.fields {
-        if let Some(object) = object {
-            for key in object.keys().filter(|key| key.as_str() != "_type") {
-                if !fields
-                    .iter()
-                    .any(|field| matches!(field, ast::Field::Column(column) if column.name == *key))
-                {
-                    return Err(Error::InvalidInput(format!(
-                        "{}.{} is not a field of variant '{}'",
-                        path, key, tag
-                    )));
-                }
-            }
-        }
+    } else if columns.count() != 0 {
+        return Err(Error::InvalidInput(format!(
+            "{} variant '{}' requires fields",
+            path, tag
+        )));
     }
     Ok(Constructed {
         tag,
@@ -658,7 +645,7 @@ fn serialize_uuid(value: &JsonValue, path: &str) -> Result<SqlValue, Error> {
 fn insert_statement(table: &str, values: Vec<(String, SqlValue)>, path: String) -> Insert {
     let table = quote(table);
     let sql = if values.is_empty() {
-        format!("INSERT INTO main.{table} DEFAULT VALUES RETURNING *")
+        format!("INSERT OR ABORT INTO main.{table} DEFAULT VALUES RETURNING *")
     } else {
         let columns = values
             .iter()
@@ -669,7 +656,7 @@ fn insert_statement(table: &str, values: Vec<(String, SqlValue)>, path: String) 
             .take(values.len())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("INSERT INTO main.{table} ({columns}) VALUES ({placeholders}) RETURNING *")
+        format!("INSERT OR ABORT INTO main.{table} ({columns}) VALUES ({placeholders}) RETURNING *")
     };
     Insert {
         sql,

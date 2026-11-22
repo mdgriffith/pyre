@@ -34,10 +34,10 @@ test("WASM seed matches the native fixture and persists both directions of neste
     });
     expect((await db.execute("select id, authorId from posts order by id")).rows.map(row => [row.id, row.authorId]))
       .toEqual([[4, 1], [5, 2]]);
-    expect((await db.execute(`select status, status__note as note,
+    expect((await db.execute(`select status, status__type as payload,
       json_extract(jsonStatus, '$._type') as jsonTag,
       json_extract(jsonColor, '$') as jsonColor from posts where id = 5`)).rows[0])
-      .toEqual({ status: "Draft", note: null, jsonTag: "Draft", jsonColor: "Blue" });
+      .toEqual({ status: "Draft", payload: null, jsonTag: "Draft", jsonColor: "Blue" });
     expect(await seed(db, { posts: [{
       authorId: 1, title: "Missing payload", metadata: {}, status: "Draft", jsonStatus: "Published",
     }] })).toMatchObject({
@@ -58,6 +58,40 @@ test("seed rejects an uninitialized target and rolls back late validation errors
     const result = await seed(db, { users: [{ name: "Discard", posts: [{ title: null }] }] });
     expect(result).toMatchObject({ kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("users[0].posts[0].title") } });
     expect((await db.execute("select count(*) as n from users")).rows[0].n).toBe(0);
+  } finally { close(); }
+});
+
+test("disposable init cannot overlook user objects named after catalog PRAGMAs", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await db.executeMultiple(`create table legacy (id integer); insert into legacy values (7);
+      create table pragma_table_list (schema text, name text, type text);
+      insert into pragma_table_list values ('main', 'legacy', 'shadow'), ('main', 'pragma_table_list', 'shadow');`);
+    await expect(initDisposableDatabase(db, "Fixtures", fixtureSchema)).rejects.toThrow("requires an empty database");
+    expect(await inspectDatabasePolicy(db, "Fixtures")).toBe("preserved");
+    expect((await db.execute("select id from legacy")).rows[0]?.id).toBe(7);
+  } finally { close(); }
+});
+
+test("seed preserves original rows even when the installed constraint defaults to REPLACE", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    const source = `@syncable(false)
+record Item {
+  id Id.Int @id
+  name String
+  @public
+}
+`;
+    await ensureDatabase(db, "Fixtures", source);
+    await db.executeMultiple(`drop table items;
+      create table items (id integer primary key, name text unique on conflict replace, updatedAt integer);
+      insert into items (id, name) values (1, 'original');`);
+    expect(await inspectDatabasePolicy(db)).toBe("preserved");
+    expect(await seed(db, { items: [{ id: 2, name: "rollback-me" }, { id: 3, name: "original" }] }))
+      .toMatchObject({ kind: "error", error: { errorType: "DatabaseError", message: expect.stringContaining("items[1]") } });
+    expect((await db.execute("select id, name from items order by id")).rows.map(row => [row.id, row.name]))
+      .toEqual([[1, "original"]]);
   } finally { close(); }
 });
 
@@ -207,12 +241,6 @@ test("reseed commits a fresh schema before loading fixtures and before admitting
     });
     expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
 
-    // A remote-style adapter can open a transaction on a session where FK
-    // enforcement cannot be changed. It must stop before dropping any tables.
-    const remote = { protocol: "http", transaction: db.transaction.bind(db) } as unknown as typeof db;
-    await expect(reseedDatabase(remote, namespace, fixtureSchema, loader)).rejects.toMatchObject({
-      kind: "reset-failed", message: expect.stringContaining("requires foreign-key enforcement to be disabled"),
-    });
     expect(loader).not.toHaveBeenCalled();
     expect(await epoch()).toBe(oldEpoch);
     expect((await db.execute("select b from cycle_c")).rows[0]?.b).toBe(1);
@@ -220,7 +248,7 @@ test("reseed commits a fresh schema before loading fixtures and before admitting
     await expect(reseedDatabase(db, namespace, fixtureSchema, async () => {
       expect(await epoch()).not.toBe(oldEpoch);
       expect(await counts()).toEqual({ users: 0, posts: 0 });
-      expect((await db.execute("select name from main.sqlite_schema where name glob 'cycle_*' or name = 'self_ref'")).rows).toHaveLength(0);
+      expect((await db.execute("select name from main.sqlite_schema where name glob 'cycle_*' or name = 'self_ref' or name glob 'pragma_*'")).rows).toHaveLength(0);
       expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
       return loader();
     })).rejects.toMatchObject({ kind: "fresh-without-fixtures", cause: expect.any(SyntaxError) });

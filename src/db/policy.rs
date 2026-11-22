@@ -10,7 +10,7 @@ pub const CREATE: &str = "CREATE TABLE _pyre_database_policy (
 pub const FIND: &str = "select sql from main.sqlite_schema where name = '_pyre_database_policy' collate nocase or (type = 'trigger' and tbl_name = '_pyre_database_policy' collate nocase) union all select sql from temp.sqlite_schema where type = 'trigger' and tbl_name = '_pyre_database_policy' collate nocase";
 pub const READ: &str = "select case when count(*) = 1 and min(typeof(id)) = 'integer' and min(id) = 1 then min(policy) end as policy from main._pyre_database_policy";
 pub const WRITE: &str = "insert into main._pyre_database_policy (id, policy) values (1, ?) on conflict (id) do update set policy = excluded.policy";
-pub const HAS_NAMESPACE: &str = "select name from pragma_table_info('_pyre_migrations', 'main') where name = 'schema_namespace'";
+pub const HAS_NAMESPACE: &str = "select name from temp.pragma_table_info('_pyre_migrations', 'main') where name = 'schema_namespace'";
 pub const READ_NAMESPACE: &str = "select schema_namespace from main._pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

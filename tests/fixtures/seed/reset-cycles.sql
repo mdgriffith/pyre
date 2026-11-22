@@ -17,4 +17,12 @@ INSERT INTO cycle_y VALUES (1, 1);
 
 CREATE TABLE self_ref (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES self_ref(id) ON DELETE RESTRICT);
 INSERT INTO self_ref VALUES (1, NULL), (2, 1);
+
+-- Real user tables must never supply the reset planner's PRAGMA metadata.
+CREATE TABLE pragma_foreign_keys (foreign_keys INTEGER);
+INSERT INTO pragma_foreign_keys VALUES (0);
+CREATE TABLE pragma_database_list (name TEXT);
+CREATE TABLE pragma_table_info (name TEXT);
+CREATE TABLE pragma_table_list (schema TEXT, name TEXT, type TEXT);
+INSERT INTO pragma_table_list VALUES ('main', 'pragma_table_list', 'shadow'), ('main', 'self_ref', 'shadow');
 COMMIT;

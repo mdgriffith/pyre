@@ -5,18 +5,22 @@ use serde::Deserialize;
 
 // SQLite-owned objects are identified by the reserved prefix, not a LIKE
 // wildcard. Virtual-table shadow objects are managed by DROP of the virtual root.
+// Qualify PRAGMA functions with temp so user objects in main/attached databases
+// cannot shadow them. A collision in temp itself fails before any DDL.
+// Include definitions in a deterministic order for the remote batch recheck.
 pub const CATALOG_SQL: &str = r#"
 select json_object(
-  'foreign_keys', (select foreign_keys from pragma_foreign_keys),
+  'foreign_keys', (select foreign_keys from temp.pragma_foreign_keys()),
   'extra', (select count(*) from temp.sqlite_schema) +
-           (select count(*) from pragma_database_list where name not in ('main', 'temp')),
-  'objects', (select json_group_array(json_object('kind', s.type, 'name', s.name,
+           (select count(*) from temp.pragma_database_list() where name not in ('main', 'temp')),
+  'objects', (select json_group_array(json_object('kind', s.type, 'name', s.name, 'sql', s.sql,
     'has_foreign_keys', case when s.type = 'table' then (
-      select exists(select 1 from pragma_foreign_key_list(s.name, 'main'))
+      select exists(select 1 from temp.pragma_foreign_key_list(s.name, 'main'))
     ) else 0 end))
-    from main.sqlite_schema s
-    left join pragma_table_list t on t.schema = 'main' and t.name = s.name and s.type = 'table'
-    where lower(substr(s.name, 1, 7)) != 'sqlite_' and coalesce(t.type, '') != 'shadow')
+    from (select * from main.sqlite_schema
+          where lower(substr(name, 1, 7)) != 'sqlite_' order by type, name) s
+    where s.type != 'table' or not exists (
+      select 1 from temp.pragma_table_list() t where t.schema = 'main' and t.name = s.name and t.type = 'shadow'))
 ) as catalog"#;
 
 #[derive(Deserialize)]
@@ -177,10 +181,25 @@ mod native {
         identities: &[ast::ExternalIdentity],
     ) -> Result<(), Error> {
         let conn = connect()?;
-        // Some remote drivers start a separate session for the transaction.
-        // The planner checks the setting again on that session before any DDL.
-        let _ = conn.execute("pragma foreign_keys = off", ()).await;
-        run(&conn, true, namespace, source, identities).await
+        // The remote driver closes an autocommit stream after a standalone
+        // PRAGMA and opens a new one for transaction(). Batch the PRAGMA and
+        // BEGIN on the dedicated connection's stream, then keep using it.
+        conn.execute_batch("pragma foreign_keys = off; begin immediate")
+            .await?;
+        match apply(&conn, true, namespace, source, identities).await {
+            Ok(()) => conn
+                .execute("commit", ())
+                .await
+                .map(|_| ())
+                .map_err(Error::CommitUnknown),
+            Err(cause) => match conn.execute("rollback", ()).await {
+                Ok(_) => Err(cause),
+                Err(rollback) => Err(Error::RollbackUnknown {
+                    cause: Box::new(cause),
+                    rollback,
+                }),
+            },
+        }
     }
 
     #[derive(Debug)]
@@ -291,39 +310,7 @@ mod native {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
-        let result = async {
-            if reset {
-                let (policy, _) = policy::read_in_transaction(&tx, Some(namespace))
-                    .await
-                    .map_err(Error::Policy)?;
-                if policy != policy::Policy::Disposable {
-                    return Err(Error::RequiresDisposable);
-                }
-            }
-            let catalog = {
-                let mut rows = tx.query(CATALOG_SQL, ()).await?;
-                let row = rows
-                    .next()
-                    .await?
-                    .ok_or_else(|| Error::Plan("Could not read database object catalog".into()))?;
-                serde_json::from_str(&row.get::<String>(0)?).map_err(|error| {
-                    Error::Plan(format!("Invalid database object catalog: {error}"))
-                })?
-            };
-            for statement in plan_disposable(catalog, reset, namespace, source, identities)
-                .map_err(Error::Plan)?
-            {
-                match statement {
-                    SqlAndParams::Sql(sql) => tx.execute(&sql, ()).await?,
-                    SqlAndParams::SqlWithParams { sql, args } => {
-                        tx.execute(&sql, libsql::params_from_iter(args)).await?
-                    }
-                };
-            }
-            Ok(())
-        }
-        .await;
-        match result {
+        match apply(&tx, reset, namespace, source, identities).await {
             Ok(()) => tx.commit().await.map_err(Error::CommitUnknown),
             Err(cause) => match tx.rollback().await {
                 Ok(()) => Err(cause),
@@ -333,6 +320,43 @@ mod native {
                 }),
             },
         }
+    }
+
+    async fn apply(
+        conn: &Connection,
+        reset: bool,
+        namespace: &str,
+        source: &str,
+        identities: &[ast::ExternalIdentity],
+    ) -> Result<(), Error> {
+        if reset {
+            let (policy, _) = policy::read_in_transaction(conn, Some(namespace))
+                .await
+                .map_err(Error::Policy)?;
+            if policy != policy::Policy::Disposable {
+                return Err(Error::RequiresDisposable);
+            }
+        }
+        let catalog = {
+            let mut rows = conn.query(CATALOG_SQL, ()).await?;
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| Error::Plan("Could not read database object catalog".into()))?;
+            serde_json::from_str(&row.get::<String>(0)?)
+                .map_err(|error| Error::Plan(format!("Invalid database object catalog: {error}")))?
+        };
+        for statement in
+            plan_disposable(catalog, reset, namespace, source, identities).map_err(Error::Plan)?
+        {
+            match statement {
+                SqlAndParams::Sql(sql) => conn.execute(&sql, ()).await?,
+                SqlAndParams::SqlWithParams { sql, args } => {
+                    conn.execute(&sql, libsql::params_from_iter(args)).await?
+                }
+            };
+        }
+        Ok(())
     }
 }
 
