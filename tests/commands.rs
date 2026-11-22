@@ -291,19 +291,21 @@ async fn db_disposable_init_and_reset_replace_lineage_atomically() {
         create trigger stale_trigger after insert on "Z-child" begin select 1; end;
         insert into "A""stale" default values;
         insert into "Z-child" values (1);
-        create table self_ref (id integer primary key, parent integer references self_ref(id) on delete restrict);
-        insert into self_ref values (1, null), (2, 1);
-        create table cycle_0_parent (id integer primary key);
-        create table cycle_a (id integer primary key, b integer references cycle_b(id) on delete restrict);
-        create table cycle_b (id integer primary key, a integer references cycle_a(id) on delete cascade, parent integer references cycle_0_parent(id) on delete restrict);
-        insert into cycle_0_parent values (1);
-        insert into cycle_a values (1, null);
-        insert into cycle_b values (1, 1, 1);
-        update cycle_a set b = 1;
     "#,
     )
     .await
     .unwrap();
+    conn.execute_batch(include_str!("fixtures/seed/reset-cycles.sql"))
+        .await
+        .unwrap();
+    assert!(conn
+        .query("pragma foreign_key_check", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_none());
     let state = |conn: libsql::Connection| async move {
         let row = conn
             .query("select database_epoch, server_revision from _pyre_sync", ())
@@ -321,7 +323,7 @@ async fn db_disposable_init_and_reset_replace_lineage_atomically() {
         "@tablename(\"sqlite_reserved_example\")\n id Id.Uuid",
     );
     assert!(matches!(
-        lifecycle::reset(&conn, "_default", &invalid, &[]).await,
+        lifecycle::reset(&db, "_default", &invalid, &[]).await,
         Err(lifecycle::Error::Database(_))
     ));
     assert_eq!(state(conn.clone()).await, old);
@@ -336,13 +338,13 @@ async fn db_disposable_init_and_reset_replace_lineage_atomically() {
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     drop(row);
 
-    lifecycle::reset(&conn, "_default", source, &[])
+    lifecycle::reset(&db, "_default", source, &[])
         .await
         .unwrap();
     let fresh = state(conn.clone()).await;
     assert_ne!(old.0, fresh.0);
     assert_eq!(fresh.1, 0);
-    let row = conn.query("select count(*) from main.sqlite_schema where name in ('A\"stale', 'Z-child', 'stale_idx', 'stale_view', 'stale_trigger', 'self_ref', 'cycle_0_parent', 'cycle_a', 'cycle_b')", ()).await.unwrap().next().await.unwrap().unwrap();
+    let row = conn.query("select count(*) from main.sqlite_schema where name in ('A\"stale', 'Z-child', 'stale_idx', 'stale_view', 'stale_trigger', 'self_ref') or name glob 'cycle_*'", ()).await.unwrap().next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
     drop(row);
     for (pragma, expected) in [("foreign_keys", 1), ("defer_foreign_keys", 0)] {
@@ -572,7 +574,7 @@ async fn db_reseed_native_stops_on_reset_failures_and_loads_the_fresh_schema() {
         panic!("fixture loader ran before reset committed")
     };
     assert!(matches!(
-        lifecycle::reseed_with(&conn, "Fixtures", schema, &[], unused).await,
+        lifecycle::reseed_with(&db, "Fixtures", schema, &[], unused).await,
         Err(ReseedError::ResetFailed(
             lifecycle::Error::RequiresDisposable
         ))
@@ -584,7 +586,7 @@ async fn db_reseed_native_stops_on_reset_failures_and_loads_the_fresh_schema() {
 
     // A reader holding a shared lock in rollback journal mode blocks COMMIT,
     // after the writer has already executed reset statements.
-    conn.execute_batch("pragma journal_mode=delete; pragma busy_timeout=0;")
+    conn.execute_batch("pragma journal_mode=delete;")
         .await
         .unwrap();
     let reader = db.connect().unwrap();
@@ -598,7 +600,7 @@ async fn db_reseed_native_stops_on_reset_failures_and_loads_the_fresh_schema() {
         .unwrap()
         .is_none());
     assert!(matches!(
-        lifecycle::reseed_with(&conn, "Fixtures", schema, &[], unused).await,
+        lifecycle::reseed_with(&db, "Fixtures", schema, &[], unused).await,
         Err(ReseedError::ResetOutcomeUnknown(
             lifecycle::Error::CommitUnknown(_)
         ))
@@ -617,7 +619,7 @@ async fn db_reseed_native_stops_on_reset_failures_and_loads_the_fresh_schema() {
         "Fixtures"
     );
 
-    let malformed = lifecycle::reseed_with(&conn, "Fixtures", schema, &[], || {
+    let malformed = lifecycle::reseed_with(&db, "Fixtures", schema, &[], || {
         serde_json::from_str::<Value>("{")
     })
     .await;
@@ -628,7 +630,7 @@ async fn db_reseed_native_stops_on_reset_failures_and_loads_the_fresh_schema() {
     let empty = reseed_state(&conn).await;
     assert_eq!((empty.1, empty.2, empty.3), (0, 0, 0));
     let late = lifecycle::reseed(
-        &conn,
+        &db,
         "Fixtures",
         schema,
         &[],
@@ -641,7 +643,7 @@ async fn db_reseed_native_stops_on_reset_failures_and_loads_the_fresh_schema() {
     assert_eq!(reseed_state(&conn).await.2, 0);
 
     let result = lifecycle::reseed(
-        &conn,
+        &db,
         "Fixtures",
         schema,
         &[],

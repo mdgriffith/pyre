@@ -2,7 +2,6 @@ use super::{introspect, migrate, policy};
 use crate::ast;
 use crate::generate::sql::to_sql::SqlAndParams;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
 
 // SQLite-owned objects are identified by the reserved prefix, not a LIKE
 // wildcard. Virtual-table shadow objects are managed by DROP of the virtual root.
@@ -12,9 +11,9 @@ select json_object(
   'extra', (select count(*) from temp.sqlite_schema) +
            (select count(*) from pragma_database_list where name not in ('main', 'temp')),
   'objects', (select json_group_array(json_object('kind', s.type, 'name', s.name,
-    'parents', json(case when s.type = 'table' then (
-      select json_group_array(f."table") from pragma_foreign_key_list(s.name, 'main') f
-    ) else '[]' end)))
+    'has_foreign_keys', case when s.type = 'table' then (
+      select exists(select 1 from pragma_foreign_key_list(s.name, 'main'))
+    ) else 0 end))
     from main.sqlite_schema s
     left join pragma_table_list t on t.schema = 'main' and t.name = s.name and s.type = 'table'
     where lower(substr(s.name, 1, 7)) != 'sqlite_' and coalesce(t.type, '') != 'shadow')
@@ -31,7 +30,7 @@ pub struct Catalog {
 struct Object {
     kind: String,
     name: String,
-    parents: Vec<String>,
+    has_foreign_keys: u8,
 }
 
 pub fn plan_disposable(
@@ -91,16 +90,20 @@ pub fn plan_disposable(
 }
 
 #[cfg(feature = "database")]
-pub use native::{init_disposable, reseed, reseed_with, reset, Error, ReseedError};
+pub use native::{
+    init_disposable, reseed, reseed_with, reseed_with_connection_factory, reset,
+    reset_with_connection_factory, Error, ReseedError,
+};
 
 #[cfg(feature = "database")]
 mod native {
     use super::*;
     use crate::server::seed;
-    use libsql::{Connection, TransactionBehavior};
+    use libsql::{Connection, Database, TransactionBehavior};
     use serde::Serialize;
     use std::convert::Infallible;
     use std::fmt;
+    use std::ops::Deref;
 
     #[derive(Debug)]
     pub enum Error {
@@ -154,13 +157,30 @@ mod native {
     }
 
     /// Replace the schema and lineage in place in one write transaction.
+    /// Opens a dedicated connection so FK settings cannot leak into other work.
     pub async fn reset(
-        conn: &Connection,
+        db: &Database,
         namespace: &str,
         source: &str,
         identities: &[ast::ExternalIdentity],
     ) -> Result<(), Error> {
-        run(conn, true, namespace, source, identities).await
+        reset_with_connection_factory(|| db.connect().map(Box::new), namespace, source, identities)
+            .await
+    }
+
+    /// The factory must open a connection reserved exclusively for reset.
+    #[doc(hidden)]
+    pub async fn reset_with_connection_factory<C: Deref<Target = Connection>>(
+        connect: impl FnOnce() -> Result<C, libsql::Error>,
+        namespace: &str,
+        source: &str,
+        identities: &[ast::ExternalIdentity],
+    ) -> Result<(), Error> {
+        let conn = connect()?;
+        // Some remote drivers start a separate session for the transaction.
+        // The planner checks the setting again on that session before any DDL.
+        let _ = conn.execute("pragma foreign_keys = off", ()).await;
+        run(&conn, true, namespace, source, identities).await
     }
 
     #[derive(Debug)]
@@ -196,13 +216,13 @@ mod native {
     /// Commit a reset, then serialize and insert fixtures in a separate seed operation.
     /// The caller must keep application traffic stopped until the database is ready.
     pub async fn reseed<T: Serialize>(
-        conn: &Connection,
+        db: &Database,
         namespace: &str,
         source: &str,
         identities: &[ast::ExternalIdentity],
         input: T,
     ) -> Result<seed::SeedResult, ReseedError> {
-        reseed_with(conn, namespace, source, identities, || {
+        reseed_with(db, namespace, source, identities, || {
             Ok::<_, Infallible>(input)
         })
         .await
@@ -210,13 +230,36 @@ mod native {
 
     /// Like [`reseed`], but load the fixture input only after reset commits.
     pub async fn reseed_with<T: Serialize, E: fmt::Display>(
-        conn: &Connection,
+        db: &Database,
         namespace: &str,
         source: &str,
         identities: &[ast::ExternalIdentity],
         load_fixtures: impl FnOnce() -> Result<T, E>,
     ) -> Result<seed::SeedResult, ReseedError> {
-        reset(conn, namespace, source, identities)
+        reseed_with_connection_factory(
+            || db.connect().map(Box::new),
+            namespace,
+            source,
+            identities,
+            load_fixtures,
+        )
+        .await
+    }
+
+    /// The factory must open separate connections for reset and fixture ingestion.
+    #[doc(hidden)]
+    pub async fn reseed_with_connection_factory<
+        T: Serialize,
+        E: fmt::Display,
+        C: Deref<Target = Connection>,
+    >(
+        connect: impl Fn() -> Result<C, libsql::Error>,
+        namespace: &str,
+        source: &str,
+        identities: &[ast::ExternalIdentity],
+        load_fixtures: impl FnOnce() -> Result<T, E>,
+    ) -> Result<seed::SeedResult, ReseedError> {
+        reset_with_connection_factory(&connect, namespace, source, identities)
             .await
             .map_err(|error| match error {
                 Error::CommitUnknown(_) | Error::RollbackUnknown { .. } => {
@@ -226,7 +269,9 @@ mod native {
             })?;
         let input = load_fixtures()
             .map_err(|error| ReseedError::FreshWithoutFixtures(error.to_string()))?;
-        seed::seed_for_namespace(conn, Some(namespace), input)
+        let conn =
+            connect().map_err(|error| ReseedError::FreshWithoutFixtures(error.to_string()))?;
+        seed::seed_for_namespace(&conn, Some(namespace), input)
             .await
             .map_err(|error| match error {
                 seed::Error::CommitUnknown(_) | seed::Error::RollbackUnknown { .. } => {
@@ -292,16 +337,16 @@ mod native {
 }
 
 fn drop_statements(catalog: Catalog) -> Result<Vec<SqlAndParams>, String> {
-    let mut statements = vec![];
-    let mut tables = BTreeMap::new();
+    // DROP TABLE implicitly deletes rows with FK enforcement on. Deferring
+    // checks does not stop cascades or other referential actions from running.
+    if catalog.foreign_keys != 0 && catalog.objects.iter().any(|obj| obj.has_foreign_keys != 0) {
+        return Err("Reset requires foreign-key enforcement to be disabled on the reset transaction; this connection cannot reset a schema with foreign keys".into());
+    }
+    let mut objects = vec![];
     for object in catalog.objects {
         match object.kind.as_str() {
-            "trigger" | "view" => statements.push(object),
-            "table" => {
-                tables.insert(object.name.to_ascii_lowercase(), object);
-            }
-            // Explicit indexes disappear with their owning table. Keep them
-            // until then, as foreign keys may rely on their uniqueness.
+            "trigger" | "view" | "table" => objects.push(object),
+            // Explicit indexes disappear with their owning table.
             "index" => (),
             _ => {
                 return Err(format!(
@@ -311,40 +356,16 @@ fn drop_statements(catalog: Catalog) -> Result<Vec<SqlAndParams>, String> {
             }
         }
     }
-    statements.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
-    let mut sql = Vec::new();
-    if catalog.foreign_keys == 0 {
-        statements.extend(tables.into_values());
-    } else {
-        // DROP's implicit DELETE can trip even a single self-reference. Defer
-        // checks until the replacement is complete; SQLite restores this at
-        // transaction end. Keep each group of mutually referencing tables
-        // ahead of its parents so referential actions can still resolve them.
-        sql.push(SqlAndParams::Sql("pragma defer_foreign_keys = on".into()));
-        let dependencies: HashMap<_, _> = tables
-            .iter()
-            .map(|(key, object)| {
-                let parents = object
-                    .parents
-                    .iter()
-                    .map(|name| name.to_ascii_lowercase())
-                    .filter(|name| tables.contains_key(name))
-                    .collect();
-                (key.clone(), parents)
-            })
-            .collect();
-        let components =
-            crate::typecheck::find_strongly_connected_components(tables.keys(), &dependencies);
-        for mut component in components.into_iter().rev() {
-            component.sort_unstable();
-            for key in component {
-                statements.push(tables.remove(&key).expect("known table"));
-            }
-        }
-    }
-    sql.extend(statements.into_iter().map(|object| {
-        let quoted = crate::ext::string::quote(&object.name);
-        SqlAndParams::Sql(format!("DROP {} main.{quoted}", object.kind))
-    }));
-    Ok(sql)
+    objects.sort_by(|a, b| {
+        // Drop triggers and views before their tables. Tables need no ordering
+        // beyond deterministic output when there are no active FK actions.
+        (a.kind == "table", &a.kind, &a.name).cmp(&(b.kind == "table", &b.kind, &b.name))
+    });
+    Ok(objects
+        .into_iter()
+        .map(|object| {
+            let quoted = crate::ext::string::quote(&object.name);
+            SqlAndParams::Sql(format!("DROP {} main.{quoted}", object.kind))
+        })
+        .collect())
 }

@@ -93,8 +93,8 @@ export async function setDatabaseDisposable(db: Client, namespace?: string): Pro
 
 export class DatabaseOutcomeUnknown extends Error {}
 
-async function databaseWrite<T>(db: Client, operation: string, work: (tx: Transaction) => Promise<T>): Promise<T> {
-    const tx = await db.transaction("write");
+async function databaseWrite<T>(db: Client, operation: string, work: (tx: Transaction) => Promise<T>, openReset = false): Promise<T> {
+    const tx = openReset ? await openResetTransaction(db) : await db.transaction("write");
     let committing = false;
     try {
         const result = await work(tx);
@@ -120,7 +120,7 @@ export function initDisposableDatabase(db: Client, namespace: string, source: st
     return runDisposableDatabase(db, "init", namespace, source, identities);
 }
 
-/** Replace the schema and lineage of a disposable database in place. */
+/** Replace the schema and lineage in place. Use a dedicated maintenance client. */
 export function resetDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[] = []): Promise<void> {
     return runDisposableDatabase(db, "reset", namespace, source, identities);
 }
@@ -142,7 +142,7 @@ export class ReseedError extends Error {
 }
 
 /**
- * Commit a reset, then seed separately. Keep application traffic stopped until success.
+ * Commit a reset, then seed separately. Use a dedicated maintenance client.
  * Pass a loader to defer reading and parsing input until after reset.
  */
 export async function reseedDatabase(
@@ -189,6 +189,34 @@ export async function requireSeedIntegerMode(tx: Transaction): Promise<void> {
     }
 }
 
+async function openResetTransaction(db: Client): Promise<Transaction> {
+    // Remote clients open a different stream for an interactive transaction.
+    // The planner refuses FK-bearing schemas if enforcement is still on there.
+    if (db.protocol !== "file") return db.transaction("write");
+
+    // Local libSQL transfers its current SQLite connection to the transaction;
+    // later client calls get a new connection with the driver's defaults.
+    const fkMode = async () => Number((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys);
+    const previous = await fkMode();
+    if (previous !== 0 && previous !== 1) throw new Error("Could not read foreign-key enforcement for reset");
+    if (previous === 0) return db.transaction("write");
+    try {
+        await db.execute("pragma foreign_keys = off");
+        if (await fkMode() !== 0) throw new Error("Could not disable foreign-key enforcement for reset");
+        return await db.transaction("write");
+    } catch (error) {
+        // BEGIN failed before detaching the connection; put its setting back.
+        try {
+            await db.execute("pragma foreign_keys = on");
+            if (await fkMode() !== 1) throw new Error("Could not restore foreign-key enforcement");
+        } catch (restore) {
+            db.close();
+            throw new AggregateError([error, restore], "Could not open reset transaction or restore the client; client closed");
+        }
+        throw error;
+    }
+}
+
 async function runDisposableDatabase(db: Client, operation: "init" | "reset" | "reseed", namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
     await requireFileBackedLocalDatabase(db, "Database lifecycle operations");
     const reset = operation !== "init";
@@ -208,7 +236,7 @@ async function runDisposableDatabase(db: Client, operation: "init" | "reset" | "
             throw new Error(String(error));
         }
         for (const statement of statements) await tx.execute(statement);
-    });
+    }, reset);
 }
 
 type MigrationPlan = {

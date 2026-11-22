@@ -190,19 +190,38 @@ test("reseed commits a fresh schema before loading fixtures and before admitting
     expect(await epoch()).toBe(oldEpoch);
 
     await setDatabaseDisposable(db, namespace);
-    await db.executeMultiple(`
-      create table cycle_0_parent (id integer primary key);
-      create table cycle_a (id integer primary key, b integer references cycle_b(id) on delete restrict);
-      create table cycle_b (id integer primary key, a integer references cycle_a(id) on delete cascade, parent integer references cycle_0_parent(id) on delete restrict);
-      insert into cycle_0_parent values (1);
-      insert into cycle_a values (1, null);
-      insert into cycle_b values (1, 1, 1);
-      update cycle_a set b = 1;
-    `);
+    await db.execute("pragma foreign_keys = on");
+    await db.executeMultiple(fixtureFile("reset-cycles.sql"));
+    expect((await db.execute("pragma foreign_key_check")).rows).toHaveLength(0);
+
+    const blocked = {
+      protocol: "file",
+      execute: db.execute.bind(db),
+      async transaction() {
+        expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(0);
+        throw new Error("BEGIN blocked");
+      },
+    } as unknown as typeof db;
+    await expect(reseedDatabase(blocked, namespace, fixtureSchema, loader)).rejects.toMatchObject({
+      kind: "reset-failed", message: expect.stringContaining("BEGIN blocked"),
+    });
+    expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
+
+    // A remote-style adapter can open a transaction on a session where FK
+    // enforcement cannot be changed. It must stop before dropping any tables.
+    const remote = { protocol: "http", transaction: db.transaction.bind(db) } as unknown as typeof db;
+    await expect(reseedDatabase(remote, namespace, fixtureSchema, loader)).rejects.toMatchObject({
+      kind: "reset-failed", message: expect.stringContaining("requires foreign-key enforcement to be disabled"),
+    });
+    expect(loader).not.toHaveBeenCalled();
+    expect(await epoch()).toBe(oldEpoch);
+    expect((await db.execute("select b from cycle_c")).rows[0]?.b).toBe(1);
+
     await expect(reseedDatabase(db, namespace, fixtureSchema, async () => {
       expect(await epoch()).not.toBe(oldEpoch);
       expect(await counts()).toEqual({ users: 0, posts: 0 });
-      expect((await db.execute("select name from main.sqlite_schema where name in ('cycle_0_parent', 'cycle_a', 'cycle_b')")).rows).toHaveLength(0);
+      expect((await db.execute("select name from main.sqlite_schema where name glob 'cycle_*' or name = 'self_ref'")).rows).toHaveLength(0);
+      expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
       return loader();
     })).rejects.toMatchObject({ kind: "fresh-without-fixtures", cause: expect.any(SyntaxError) });
     const emptyEpoch = await epoch();
@@ -235,7 +254,8 @@ test("reseed reports lost commit or rollback confirmation for the correct phase"
       for (const operation of ["commit", "rollback"] as const) {
         let transactions = 0;
         const uncertain = {
-          protocol: "http",
+          protocol: "file",
+          execute: db.execute.bind(db),
           async transaction() {
             const tx = await db.transaction("write");
             const fault = ++transactions === (phase === "reset" ? 1 : 2);

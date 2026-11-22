@@ -867,9 +867,9 @@ fn compute_sync_layers(context: &mut Context) {
     }
 }
 
-/// Find strongly connected components in reverse topological order using Tarjan's algorithm.
-pub(crate) fn find_strongly_connected_components<'a>(
-    all_tables: impl IntoIterator<Item = &'a String>,
+/// Find strongly connected components using Tarjan's algorithm
+fn find_strongly_connected_components(
+    all_tables: &HashSet<String>,
     dependencies: &HashMap<String, Vec<String>>,
 ) -> Vec<Vec<String>> {
     let mut index = 0;

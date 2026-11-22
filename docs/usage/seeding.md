@@ -259,13 +259,13 @@ pyre db reset ./demo.db
 pyre db reseed ./demo.db --fixtures ./fixtures.json
 ```
 
-Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. Reset defers foreign-key checks within the transaction so it can remove mutually referencing tables. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
+Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. For local databases, reset disables foreign-key enforcement on the reset connection before opening the transaction, so deletes and cascades need not be unwound. If a remote driver starts a transaction with enforcement still enabled, reset rejects a target with foreign keys before dropping anything. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
 
 Reseed commits the same reset before opening or parsing the fixture file, then inserts the fixtures in a separate write transaction. It prints the inserted rows as JSON only after both commits. If reading, parsing, validation, or insertion fails and Pyre confirms no fixture writes committed, the target has the fresh schema and no fixture rows. Fix the failure and rerun reseed from the beginning. If reset fails, fixture loading never starts. If either transaction's outcome is unknown, keep the target out of service and inspect it before retrying. Reseed never restores the discarded database.
 
 The application or CI owns the maintenance window: stop access, drain in-flight work and old connections or subscriptions, and prevent stale work from reaching the target. After success, load fresh schema and authorization contexts before admitting clients. Old clients see the new epoch on reconnect and replace their cached data; this does not update their client code. To make several [fixture facets](#composing-fixture-facets) part of one seed transaction, compose them into one fixture value or file.
 
-Rust exposes `pyre::db::lifecycle::{init_disposable, reset}`; TypeScript exposes `initDisposableDatabase` and `resetDatabase` from `@pyre/server/schema` after WASM initialization. Both take a database connection, the namespace and current standalone schema, and any external identities required by that schema.
+Rust exposes `pyre::db::lifecycle::{init_disposable, reset}`. Init takes a `libsql::Connection`; reset and reseed take a `libsql::Database` and open their own connections. TypeScript exposes `initDisposableDatabase` and `resetDatabase` from `@pyre/server/schema` after WASM initialization; use a dedicated maintenance client for reset and reseed. These APIs take the namespace and current standalone schema, and any external identities required by that schema.
 
 ```ts
 import { reseedDatabase } from "@pyre/server/schema";
@@ -277,7 +277,7 @@ const rows = await reseedDatabase(db, "Main", source, fixtures, identities);
 ```rust
 use pyre::db::lifecycle;
 
-let seeded = lifecycle::reseed(&conn, "Main", source, &identities, fixtures).await?;
+let seeded = lifecycle::reseed(&db, "Main", source, &identities, fixtures).await?;
 // Use reseed_with(..., || read_fixtures()) to defer loading or parsing.
 ```
 
