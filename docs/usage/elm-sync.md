@@ -278,6 +278,61 @@ To acquire multiple IDs in one round trip, start with a function of the IDs and 
 
 See [`tests/fixtures/AcquireExample.elm`](../../tests/fixtures/AcquireExample.elm) for a runnable standard Elm example with both explicit and automatic child IDs.
 
+## Typed Drafts, Patches, And Headless Forms
+
+Store a `Draft` directly in your Elm model and edit it using record updates.
+`draft` takes the required create fields; `emptyPatch` starts with no changes.
+Both use the same bridge as the list-based builders above:
+
+```elm
+import Db
+import Db.Edit
+import Db.Edit.Document.Draft as Document
+
+
+draft =
+    Document.draft { title = "Untitled", owner = "Me", tags = [] }
+
+
+createDocument database requestId =
+    Db.Edit.submit database requestId [ Document.create draft ]
+
+
+clearSummary database requestId id =
+    let
+        patch =
+            Document.emptyPatch
+    in
+    Db.Edit.submit database requestId
+        [ Document.update id { patch | summary = Db.Null } ]
+```
+
+The top-level `Db` provides `Nullable a = Absent | Null | Present a` for the whole project. For nullable writes, `Db.Absent` omits the field, `Db.Null` clears it, and `Db.Present value` writes it. Non-null optional fields use `Maybe`; required create fields use plain values. An optional create UUID uses the record's actual primary-key name and brand. Leave it unset for automatic allocation. The update ID is a separate argument.
+
+Use `Db.Editor` when you want to render fields from generated metadata. Each record has `Db.Edit.<Record>.Editor` with its own `FieldId`, `createForm`, and `editForm row`. Each schema namespace has `Db.Editor.Input.<Namespace>` (`Default` for unnamed schemas) with `Kind`, `Value`, and `kind`. A value constructor represents an Elm payload type: every string field in the namespace uses `Input.StringValue`. Branded IDs, unions, and typed JSON retain their Elm types. If generated Elm names collide, suffixes disambiguate them without changing schema or wire names.
+
+Render the views from `Editor.fields form`. For example, pass each string view to the same text widget, using `field.current` for display and the field view itself for edits. This helper works for `Title`, `Owner`, and other records in the same namespace:
+
+```elm
+import Db.Editor as Editor
+import Db.Editor.Field as Field
+import Db.Editor.Input.Default as Input
+
+
+textChanged : Field.View fieldId Input.Kind Input.Value -> String -> Editor.Form fieldId Input.Kind Input.Value result -> Editor.Form fieldId Input.Kind Input.Value result
+textChanged field text form =
+    case field.kind of
+        Input.StringKind ->
+            Editor.set field.id (Db.Present (Input.StringValue text)) form
+
+        _ ->
+            form
+```
+
+The form starts empty for create. Keep the checked form from `Editor.validate form` to show feedback on its field views, and use the returned `Maybe Draft` with `Document.create`. Validation checks requiredness, nullability, accepted kind, and whether the field is writable on that form. Your app owns labels, widgets, and intermediate input such as an unfinished number; the server enforces authorization and database constraints.
+
+For editing, select the ID plus all update-writable fields in a local query using their schema field names. Open `DocumentEditor.editForm row` from that synced result and keep `row.id` separately. Keep the form in your model while newer query results arrive. `Db.Absent` restores the captured baseline, and validation returns a `Maybe Patch` containing only changed top-level values. This keeps unrelated newer synced values out of the write. Submit a valid patch with `Db.Edit.submit database requestId [ Document.update id patch ]`. Unions and JSON are replaced as whole values.
+
 ## Named Mutation Compatibility
 
 Generated mutation modules in `Query.*` remain available for individual commands and existing integrations.
