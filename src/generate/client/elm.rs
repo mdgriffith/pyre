@@ -1676,10 +1676,17 @@ pub fn generate_queries(
     let mut records: Vec<_> = edit_modules.into_iter().collect();
     records.sort_by(|a, b| a.0.cmp(&b.0));
     for (record, queries) in records {
+        let (builders, draft) = to_edit_modules(context, all_query_info, &record, &queries);
         files.push(generate_text_file(
             base_out_dir.join(format!("Db/Edit/{record}.elm")),
-            to_edit_module(context, all_query_info, &record, &queries),
+            builders,
         ));
+        if let Some(draft) = draft {
+            files.push(generate_text_file(
+                base_out_dir.join(format!("Db/Edit/{record}/Draft.elm")),
+                draft,
+            ));
+        }
     }
 
     for operation in &query_list.queries {
@@ -1750,12 +1757,12 @@ const ELM_PRELUDE_VALUE_NAMES: &[&str] = &[
     "isInfinite",
 ];
 
-fn to_edit_module(
+fn to_edit_modules(
     context: &typecheck::Context,
     info: &HashMap<String, typecheck::QueryInfo>,
     record: &str,
     queries: &[&ast::Query],
-) -> String {
+) -> (String, Option<String>) {
     let lookup = ElmLookup::from_context(context);
     let mut exposing = vec!["Patch".to_string(), "CreateOption".to_string()];
     let mut used_names: HashSet<String> = [
@@ -1984,10 +1991,109 @@ fn to_edit_module(
             _ => {}
         }
     }
-    format!(
+    let builders = format!(
         "module Db.Edit.{record} exposing ({})\n\n{body}",
         exposing.join(", ")
-    )
+    );
+    let draft = to_draft_module(context, info, record, queries, &lookup, &builder_names);
+    (builders, draft)
+}
+
+fn to_draft_module(
+    context: &typecheck::Context,
+    info: &HashMap<String, typecheck::QueryInfo>,
+    record: &str,
+    queries: &[&ast::Query],
+    lookup: &ElmLookup,
+    builder_names: &HashMap<(&str, String), String>,
+) -> Option<String> {
+    let mut exposing = Vec::new();
+    let mut body = format!("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Edit.{record} as Builders\nimport Db.Id\nimport Dict\nimport Time\n\n\n");
+    for query in queries {
+        let (alias, prefix) = match query.operation {
+            ast::QueryOperation::Insert => ("Draft", "create"),
+            ast::QueryOperation::Update => ("Patch", "patch"),
+            _ => continue,
+        };
+        let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
+        let key = ast::collect_columns(&table.record.fields)
+            .into_iter()
+            .find(|column| ast::is_primary_key(column))
+            .unwrap();
+        let key_type = typecheck::query_param_type_for_column(&table.record, &key);
+        let key_type = to_elm_typename(lookup, &key_type, false);
+        let namespace = elm_database_namespace(&info[&query.name].primary_db);
+        let edit = format!("Db.Edit.Edit Db.Database.{namespace}");
+
+        let mut fields = Vec::new();
+        let mut defaults = Vec::new();
+        let mut required = Vec::new();
+        let mut options = Vec::new();
+        for arg in &query.args {
+            let field = &arg.name;
+            if field == &key.name {
+                if prefix == "patch" {
+                    continue;
+                }
+                if matches!(key.type_, ast::ColumnType::IdUuid { .. }) {
+                    fields.push(format!("{field} : Maybe ({key_type})"));
+                    defaults.push(format!("{field} = Nothing"));
+                    options.push(format!("Maybe.map Builders.withId values.{field}"));
+                    continue;
+                }
+            }
+            let base = to_elm_typename(lookup, arg.type_.as_deref().unwrap(), false);
+            if arg.omittable {
+                let builder = &builder_names[&(prefix, field.clone())];
+                if arg.nullable {
+                    fields.push(format!("{field} : Db.Edit.Field ({base})"));
+                    defaults.push(format!("{field} = Db.Edit.Absent"));
+                    options.push(format!("nullableOption Builders.{builder} values.{field}"));
+                } else {
+                    fields.push(format!("{field} : Maybe ({base})"));
+                    defaults.push(format!("{field} = Nothing"));
+                    options.push(format!("Maybe.map Builders.{builder} values.{field}"));
+                }
+            } else {
+                let field_type = if arg.nullable {
+                    format!("Maybe ({base})")
+                } else {
+                    base
+                };
+                fields.push(format!("{field} : {field_type}"));
+                defaults.push(format!("{field} = input.{field}"));
+                required.push(format!("{field} = values.{field}"));
+            }
+        }
+
+        body.push_str(&format!(
+            "type alias {alias} =\n    {{ {} }}\n\n\n",
+            fields.join("\n    , ")
+        ));
+        let options = if options.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "(List.filterMap identity\n        [ {}\n        ]\n    )",
+                options.join("\n        , ")
+            )
+        };
+        if prefix == "create" {
+            exposing.extend(["Draft", "draft", "create"]);
+            body.push_str(&format!("draft : Builders.Required -> Draft\ndraft {} =\n    {{ {} }}\n\n\ncreate : Draft -> {edit}\ncreate {} =\n    Builders.create {{ {} }} {options}\n\n\n", if required.is_empty() { "_" } else { "input" }, defaults.join("\n    , "), if fields.is_empty() { "_" } else { "values" }, required.join(", ")));
+        } else {
+            exposing.extend(["Patch", "emptyPatch", "update"]);
+            body.push_str(&format!("emptyPatch : Patch\nemptyPatch =\n    {{ {} }}\n\n\nupdate : ({key_type}) -> Patch -> {edit}\nupdate id {} =\n    Builders.update id {options}\n\n\n", defaults.join("\n    , "), if fields.is_empty() { "_" } else { "values" }));
+        }
+    }
+    if exposing.is_empty() {
+        return None;
+    }
+    body.push_str("nullableOption : (Maybe a -> b) -> Db.Edit.Field a -> Maybe b\nnullableOption build field =\n    case field of\n        Db.Edit.Absent ->\n            Nothing\n\n        Db.Edit.Null ->\n            Just (build Nothing)\n\n        Db.Edit.Present value ->\n            Just (build (Just value))\n");
+    Some(format!(
+        "module Db.Edit.{record}.Draft exposing ({})\n\n{body}",
+        exposing.join(", ")
+    ))
 }
 
 fn to_query_file(

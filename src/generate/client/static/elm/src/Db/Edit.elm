@@ -1,4 +1,4 @@
-module Db.Edit exposing (Edit, Receipt, receive, result, submit)
+module Db.Edit exposing (Edit, Field(..), Receipt, receive, result, submit)
 
 import Db.Database
 import Db.Internal.Edit as Internal
@@ -8,6 +8,15 @@ import Json.Encode as Encode
 
 type alias Edit namespace =
     Internal.Edit namespace
+
+
+{-| An optional nullable write. `Absent` omits the field (leaving its default
+or current value in place); `Null` and `Present` explicitly write a value.
+-}
+type Field a
+    = Absent
+    | Null
+    | Present a
 
 
 {-| A completion scoped to the database instance and request that submitted it.

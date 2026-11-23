@@ -421,6 +421,8 @@ record Document {
     summary String?
     tags Json<List<String>>
     assignee Account.id?
+    caption String? @default("Default caption")
+    published Bool @default(False)
 }
 record Account {
     @public
@@ -473,8 +475,10 @@ record Reply {
     std::fs::write(dir.path().join("Main.elm"), r#"port module Main exposing (main)
 import Db.Edit
 import Db.Edit.Document as Document
+import Db.Edit.Document.Draft as DocumentDraft
 import Db.Edit.Account as Account
 import Db.Edit.Note as Note
+import Db.Edit.Note.Draft as NoteDraft
 import Db.Internal.Edit as Internal
 import Db.Id
 import Db.Database
@@ -484,14 +488,35 @@ import Query.DocumentDelete
 port output : Encode.Value -> Cmd msg
 main =
     Platform.worker
-        { init = \() -> ( (), output (Encode.list identity [ Internal.encode create, Internal.encode (Document.update (Db.Id.uuid "01900000-0000-7000-8000-000000000000") patch), receiptCheck, Internal.encode (note [ explicit ]), Internal.encode (note [ explicit, explicit ]) ]) )
+        { init = \() ->
+            ( (), output (Encode.list identity
+                [ Internal.encode create
+                , Internal.encode (Document.update documentId patch)
+                , receiptCheck
+                , Internal.encode (note [ explicit ])
+                , Internal.encode (note [ explicit, explicit ])
+                , Internal.encode (DocumentDraft.create documentDraft)
+                , Internal.encode (DocumentDraft.create { documentDraft | caption = Db.Edit.Null, published = Just False })
+                , Internal.encode (DocumentDraft.update documentId { documentPatch | title = Just "New title", summary = Db.Edit.Null, tags = Just [ "tag" ] })
+                , Internal.encode (DocumentDraft.update documentId { documentPatch | caption = Db.Edit.Present "Updated" })
+                , Internal.encode (DocumentDraft.update documentId documentPatch)
+                , Internal.encode (NoteDraft.create { noteDraft | noteKey = Just noteId })
+                ])
+            )
         , update = \() model -> ( model, Cmd.none )
         , subscriptions = \_ -> Sub.none
         }
 create = Document.create { title = "Title", owner = "Owner", tags = [] } [ Document.withSummary Nothing ]
 note = Note.create { id = "ordinary", title = "Custom key" }
-explicit = Note.withId (Db.Id.uuid "01900000-0000-7000-8000-000000000002")
+documentId : Db.Id.Document
+documentId = Db.Id.uuid "01900000-0000-7000-8000-000000000000"
+noteId : Db.Id.Note
+noteId = Db.Id.uuid "01900000-0000-7000-8000-000000000002"
+explicit = Note.withId noteId
 patch = [ Document.title "New title", Document.summary Nothing, Document.tags [ "tag" ] ]
+documentDraft = DocumentDraft.draft { title = "Title", owner = "Owner", tags = [] }
+documentPatch = DocumentDraft.emptyPatch
+noteDraft = NoteDraft.draft { id = "ordinary", title = "Custom key" }
 receiptCheck =
     let
         database = Db.Database.fromString "tenant:1"
@@ -550,6 +575,10 @@ receiptCheck =
         "Document.create { title = \"missing\" } []",
         "Document.withId wrongAccount\n\nwrongAccount : Db.Id.Account\nwrongAccount = Db.Id.uuid \"any\"",
         "Document.update (Db.Id.uuid \"01900000-0000-7000-8000-000000000000\") [ Account.name \"wrong record\" ]",
+        "NoteDraft.create { noteDraft | noteKey = Just documentId }",
+        "DocumentDraft.update documentId { documentPatch | owner = Just \"immutable\" }",
+        "DocumentDraft.update documentId { documentPatch | id = Just documentId }",
+        "DocumentDraft.update documentId { documentPatch | title = Db.Edit.Null }",
     ] {
         std::fs::write(
             dir.path().join("Main.elm"),
@@ -665,6 +694,12 @@ assert.deepEqual(edits[3].createId, { mode: 'explicit', field: 'noteKey', id: '0
 assert.equal(edits[3].optimistic.where.field, 'noteKey');
 assert.deepEqual(edits[3].input, { id: 'ordinary', title: 'Custom key' });
 assert.deepEqual(edits[4].createId, { mode: 'duplicate' });
+assert.deepEqual(edits[5], { ...edits[0], input: { title: 'Title', owner: 'Owner', tags: [] } });
+assert.deepEqual(edits[6], { ...edits[5], input: { ...edits[5].input, caption: null, published: false } });
+assert.deepEqual(edits[7], edits[1]);
+assert.deepEqual(edits[8], { ...edits[1], input: { id: edits[1].input.id, caption: 'Updated' } });
+assert.deepEqual(edits[9], { ...edits[1], input: { id: edits[1].input.id } });
+assert.deepEqual(edits[10], edits[3]);
 "#).unwrap();
     std::fs::write(
         dir.path().join("composed-browser.ts"),
