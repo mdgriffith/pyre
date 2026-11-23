@@ -70,6 +70,8 @@ fn has_replace_policy(ddl: &str) -> bool {
     while let Some((&first, rest)) = bytes.split_first() {
         bytes = match first {
             c if c.is_ascii_whitespace() => rest,
+            // SQLite treats a UTF-8 BOM at a token boundary as whitespace.
+            0xef if rest.starts_with(&[0xbb, 0xbf]) => &rest[2..],
             b'-' if rest.starts_with(b"-") => {
                 &rest[rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len())..]
             }

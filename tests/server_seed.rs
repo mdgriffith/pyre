@@ -526,7 +526,7 @@ record Item {
         "DROP TABLE items;
          CREATE TABLE items (id INTEGER PRIMARY KEY,
             name TEXT UNIQUE ON/* block comment */ CONFLICT -- line comment
-            REPLACE, updatedAt INTEGER DEFAULT 0);
+            \u{feff}REPLACE, updatedAt INTEGER DEFAULT 0);
          INSERT INTO items VALUES (1, 'known', 0);
          CREATE TRIGGER remember AFTER INSERT ON items BEGIN
             INSERT OR IGNORE INTO seen VALUES (new.name);
