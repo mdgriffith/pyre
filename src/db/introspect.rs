@@ -52,7 +52,7 @@ WITH RECURSIVE
         )
       ) as columns_json
     FROM all_tables t
-    CROSS JOIN pragma_table_info(t.name, 'main') c
+    CROSS JOIN temp.pragma_table_info(t.name, 'main') c
     GROUP BY t.name
   ),
   -- Get foreign key info for each table
@@ -72,7 +72,7 @@ WITH RECURSIVE
         )
       ) as fks_json
     FROM all_tables t
-    CROSS JOIN pragma_foreign_key_list(t.name, 'main') f
+    CROSS JOIN temp.pragma_foreign_key_list(t.name, 'main') f
     GROUP BY t.name
   ),
   -- Get index columns for each table/index
@@ -92,8 +92,8 @@ WITH RECURSIVE
         ELSE 0
       END as is_expression
     FROM all_tables t
-    CROSS JOIN pragma_index_list(t.name, 'main') il
-    CROSS JOIN pragma_index_xinfo(il.name, 'main') ix
+    CROSS JOIN temp.pragma_index_list(t.name, 'main') il
+    CROSS JOIN temp.pragma_index_xinfo(il.name, 'main') ix
     WHERE il.origin != 'pk'
       AND ix.key = 1
       AND (ix.name IS NOT NULL OR il.name = 'uniq_' || t.name || '_singleton')
@@ -202,7 +202,7 @@ WITH RECURSIVE
         )
       ) as columns_json
     FROM all_tables t
-    CROSS JOIN pragma_table_info(t.name, 'main') c
+    CROSS JOIN temp.pragma_table_info(t.name, 'main') c
     GROUP BY t.name
   ),
   -- Get foreign key info for each table
@@ -222,7 +222,7 @@ WITH RECURSIVE
         )
       ) as fks_json
     FROM all_tables t
-    CROSS JOIN pragma_foreign_key_list(t.name, 'main') f
+    CROSS JOIN temp.pragma_foreign_key_list(t.name, 'main') f
     GROUP BY t.name
   ),
   -- Get index columns for each table/index
@@ -242,8 +242,8 @@ WITH RECURSIVE
         ELSE 0
       END as is_expression
     FROM all_tables t
-    CROSS JOIN pragma_index_list(t.name, 'main') il
-    CROSS JOIN pragma_index_xinfo(il.name, 'main') ix
+    CROSS JOIN temp.pragma_index_list(t.name, 'main') il
+    CROSS JOIN temp.pragma_index_xinfo(il.name, 'main') ix
     WHERE il.origin != 'pk'
       AND ix.key = 1
       AND (ix.name IS NOT NULL OR il.name = 'uniq_' || t.name || '_singleton')
@@ -398,7 +398,7 @@ pub async fn load_namespace(
     conn: &libsql::Connection,
     raw: &mut IntrospectionRaw,
 ) -> Result<(), libsql::Error> {
-    let mut columns = conn.query("select name from pragma_table_info('_pyre_migrations', 'main') where name = 'schema_namespace'", ()).await?;
+    let mut columns = conn.query("select name from temp.pragma_table_info('_pyre_migrations', 'main') where name = 'schema_namespace'", ()).await?;
     if columns.next().await?.is_some() {
         let mut rows = conn.query("select schema_namespace from main._pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1", ()).await?;
         if let Some(row) = rows.next().await? {

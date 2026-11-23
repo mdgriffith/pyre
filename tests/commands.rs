@@ -130,6 +130,44 @@ fn db_seed_requires_existing_database_and_runs_the_conformance_fixture() {
 }
 
 #[tokio::test]
+async fn db_seed_keeps_fixture_file_order_for_flat_foreign_keys() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        "@syncable(false)\nrecord Zebra {\n id Id.Int @id\n @public\n}\nrecord Ant {\n id Id.Int @id\n parentId Zebra.id\n @public\n}\n",
+    )
+    .unwrap();
+    ctx.run_command("db")
+        .args(["init", "app.db", "--disposable"])
+        .assert()
+        .success();
+    let db = libsql::Builder::new_local(ctx.workspace_path.join("app.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch("drop table ants; create table ants (id integer primary key, parentId integer not null references zebras(id), updatedAt integer default 0);").await.unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("fixtures.json"),
+        r#"{"zebras":[{"id":22}],"ants":[{"id":1,"parentId":22}]}"#,
+    )
+    .unwrap();
+    ctx.run_command("db")
+        .args(["seed", "app.db", "--fixtures", "fixtures.json"])
+        .assert()
+        .success();
+    let row = conn
+        .query("select parentId from ants where id = 1", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 22);
+}
+
+#[tokio::test]
 async fn db_remote_reset_and_reseed_through_hrana() {
     let Ok(url) = std::env::var("PYRE_TEST_SQLD_URL") else {
         return; // CI also runs this test against an isolated, empty libSQL server.
@@ -521,31 +559,11 @@ assert.deepEqual(await catchup(app, { tables: {} }, {}, 100, 'app', old.database
 const created = createClient({ url: 'file:ts-init.db' });
 await initDisposableDatabase(created, '_default', source);
 assert.equal(await inspectDatabasePolicy(created), 'disposable');
-for (const failedOperation of ['commit', 'rollback'] as const) {
-  const uncertain = {
-    protocol: 'file',
-    execute: created.execute.bind(created),
-    close: created.close.bind(created),
-    async transaction() {
-      const tx = await created.transaction('write');
-      return {
-        get closed() { return tx.closed; },
-        execute: tx.execute.bind(tx),
-        close: tx.close.bind(tx),
-        async commit() {
-          await tx.commit();
-          if (failedOperation === 'commit') throw new Error('Lost commit response');
-        },
-        async rollback() {
-          await tx.rollback();
-          if (failedOperation === 'rollback') throw new Error('Lost rollback response');
-        },
-      };
-    },
-  } as unknown as typeof created;
-  await assert.rejects(resetDatabase(uncertain, '_default', failedOperation === 'rollback' ? 'not a schema' : source),
-    error => error instanceof DatabaseOutcomeUnknown && error.message.includes(`${failedOperation} outcome unknown`));
-}
+const beforeInvalid = (await created.execute('select database_epoch from _pyre_sync')).rows[0].database_epoch;
+const invalid = source.replace('record Note {', 'record Note {\n @tablename("sqlite_reserved_example")');
+await assert.rejects(resetDatabase(created, '_default', invalid), DatabaseOutcomeUnknown);
+assert.equal((await created.execute('select database_epoch from _pyre_sync')).rows[0].database_epoch, beforeInvalid);
+assert.equal((await created.execute('pragma foreign_keys')).rows[0].foreign_keys, 1);
 console.log('disposable-reset-ok');
 "#,
         "disposable-reset-ok",

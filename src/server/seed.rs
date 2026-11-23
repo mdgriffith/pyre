@@ -1,6 +1,40 @@
 use crate::fixture::{self, Insert, ReturnedRow, SqlValue};
+use serde::de::{MapAccess, Visitor};
 use serde::Serialize;
 use serde_json::Value;
+
+// Keep top-level insert order without changing how the rest of Pyre orders JSON maps.
+struct FixtureEntries(Vec<(String, Value)>);
+
+impl<'de> serde::Deserialize<'de> for FixtureEntries {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntriesVisitor;
+
+        impl<'de> Visitor<'de> for EntriesVisitor {
+            type Value = FixtureEntries;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a fixture object keyed by table name")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut entries = Vec::new();
+                let mut tables = std::collections::HashSet::new();
+                while let Some((table, rows)) = map.next_entry::<String, Value>()? {
+                    if !tables.insert(table.clone()) {
+                        return Err(serde::de::Error::custom(format_args!(
+                            "duplicate fixture table '{table}'"
+                        )));
+                    }
+                    entries.push((table, rows));
+                }
+                Ok(FixtureEntries(entries))
+            }
+        }
+
+        deserializer.deserialize_map(EntriesVisitor)
+    }
+}
 
 #[derive(Debug)]
 pub struct SeedResult {
@@ -18,7 +52,9 @@ pub async fn seed_for_namespace<T: Serialize>(
     expected_namespace: Option<&str>,
     input: T,
 ) -> Result<SeedResult, Error> {
-    let input = serde_json::to_value(input).map_err(Error::Json)?;
+    let json = serde_json::to_vec(&input).map_err(Error::Json)?;
+    let FixtureEntries(entries) =
+        serde_json::from_slice(&json).map_err(|error| Error::InvalidInput(error.to_string()))?;
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
@@ -37,7 +73,7 @@ pub async fn seed_for_namespace<T: Serialize>(
         }
         let context = loaded.context().map_err(Error::Schema)?;
         let conn: &libsql::Connection = &tx;
-        fixture::ingest(context, namespace, input, |insert| execute(conn, insert)).await
+        fixture::ingest_entries(context, namespace, entries, |insert| execute(conn, insert)).await
     }
     .await;
 

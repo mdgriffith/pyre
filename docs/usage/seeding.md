@@ -202,6 +202,7 @@ Pyre writes the discriminator and flattened backing columns behind the scenes, a
 - The whole seed call is atomic. Pyre starts a transaction, commits on success, and rolls back on validation or insert failure.
 - Inserts are sequential for now: Pyre inserts one row at a time so it can read generated parent ids and report path-specific errors.
 - `seed` bypasses Pyre query permissions.
+- SQLite still runs triggers defined in your database. If a migration installs an insert trigger, its side effects are part of the seed transaction.
 - `seed` does not currently update Pyre sync metadata. Use it for setup/import workflows before synced clients rely on live deltas.
 
 ## Runtime API
@@ -230,7 +231,7 @@ const result = await seed(db, data, { namespace: "Main" }); // namespace check i
 
 The legacy `(db, schemaMetadata, data, validators?, options?)` signature still works; supplied metadata and validators no longer control ingestion. `batchSize` has no effect, and `transactionMode: "batch"` or `"none"` is rejected. Seed requires interactive write transactions and a file-backed database for local libSQL clients. Use `intMode: "number"` (the default) or `"bigint"` for seed and reseed; `"string"` is unsupported. Use `"bigint"` for 64-bit integer keys outside JavaScript’s safe integer range; the JSON-compatible response still uses JavaScript numbers. Treat an `OutcomeUnknown` result as requiring inspection before retrying.
 
-TypeScript seeds flat tables in the fixture object's key order. Put referenced rows first, or use nested links so the fixture engine can derive the keys and insert rows in dependency order. Typed JSON is validated recursively against the installed schema, including tagged payloads and elements of lists and dictionaries.
+Seed processes flat tables in the order supplied by the fixture input. Put referenced rows first, or use nested links so the fixture engine can derive the keys and insert rows in dependency order. In Rust the order comes from the value's serializer; if your map or generated type emits a fixed order, use nested links or separate calls for dependencies. Typed JSON is validated recursively against the installed schema, including tagged payloads and elements of lists and dictionaries. A bare `null` stores SQL `NULL` for nullable columns; in a required SQL column whose JSON type accepts null (such as `Json<String?>`), it stores JSON `null`.
 
 ## CLI
 
@@ -259,7 +260,7 @@ pyre db reset ./demo.db
 pyre db reseed ./demo.db --fixtures ./fixtures.json
 ```
 
-Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. Reset disables foreign-key enforcement on the reset session before beginning the transaction, so drops do not run referential actions. For remote libSQL, the TypeScript adapter uses a migration batch and checks the policy, namespace, catalog, and FK setting again inside the batch before dropping anything. A rejected remote batch is reported as an unknown outcome if the driver cannot confirm rollback. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
+Disposable init requires an empty target and installs the selected working schema. Reset requires an existing disposable target and replaces its entire user schema and Pyre metadata in one write transaction. The physical database, endpoint, and credentials stay the same. Reset disables foreign-key enforcement on the reset session before beginning the transaction, so drops do not run referential actions. The TypeScript adapter uses a migration batch and checks the policy, namespace, catalog, and FK setting again inside the batch before dropping anything. Local TypeScript maintenance clients must start with foreign-key enforcement enabled. A rejected batch is reported as an unknown outcome if the driver cannot confirm rollback. A successful reset restores the disposable marker and installs a new sync epoch at revision zero; it records the working schema for runtimes without claiming any migration files ran.
 
 Reseed commits the same reset before opening or parsing the fixture file, then inserts the fixtures in a separate write transaction. It prints the inserted rows as JSON only after both commits. If reading, parsing, validation, or insertion fails and Pyre confirms no fixture writes committed, the target has the fresh schema and no fixture rows. Fix the failure and rerun reseed from the beginning. If reset fails, fixture loading never starts. If either transaction's outcome is unknown, keep the target out of service and inspect it before retrying. Reseed never restores the discarded database.
 

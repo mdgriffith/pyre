@@ -340,7 +340,14 @@ fn serialize_column(
     }
     if value.is_null() {
         if !column.nullable && !matches!(column.type_, ast::ColumnType::Nullable(_)) {
-            return Err(Error::InvalidInput(format!("{} cannot be null", path)));
+            // A required SQL column can still hold a JSON null if its JSON
+            // type allows it. Use the normal JSON validation and serialization.
+            return match column.type_ {
+                ast::ColumnType::Json | ast::ColumnType::JsonTyped(_) => {
+                    serialize_value(context, &column.type_, physical_name, value, path, output)
+                }
+                _ => Err(Error::InvalidInput(format!("{} cannot be null", path))),
+            };
         }
         output.push((physical_name.to_string(), SqlValue::Null));
         return Ok(());

@@ -138,6 +138,24 @@ test("WASM seed rolls back earlier rows for a late typed JSON error", async () =
   } finally { close(); }
 });
 
+test("seed handles PRAGMA-named tables and distinguishes JSON null from SQL NULL", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await initDisposableDatabase(db, "Fixtures", `@syncable(false)
+record Entry {
+    @tablename("pragma_table_info")
+    id Id.Int @id
+    requiredJson Json<String?>
+    optionalJson Json<String>?
+    @public
+}`);
+    expect(await seed(db, { pragma_table_info: [{ requiredJson: null, optionalJson: null }] }))
+      .toMatchObject({ kind: "success" });
+    expect((await db.execute("select typeof(requiredJson) as storage, json_type(requiredJson) as json, optionalJson is null as sqlNull from main.pragma_table_info")).rows)
+      .toEqual([{ storage: "text", json: "null", sqlNull: 1 }]);
+  } finally { close(); }
+});
+
 test("WASM seed preserves exact returned integer keys and generates UUIDv7 without assigning sequences", async () => {
   const { db, close } = seedDatabase("bigint");
   try {
@@ -228,30 +246,33 @@ test("reseed commits a fresh schema before loading fixtures and before admitting
     await db.executeMultiple(fixtureFile("reset-cycles.sql"));
     expect((await db.execute("pragma foreign_key_check")).rows).toHaveLength(0);
 
-    const blocked = {
-      protocol: "file",
-      execute: db.execute.bind(db),
-      async transaction() {
-        expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(0);
-        throw new Error("BEGIN blocked");
-      },
-    } as unknown as typeof db;
-    await expect(reseedDatabase(blocked, namespace, fixtureSchema, loader)).rejects.toMatchObject({
-      kind: "reset-failed", message: expect.stringContaining("BEGIN blocked"),
+    await db.execute("pragma foreign_keys = off");
+    await expect(reseedDatabase(db, namespace, fixtureSchema, loader)).rejects.toMatchObject({
+      kind: "reset-failed", message: expect.stringContaining("foreign-key enforcement enabled"),
     });
-    expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
+    expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(0);
+    await db.execute("pragma foreign_keys = on");
 
     expect(loader).not.toHaveBeenCalled();
     expect(await epoch()).toBe(oldEpoch);
     expect((await db.execute("select b from cycle_c")).rows[0]?.b).toBe(1);
 
-    await expect(reseedDatabase(db, namespace, fixtureSchema, async () => {
+    const reseeding = reseedDatabase(db, namespace, fixtureSchema, async () => {
       expect(await epoch()).not.toBe(oldEpoch);
       expect(await counts()).toEqual({ users: 0, posts: 0 });
       expect((await db.execute("select name from main.sqlite_schema where name glob 'cycle_*' or name = 'self_ref' or name glob 'pragma_*'")).rows).toHaveLength(0);
       expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
       return loader();
-    })).rejects.toMatchObject({ kind: "fresh-without-fixtures", cause: expect.any(SyntaxError) });
+    });
+    const observeFk = async () => {
+      for (let i = 0; i < 30; i += 1) {
+        expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
+      }
+    };
+    await Promise.all([
+      expect(reseeding).rejects.toMatchObject({ kind: "fresh-without-fixtures", cause: expect.any(SyntaxError) }),
+      observeFk(),
+    ]);
     const emptyEpoch = await epoch();
     await expect(reseedDatabase(db, namespace, fixtureSchema, { users: [{ id: 1 }, { id: 1 }] })).rejects.toMatchObject({
       kind: "fresh-without-fixtures", message: expect.stringContaining("users[1]"),
@@ -284,9 +305,14 @@ test("reseed reports lost commit or rollback confirmation for the correct phase"
         const uncertain = {
           protocol: "file",
           execute: db.execute.bind(db),
+          async migrate(statements: Parameters<typeof db.migrate>[0]) {
+            if (phase !== "reset") return db.migrate(statements);
+            if (operation === "commit") await db.migrate(statements);
+            throw new Error(`Lost ${operation} response`);
+          },
           async transaction() {
-            const tx = await db.transaction("write");
-            const fault = ++transactions === (phase === "reset" ? 1 : 2);
+            const tx = await db.transaction(++transactions === 1 ? "read" : "write");
+            const fault = phase === "seed" && transactions === 2;
             return {
               get closed() { return tx.closed; },
               close: tx.close.bind(tx),
@@ -302,10 +328,9 @@ test("reseed reports lost commit or rollback confirmation for the correct phase"
             };
           },
         } as unknown as typeof db;
-        const source = phase === "reset" && operation === "rollback" ? "not a schema" : fixtureSchema;
         const load = mock(() => ({ users: operation === "rollback" ? [{ id: 1 }, { id: 1 }] : [{ id: 1 }] }));
-        await expect(reseedDatabase(uncertain, "Fixtures", source, load)).rejects.toMatchObject({
-          kind: `${phase}-outcome-unknown`, message: expect.stringContaining(`${operation} outcome unknown`),
+        await expect(reseedDatabase(uncertain, "Fixtures", fixtureSchema, load)).rejects.toMatchObject({
+          kind: `${phase}-outcome-unknown`, message: expect.stringContaining(`${phase === "reset" ? "batch" : operation} outcome unknown`),
         });
         expect(transactions).toBe(phase === "reset" ? 1 : 2);
         expect(load).toHaveBeenCalledTimes(phase === "reset" ? 0 : 1);

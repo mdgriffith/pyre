@@ -133,7 +133,7 @@ pub async fn seed_database(
     Ok(())
 }
 
-fn read_fixtures(path: &Path) -> io::Result<serde_json::Value> {
+fn read_fixtures(path: &Path) -> io::Result<Box<serde_json::value::RawValue>> {
     let file = std::fs::File::open(path).map_err(|err| {
         io::Error::new(
             err.kind(),

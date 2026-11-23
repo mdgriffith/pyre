@@ -93,8 +93,8 @@ export async function setDatabaseDisposable(db: Client, namespace?: string): Pro
 
 export class DatabaseOutcomeUnknown extends Error {}
 
-async function databaseWrite<T>(db: Client, operation: string, work: (tx: Transaction) => Promise<T>, openReset = false): Promise<T> {
-    const tx = openReset ? await openResetTransaction(db) : await db.transaction("write");
+async function databaseWrite<T>(db: Client, operation: string, work: (tx: Transaction) => Promise<T>): Promise<T> {
+    const tx = await db.transaction("write");
     let committing = false;
     try {
         const result = await work(tx);
@@ -189,30 +189,6 @@ export async function requireSeedIntegerMode(tx: Transaction): Promise<void> {
     }
 }
 
-async function openResetTransaction(db: Client): Promise<Transaction> {
-    // Local libSQL transfers its current SQLite connection to the transaction;
-    // later client calls get a new connection with the driver's defaults.
-    const fkMode = async () => Number((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys);
-    const previous = await fkMode();
-    if (previous !== 0 && previous !== 1) throw new Error("Could not read foreign-key enforcement for reset");
-    if (previous === 0) return db.transaction("write");
-    try {
-        await db.execute("pragma foreign_keys = off");
-        if (await fkMode() !== 0) throw new Error("Could not disable foreign-key enforcement for reset");
-        return await db.transaction("write");
-    } catch (error) {
-        // BEGIN failed before detaching the connection; put its setting back.
-        try {
-            await db.execute("pragma foreign_keys = on");
-            if (await fkMode() !== 1) throw new Error("Could not restore foreign-key enforcement");
-        } catch (restore) {
-            db.close();
-            throw new AggregateError([error, restore], "Could not open reset transaction or restore the client; client closed");
-        }
-        throw error;
-    }
-}
-
 function planDisposable(catalog: string, reset: boolean, namespace: string, source: string, identities: ExternalIdentity[]): InStatement[] {
     try {
         return wasm.plan_disposable_database(catalog, reset, namespace, source, identities) as InStatement[];
@@ -227,10 +203,13 @@ async function readCatalog(tx: Transaction): Promise<string> {
     return catalog;
 }
 
-async function resetRemoteDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[], reseed: boolean): Promise<void> {
-    // The remote client's migrate() puts PRAGMA foreign_keys=off before BEGIN
-    // on the same stream. It only accepts a static batch, so plan from a read
-    // snapshot and verify its reset preconditions again inside that batch.
+async function resetDatabaseInBatch(db: Client, namespace: string, source: string, identities: ExternalIdentity[], reseed: boolean): Promise<void> {
+    // migrate() switches FK enforcement off before BEGIN and restores it after
+    // the batch. This is synchronous on SQLite and stream-scoped on Hrana.
+    // Plan from a read snapshot and verify its preconditions in the batch.
+    if (db.protocol === "file" && Number((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys) !== 1) {
+        throw new Error("Local reset requires a maintenance client with foreign-key enforcement enabled");
+    }
     const sql = wasm.database_policy_sql() as PolicySql;
     const tx = await db.transaction("read");
     let catalog: string;
@@ -270,19 +249,13 @@ async function resetRemoteDatabase(db: Client, namespace: string, source: string
 
 async function runDisposableDatabase(db: Client, operation: "init" | "reset" | "reseed", namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
     await requireFileBackedLocalDatabase(db, "Database lifecycle operations");
-    const reset = operation !== "init";
-    if (reset && db.protocol !== "file") {
-        return resetRemoteDatabase(db, namespace, source, identities, operation === "reseed");
+    if (operation !== "init") {
+        return resetDatabaseInBatch(db, namespace, source, identities, operation === "reseed");
     }
-    return databaseWrite(db, reset ? "Database reset" : "Database initialization", async tx => {
-        if (reset && (await readPolicy(tx, wasm.database_policy_sql() as PolicySql, namespace)).policy !== "disposable") {
-            throw new Error("Reset requires an existing disposable database");
-        }
-        // Reject unsupported fixture connections before discarding any data.
-        if (operation === "reseed") await requireSeedIntegerMode(tx);
-        const statements = planDisposable(await readCatalog(tx), reset, namespace, source, identities);
+    return databaseWrite(db, "Database initialization", async tx => {
+        const statements = planDisposable(await readCatalog(tx), false, namespace, source, identities);
         for (const statement of statements) await tx.execute(statement);
-    }, reset);
+    });
 }
 
 type MigrationPlan = {
