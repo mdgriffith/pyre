@@ -555,7 +555,7 @@ function combineAffectedRows(affected: any[]): any[] {
 }
 
 type SeedBind = { type: "null" } | { type: "blob"; value: number[] }
-    | { type: "integer" | "real" | "text"; value: bigint | number | string };
+    | { type: "integer" | "real" | "text" | "json"; value: bigint | number | string };
 
 /** Insert trusted fixtures in one write transaction using the target's installed schema. */
 export function seed(db: Client, input: SeedInput, options?: SeedOptions): Promise<SeedResult>;
@@ -610,7 +610,9 @@ export async function seed(
         if (!initialized || !introspection.schema_source) {
             throw new Error("Database does not contain an initialized Pyre schema");
         }
-        const response = await wasm.ingest_fixture(introspection, entries, async ({ sql, args, path }: {
+        const triggerTables = (await transaction.execute(wasm.fixture_trigger_tables_sql())).rows[0]?.trigger_tables;
+        if (typeof triggerTables !== "string") throw new Error("Could not read fixture trigger tables");
+        const response = await wasm.ingest_fixture(introspection, entries, triggerTables, async ({ sql, args, path }: {
             sql: string; args: SeedBind[]; path: string;
         }) => {
             try {

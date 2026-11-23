@@ -73,7 +73,24 @@ pub async fn seed_for_namespace<T: Serialize>(
         }
         let context = loaded.context().map_err(Error::Schema)?;
         let conn: &libsql::Connection = &tx;
-        fixture::ingest_entries(context, namespace, entries, |insert| execute(conn, insert)).await
+        let trigger_tables = {
+            let mut rows = conn
+                .query(fixture::TRIGGER_TABLES_SQL, ())
+                .await
+                .map_err(Error::Database)?;
+            rows.next()
+                .await
+                .map_err(Error::Database)?
+                .ok_or_else(|| Error::Unsupported("could not read fixture trigger tables".into()))?
+                .get::<String>(0)
+                .map_err(Error::Database)?
+        };
+        let policies =
+            fixture::InsertPolicies::from_trigger_tables(&trigger_tables).map_err(Error::Json)?;
+        fixture::ingest_entries(context, namespace, entries, &policies, |insert| {
+            execute(conn, insert)
+        })
+        .await
     }
     .await;
 
@@ -102,7 +119,7 @@ async fn execute(conn: &libsql::Connection, insert: Insert) -> Result<ReturnedRo
         SqlValue::Null => libsql::Value::Null,
         SqlValue::Integer(value) => libsql::Value::Integer(value),
         SqlValue::Real(value) => libsql::Value::Real(value),
-        SqlValue::Text(value) => libsql::Value::Text(value),
+        SqlValue::Text(value) | SqlValue::Json(value) => libsql::Value::Text(value),
         SqlValue::Blob(value) => libsql::Value::Blob(value),
     });
     let mut rows = conn

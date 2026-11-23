@@ -13,6 +13,7 @@ pub enum SqlValue {
     Integer(i64),
     Real(f64),
     Text(String),
+    Json(String),
     Blob(Vec<u8>),
 }
 
@@ -25,12 +26,109 @@ pub struct Insert {
 
 pub type ReturnedRow = serde_json::Map<String, JsonValue>;
 
+/// Read on the same write transaction that will execute the fixture inserts.
+pub const TRIGGER_TABLES_SQL: &str = "select json_group_object(lower(t.name), t.sql) as trigger_tables
+    from main.sqlite_schema as t
+    where t.type in ('table', 'view') and (exists (
+        select 1 from main.sqlite_schema as tr where tr.type = 'trigger' and tr.tbl_name = t.name collate nocase
+    ) or exists (
+        select 1 from temp.sqlite_schema as tr where tr.type = 'trigger' and tr.tbl_name = t.name collate nocase
+    ))";
+
+pub struct InsertPolicies(HashMap<String, bool>);
+
+impl InsertPolicies {
+    pub fn from_trigger_tables(json: &str) -> Result<Self, serde_json::Error> {
+        let tables: HashMap<String, String> = serde_json::from_str(json)?;
+        Ok(Self(
+            tables
+                .into_iter()
+                .map(|(name, ddl)| (name, has_replace_policy(&ddl)))
+                .collect(),
+        ))
+    }
+
+    fn insert_prefix(&self, table: &str, path: &str) -> Result<&'static str, Error> {
+        match self.0.get(&table.to_ascii_lowercase()) {
+            None => Ok("INSERT OR ABORT"),
+            Some(false) => Ok("INSERT"),
+            Some(true) => Err(Error::Unsupported(format!(
+                "{path}: cannot seed '{table}' with both triggers and an ON CONFLICT REPLACE constraint"
+            ))),
+        }
+    }
+}
+
+// SQLite's statement-level policy also overrides conflict handling inside triggers.
+// A plain INSERT preserves triggers but cannot safely run against a REPLACE
+// constraint. Detect the clause in persisted DDL, ignoring quotes and comments.
+fn has_replace_policy(ddl: &str) -> bool {
+    let mut bytes = ddl.as_bytes();
+    let mut matched = 0;
+    let keywords: [&[u8]; 3] = [b"on", b"conflict", b"replace"];
+    let identifier_byte = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$') || c >= 128;
+    while let Some((&first, rest)) = bytes.split_first() {
+        bytes = match first {
+            c if c.is_ascii_whitespace() => rest,
+            b'-' if rest.starts_with(b"-") => {
+                &rest[rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len())..]
+            }
+            b'/' if rest.starts_with(b"*") => {
+                let body = &rest[1..];
+                &body[body
+                    .windows(2)
+                    .position(|w| w == b"*/")
+                    .map_or(body.len(), |i| i + 2)..]
+            }
+            quote @ (b'\'' | b'"' | b'`' | b'[') => {
+                matched = 0;
+                let end = if quote == b'[' { b']' } else { quote };
+                let mut quoted = rest;
+                loop {
+                    let Some(i) = quoted.iter().position(|&c| c == end) else {
+                        break &quoted[quoted.len()..];
+                    };
+                    quoted = &quoted[i + 1..];
+                    if quote == b'[' || !quoted.starts_with(&[end]) {
+                        break quoted;
+                    }
+                    quoted = &quoted[1..];
+                }
+            }
+            c if identifier_byte(c) => {
+                let end = 1 + rest.iter().take_while(|&&c| identifier_byte(c)).count();
+                let token = &bytes[..end];
+                if token.eq_ignore_ascii_case(keywords[matched]) {
+                    matched += 1;
+                    if matched == keywords.len() {
+                        return true;
+                    }
+                } else {
+                    matched = usize::from(token.eq_ignore_ascii_case(keywords[0]));
+                }
+                &bytes[end..]
+            }
+            _ => {
+                matched = 0;
+                rest
+            }
+        };
+    }
+    false
+}
+
+struct Engine<'a> {
+    context: &'a typecheck::Context,
+    policies: &'a InsertPolicies,
+}
+
 /// Run the fixture against one schema. The host executes each insert in the same
 /// transaction and returns its physical row before dependent inserts are prepared.
 pub async fn ingest<F, Fut, E>(
     context: &typecheck::Context,
     namespace: &str,
     input: JsonValue,
+    policies: &InsertPolicies,
     execute: F,
 ) -> Result<JsonValue, E>
 where
@@ -41,7 +139,7 @@ where
     let JsonValue::Object(input) = input else {
         return Err(Error::InvalidInput("seed input must be an object".to_string()).into());
     };
-    ingest_entries(context, namespace, input, execute).await
+    ingest_entries(context, namespace, input, policies, execute).await
 }
 
 /// Like [`ingest`], but preserve the host's top-level entry order.
@@ -49,6 +147,7 @@ pub async fn ingest_entries<F, Fut, E>(
     context: &typecheck::Context,
     namespace: &str,
     input: impl IntoIterator<Item = (String, JsonValue)>,
+    policies: &InsertPolicies,
     mut execute: F,
 ) -> Result<JsonValue, E>
 where
@@ -67,6 +166,7 @@ where
             )
         })
         .collect();
+    let engine = Engine { context, policies };
     let mut response = serde_json::Map::new();
 
     for (table_name, value) in input {
@@ -79,7 +179,7 @@ where
                 Error::InvalidInput(format!("{}. expected an array of rows", table_name)).into(),
             );
         };
-        let inserted = insert_rows(&mut execute, context, table, rows, table_name.clone()).await?;
+        let inserted = insert_rows(&mut execute, &engine, table, rows, table_name.clone()).await?;
         response.insert(table_name, JsonValue::Array(inserted));
     }
     Ok(JsonValue::Object(response))
@@ -87,7 +187,7 @@ where
 
 async fn insert_rows<F, Fut, E>(
     execute: &mut F,
-    context: &typecheck::Context,
+    engine: &Engine<'_>,
     table: &typecheck::Table,
     rows: Vec<JsonValue>,
     path: String,
@@ -100,14 +200,14 @@ where
     let mut inserted = Vec::with_capacity(rows.len());
     for (index, row) in rows.into_iter().enumerate() {
         inserted
-            .push(insert_row(execute, context, table, row, format!("{}[{}]", path, index)).await?);
+            .push(insert_row(execute, engine, table, row, format!("{}[{}]", path, index)).await?);
     }
     Ok(inserted)
 }
 
 fn insert_row<'a, F, Fut, E>(
     execute: &'a mut F,
-    context: &'a typecheck::Context,
+    engine: &'a Engine<'_>,
     table: &'a typecheck::Table,
     row: JsonValue,
     path: String,
@@ -118,6 +218,9 @@ where
     E: From<Error> + 'a,
 {
     Box::pin(async move {
+        let context = engine.context;
+        let table_name = ast::get_tablename(&table.record.name, &table.record.fields);
+        let insert_prefix = engine.policies.insert_prefix(&table_name, &path)?;
         let JsonValue::Object(mut input) = row else {
             return Err(Error::InvalidInput(format!("{} must be an object", path)).into());
         };
@@ -156,7 +259,7 @@ where
             let linked_table = local_link_table(context, table, link, &path)?;
             let nested_row = insert_row(
                 execute,
-                context,
+                engine,
                 linked_table,
                 nested,
                 format!("{}.{}", path, link.link_name),
@@ -175,7 +278,6 @@ where
             inserted_to_one.push((link.link_name.clone(), nested_row));
         }
 
-        let table_name = ast::get_tablename(&table.record.name, &table.record.fields);
         let mut physical_values = Vec::new();
         for column in &columns {
             if let Some(value) = input.get(&column.name) {
@@ -196,8 +298,15 @@ where
                 ));
             }
         }
-        let physical_row =
-            execute(insert_statement(&table_name, physical_values, path.clone())).await?;
+        let physical_row = execute(insert_statement(
+            context,
+            table,
+            &table_name,
+            insert_prefix,
+            physical_values,
+            path.clone(),
+        ))
+        .await?;
         let mut result = format_row(context, table, &physical_row)?;
         for (link_name, nested_row) in inserted_to_one {
             result
@@ -248,12 +357,12 @@ where
             }
             let nested_result = if collection {
                 JsonValue::Array(
-                    insert_rows(execute, context, linked_table, nested_rows, nested_path).await?,
+                    insert_rows(execute, engine, linked_table, nested_rows, nested_path).await?,
                 )
             } else {
                 insert_row(
                     execute,
-                    context,
+                    engine,
                     linked_table,
                     nested_rows.remove(0),
                     nested_path,
@@ -410,9 +519,9 @@ fn serialize_value(
                 .ok_or_else(|| invalid_type(path, "a string"))?
                 .to_string(),
         ),
-        ColumnType::Json => SqlValue::Text(value.to_string()),
+        ColumnType::Json => SqlValue::Json(value.to_string()),
         ColumnType::JsonTyped(_) | ColumnType::List(_) | ColumnType::Dict(_) => {
-            SqlValue::Text(normalize_json(context, type_, value, path)?.to_string())
+            SqlValue::Json(normalize_json(context, type_, value, path)?.to_string())
         }
         ColumnType::Custom(type_name) => {
             return serialize_constructed(context, type_name, physical_name, value, path, output)
@@ -625,7 +734,7 @@ fn serialize_concrete(
         Type::DateTime => datetime_to_epoch(value)
             .map(SqlValue::Integer)
             .ok_or_else(|| invalid_type(path, "RFC3339 or Unix seconds")),
-        Type::JsonB => Ok(SqlValue::Text(value.to_string())),
+        Type::JsonB => Ok(SqlValue::Json(value.to_string())),
         Type::Blob | Type::VectorBlob { .. } => {
             let bytes = value
                 .as_array()
@@ -649,22 +758,54 @@ fn serialize_uuid(value: &JsonValue, path: &str) -> Result<SqlValue, Error> {
     Ok(SqlValue::Text(raw.to_owned()))
 }
 
-fn insert_statement(table: &str, values: Vec<(String, SqlValue)>, path: String) -> Insert {
-    let table = quote(table);
-    let sql = if values.is_empty() {
-        format!("INSERT OR ABORT INTO main.{table} DEFAULT VALUES RETURNING *")
+fn insert_statement(
+    context: &typecheck::Context,
+    table: &typecheck::Table,
+    table_name: &str,
+    insert_prefix: &str,
+    values: Vec<(String, SqlValue)>,
+    path: String,
+) -> Insert {
+    let table_name = quote(table_name);
+    let mut sql = if values.is_empty() {
+        format!("{insert_prefix} INTO main.{table_name} DEFAULT VALUES")
     } else {
         let columns = values
             .iter()
             .map(|(name, _)| quote(name))
             .collect::<Vec<_>>()
             .join(", ");
-        let placeholders = std::iter::repeat("?")
-            .take(values.len())
+        let placeholders = values
+            .iter()
+            .map(|(_, value)| {
+                if matches!(value, SqlValue::Json(_)) {
+                    "jsonb(?)"
+                } else {
+                    "?"
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        format!("INSERT OR ABORT INTO main.{table} ({columns}) VALUES ({placeholders}) RETURNING *")
+        format!("{insert_prefix} INTO main.{table_name} ({columns}) VALUES ({placeholders})")
     };
+    // Decode both JSONB and text JSON defaults in SQLite, before crossing the
+    // driver boundary. Keep the other returned fields in their native types.
+    let physical = crate::db::diff::physical_columns(context, &table.record.fields);
+    let returning = physical
+        .info
+        .iter()
+        .map(|column| {
+            let name = quote(&column.name);
+            if physical.json.contains(&column.name) {
+                format!("json({table_name}.{name}) AS {name}")
+            } else {
+                format!("{table_name}.{name}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(" RETURNING ");
+    sql.push_str(&returning);
     Insert {
         sql,
         args: values.into_iter().map(|(_, value)| value).collect(),

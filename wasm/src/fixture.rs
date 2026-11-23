@@ -4,6 +4,11 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
+#[wasm_bindgen]
+pub fn fixture_trigger_tables_sql() -> String {
+    fixture::TRIGGER_TABLES_SQL.into()
+}
+
 struct IngestError(JsValue);
 
 impl From<fixture::Error> for IngestError {
@@ -18,6 +23,7 @@ impl From<fixture::Error> for IngestError {
 pub async fn ingest_fixture(
     introspection: JsValue,
     entries: JsValue,
+    trigger_tables: &str,
     execute: js_sys::Function,
     expected_namespace: Option<String>,
 ) -> Result<JsValue, JsValue> {
@@ -40,7 +46,9 @@ pub async fn ingest_fixture(
         }
     }
     let entries: Vec<(String, serde_json::Value)> = serde_wasm_bindgen::from_value(entries)?;
-    let response = fixture::ingest_entries(context, &schema.namespace, entries, |insert| {
+    let policies = fixture::InsertPolicies::from_trigger_tables(trigger_tables)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let response = fixture::ingest_entries(context, &schema.namespace, entries, &policies, |insert| {
         let execute = &execute;
         async move {
             let serializer =

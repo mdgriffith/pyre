@@ -202,7 +202,7 @@ Pyre writes the discriminator and flattened backing columns behind the scenes, a
 - The whole seed call is atomic. Pyre starts a transaction, commits on success, and rolls back on validation or insert failure.
 - Inserts are sequential for now: Pyre inserts one row at a time so it can read generated parent ids and report path-specific errors.
 - `seed` bypasses Pyre query permissions.
-- SQLite still runs triggers defined in your database. If a migration installs an insert trigger, its side effects are part of the seed transaction.
+- SQLite still runs triggers defined in your database, including their own conflict handling. If a migration installs an insert trigger, its side effects are part of the seed transaction. Seed rejects tables that combine triggers with `ON CONFLICT REPLACE` constraints: overriding the constraint would also override the trigger, and honoring the constraint could replace existing rows.
 - `seed` does not currently update Pyre sync metadata. Use it for setup/import workflows before synced clients rely on live deltas.
 
 ## Runtime API
@@ -231,7 +231,7 @@ const result = await seed(db, data, { namespace: "Main" }); // namespace check i
 
 The legacy `(db, schemaMetadata, data, validators?, options?)` signature still works; supplied metadata and validators no longer control ingestion. `batchSize` has no effect, and `transactionMode: "batch"` or `"none"` is rejected. Seed requires interactive write transactions and a file-backed database for local libSQL clients. Use `intMode: "number"` (the default) or `"bigint"` for seed and reseed; `"string"` is unsupported. Use `"bigint"` for 64-bit integer keys outside JavaScript’s safe integer range; the JSON-compatible response still uses JavaScript numbers. Treat an `OutcomeUnknown` result as requiring inspection before retrying.
 
-Seed processes flat tables in the order supplied by the fixture input. Put referenced rows first, or use nested links so the fixture engine can derive the keys and insert rows in dependency order. In Rust the order comes from the value's serializer; if your map or generated type emits a fixed order, use nested links or separate calls for dependencies. Typed JSON is validated recursively against the installed schema, including tagged payloads and elements of lists and dictionaries. A bare `null` stores SQL `NULL` for nullable columns; in a required SQL column whose JSON type accepts null (such as `Json<String?>`), it stores JSON `null`.
+Seed processes flat tables in the order supplied by the fixture input. Put referenced rows first, or use nested links so the fixture engine can derive the keys and insert rows in dependency order. In Rust the order comes from the value's serializer; if your map or generated type emits a fixed order, use nested links or separate calls for dependencies. Typed JSON is validated recursively against the installed schema, including tagged payloads and elements of lists and dictionaries. A bare `null` stores SQL `NULL` for nullable columns; in a required SQL column whose JSON type accepts null (such as `Json<String?>`), it stores JSON `null` as SQLite JSONB.
 
 ## CLI
 

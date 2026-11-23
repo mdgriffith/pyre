@@ -498,6 +498,83 @@ record Item {
 }
 
 #[tokio::test]
+async fn seed_preserves_trigger_conflict_handling_and_refuses_replacing_tables_with_triggers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+@syncable(false)
+record Item {
+    id Id.Int @id
+    name String
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    conn.execute_batch(
+        "CREATE TABLE seen (name TEXT PRIMARY KEY);
+         INSERT INTO seen VALUES ('known');
+         CREATE TEMP TRIGGER remember AFTER INSERT ON main.items BEGIN
+            INSERT OR IGNORE INTO seen VALUES (new.name);
+         END;",
+    )
+    .await?;
+    seed::seed(&conn, json!({"items": [{"id": 1, "name": "known"}]})).await?;
+
+    conn.execute_batch(
+        "DROP TABLE items;
+         CREATE TABLE items (id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE ON/* block comment */ CONFLICT -- line comment
+            REPLACE, updatedAt INTEGER DEFAULT 0);
+         INSERT INTO items VALUES (1, 'known', 0);
+         CREATE TRIGGER remember AFTER INSERT ON items BEGIN
+            INSERT OR IGNORE INTO seen VALUES (new.name);
+         END;",
+    )
+    .await?;
+    let error = seed::seed(&conn, json!({"items": [{"id": 2, "name": "known"}]}))
+        .await
+        .expect_err("seed must not silently replace the original");
+    assert!(error.to_string().contains("ON CONFLICT REPLACE"), "{error}");
+    let mut rows = conn.query("SELECT id FROM items", ()).await?;
+    assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 1);
+    assert!(rows.next().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn seed_distinguishes_jsonb_null_from_sql_null() -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new(
+        r#"
+@syncable(false)
+record Entry {
+    id Id.Int @id
+    requiredJson Json<String?>
+    optionalJson Json<String>?
+    @public
+}
+"#,
+    )
+    .await?;
+    let conn = db.db.connect()?;
+    let result = seed::seed(
+        &conn,
+        json!({"entries": [{"requiredJson": null, "optionalJson": null}]}),
+    )
+    .await?;
+    assert!(result.response["entries"][0]["requiredJson"].is_null());
+    let mut rows = conn
+        .query(
+            "SELECT id FROM entries WHERE requiredJson IS jsonb('null') AND optionalJson IS NULL",
+            (),
+        )
+        .await?;
+    assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn seed_rejects_unknown_fields_legacy_discriminators_and_link_conflicts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new(

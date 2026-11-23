@@ -151,8 +151,26 @@ record Entry {
 }`);
     expect(await seed(db, { pragma_table_info: [{ requiredJson: null, optionalJson: null }] }))
       .toMatchObject({ kind: "success" });
-    expect((await db.execute("select typeof(requiredJson) as storage, json_type(requiredJson) as json, optionalJson is null as sqlNull from main.pragma_table_info")).rows)
-      .toEqual([{ storage: "text", json: "null", sqlNull: 1 }]);
+    expect((await db.execute("select typeof(requiredJson) as storage, json_type(requiredJson) as json, optionalJson is null as sqlNull from main.pragma_table_info where requiredJson is jsonb('null')")).rows)
+      .toEqual([{ storage: "blob", json: "null", sqlNull: 1 }]);
+  } finally { close(); }
+});
+
+test("WASM seed preserves explicit conflict handling inside a trigger", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await initDisposableDatabase(db, "Fixtures", fixtureSchema);
+    await db.executeMultiple(`create table seen (name text primary key);
+      insert into seen values ('known');
+      create trigger remember after insert on users begin
+        insert or ignore into seen values (new.name);
+      end;`);
+    expect(await seed(db, { users: [{ name: "known" }, { name: "new" }] }))
+      .toMatchObject({ kind: "success" });
+    expect((await db.execute("select name from users order by id")).rows)
+      .toEqual([{ name: "known" }, { name: "new" }]);
+    expect((await db.execute("select name from seen order by name")).rows)
+      .toEqual([{ name: "known" }, { name: "new" }]);
   } finally { close(); }
 });
 

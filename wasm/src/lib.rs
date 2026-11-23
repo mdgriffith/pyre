@@ -11,7 +11,7 @@ mod sync;
 mod sync_deltas;
 mod sync_shape;
 
-pub use fixture::ingest_fixture;
+pub use fixture::{fixture_trigger_tables_sql, ingest_fixture};
 
 #[wasm_bindgen(start)]
 pub fn start() {
