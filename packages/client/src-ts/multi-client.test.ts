@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 
 import { operation, PyreClient } from './index';
 import { QueryClientService } from './service/query-client';
@@ -667,7 +667,7 @@ test('Elm bridge routes mutation messages by databaseId', async () => {
   ]);
 });
 
-test('Elm edit submission allocates UUIDv7 once and shares captured input with prediction', async () => {
+test('Elm edit submission captures automatic and explicit IDs for prediction and transport', async () => {
   const received: any[] = [];
   const outbound = fakePort();
   const results = fakePort();
@@ -683,10 +683,12 @@ test('Elm edit submission allocates UUIDv7 once and shares captured input with p
     elm: { app: { ports: { pyreStoreOut: outbound.port, pyre_receiveMutationResult: results.port } } },
   });
   const prediction = { queryField: 'notes', where: { field: 'id', input: 'id' }, set: [] };
-  outbound.emit({ type: 'submit', databaseId: 'campaign:123', requestId: 'create-batch', operations: [
-    { queryId: 'create', input: { title: 'Title' }, createId: 'id', optimistic: prediction },
-    { queryId: 'update', input: { id: 'existing', title: 'Updated' }, optimistic: prediction },
-  ] });
+  const id = '01900000-0000-7000-8000-00000000000a';
+  const submit = (requestId, operations) => outbound.emit({ type: 'submit', databaseId: 'campaign:123', requestId, operations });
+  submit('create-batch', [
+    { queryId: 'create', input: { title: 'Title' }, createId: { mode: 'auto', field: 'id' }, optimistic: prediction },
+    { queryId: 'create', input: { id: 'ordinary' }, createId: { mode: 'explicit', field: 'customKey', id }, optimistic: { ...prediction, where: { field: 'customKey', input: 'customKey' } } },
+  ]);
   await Bun.sleep(0);
   expect(received).toHaveLength(1);
   const sent = received[0];
@@ -694,8 +696,64 @@ test('Elm edit submission allocates UUIDv7 once and shares captured input with p
   expect(sent.input[0].input.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   expect(sent.queryModule.optimistic[0].input).toEqual(sent.input[0].input);
   expect(sent.input[0]).not.toHaveProperty('createId');
-  expect(sent.input[1].input).toEqual({ id: 'existing', title: 'Updated' });
+  expect(sent.input[1].input).toEqual({ id: 'ordinary', customKey: id });
+  expect(sent.queryModule.optimistic[1].input).toEqual(sent.input[1].input);
   expect(results.sent[0]).toMatchObject({ databaseId: 'campaign:123', requestId: 'create-batch', result: { ok: true } });
+
+  for (const [requestId, input, createId, error] of [
+    ['duplicate', {}, { mode: 'duplicate' }, 'Duplicate withId options'],
+    ['invalid', {}, { mode: 'explicit', field: 'customKey', id: id.toUpperCase() }, 'Generated creates require a canonical lowercase UUIDv7'],
+    ['already-present', { customKey: id }, { mode: 'auto', field: 'customKey' }, 'Create input already contains the primary key'],
+  ]) {
+    submit(requestId, [{ queryId: 'create', input, createId, optimistic: prediction }]);
+    expect(results.sent.at(-1)).toMatchObject({ requestId, result: { ok: false, error } });
+  }
+  await Bun.sleep(0);
+  expect(received).toHaveLength(1);
+});
+
+test('Elm bridge acquires bounded UUID lists locally, including failure responses', async () => {
+  const outbound = fakePort();
+  const replies = fakePort();
+  const errors: Error[] = [];
+  const client = await PyreClient.create({
+    schema, server, cacheNamespace: 'acquire-bridge',
+    createInternalClient: async () => { throw new Error('Acquisition must not create a database client'); },
+    elm: { app: { ports: { pyreStoreOut: outbound.port, response: replies.port } }, idAcquisitionResultPort: 'response', onError: error => errors.push(error) },
+  });
+  const acquire = (requestId, count) => outbound.emit({ type: 'acquire-ids', requestId, count });
+  acquire('pyre:valid', 64);
+  const { type, requestId, ids } = replies.sent[0];
+  expect([type, requestId, new Set(ids).size]).toEqual(['ids-acquired', 'pyre:valid', 64]);
+  for (const id of ids) expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  for (const count of [0, -1, '2', 1.5, 65]) {
+    acquire('pyre:bad-count', count);
+    expect(replies.sent.at(-1)).toMatchObject({ type: 'ids-failed', requestId: 'pyre:bad-count' });
+  }
+  acquire('invalid\n', 1);
+  expect(errors.at(-1)?.message).toBe('Invalid acquisition request ID');
+  expect(replies.sent).toHaveLength(6);
+
+  const cryptoFailure = spyOn(crypto, 'getRandomValues').mockImplementation(() => { throw new Error('Randomness unavailable'); });
+  try {
+    acquire('pyre:failure', 1);
+    expect(replies.sent.at(-1)).toEqual({ type: 'ids-failed', requestId: 'pyre:failure', error: 'Randomness unavailable' });
+  } finally {
+    cryptoFailure.mockRestore();
+  }
+
+  // Even a custom outgoing port without unsubscribe must not get a second
+  // live acquisition handler when the bridge is replaced.
+  const callbacks: ((message: unknown) => void)[] = [];
+  const ports = { pyreStoreOut: { subscribe: callback => callbacks.push(callback) }, response: replies.port };
+  const bridge = { app: { ports }, idAcquisitionResultPort: 'response' };
+  client.attachElmBridge(bridge);
+  client.attachElmBridge(bridge);
+  const before = replies.sent.length;
+  callbacks.forEach(callback => callback({ type: 'acquire-ids', requestId: 'pyre:replacement', count: 1 }));
+  expect(replies.sent).toHaveLength(before + 1);
+  expect(replies.sent.at(-1)).toMatchObject({ type: 'ids-acquired', requestId: 'pyre:replacement' });
+  client.disconnect();
 });
 
 test('Elm bridge routes entity stream registrations and batches by streamId', async () => {

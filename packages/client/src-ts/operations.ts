@@ -92,7 +92,7 @@ export function captureOperations(operations: readonly Operation[], target?: Dat
   });
 }
 
-/** Allocate one canonical UUIDv7 when a create is constructed, before submission. */
+/** Allocate one canonical UUIDv7 locally, without reserving a row. */
 export function createId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   let timestamp = Date.now();
@@ -104,6 +104,13 @@ export function createId(): string {
   bytes[8] = (bytes[8] & 63) | 128;
   const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function requireCreateId(value: unknown): string {
+  if (typeof value !== 'string' || value.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
+    throw new Error('Generated creates require a canonical lowercase UUIDv7');
+  }
+  return value;
 }
 
 /** Pure ordered composition. Validation also rejects forged descriptors. */

@@ -100,7 +100,7 @@ This defines:
 
 For a deeper language reference, see [Schema Guide](./schema.md).
 
-Namespaces sync by default, so these records use non-null UUID primary keys. Use `@syncable(false)` at namespace scope for a query-only database that needs integer or plain-string keys. Generated create builders allocate UUIDv7 identities; see [Generated CRUD And Composed Operations](./query.md#generated-crud-and-composed-operations).
+Namespaces sync by default, so these records use non-null UUID primary keys. Use `@syncable(false)` at namespace scope for a query-only database that needs integer or plain-string keys. Generated TypeScript records provide `Record.newId()` for creates, and Elm creates allocate IDs automatically by default; see [Generated CRUD And Composed Operations](./query.md#generated-crud-and-composed-operations).
 
 CLI shortcut: `pyre docs schema`
 

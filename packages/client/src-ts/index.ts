@@ -4,6 +4,7 @@ import {
   captureOperations,
   createId,
   decodeOperationResults,
+  requireCreateId,
   type Operation,
   type OperationResults,
   type SubmissionResult,
@@ -285,6 +286,7 @@ export interface ElmBridgeConfig {
   entityChangesPort?: string;
   syncStatePort?: string;
   mutationResultPort?: string;
+  idAcquisitionResultPort?: string;
   onMutation?: (payload: {
     client: PyreBridgeClient;
     message: ElmBridgeMutationMessage;
@@ -931,6 +933,8 @@ class SingleDatabasePyreClient {
       ? getElmBridgePort(config.app, config.mutationResultPort)
       : getElmBridgePort(config.app, 'pyre_receiveMutationResult')
       ;
+    const acquisitionPort = getElmBridgePort(config.app, config.idAcquisitionResultPort ?? 'pyre_receiveAcquiredIds');
+    let active = true;
 
     const onSyncStateUnsubscribe = syncStatePort?.send
       ? this.onSyncState((syncState) => {
@@ -943,6 +947,7 @@ class SingleDatabasePyreClient {
       : () => {};
 
     const unsubscribeAll = () => {
+      active = false;
       registrations.forEach((subscription) => {
         subscription.unsubscribe();
       });
@@ -959,9 +964,11 @@ class SingleDatabasePyreClient {
     };
 
     const handleIncoming = (incoming: unknown) => {
+      if (!active) return;
       void (async () => {
         try {
-          const message = parseElmBridgeIncomingMessage(incoming);
+          const message = parseElmBridgeIncomingMessage(incoming, acquisitionPort, mutationResultPort);
+          if (!message) return;
 
           if (message.type === 'mutate') {
             if (config.onMutation) {
@@ -1576,6 +1583,8 @@ export class PyreClient {
       ? getElmBridgePort(config.app, config.mutationResultPort)
       : getElmBridgePort(config.app, 'pyre_receiveMutationResult')
       ;
+    const acquisitionPort = getElmBridgePort(config.app, config.idAcquisitionResultPort ?? 'pyre_receiveAcquiredIds');
+    let active = true;
 
     const onSyncStateUnsubscribe = syncStatePort?.send
       ? this.onSyncState((syncState) => {
@@ -1588,6 +1597,7 @@ export class PyreClient {
       : () => {};
 
     const unsubscribeAll = () => {
+      active = false;
       registrations.forEach((subscriptionPromise) => {
         void subscriptionPromise.then((subscription) => {
           subscription?.unsubscribe();
@@ -1606,9 +1616,11 @@ export class PyreClient {
     };
 
     const handleIncoming = (incoming: unknown) => {
+      if (!active) return;
       void (async () => {
         try {
-          const message = parseElmBridgeIncomingMessage(incoming);
+          const message = parseElmBridgeIncomingMessage(incoming, acquisitionPort, mutationResultPort);
+          if (!message) return;
 
           if (message.type === 'mutate') {
             if (config.onMutation) {
@@ -2327,24 +2339,80 @@ function entityValuesEqual(left: unknown, right: unknown): boolean {
   return false;
 }
 
-function parseElmBridgeIncomingMessage(message: unknown): ElmBridgeIncomingMessage {
+// Keep this in sync with Db.Id.Acquire.maxIds. One round trip, no retries.
+const MAX_ACQUIRED_IDS = 64;
+
+function acquireElmIds(raw: Record<string, unknown>, port: ElmBridgePort | undefined): void {
+  const { requestId, count } = raw;
+  if (typeof requestId !== 'string' || requestId.length < 1 || requestId.length > 128 || /[^A-Za-z0-9._:-]/.test(requestId)) {
+    throw new Error('Invalid acquisition request ID');
+  }
+  if (!port?.send) throw new Error('Missing Elm ID acquisition response port');
+
+  let ids: string[];
+  try {
+    if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > MAX_ACQUIRED_IDS) {
+      throw new Error(`Expected an acquisition count from 1 to ${MAX_ACQUIRED_IDS}`);
+    }
+    ids = Array.from({ length: count }, createId);
+    if (new Set(ids).size !== count) throw new Error('Generated duplicate UUIDs');
+  } catch (error) {
+    port.send({ type: 'ids-failed', requestId, error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  port.send({ type: 'ids-acquired', requestId, ids });
+}
+
+function captureElmOperation(value: unknown) {
+  const descriptor = asObject(value, 'operation');
+  const queryId = asNonEmptyString(descriptor.queryId, 'operation queryId');
+  let input = { ...asObject(descriptor.input, 'operation input') };
+  if (descriptor.createId != null) {
+    // Older generated Elm clients described automatic allocation with just the field name.
+    const identity = typeof descriptor.createId === 'string'
+      ? { mode: 'auto', field: descriptor.createId }
+      : asObject(descriptor.createId, 'create identity');
+    if (identity.mode === 'duplicate') throw new Error('Duplicate withId options');
+    const field = asNonEmptyString(identity.field, 'create identity field');
+    if (Object.prototype.hasOwnProperty.call(input, field)) throw new Error('Create input already contains the primary key');
+    if (identity.mode !== 'auto' && identity.mode !== 'explicit') throw new Error('Invalid create identity mode');
+    input = { ...input, [field]: identity.mode === 'auto' ? createId() : requireCreateId(identity.id) };
+  }
+  return { queryId, input, optimistic: descriptor.optimistic };
+}
+
+function parseElmBridgeIncomingMessage(
+  message: unknown,
+  acquisitionPort: ElmBridgePort | undefined,
+  mutationResultPort: ElmBridgePort | undefined,
+): ElmBridgeIncomingMessage | undefined {
   const raw = asObject(message, 'Pyre bridge message');
   const type = raw.type;
 
+  if (type === 'acquire-ids') {
+    acquireElmIds(raw, acquisitionPort);
+    return;
+  }
+
   if (type === 'submit') {
-    if (!Array.isArray(raw.operations)) throw new Error('Expected an operation batch');
-    const captured = raw.operations.map((value) => {
-      const descriptor = asObject(value, 'operation');
-      const input = { ...asObject(descriptor.input, 'operation input') };
-      if (descriptor.createId != null) {
-        input[asNonEmptyString(descriptor.createId, 'create identity field')] = createId();
-      }
-      return { queryId: asNonEmptyString(descriptor.queryId, 'operation queryId'), input, optimistic: descriptor.optimistic };
-    });
+    const databaseId = requireDatabaseId(raw.databaseId, 'submit message databaseId');
+    const requestId = asNonEmptyString(raw.requestId, 'submit message requestId');
+    let captured: ReturnType<typeof captureElmOperation>[];
+    try {
+      if (!Array.isArray(raw.operations)) throw new Error('Expected an operation batch');
+      captured = raw.operations.map(captureElmOperation);
+    } catch (error) {
+      if (!mutationResultPort?.send) throw error;
+      mutationResultPort.send({
+        type: 'mutation-result', databaseId, requestId, mutationId: '$batch', mutationName: null,
+        result: { ok: false, error: error instanceof Error ? error.message : String(error) },
+      } satisfies ElmBridgeMutationResultMessage);
+      return;
+    }
     return {
       type: 'mutate',
-      databaseId: requireDatabaseId(raw.databaseId, 'submit message databaseId'),
-      requestId: asNonEmptyString(raw.requestId, 'submit message requestId'),
+      databaseId,
+      requestId,
       mutationId: '$batch',
       mutationInput: captured.map(({ queryId, input }) => ({ queryId, input })),
       optimistic: captured.filter(item => item.optimistic != null).map(({ input, optimistic }) => ({ input, optimistic })),

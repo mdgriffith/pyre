@@ -1653,6 +1653,14 @@ pub fn generate_queries(
         base_out_dir.join("Db/Internal/Edit.elm"),
         include_str!("./static/elm/src/Db/Internal/Edit.elm"),
     ));
+    files.push(generate_text_file(
+        base_out_dir.join("Db/Id/Acquire.elm"),
+        include_str!("./static/elm/src/Db/Id/Acquire.elm"),
+    ));
+    files.push(generate_text_file(
+        base_out_dir.join("Db/Id/Broker.elm"),
+        include_str!("./static/elm/src/Db/Id/Broker.elm"),
+    ));
 
     let mut edit_modules: HashMap<String, Vec<&ast::Query>> = HashMap::new();
     for definition in &query_list.queries {
@@ -1771,6 +1779,20 @@ fn to_edit_module(
     .chain(ELM_PRELUDE_VALUE_NAMES.iter().copied())
     .map(str::to_string)
     .collect();
+    let uuid_create = queries.iter().any(|query| {
+        query.operation == ast::QueryOperation::Insert
+            && crate::generated_queries::generated_crud_table(context, query).is_some_and(|table| {
+                ast::collect_columns(&table.record.fields)
+                    .iter()
+                    .any(|column| {
+                        ast::is_primary_key(column)
+                            && matches!(column.type_, ast::ColumnType::IdUuid { .. })
+                    })
+            })
+    });
+    if uuid_create {
+        used_names.extend(["withId", "optionPair", "optionId"].map(str::to_string));
+    }
     let mut builder_names = HashMap::new();
     // Reserve patch names first, then disambiguate optional-create builders.
     for operation in [ast::QueryOperation::Update, ast::QueryOperation::Insert] {
@@ -1797,7 +1819,11 @@ fn to_edit_module(
     for query in queries {
         body.push_str(&format!("import Query.{}\n", query.name));
     }
-    body.push_str("\n\ntype Patch\n    = Patch ( String, Encode.Value )\n\n\ntype CreateOption\n    = CreateOption ( String, Encode.Value )\n\n\n");
+    body.push_str("\n\ntype Patch\n    = Patch ( String, Encode.Value )\n\n\ntype CreateOption\n    = CreateOption ( String, Encode.Value )\n");
+    if uuid_create {
+        body.push_str("    | ExplicitId Encode.Value\n\n\noptionPair : CreateOption -> Maybe ( String, Encode.Value )\noptionPair option =\n    case option of\n        CreateOption pair -> Just pair\n        ExplicitId _ -> Nothing\n\n\noptionId : CreateOption -> Maybe Encode.Value\noptionId option =\n    case option of\n        CreateOption _ -> Nothing\n        ExplicitId id -> Just id\n");
+    }
+    body.push_str("\n\n");
     for query in queries {
         let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
         let key = ast::collect_columns(&table.record.fields)
@@ -1922,7 +1948,25 @@ fn to_edit_module(
                 } else {
                     "Encode.null"
                 };
-                body.push_str(&format!("create : Required -> List CreateOption -> {edit_type}\ncreate input options =\n    {}\n\n\n", construct(&format!("(Encode.object ([ {} ] ++ List.map (\\(CreateOption pair) -> pair) options))", pairs.join(", ")), prediction, &if allocated_id { format!("(Just {})", string::quote(&key.name)) } else { "Nothing".into() })));
+                let (options, identity) = if allocated_id {
+                    exposing.push("withId".into());
+                    let key_type = typecheck::query_param_type_for_column(&table.record, &key);
+                    let key_type = to_elm_typename(&lookup, &key_type, false);
+                    body.push_str(&format!("withId : {key_type} -> CreateOption\nwithId id =\n    ExplicitId (Db.Id.encodeUuid id)\n\n\n"));
+                    (
+                        "List.filterMap optionPair options",
+                        format!(
+                            "(Internal.createIdentity {} (List.filterMap optionId options))",
+                            string::quote(&key.name)
+                        ),
+                    )
+                } else {
+                    (
+                        "List.map (\\(CreateOption pair) -> pair) options",
+                        "Nothing".into(),
+                    )
+                };
+                body.push_str(&format!("create : Required -> List CreateOption -> {edit_type}\ncreate input options =\n    {}\n\n\n", construct(&format!("(Encode.object ([ {} ] ++ {options}))", pairs.join(", ")), prediction, &identity)));
                 for arg in args.iter().filter(|arg| arg.omittable) {
                     let name = builder_names[&("create", arg.name.clone())].clone();
                     exposing.push(name.clone());
