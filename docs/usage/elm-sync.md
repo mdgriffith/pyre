@@ -278,6 +278,75 @@ To acquire multiple IDs in one round trip, start with a function of the IDs and 
 
 See [`tests/fixtures/AcquireExample.elm`](../../tests/fixtures/AcquireExample.elm) for a runnable standard Elm example with both explicit and automatic child IDs.
 
+## Local Drafts and Headless Editors
+
+Use `Db.Edit.<Record>.Draft` to store a typed create draft or update patch in
+your model. `draft` takes just the required fields; `emptyPatch` starts with no
+changes. A `Maybe` field in a patch omits on `Nothing` and sets on `Just`. An
+optional nullable field uses `Db.Edit.Absent`, `Db.Edit.Null`, or
+`Db.Edit.Present value` to distinguish omission, clearing, and setting. On a UUID
+draft, the optional field named after the schema's primary key uses `Maybe`:
+leave it `Nothing` to allocate automatically or set it to `Just knownId`.
+
+```elm
+import Db.Edit
+import Db.Edit.Document.Draft as Document
+
+newDocument =
+    Document.draft { title = "Untitled", owner = "Alice", tags = [] }
+
+saveDraft databaseId requestId draft =
+    Db.Edit.submit databaseId requestId [ Document.create draft ]
+```
+
+If you want field views and validation, use the generated record's `Editor`
+module. `createForm` starts unset and `editForm row` starts with the row's current
+values. Select the fields available for update in your local query so the row
+can be passed directly to `editForm`; select the primary key separately if you
+need it for submission. Include writable nullable and defaulted fields in that
+query as well as required fields. For the repository's `Document` fixture, see
+the `EditorDocuments` query in `tests/crud_builders.rs`.
+
+```elm
+import Db.Edit.Document.Editor as DocumentEditor
+import Db.Editor as Editor
+import Db.Editor.Field as Field
+import Db.Editor.Input.Default as Input
+
+openEditor syncedRow =
+    { id = syncedRow.id, form = DocumentEditor.editForm syncedRow }
+
+setTitle title editing =
+    { editing | form = Editor.set "title" (Field.Value (Input.Document_Title title)) editing.form }
+
+saveEdit databaseId requestId editing =
+    let
+        ( patch, checked ) =
+            Editor.validate editing.form
+    in
+    ( { editing | form = checked }
+    , Maybe.map (\value -> Db.Edit.submit databaseId requestId [ Document.update editing.id value ]) patch
+    )
+```
+
+In a named namespace, import the corresponding `Db.Editor.Input.<Namespace>`
+module. Inspect `Editor.fields` for metadata, original/current values and
+field feedback; `Editor.errors` lists field errors and `Editor.formError`
+reports form-wide errors. Keep the returned form after validation. Pass
+`Field.Null` to clear a nullable field or `Field.Unset` to revert an edit field
+to its original value. Setting the original typed value also reverts the field.
+Updates include only changed top-level fields; typed JSON and unions are
+replaced as whole values. Store the form separately from the query result so
+subsequent sync updates leave the open form alone.
+
+Your app owns widgets, labels, and raw or invalid intermediate input. The editor
+checks requiredness, nullability and the field's accepted input variant; the
+server still checks permissions and database constraints. The existing list-based
+builders can be used alongside drafts and forms.
+
+See [`tests/fixtures/EditorExample.elm`](../../tests/fixtures/EditorExample.elm)
+for a runnable create-and-edit flow.
+
 ## Named Mutation Compatibility
 
 Generated mutation modules in `Query.*` remain available for individual commands and existing integrations.

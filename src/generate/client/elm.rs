@@ -7,6 +7,8 @@ use crate::typecheck;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+mod editor;
+
 const ELM_DELTA_MODULE: &str = include_str!("./static/elm/src/Db/Delta.elm");
 const ELM_UPDATES_MODULE: &str = include_str!("./static/elm/src/Db/Updates.elm");
 
@@ -453,13 +455,13 @@ fn entity_stream_row_alias(database: &ast::Database, record: &EntityStreamRecord
             result.push_str("    , ");
         }
 
-        let maybe = if column.nullable { "Maybe " } else { "" };
-        result.push_str(&format!(
-            "{} : {}{}\n",
-            column.name,
-            maybe,
-            entity_stream_elm_type(database, &column.type_)
-        ));
+        let type_ = entity_stream_elm_type(database, &column.type_);
+        let type_ = if column.nullable {
+            format!("Maybe {}", type_argument(type_))
+        } else {
+            type_
+        };
+        result.push_str(&format!("{} : {}\n", column.name, type_));
         is_first = false;
     }
 
@@ -596,12 +598,21 @@ fn entity_stream_elm_type(database: &ast::Database, type_: &ast::ColumnType) -> 
             }
         }
         ast::ColumnType::JsonTyped(inner) => entity_stream_elm_type(database, inner),
-        ast::ColumnType::List(inner) => format!("List {}", entity_stream_elm_type(database, inner)),
+        ast::ColumnType::List(inner) => format!(
+            "List {}",
+            type_argument(entity_stream_elm_type(database, inner))
+        ),
         ast::ColumnType::Dict(inner) => {
-            format!("Dict String {}", entity_stream_elm_type(database, inner))
+            format!(
+                "Dict String {}",
+                type_argument(entity_stream_elm_type(database, inner))
+            )
         }
         ast::ColumnType::Nullable(inner) => {
-            format!("Maybe {}", entity_stream_elm_type(database, inner))
+            format!(
+                "Maybe {}",
+                type_argument(entity_stream_elm_type(database, inner))
+            )
         }
         _ => elm_type_from_column_type(type_, true),
     }
@@ -1126,14 +1137,18 @@ fn to_string_field(is_first: bool, indent: usize, field: &ast::Field) -> String 
 }
 
 fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> String {
-    let maybe = if column.nullable { "Maybe " } else { "" };
     let type_str = column_to_elm_type(column);
+    let type_str = if column.nullable {
+        format!("Maybe {}", type_argument(type_str))
+    } else {
+        type_str
+    };
 
     if is_first {
-        return format!("{} : {}{}\n", column.name, maybe, type_str);
+        return format!("{} : {}\n", column.name, type_str);
     } else {
         let spaces = " ".repeat(indent);
-        return format!("{}, {} : {}{}\n", spaces, column.name, maybe, type_str);
+        return format!("{}, {} : {}\n", spaces, column.name, type_str);
     }
 }
 
@@ -1141,6 +1156,14 @@ fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> Stri
 /// For ID types with brands, generates branded types like `UserId` or `Uuid User`
 fn column_to_elm_type(column: &ast::Column) -> String {
     elm_type_from_column_type(&column.type_, false)
+}
+
+fn type_argument(type_: String) -> String {
+    if type_.contains(' ') {
+        format!("({type_})")
+    } else {
+        type_
+    }
 }
 
 fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) -> String {
@@ -1162,19 +1185,19 @@ fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) ->
         ast::ColumnType::List(inner) => {
             format!(
                 "List {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                type_argument(elm_type_from_column_type(inner, qualify_db_types))
             )
         }
         ast::ColumnType::Dict(inner) => {
             format!(
                 "Dict String {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                type_argument(elm_type_from_column_type(inner, qualify_db_types))
             )
         }
         ast::ColumnType::Nullable(inner) => {
             format!(
                 "Maybe {}",
-                elm_type_from_column_type(inner, qualify_db_types)
+                type_argument(elm_type_from_column_type(inner, qualify_db_types))
             )
         }
         ast::ColumnType::IdInt { table } => {
@@ -1575,14 +1598,14 @@ fn to_type_encoder(database: &ast::Database, type_: &ast::ColumnType) -> String 
         ast::ColumnType::Json => "json".to_string(),
         ast::ColumnType::JsonTyped(inner) => to_type_encoder(database, inner),
         ast::ColumnType::List(inner) => {
-            format!("Encode.list {}", to_type_encoder(database, inner))
+            format!("(Encode.list {})", to_type_encoder(database, inner))
         }
         ast::ColumnType::Dict(inner) => format!(
-            "(\\dict__ -> dict__ |> Dict.toList |> List.map (\\( key__, value__ ) -> ( key__, {} value__ )) |> Encode.object)",
+            "(Encode.dict identity {})",
             to_type_encoder(database, inner)
         ),
         ast::ColumnType::Nullable(inner) => format!(
-            "(\\maybe__ -> Maybe.map ({} ) maybe__ |> Maybe.withDefault Encode.null)",
+            "(Maybe.map {} >> Maybe.withDefault Encode.null)",
             to_type_encoder(database, inner)
         ),
         ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
@@ -1612,13 +1635,12 @@ fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
         ast::ColumnType::Date => "Encode.string".to_string(),
         ast::ColumnType::Json => "Db.Encode.json".to_string(),
         ast::ColumnType::JsonTyped(inner) => to_elm_encoder(lookup, inner),
-        ast::ColumnType::List(inner) => format!("Encode.list {}", to_elm_encoder(lookup, inner)),
-        ast::ColumnType::Dict(inner) => format!(
-            "(\\dict__ -> dict__ |> Dict.toList |> List.map (\\( key__, value__ ) -> ( key__, {} value__ )) |> Encode.object)",
-            to_elm_encoder(lookup, inner)
-        ),
+        ast::ColumnType::List(inner) => format!("(Encode.list {})", to_elm_encoder(lookup, inner)),
+        ast::ColumnType::Dict(inner) => {
+            format!("(Encode.dict identity {})", to_elm_encoder(lookup, inner))
+        }
         ast::ColumnType::Nullable(inner) => format!(
-            "(\\maybe__ -> Maybe.map ({} ) maybe__ |> Maybe.withDefault Encode.null)",
+            "(Maybe.map {} >> Maybe.withDefault Encode.null)",
             to_elm_encoder(lookup, inner)
         ),
         ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
@@ -1675,6 +1697,7 @@ pub fn generate_queries(
     }
     let mut records: Vec<_> = edit_modules.into_iter().collect();
     records.sort_by(|a, b| a.0.cmp(&b.0));
+    editor::generate(context, all_query_info, base_out_dir, files, &records);
     for (record, queries) in records {
         let (builders, draft) = to_edit_modules(context, all_query_info, &record, &queries);
         files.push(generate_text_file(
@@ -1822,7 +1845,7 @@ fn to_edit_modules(
             }
         }
     }
-    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Internal.Edit as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict\nimport Json.Encode as Encode\nimport Time\n");
+    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Internal.Edit as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict exposing (Dict)\nimport Json.Encode as Encode\nimport Time\n");
     for query in queries {
         body.push_str(&format!("import Query.{}\n", query.name));
     }
@@ -2008,7 +2031,7 @@ fn to_draft_module(
     builder_names: &HashMap<(&str, String), String>,
 ) -> Option<String> {
     let mut exposing = Vec::new();
-    let mut body = format!("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Edit.{record} as Builders\nimport Db.Id\nimport Dict\nimport Time\n\n\n");
+    let mut body = format!("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Edit.{record} as Builders\nimport Db.Id\nimport Dict exposing (Dict)\nimport Time\n\n\n");
     for query in queries {
         let (alias, prefix) = match query.operation {
             ast::QueryOperation::Insert => ("Draft", "create"),
@@ -2170,13 +2193,13 @@ fn to_query_file(
 
                 let type_str = if is_link {
                     if is_optional {
-                        format!("Maybe {}", base_type)
+                        format!("Maybe {}", type_argument(base_type))
                     } else {
                         format!("List {}", base_type)
                     }
                 } else {
                     if is_optional {
-                        format!("Maybe {}", base_type)
+                        format!("Maybe {}", type_argument(base_type))
                     } else {
                         base_type.to_string()
                     }
@@ -2498,7 +2521,7 @@ fn to_param_type_alias(
                 if base_type.contains(' ') {
                     format!("Maybe ({})", base_type)
                 } else {
-                    format!("Maybe {}", base_type)
+                    format!("Maybe {}", type_argument(base_type))
                 }
             } else {
                 base_type
@@ -2610,16 +2633,22 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
         ast::ColumnType::Json => "Db.Json".to_string(),
         ast::ColumnType::JsonTyped(inner) => to_elm_type_from_column_type(lookup, inner),
         ast::ColumnType::List(inner) => {
-            format!("List {}", to_elm_type_from_column_type(lookup, inner))
+            format!(
+                "List {}",
+                type_argument(to_elm_type_from_column_type(lookup, inner))
+            )
         }
         ast::ColumnType::Dict(inner) => {
             format!(
                 "Dict String {}",
-                to_elm_type_from_column_type(lookup, inner)
+                type_argument(to_elm_type_from_column_type(lookup, inner))
             )
         }
         ast::ColumnType::Nullable(inner) => {
-            format!("Maybe {}", to_elm_type_from_column_type(lookup, inner))
+            format!(
+                "Maybe {}",
+                type_argument(to_elm_type_from_column_type(lookup, inner))
+            )
         }
         ast::ColumnType::IdInt { table } => {
             if !table.is_empty() {
@@ -2670,7 +2699,7 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
         }
         ast::ColumnType::Nullable(inner) => {
             format!(
-                "Decode.nullable ({})",
+                "(Decode.nullable {})",
                 to_elm_decoder_from_column_type(lookup, inner)
             )
         }

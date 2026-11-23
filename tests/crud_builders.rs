@@ -413,6 +413,7 @@ fn generated_builders_compile() {
 session {
     write Bool
 }
+type Status = Open | Closed { reason String }
 record Document {
     @public
     id Id.Uuid @id
@@ -423,6 +424,9 @@ record Document {
     assignee Account.id?
     caption String? @default("Default caption")
     published Bool @default(False)
+    status Status?
+    groups Json<Dict<List<Status?>>>?
+    payload Json?
 }
 record Account {
     @public
@@ -453,7 +457,7 @@ record Reply {
     let context = typecheck::check_schema(&database).unwrap();
     let mut queries = parser::parse_query(
         "queries.pyre",
-        "query Notes { note { @where { id == \"ordinary\" } noteKey id title } }",
+        "query Notes { note { @where { id == \"ordinary\" } noteKey id title } }\nquery EditorDocuments($id: Document.id) { document { @where { id == $id } id title summary tags assignee caption published status groups payload updatedAt } }",
     )
     .unwrap();
     generated_queries::append_generated_crud_queries(&mut queries, &context);
@@ -716,6 +720,11 @@ assert.deepEqual(edits[10], edits[3]);
             "AcquireChecks.elm",
             "acquire-checks.js",
             include_str!("fixtures/AcquireChecks.elm"),
+        ),
+        (
+            "EditorExample.elm",
+            "editor.js",
+            include_str!("fixtures/EditorExample.elm"),
         ),
     ] {
         std::fs::write(dir.path().join(module), source).unwrap();

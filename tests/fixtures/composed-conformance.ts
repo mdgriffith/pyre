@@ -42,7 +42,7 @@ const updated = await executeOperations(db, queries, database('_default', 'first
 assert.equal(updated.ok, true);
 assert.equal(messages[0].type, 'delta');
 // Nullable omission/null/value and whole JSON replacement through real generated SQL.
-const doc = await executeOperations(db, queries, database('_default', 'first'), [Document.create(Document.newId(), { title: 'Doc', owner: 'Owner', summary: null, tags: ['first'] })], actor, { mode: 'normal' });
+const doc = await executeOperations(db, queries, database('_default', 'first'), [Document.create(Document.newId(), { title: 'Doc', owner: 'Owner', summary: null, tags: ['first'], payload: {} })], actor, { mode: 'normal' });
 assert.equal(doc.ok, true);
 const documentId = doc.value[0].result.document[0].id;
 for (const [patch, summary, tags] of [[{ summary: 'Set' }, 'Set', ['first']], [{ tags: ['replacement'] }, 'Set', ['replacement']], [{ summary: null }, null, ['replacement']]] as const) {
@@ -162,6 +162,24 @@ try {
   await Bun.sleep(150);
   assert.equal(submissions.length, beforeUnknown + 1, 'unknown outcome is not replayed');
   assert.equal((await db.execute({ sql: 'select count(*) as count from notes where noteKey = ?', args: [unknown.note] })).rows[0].count, 1);
+  await page.evaluate('example.attachEditor()');
+  await page.evaluate("example.editorAction('check-create')");
+  await page.waitForFunction('example.editorReports.some(report => report.create === true)');
+  await page.evaluate("example.editorAction('submit-create')");
+  await page.waitForFunction("example.editorReports.some(report => report.requestId === 'editor-create' && report.result.ok)");
+  assert.deepEqual(submissions.at(-1)[0].input.status, { _type: 'Closed', reason: 'Done' });
+  assert.deepEqual(submissions.at(-1)[0].input.groups, { draft: [{ _type: 'Open' }, null] });
+  await page.evaluate(key => (window as any).example.editorAction(key), documentId);
+  await page.waitForFunction("example.editorReports.some(report => report.queryTitle === 'Doc')");
+  await page.evaluate("example.editorAction('open')");
+  await page.waitForFunction('example.editorReports.some(report => report.opened === true)');
+  assert.equal((await page.evaluate(key => (window as any).example.updateDocument(key), documentId)).ok, true);
+  await page.waitForFunction("example.editorReports.some(report => report.queryTitle === 'New synced title')");
+  await page.evaluate("example.editorAction('submit-edit')");
+  await page.waitForFunction("example.editorReports.some(report => report.requestId === 'editor-update' && report.result.ok)");
+  assert.deepEqual(submissions.at(-1)[0].input, { id: documentId, caption: null, payload: [], tags: ['whole', 'replacement'] });
+  const { value: edited } = await page.evaluate("example.editorReports.find(report => report.requestId === 'editor-update').result");
+  assert.equal(edited[0].result.document[0].title, 'New synced title');
   console.log('PASS: generated TS/Elm create IDs, optional local acquisition, ordered related writes, authoritative reconciliation, rollback, and unknown outcome');
 } finally {
   await browser.close(); server.stop(true); for (const db of stores.values()) db.close();

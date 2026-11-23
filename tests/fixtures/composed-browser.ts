@@ -1,9 +1,10 @@
 // Copied alongside compiler output by crud_builders.rs, then bundled for Chromium.
 import { PyreClient } from '@pyre/client';
-import { Note, Reply, noteId, database } from './typescript/core/edits';
+import { Document, Note, Reply, documentId, noteId, database } from './typescript/core/edits';
 import { schemaMetadata } from './typescript/core/schema';
 import { Elm as Ordinary } from './example.js';
 import { Elm as Acquisition } from './acquire.js';
+import { Elm as Editing } from './editor.js';
 
 const app = Ordinary.ComposedExample.init({ flags: null });
 const completions: any[] = [];
@@ -28,7 +29,10 @@ const acquisitionApp = Acquisition.AcquireExample.init({ flags: null });
 acquisitionApp.ports.acquired.subscribe((value: any) => acquired.push(value));
 acquisitionApp.ports.completed.subscribe((value: any) => related.push(value));
 acquisitionApp.ports.pyreStoreOut.subscribe((value: any) => { if (value.type === 'acquire-ids') outgoingAcquisition.push(value); });
-Object.assign(window, { example: { rows, replies, events, completions, counts, acquired, related, outgoingAcquisition,
+const editorApp = Editing.EditorExample.init({ flags: null });
+const editorReports: any[] = [];
+editorApp.ports.editorReport.subscribe((value: any) => editorReports.push(value));
+Object.assign(window, { example: { rows, replies, events, completions, counts, acquired, related, outgoingAcquisition, editorReports,
   observe() { app.ports.observe.send(null); },
   elmCreate(instance: string) { app.ports.createNote.send(instance); },
   elmUpdate(instance: string) { app.ports.updateNote.send([instance, rows[instance][0].noteKey]); },
@@ -48,6 +52,9 @@ Object.assign(window, { example: { rows, replies, events, completions, counts, a
   attachAcquisition() { client.attachElmBridge({ app: acquisitionApp }); },
   acquire(explicitReply: boolean) { acquisitionApp.ports.acquire.send(explicitReply); },
   submitRelated(instance: string, title: string) { acquisitionApp.ports.submit.send([instance, title]); },
+  attachEditor() { client.attachElmBridge({ app: editorApp }); },
+  editorAction(action: string) { editorApp.ports.editorAction.send(action); },
+  updateDocument(id: string) { return client.submit(database('_default', 'first'), [Document.update(documentId(id), { title: 'New synced title' })]); },
   async rollback(instance: string, id: string) {
     return client.submit(database('_default', instance), [Note.update(noteId(id), { title: 'Must rollback' }), Note.delete(noteId('00000000-0000-7000-8000-000000000999'))]);
   },
