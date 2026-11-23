@@ -86,8 +86,23 @@ pub fn is_remote(db: &str) -> Result<bool, DbError> {
 }
 
 pub async fn connect(
-    db: &String,
+    db: &str,
     maybe_auth_token: &Option<String>,
+) -> Result<libsql::Database, DbError> {
+    connect_with_creation(db, maybe_auth_token, true).await
+}
+
+pub async fn connect_existing(
+    db: &str,
+    maybe_auth_token: &Option<String>,
+) -> Result<libsql::Database, DbError> {
+    connect_with_creation(db, maybe_auth_token, false).await
+}
+
+async fn connect_with_creation(
+    db: &str,
+    maybe_auth_token: &Option<String>,
+    create: bool,
 ) -> Result<libsql::Database, DbError> {
     let db_value = parse_arg_or_env(&db)?;
     let database_location = error::database_location(&db_value);
@@ -117,9 +132,13 @@ pub async fn connect(
             }
         }
     } else {
-        ensure_local_db_parent_exists(&db_value)?;
-
-        let connected_result = libsql::Builder::new_local(db_value).build().await;
+        let mut builder = libsql::Builder::new_local(&db_value);
+        if create {
+            ensure_local_db_parent_exists(&db_value)?;
+        } else {
+            builder = builder.flags(libsql::OpenFlags::SQLITE_OPEN_READ_WRITE);
+        }
+        let connected_result = builder.build().await;
         match connected_result {
             Ok(connected) => return Ok(connected),
             Err(e) => {
@@ -477,6 +496,7 @@ async fn preflight_database_compatibility(
             name.as_str() != pyre::db::migrate::MIGRATION_TABLE
                 && name.as_str() != pyre::db::migrate::SYNC_TABLE
                 && name.as_str() != "_pyre_external_identities"
+                && name.as_str() != pyre::db::policy::TABLE
         })
         .cloned()
         .collect();

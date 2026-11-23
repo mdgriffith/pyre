@@ -2,4 +2,7 @@
 pub mod diagnostic;
 pub mod diff;
 pub mod introspect;
+#[cfg(feature = "json")]
+pub mod lifecycle;
 pub mod migrate;
+pub mod policy;

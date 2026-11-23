@@ -1645,6 +1645,15 @@ fn populate_context_with_external_identities(
                                                 primary: vec![convert_range(tablename_range)],
                                             }],
                                         });
+                                    } else if tablename
+                                        .eq_ignore_ascii_case(crate::db::policy::TABLE)
+                                    {
+                                        errors.push(invalid_type_usage_error(
+                                            &file.path,
+                                            format!("Table name '{tablename}' is reserved for Pyre database policy metadata."),
+                                            to_range(&start, &end),
+                                            vec![convert_range(tablename_range)],
+                                        ));
                                     }
                                 }
 
@@ -3048,6 +3057,15 @@ fn check_where_args(
 
             match column_type {
                 None => mark_as_used(&query_context, query_val, params),
+                Some(column_type) if is_opaque_json_type(&column_type) => {
+                    errors.push(opaque_json_comparison(
+                        &error_filepath,
+                        *is_session_var,
+                        path,
+                        field_name_range,
+                    ));
+                    mark_as_used(query_context, query_val, params);
+                }
                 Some(column_type_string) => {
                     check_value(
                         context,
@@ -3068,6 +3086,33 @@ fn check_where_args(
             // Check if the field exists
             // Get field type
         }
+    }
+}
+
+fn is_opaque_json_type(type_: &str) -> bool {
+    matches!(type_, "Json" | "Json?")
+}
+
+fn opaque_json_comparison(
+    filepath: &str,
+    is_session_var: bool,
+    path: &ast::PredicatePath,
+    range: &ast::Range,
+) -> Error {
+    let field = path.authored();
+    Error {
+        filepath: filepath.to_string(),
+        error_type: ErrorType::OpaqueJsonComparison {
+            field: if is_session_var {
+                format!("Session.{field}")
+            } else {
+                field
+            },
+        },
+        locations: vec![Location {
+            contexts: vec![],
+            primary: vec![convert_range(range)],
+        }],
     }
 }
 
@@ -3271,6 +3316,18 @@ fn check_permissions_where_args(
                         }],
                     });
                 }
+            }
+
+            if terminal_column.as_ref().is_some_and(|column| {
+                is_opaque_json_type(&query_param_type_for_column(table, column))
+            }) {
+                errors.push(opaque_json_comparison(
+                    filepath,
+                    *is_session_var,
+                    path,
+                    field_name_range,
+                ));
+                return;
             }
 
             if !matches!(operator, ast::Operator::In | ast::Operator::NotIn) {

@@ -22,6 +22,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Operate on a physical Pyre database.
+    Db {
+        #[command(subcommand)]
+        command: DatabaseCommand,
+    },
     /// Get started using Pyre.  Generates a starter schema.
     Init {
         /// Generate a setup that has multiple database schemas.
@@ -185,6 +190,74 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum DatabaseCommand {
+    /// Install a schema on an empty database.
+    Init {
+        /// A local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Use the working schema and opt in to disposable workflows.
+        #[arg(long)]
+        disposable: bool,
+    },
+    /// Replace a disposable database's schema in place and start a new lineage.
+    Reset {
+        /// An existing local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+    },
+    /// Inspect or explicitly change the database's lifecycle policy.
+    Policy {
+        /// An existing local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, value_enum)]
+        set: Option<DatabasePolicyArg>,
+    },
+    /// Add fixtures to an initialized database in one transaction.
+    Seed {
+        /// A local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        /// Database auth token or an environment variable prefixed with a $.
+        #[arg(long)]
+        auth: Option<String>,
+        /// Which project schema namespace the database must contain.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// JSON file containing fixture rows keyed by physical table name.
+        #[arg(long)]
+        fixtures: std::path::PathBuf,
+    },
+    /// Reset an existing disposable database, then seed it in a separate transaction.
+    Reseed {
+        /// An existing local filename, URL, or environment variable prefixed with a $.
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        /// JSON fixture file, read only after reset commits.
+        #[arg(long)]
+        fixtures: std::path::PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DatabasePolicyArg {
+    Disposable,
+    Preserved,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -206,6 +279,73 @@ async fn run() -> io::Result<()> {
     };
 
     match &cli.command {
+        Commands::Db { command } => match command {
+            DatabaseCommand::Init {
+                database,
+                auth,
+                namespace,
+                disposable,
+            } => {
+                if !disposable {
+                    return Err(io::Error::other("Preserved initialization requires finalized migration history and is not yet supported"));
+                }
+                command::prepare_disposable_database(
+                    &options,
+                    database,
+                    auth,
+                    namespace,
+                    command::DisposableOperation::Init,
+                )
+                .await?;
+                println!("Initialized disposable database");
+            }
+            DatabaseCommand::Reset {
+                database,
+                auth,
+                namespace,
+            } => {
+                command::prepare_disposable_database(
+                    &options,
+                    database,
+                    auth,
+                    namespace,
+                    command::DisposableOperation::Reset,
+                )
+                .await?;
+                println!("Reset disposable database");
+            }
+            DatabaseCommand::Policy {
+                database,
+                auth,
+                namespace,
+                set,
+            } => {
+                command::database_policy(&options, database, auth, namespace, *set).await?;
+            }
+            DatabaseCommand::Seed {
+                database,
+                auth,
+                namespace,
+                fixtures,
+            } => {
+                command::seed_database(&options, database, auth, namespace, fixtures).await?;
+            }
+            DatabaseCommand::Reseed {
+                database,
+                auth,
+                namespace,
+                fixtures,
+            } => {
+                command::prepare_disposable_database(
+                    &options,
+                    database,
+                    auth,
+                    namespace,
+                    command::DisposableOperation::Reseed(fixtures),
+                )
+                .await?;
+            }
+        },
         Commands::Init { multidb, session } => {
             command::init(&options, *multidb, session.as_deref())?;
         }

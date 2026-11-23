@@ -1958,6 +1958,79 @@ record User {
 }
 
 #[test]
+fn opaque_json_cannot_be_compared_in_query_filters() {
+    let context = checked_context(
+        r#"
+@syncable(false)
+record Report {
+    id Id.Int @id
+    settings Json
+    optionalSettings JSON?
+    name Json<String>
+    @public
+}
+"#,
+    );
+
+    for (params, predicate, field) in [
+        ("($settings: Json)", "settings == $settings", "settings"),
+        ("($settings: Json)", "settings > $settings", "settings"),
+        ("", "optionalSettings == null", "optionalSettings"),
+    ] {
+        let source = format!("query Find{params} {{ report {{ @where {{ {predicate} }} id }} }}");
+        let queries = parser::parse_query("query.pyre", &source).unwrap();
+        let errors = typecheck::check_queries(&queries, &context)
+            .err()
+            .expect("opaque JSON comparisons must fail");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(matches!(
+            &errors[0].error_type,
+            ErrorType::OpaqueJsonComparison { field: found } if found == field
+        ));
+    }
+
+    let queries = parser::parse_query(
+        "query.pyre",
+        r#"query Find { report { @where { name == "monthly" } settings } }"#,
+    )
+    .unwrap();
+    typecheck::check_queries(&queries, &context).expect("typed comparison and opaque read work");
+}
+
+#[test]
+fn opaque_json_cannot_be_compared_in_permissions() {
+    let mut schema = ast::Schema::default();
+    parser::run(
+        "schema.pyre",
+        r#"
+@syncable(false)
+session {
+    settings Json
+}
+
+record Report {
+    id Id.Int @id
+    settings Json
+    @allow(query) { Session.settings != null || settings == Session.settings }
+    @allow(insert, update, delete) { False }
+}
+"#,
+        &mut schema,
+    )
+    .unwrap();
+    let errors = typecheck::check_schema(&ast::Database {
+        schemas: vec![schema],
+    })
+    .expect_err("opaque JSON in permissions must fail");
+    for expected in ["Session.settings", "settings"] {
+        assert!(errors.iter().any(|error| matches!(
+            &error.error_type,
+            ErrorType::OpaqueJsonComparison { field } if field == expected
+        )));
+    }
+}
+
+#[test]
 fn nullable_session_id_is_comparable_with_non_nullable_id() {
     let schema = r#"
 session {

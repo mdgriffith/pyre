@@ -1,13 +1,361 @@
 import { expect, mock, test } from "bun:test";
-import type { SchemaMetadata } from "@pyre/core";
 import { createClient } from "@libsql/client";
 import { z } from "zod";
 import { run, seed } from "./query";
 import { toRunner } from "./runtime/runner";
 import { buildArgs, toSqlStatements } from "./runtime/sql";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ensureDatabase, getIntrospectionJson, initDisposableDatabase, inspectDatabasePolicy, loadSchemaFromDatabase, reseedDatabase, setDatabaseDisposable } from "./schema";
+import { catchup } from "./sync";
+import { initSync } from "./wasm/pyre_wasm.js";
+
+const fixtureFile = (name: string) => readFileSync(new URL(`../../tests/fixtures/seed/${name}`, import.meta.url), "utf8");
+const fixtureSchema = fixtureFile("schema.pyre");
+
+function seedDatabase(intMode: "number" | "bigint" | "string" = "number") {
+  initSync({ module: readFileSync(new URL("./wasm/pyre_wasm_bg.wasm", import.meta.url)) });
+  const directory = mkdtempSync(join(tmpdir(), "pyre-fixture-"));
+  const db = createClient({ url: `file:${join(directory, "test.db")}`, intMode });
+  return { db, close() { db.close(); rmSync(directory, { recursive: true, force: true }); } };
+}
+
+test("WASM seed matches the native fixture and persists both directions of nested links", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    const input = JSON.parse(fixtureFile("input.json"));
+    expect(await seed(db, input, { namespace: "Wrong" })).toMatchObject({
+      kind: "error", error: { message: expect.stringContaining("found 'Fixtures'") },
+    });
+    expect(await seed(db, input, { namespace: "Fixtures" })).toEqual({
+      kind: "success", response: JSON.parse(fixtureFile("expected.json")),
+    });
+    expect((await db.execute("select id, authorId from posts order by id")).rows.map(row => [row.id, row.authorId]))
+      .toEqual([[4, 1], [5, 2]]);
+    expect((await db.execute(`select status, status__type as payload,
+      json_extract(jsonStatus, '$._type') as jsonTag,
+      json_extract(jsonColor, '$') as jsonColor from posts where id = 5`)).rows[0])
+      .toEqual({ status: "Draft", payload: null, jsonTag: "Draft", jsonColor: "Blue" });
+    expect(await seed(db, { posts: [{
+      authorId: 1, title: "Missing payload", metadata: {}, status: "Draft", jsonStatus: "Published",
+    }] })).toMatchObject({
+      kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("posts[0].jsonStatus variant 'Published' requires fields") },
+    });
+    // Replaying the explicit post ID fails, including the to-one author inserted first.
+    expect(await seed(db, input)).toMatchObject({ kind: "error", error: { errorType: "DatabaseError", message: expect.stringContaining("posts[0]") } });
+    expect((await db.execute("select count(*) as n from users")).rows[0].n).toBe(2);
+  } finally { close(); }
+});
+
+test("seed rejects an uninitialized target and rolls back late validation errors", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    expect(await seed(db, {})).toMatchObject({ kind: "error", error: { message: expect.stringContaining("initialized") } });
+    expect((await db.execute("select name from sqlite_schema")).rows).toHaveLength(0);
+    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    const result = await seed(db, { users: [{ name: "Discard", posts: [{ title: null }] }] });
+    expect(result).toMatchObject({ kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("users[0].posts[0].title") } });
+    expect((await db.execute("select count(*) as n from users")).rows[0].n).toBe(0);
+  } finally { close(); }
+});
+
+test("disposable init cannot overlook user objects named after catalog PRAGMAs", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await db.executeMultiple(`create table legacy (id integer); insert into legacy values (7);
+      create table pragma_table_list (schema text, name text, type text);
+      insert into pragma_table_list values ('main', 'legacy', 'shadow'), ('main', 'pragma_table_list', 'shadow');`);
+    await expect(initDisposableDatabase(db, "Fixtures", fixtureSchema)).rejects.toThrow("requires an empty database");
+    expect(await inspectDatabasePolicy(db, "Fixtures")).toBe("preserved");
+    expect((await db.execute("select id from legacy")).rows[0]?.id).toBe(7);
+  } finally { close(); }
+});
+
+test("seed preserves original rows even when the installed constraint defaults to REPLACE", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    const source = `@syncable(false)
+record Item {
+  id Id.Int @id
+  name String
+  @public
+}
+`;
+    await ensureDatabase(db, "Fixtures", source);
+    await db.executeMultiple(`drop table items;
+      create table items (id integer primary key, name text unique on conflict replace, updatedAt integer);
+      insert into items (id, name) values (1, 'original');`);
+    expect(await inspectDatabasePolicy(db)).toBe("preserved");
+    expect(await seed(db, { items: [{ id: 2, name: "rollback-me" }, { id: 3, name: "original" }] }))
+      .toMatchObject({ kind: "error", error: { errorType: "DatabaseError", message: expect.stringContaining("items[1]") } });
+    expect((await db.execute("select id, name from items order by id")).rows.map(row => [row.id, row.name]))
+      .toEqual([[1, "original"]]);
+  } finally { close(); }
+});
+
+test("policy calls reject an in-memory client without detaching its database", async () => {
+  const db = createClient({ url: ":memory:" });
+  try {
+    await db.execute("create table keep (value text)");
+    await db.execute("insert into keep values ('still here')");
+    for (const policy of [inspectDatabasePolicy, setDatabaseDisposable]) {
+      await expect(policy(db)).rejects.toThrow("require a file-backed local database");
+      expect((await db.execute("select value from keep")).rows[0].value).toBe("still here");
+    }
+  } finally { db.close(); }
+});
+
+test("WASM seed preserves caller table order and ignores TEMP shadows", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    await db.execute("create temp table users (id integer primary key, decoy text)");
+    await db.execute("create temp table _pyre_migrations (decoy text)");
+    await db.execute(`create trigger require_author before insert on posts
+      when not exists (select 1 from users where id = new.authorId)
+      begin select raise(abort, 'author must be inserted first'); end`);
+    expect(await seed(db, {
+      users: [{ id: 42, name: "Parent" }],
+      posts: [{ authorId: 42, title: "Child", metadata: {}, status: "Draft" }],
+    }, { namespace: "Fixtures" })).toMatchObject({ kind: "success" });
+    expect((await db.execute("select name from main.users where id = 42")).rows[0].name).toBe("Parent");
+    expect((await db.execute("select title from main.posts where authorId = 42")).rows[0].title).toBe("Child");
+  } finally { close(); }
+});
+
+test("WASM seed rolls back earlier rows for a late typed JSON error", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await ensureDatabase(db, "Fixtures", fixtureFile("typed-json.pyre"));
+    const payload = { _type: "Payload", count: 7 };
+    const valid = { payload, groups: { group: [null, payload] } };
+    expect(await seed(db, { entries: [valid, { payload, groups: { group: [{ ...payload, count: "wrong" }] } }] }))
+      .toMatchObject({ kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining('entries[1].groups["group"][0].count') } });
+    expect((await db.execute("select id from entries")).rows).toHaveLength(0);
+    expect(await seed(db, { entries: [valid] })).toMatchObject({ kind: "success", response: { entries: [valid] } });
+  } finally { close(); }
+});
+
+test("seed handles PRAGMA-named tables and distinguishes JSON null from SQL NULL", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await initDisposableDatabase(db, "Fixtures", `@syncable(false)
+record Entry {
+    @tablename("pragma_table_info")
+    id Id.Int @id
+    requiredJson Json<String?>
+    optionalJson Json<String>?
+    @public
+}`);
+    expect(await seed(db, { pragma_table_info: [{ requiredJson: null, optionalJson: null }] }))
+      .toMatchObject({ kind: "success" });
+    expect((await db.execute("select typeof(requiredJson) as storage, json_type(requiredJson) as json, optionalJson is null as sqlNull from main.pragma_table_info where requiredJson is jsonb('null')")).rows)
+      .toEqual([{ storage: "blob", json: "null", sqlNull: 1 }]);
+  } finally { close(); }
+});
+
+test("WASM seed preserves explicit conflict handling inside a trigger", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await initDisposableDatabase(db, "Fixtures", fixtureSchema);
+    await db.executeMultiple(`create table seen (name text primary key);
+      insert into seen values ('known');
+      create trigger remember after insert on users begin
+        insert or ignore into seen values (new.name);
+      end;`);
+    expect(await seed(db, { users: [{ name: "known" }, { name: "new" }] }))
+      .toMatchObject({ kind: "success" });
+    expect((await db.execute("select name from users order by id")).rows)
+      .toEqual([{ name: "known" }, { name: "new" }]);
+    expect((await db.execute("select name from seen order by name")).rows)
+      .toEqual([{ name: "known" }, { name: "new" }]);
+  } finally { close(); }
+});
+
+test("WASM seed preserves exact returned integer keys and generates UUIDv7 without assigning sequences", async () => {
+  const { db, close } = seedDatabase("bigint");
+  try {
+    await ensureDatabase(db, "Fixtures", `${fixtureSchema}
+record Event {
+    key Id.Uuid @id
+    sequence Sequence.Int
+    payload String
+    @public
+}
+`);
+    await db.execute("insert into users (id, name) values (9007199254740992, 'Existing')");
+    expect(await seed(db, { users: [{ posts: [{ title: "Nested", metadata: {}, status: "Draft" }] }] })).toMatchObject({ kind: "success" });
+    expect((await db.execute("select authorId from posts")).rows[0].authorId).toBe(9007199254740993n);
+    const result = await seed(db, { events: [{ payload: "First" }] });
+    expect(result).toMatchObject({ kind: "success", response: { events: [{
+      key: expect.stringMatching(/^[\da-f]{8}-[\da-f]{4}-7[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/), sequence: 1,
+    }] } });
+    expect(await seed(db, { events: [{ payload: "Forged", sequence: 99 }] })).toMatchObject({
+      kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("events[0].sequence") },
+    });
+  } finally { close(); }
+});
+
+test("seed reports uncertain commit and rollback and rejects non-atomic transaction modes", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    const client = (failure: "commit" | "rollback") => ({
+      transaction: async () => {
+        const tx = await db.transaction("write");
+        return {
+          get closed() { return tx.closed; },
+          execute: tx.execute.bind(tx),
+          close: tx.close.bind(tx),
+          commit: failure === "commit" ? async () => { await tx.commit(); throw new Error("lost response"); } : tx.commit.bind(tx),
+          rollback: failure === "rollback" ? async () => { throw new Error("lost response"); } : tx.rollback.bind(tx),
+        };
+      },
+    }) as unknown as typeof db;
+    expect(await seed(client("commit"), { users: [{}] })).toMatchObject({
+      kind: "error", error: { errorType: "OutcomeUnknown", message: expect.stringContaining("commit outcome unknown") },
+    });
+    expect(await seed(client("rollback"), { users: [{}, { missing: 1 }] })).toMatchObject({
+      kind: "error", error: { errorType: "OutcomeUnknown", message: expect.stringContaining("rollback outcome unknown") },
+    });
+    for (const transactionMode of ["batch", "none"] as const) {
+      expect(await seed(db, {}, { transactionMode })).toMatchObject({ kind: "error", error: { errorType: "InvalidInput" } });
+    }
+  } finally { close(); }
+});
+
+test('seed and reseed reject libSQL intMode "string" before changing data', async () => {
+  const { db, close } = seedDatabase("string");
+  try {
+    const namespace = "Fixtures";
+    await initDisposableDatabase(db, namespace, fixtureSchema);
+    await db.execute("insert into users (id, name) values (7, 'Keep')");
+    const epoch = async () => (await db.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch;
+    const oldEpoch = await epoch();
+    const message = expect.stringContaining('intMode "string"');
+    const loader = mock(() => ({ users: [{ name: "Overwrite" }] }));
+    expect(await seed(db, loader())).toMatchObject({ kind: "error", error: { message } });
+    loader.mockClear();
+    await expect(reseedDatabase(db, namespace, fixtureSchema, loader)).rejects.toMatchObject({ kind: "reset-failed", message });
+    expect(loader).not.toHaveBeenCalled();
+    expect(await epoch()).toBe(oldEpoch);
+    expect((await db.execute("select name from users")).rows).toEqual([{ name: "Keep" }]);
+  } finally { close(); }
+});
+
+test("reseed commits a fresh schema before loading fixtures and before admitting clients", async () => {
+  const { db, close } = seedDatabase();
+  const namespace = "Fixtures";
+  const epoch = async () => (await db.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch;
+  const counts = async () => ({ ...(await db.execute("select (select count(*) from users) as users, (select count(*) from posts) as posts")).rows[0] });
+  try {
+    await ensureDatabase(db, namespace, "record Obsolete {\n id Id.Uuid @id\n @public\n}\n");
+    await loadSchemaFromDatabase("reseed-test", db);
+    const oldEpoch = await epoch();
+    const loader = mock(() => JSON.parse("{"));
+    await expect(reseedDatabase(db, namespace, fixtureSchema, loader)).rejects.toMatchObject({ kind: "reset-failed" });
+    expect(loader).not.toHaveBeenCalled();
+    expect(await epoch()).toBe(oldEpoch);
+
+    await setDatabaseDisposable(db, namespace);
+    await db.execute("pragma foreign_keys = on");
+    await db.executeMultiple(fixtureFile("reset-cycles.sql"));
+    expect((await db.execute("pragma foreign_key_check")).rows).toHaveLength(0);
+
+    await db.execute("pragma foreign_keys = off");
+    await expect(reseedDatabase(db, namespace, fixtureSchema, loader)).rejects.toMatchObject({
+      kind: "reset-failed", message: expect.stringContaining("foreign-key enforcement enabled"),
+    });
+    expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(0);
+    await db.execute("pragma foreign_keys = on");
+
+    expect(loader).not.toHaveBeenCalled();
+    expect(await epoch()).toBe(oldEpoch);
+    expect((await db.execute("select b from cycle_c")).rows[0]?.b).toBe(1);
+
+    const reseeding = reseedDatabase(db, namespace, fixtureSchema, async () => {
+      expect(await epoch()).not.toBe(oldEpoch);
+      expect(await counts()).toEqual({ users: 0, posts: 0 });
+      expect((await db.execute("select name from main.sqlite_schema where name glob 'cycle_*' or name = 'self_ref' or name glob 'pragma_*'")).rows).toHaveLength(0);
+      expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
+      return loader();
+    });
+    const observeFk = async () => {
+      for (let i = 0; i < 30; i += 1) {
+        expect((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys).toBe(1);
+      }
+    };
+    await Promise.all([
+      expect(reseeding).rejects.toMatchObject({ kind: "fresh-without-fixtures", cause: expect.any(SyntaxError) }),
+      observeFk(),
+    ]);
+    const emptyEpoch = await epoch();
+    await expect(reseedDatabase(db, namespace, fixtureSchema, { users: [{ id: 1 }, { id: 1 }] })).rejects.toMatchObject({
+      kind: "fresh-without-fixtures", message: expect.stringContaining("users[1]"),
+    });
+    expect(await counts()).toEqual({ users: 0, posts: 0 });
+    expect(await epoch()).not.toBe(emptyEpoch);
+
+    const rolledBackEpoch = await epoch();
+    expect(await reseedDatabase(db, namespace, fixtureSchema, JSON.parse(fixtureFile("input.json"))))
+      .toEqual(JSON.parse(fixtureFile("expected.json")));
+    const currentEpoch = await epoch();
+    expect(currentEpoch).not.toBe(rolledBackEpoch);
+    expect(await counts()).toEqual({ users: 2, posts: 2 });
+    await loadSchemaFromDatabase("reseed-test", db);
+    expect((await getIntrospectionJson(db)).tables.map(({ name }: { name: string }) => name)).toEqual(["posts", "users"]);
+    expect(await catchup(db, { tables: {} }, {}, 100, "reseed-test", String(oldEpoch))).toEqual({
+      type: "reset", databaseId: "reseed-test", databaseEpoch: currentEpoch,
+      operation: "replace", scope: "database", reason: "database_epoch_changed",
+    });
+  } finally { close(); }
+});
+
+test("reseed reports lost commit or rollback confirmation for the correct phase", async () => {
+  const { db, close } = seedDatabase();
+  try {
+    await initDisposableDatabase(db, "Fixtures", fixtureSchema);
+    for (const phase of ["reset", "seed"] as const) {
+      for (const operation of ["commit", "rollback"] as const) {
+        let transactions = 0;
+        const uncertain = {
+          protocol: "file",
+          execute: db.execute.bind(db),
+          async migrate(statements: Parameters<typeof db.migrate>[0]) {
+            if (phase !== "reset") return db.migrate(statements);
+            if (operation === "commit") await db.migrate(statements);
+            throw new Error(`Lost ${operation} response`);
+          },
+          async transaction() {
+            const tx = await db.transaction(++transactions === 1 ? "read" : "write");
+            const fault = phase === "seed" && transactions === 2;
+            return {
+              get closed() { return tx.closed; },
+              close: tx.close.bind(tx),
+              execute: tx.execute.bind(tx),
+              async commit() {
+                await tx.commit();
+                if (fault && operation === "commit") throw new Error("Lost commit response");
+              },
+              async rollback() {
+                await tx.rollback();
+                if (fault && operation === "rollback") throw new Error("Lost rollback response");
+              },
+            };
+          },
+        } as unknown as typeof db;
+        const load = mock(() => ({ users: operation === "rollback" ? [{ id: 1 }, { id: 1 }] : [{ id: 1 }] }));
+        await expect(reseedDatabase(uncertain, "Fixtures", fixtureSchema, load)).rejects.toMatchObject({
+          kind: `${phase}-outcome-unknown`, message: expect.stringContaining(`${phase === "reset" ? "batch" : operation} outcome unknown`),
+        });
+        expect(transactions).toBe(phase === "reset" ? 1 : 2);
+        expect(load).toHaveBeenCalledTimes(phase === "reset" ? 0 : 1);
+      }
+    }
+  } finally { close(); }
+});
 
 test("composed operations commit once, retain indexed results, and publish only final row authority", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pyre-batch-"));
@@ -614,640 +962,3 @@ test("sync does not fan out when no affected rows are returned", async () => {
   expect(syncDeltas).not.toHaveBeenCalled();
   expect(sendToSession).not.toHaveBeenCalled();
 });
-
-test("seed inserts nested rows through schema links", async () => {
-  const executed: any[] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      executed.push(statement);
-      if (statement === "begin" || statement === "commit") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "name" },
-            { name: "authorId" },
-            { name: "title" },
-          ],
-        };
-      }
-      if (statement.sql.includes('"users"')) {
-        return { rows: [{ id: 10, name: statement.args.seed_0 }] };
-      }
-      if (statement.sql.includes('"posts"')) {
-        const values = Object.values(statement.args);
-        const authorId = values.find((value) => value === 10);
-        const title = values.find(
-          (value) => value === "First" || value === "Second",
-        );
-        return { rows: [{ id: title === "First" ? 20 : 21, authorId, title }] };
-      }
-      throw new Error("unexpected statement");
-    }),
-  };
-
-  const result = await seed(db as any, userPostSchema(), {
-    users: [
-      {
-        name: "Fred",
-        posts: [{ title: "First" }, { title: "Second" }],
-      },
-    ],
-  });
-
-  expect(result).toEqual({
-    kind: "success",
-    response: {
-      users: [
-        {
-          id: 10,
-          name: "Fred",
-          posts: [
-            { id: 20, authorId: 10, title: "First" },
-            { id: 21, authorId: 10, title: "Second" },
-          ],
-        },
-      ],
-    },
-  });
-  expect(executed[0]).toBe("begin");
-  expect(executed.at(-1)).toBe("commit");
-  const postInserts = executed.filter(
-    (statement) =>
-      typeof statement !== "string" && statement.sql.includes('"posts"'),
-  );
-  expect(Object.values(postInserts[0].args)).toContain(10);
-  expect(Object.values(postInserts[1].args)).toContain(10);
-});
-
-test("seed batches sibling inserts when batch is supported", async () => {
-  const executed: any[] = [];
-  const batched: any[][] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      executed.push(statement);
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "name" },
-            { name: "authorId" },
-            { name: "title" },
-          ],
-        };
-      }
-      throw new Error("unexpected execute");
-    }),
-    batch: mock(async (statements: any[]) => {
-      batched.push(statements);
-      return statements.map((statement) => {
-        if (statement.sql.includes('"users"')) {
-          return { rows: [{ id: 10, name: statement.args.seed_0 }] };
-        }
-
-        const values = Object.values(statement.args);
-        const authorId = values.find((value) => value === 10);
-        const title = values.find(
-          (value) => value === "First" || value === "Second",
-        );
-        return { rows: [{ id: title === "First" ? 20 : 21, authorId, title }] };
-      });
-    }),
-  };
-
-  const result = await seed(db as any, userPostSchema(), {
-    users: [
-      {
-        name: "Fred",
-        posts: [{ title: "First" }, { title: "Second" }],
-      },
-    ],
-  });
-
-  expect(result).toEqual({
-    kind: "success",
-    response: {
-      users: [
-        {
-          id: 10,
-          name: "Fred",
-          posts: [
-            { id: 20, authorId: 10, title: "First" },
-            { id: 21, authorId: 10, title: "Second" },
-          ],
-        },
-      ],
-    },
-  });
-  expect(
-    executed.every(
-      (statement) =>
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info"),
-    ),
-  ).toBe(true);
-  expect(executed).not.toContain("begin");
-  expect(executed).not.toContain("commit");
-  expect(batched).toHaveLength(2);
-  expect(batched[0]).toHaveLength(1);
-  expect(batched[1]).toHaveLength(2);
-});
-
-test("seed rejects nested foreign key conflicts", async () => {
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "rollback") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "name" },
-            { name: "authorId" },
-            { name: "title" },
-          ],
-        };
-      }
-      return { rows: [{ id: 10, name: "Fred" }] };
-    }),
-  };
-
-  const result = await seed(db as any, userPostSchema(), {
-    users: [
-      {
-        name: "Fred",
-        posts: [{ authorId: 999, title: "Wrong" }],
-      },
-    ],
-  });
-
-  expect(result.kind).toBe("error");
-  expect(result.error?.errorType).toBe("InvalidInput");
-  expect(result.error?.message).toContain("users[0].posts[0].authorId");
-  expect(db.execute).toHaveBeenCalledWith("rollback");
-});
-
-test("seed rolls back when an insert fails", async () => {
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "rollback") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "name" },
-            { name: "authorId" },
-            { name: "title" },
-          ],
-        };
-      }
-      if (statement === "commit") {
-        throw new Error("should not commit");
-      }
-      if (statement.sql.includes('"users"')) {
-        return { rows: [{ id: 10, name: "Fred" }] };
-      }
-      throw new Error("post insert failed");
-    }),
-  };
-
-  const result = await seed(db as any, userPostSchema(), {
-    users: [{ name: "Fred", posts: [{ title: "First" }] }],
-  });
-
-  expect(result.kind).toBe("error");
-  expect(result.error?.errorType).toBe("DatabaseError");
-  expect(result.error?.message).toContain("post insert failed");
-  expect(db.execute).toHaveBeenCalledWith("rollback");
-});
-
-test("seed serializes json columns and flattens constructed type columns", async () => {
-  const inserts: any[] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "commit") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return {
-          rows: [
-            { name: "id" },
-            { name: "state" },
-            { name: "placement" },
-            { name: "placement__x" },
-            { name: "placement__y" },
-            { name: "placement__scale" },
-          ],
-        };
-      }
-      inserts.push(statement);
-      return {
-        rows: [
-          {
-            id: 1,
-            state: statement.args.seed_0,
-            placement: statement.args.seed_1,
-            placement__x: statement.args.seed_2,
-            placement__y: statement.args.seed_3,
-            placement__scale: statement.args.seed_4,
-          },
-        ],
-      };
-    }),
-  };
-
-  const result = await seed(db as any, jsonAndConstructedSchema(), {
-    tokens: [
-      {
-        state: {
-          groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
-          clocks: [],
-        },
-        placement: {
-          _type: "MapEntityWorldPlacement",
-          x: 10,
-          y: 20,
-          scale: 100,
-        },
-      },
-    ],
-  });
-
-  expect(inserts[0].args.seed_0).toBe(
-    JSON.stringify({
-      groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
-      clocks: [],
-    }),
-  );
-  expect(inserts[0].args.seed_1).toBe("MapEntityWorldPlacement");
-  expect(inserts[0].args.seed_2).toBe(10);
-  expect(inserts[0].args.seed_3).toBe(20);
-  expect(inserts[0].args.seed_4).toBe(100);
-  expect(result).toEqual({
-    kind: "success",
-    response: {
-      tokens: [
-        {
-          id: 1,
-          state: {
-            groups: [{ _type: "GroupState", id: "party", members: ["a"] }],
-            clocks: [],
-          },
-          placement: {
-            _type: "MapEntityWorldPlacement",
-            scale: 100,
-            x: 10,
-            y: 20,
-          },
-        },
-      ],
-    },
-  });
-});
-
-test("seed rejects legacy constructed discriminators", async () => {
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "rollback") {
-        return { rows: [] };
-      }
-      throw new Error("should not insert");
-    }),
-  };
-
-  const result = await seed(db as any, jsonAndConstructedSchema(), {
-    tokens: [
-      {
-        placement: {
-          type: "MapEntityWorldPlacement",
-          x: 10,
-          y: 20,
-          scale: 100,
-        } as any,
-      },
-    ],
-  });
-
-  expect(result.kind).toBe("error");
-  expect(result.error?.errorType).toBe("InvalidInput");
-  expect(result.error?.message).toContain("use '_type'");
-  expect(db.execute).toHaveBeenCalledWith("rollback");
-});
-
-test("seed validates columns with generated validators when provided", async () => {
-  const db = {
-    execute: mock(async (statement: any) => {
-      if (statement === "begin" || statement === "rollback") {
-        return { rows: [] };
-      }
-      throw new Error("should not insert");
-    }),
-  };
-
-  const result = await seed(
-    db as any,
-    jsonAndConstructedSchema(),
-    {
-      tokens: [
-        {
-          placement: {
-            _type: "MapEntityWorldPlacement",
-            x: "bad",
-            y: 20,
-            scale: 100,
-          } as any,
-        },
-      ],
-    },
-    {
-      tokens: {
-        placement: z.discriminatedUnion("_type", [
-          z.object({
-            _type: z.literal("MapEntityWorldPlacement"),
-            x: z.number(),
-            y: z.number(),
-            scale: z.number(),
-          }),
-        ]),
-      },
-    },
-  );
-
-  expect(result.kind).toBe("error");
-  expect(result.error?.errorType).toBe("InvalidInput");
-  expect(result.error?.message).toContain("tokens[0].placement");
-  expect(db.execute).toHaveBeenCalledWith("rollback");
-});
-
-test("seed uses transformed validator values", async () => {
-  const executed: any[] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      executed.push(statement);
-      if (statement === "begin" || statement === "commit") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return { rows: [{ name: "id" }, { name: "startedAt" }] };
-      }
-      return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
-    }),
-  };
-
-  const result = await seed(
-    db as any,
-    eventSchema(),
-    { events: [{ startedAt: "1783787812" }] },
-    {
-      events: {
-        startedAt: z
-          .string()
-          .transform((value) => new Date(Number(value) * 1000)),
-      },
-    },
-  );
-
-  expect(result.kind).toBe("success");
-  expect(executed).toContainEqual({
-    sql: 'insert into "events" ("startedAt") values ($seed_0) returning *',
-    args: { seed_0: 1783787812 },
-  });
-});
-
-test("seed serializes DateTime columns as unix seconds", async () => {
-  const executed: any[] = [];
-  const db = {
-    execute: mock(async (statement: any) => {
-      executed.push(statement);
-      if (statement === "begin" || statement === "commit") {
-        return { rows: [] };
-      }
-      if (
-        typeof statement === "string" &&
-        statement.startsWith("pragma table_info")
-      ) {
-        return { rows: [{ name: "id" }, { name: "startedAt" }] };
-      }
-      if (statement.sql.includes('"events"')) {
-        return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
-      }
-      throw new Error("unexpected statement");
-    }),
-  };
-
-  const result = await seed(db as any, eventSchema(), {
-    events: [{ startedAt: "2026-07-11T16:36:52.000Z" }],
-  });
-
-  expect(result.kind).toBe("success");
-  expect(executed).toContainEqual({
-    sql: 'insert into "events" ("startedAt") values ($seed_0) returning *',
-    args: { seed_0: 1783787812 },
-  });
-});
-
-test("seed accepts canonical DateTime forms and rejects noncanonical values", async () => {
-  const accepted = [
-    new Date("2026-07-11T16:36:52.999Z"),
-    1783787812,
-    "1783787812",
-    "2026-07-11T16:36:52.999Z",
-    "2026-07-11T18:36:52.999+02:00",
-  ];
-
-  for (const startedAt of accepted) {
-    const db = {
-      execute: mock(async (statement: any) => {
-        if (statement === "begin" || statement === "commit")
-          return { rows: [] };
-        if (
-          typeof statement === "string" &&
-          statement.startsWith("pragma table_info")
-        ) {
-          return { rows: [{ name: "id" }, { name: "startedAt" }] };
-        }
-        return { rows: [{ id: 1, startedAt: statement.args.seed_0 }] };
-      }),
-    };
-    const result = await seed(db as any, eventSchema(), {
-      events: [{ startedAt }],
-    });
-    expect(result.kind).toBe("success");
-  }
-
-  for (const startedAt of [
-    1783787812.5,
-    "1783787812.5",
-    "2026-07-11",
-    "July 11, 2026",
-    "2026-02-30T00:00:00Z",
-  ]) {
-    const db = { execute: mock(async () => ({ rows: [] })) };
-    const result = await seed(db as any, eventSchema(), {
-      events: [{ startedAt }],
-    });
-    expect(result.kind).toBe("error");
-    expect(result.error?.errorType).toBe("InvalidInput");
-  }
-});
-
-function userPostSchema(): SchemaMetadata {
-  return {
-    tables: {
-      users: {
-        name: "users",
-        columns: [
-          {
-            name: "id",
-            type: "Int",
-            nullable: false,
-            primary: true,
-            unique: true,
-            indexed: true,
-          },
-          {
-            name: "name",
-            type: "String",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-        ],
-        links: {
-          posts: {
-            type: "one-to-many",
-            from: "id",
-            to: { table: "posts", column: "authorId" },
-          },
-        },
-        indices: [],
-      },
-      posts: {
-        name: "posts",
-        columns: [
-          {
-            name: "id",
-            type: "Int",
-            nullable: false,
-            primary: true,
-            unique: true,
-            indexed: true,
-          },
-          {
-            name: "authorId",
-            type: "Int",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-          {
-            name: "title",
-            type: "String",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-        ],
-        links: {},
-        indices: [],
-      },
-    },
-    queryFieldToTable: {},
-  };
-}
-
-function eventSchema(): SchemaMetadata {
-  return {
-    tables: {
-      events: {
-        name: "events",
-        columns: [
-          {
-            name: "id",
-            type: "Int",
-            nullable: false,
-            primary: true,
-            unique: true,
-            indexed: true,
-          },
-          {
-            name: "startedAt",
-            type: "DateTime",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-        ],
-        links: {},
-        indices: [],
-      },
-    },
-    queryFieldToTable: {},
-  };
-}
-
-function jsonAndConstructedSchema(): SchemaMetadata {
-  return {
-    tables: {
-      tokens: {
-        name: "tokens",
-        columns: [
-          {
-            name: "id",
-            type: "Int",
-            nullable: false,
-            primary: true,
-            unique: true,
-            indexed: true,
-          },
-          {
-            name: "state",
-            type: "Json<GameState>",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-          {
-            name: "placement",
-            type: "MapEntityPlacement",
-            nullable: false,
-            primary: false,
-            unique: false,
-            indexed: false,
-          },
-        ],
-        links: {},
-        indices: [],
-      },
-    },
-    queryFieldToTable: {},
-  };
-}

@@ -61,7 +61,7 @@ metadata Json<Dict<String>>
 
 Pyre stores `Json<T>` values in SQLite as `BLOB`, using SQLite's JSONB representation for persisted document data.
 
-`JSON` remains available as an escape hatch for untyped raw JSON values. Unlike `Json<T>`, raw `JSON` does not guarantee a validated schema shape.
+Bare `Json` (also spelled `JSON`) is an escape hatch for opaque JSON values. Pyre guarantees valid JSON but does not validate its shape. Opaque JSON fields cannot be compared in query or permission predicates. Prefer `Json<T>` when the document shape is known.
 
 **Container Types:**
 - `List<T>` - Ordered JSON array of values of type `T`

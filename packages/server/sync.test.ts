@@ -101,8 +101,8 @@ function initializationDatabase(initialized: boolean, introspection: any) {
   const tx = {
     execute: mock(async (sql: string) => {
       if (typeof sql !== "string") return { rows: [] };
-      if (sql.startsWith("pragma table_info")) return { rows: [{ name: "schema_namespace" }] };
-      if (sql.startsWith("select name from sqlite_master")) return { rows: [] };
+      if (sql.startsWith("pragma main.table_info")) return { rows: [{ name: "schema_namespace" }] };
+      if (sql.startsWith("select name from main.sqlite_master")) return { rows: [] };
       if (sql.startsWith("select schema_namespace")) return { rows: [{ schema_namespace: introspection.schema_namespace ?? null }] };
       if (sql.includes("is_initialized")) {
         return { rows: [{ is_initialized: initialized ? 1 : 0 }] };
@@ -192,7 +192,7 @@ test("catchup activates the schema loaded for its databaseId", async () => {
       commit: async () => {}, rollback: async () => {}, close() {}, closed: false,
     })),
     execute: mock(async (sql: string) => {
-      if (sql.startsWith("pragma table_info") || sql.startsWith("select name from sqlite_master")) return { rows: [] };
+      if (sql.startsWith("pragma main.table_info") || sql.startsWith("select name from main.sqlite_master")) return { rows: [] };
       if (sql.includes("is_initialized")) {
         return { rows: [{ is_initialized: 1 }] };
       }
@@ -280,7 +280,7 @@ test("catchup stamps response with databaseId when provided", async () => {
       commit: async () => {}, rollback: async () => {}, close() {}, closed: false,
     })),
     execute: mock(async (sql: string) => {
-      if (sql.startsWith("pragma table_info") || sql.startsWith("select name from sqlite_master")) return { rows: [] };
+      if (sql.startsWith("pragma main.table_info") || sql.startsWith("select name from main.sqlite_master")) return { rows: [] };
       if (sql.includes("is_initialized")) {
         return { rows: [{ is_initialized: 1 }] };
       }

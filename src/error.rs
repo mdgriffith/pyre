@@ -180,6 +180,9 @@ pub enum ErrorType {
     WhereOnLinkIsntAllowed {
         link_name: String,
     },
+    OpaqueJsonComparison {
+        field: String,
+    },
     InvalidRelationalPermission {
         message: String,
     },
@@ -1444,6 +1447,10 @@ pub fn to_error_description(error: &Error, in_color: bool) -> String {
 
             result
         }
+        ErrorType::OpaqueJsonComparison { field } => format!(
+            "'{}' is opaque Json and cannot be compared. Use Json<T> for a validated document or a typed column for values you need to filter on.",
+            field
+        ),
         ErrorType::InvalidRelationalPermission { message }
         | ErrorType::InvalidPermissionPredicate { message } => message.clone(),
         ErrorType::SyncedRelationalQueryPermission => "Linked query permissions require a query-only namespace until dependency invalidation and permission revocation are supported.".to_string(),
@@ -1688,6 +1695,7 @@ pub fn to_error_title(error_type: &ErrorType) -> String {
         ErrorType::MultipleLimits { .. } => "Multiple Limits",
         ErrorType::MultipleWheres { .. } => "Multiple Wheres",
         ErrorType::WhereOnLinkIsntAllowed { .. } => "Where On Link Not Allowed",
+        ErrorType::OpaqueJsonComparison { .. } => "Opaque Json Comparison",
         ErrorType::InvalidRelationalPermission { .. } => "Invalid Relational Permission",
         ErrorType::InvalidPermissionPredicate { .. } => "Invalid Permission Predicate",
         ErrorType::SyncedRelationalQueryPermission => {

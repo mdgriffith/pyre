@@ -1,0 +1,10 @@
+@syncable(false)
+type Payload
+    = Payload { count Int }
+
+record Entry {
+    id Id.Int @id
+    payload Json<Payload>
+    groups Json<Dict<List<Payload?>>>
+    @public
+}

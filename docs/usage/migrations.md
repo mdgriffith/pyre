@@ -17,6 +17,8 @@ Checked-in SQL migrations for teams and deployments:
   pyre migrate <database>
 ```
 
+Use checked-in migrations to retain data in preserved databases. Create throwaway local, demo, or CI targets with `pyre db init <database> --disposable` and rebuild them with `pyre db reset` or `pyre db reseed`. Reseed discards the old rows, starts a new sync epoch, and loads fixtures after reset commits. It is an explicit setup operation; a failed migration does not trigger it. See [database policy and reseed](./seeding.md#database-policy) for copy/restore and maintenance guidance.
+
 ## Direct Push Workflow
 
 `--push` is the fastest way to get a local database in sync with the current schema:

@@ -21,7 +21,7 @@ pub const GET_SCHEMA: &str = "SELECT schema FROM _pyre_migrations WHERE finished
 pub const IS_INITIALIZED: &str = r#"
 SELECT 
   CASE 
-    WHEN EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='_pyre_migrations')
+    WHEN EXISTS (SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='_pyre_migrations')
     THEN 1
     ELSE 0
   END as is_initialized
@@ -33,9 +33,9 @@ WITH RECURSIVE
   -- Get all tables except system tables
   all_tables AS (
     SELECT name 
-    FROM sqlite_master 
+    FROM main.sqlite_master
     WHERE type='table' 
-    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync', '_pyre_external_identities')
+    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync', '_pyre_external_identities', '_pyre_database_policy')
   ),
   -- Get table info for each table
   table_info AS (
@@ -52,7 +52,7 @@ WITH RECURSIVE
         )
       ) as columns_json
     FROM all_tables t
-    CROSS JOIN pragma_table_info(t.name) c
+    CROSS JOIN temp.pragma_table_info(t.name, 'main') c
     GROUP BY t.name
   ),
   -- Get foreign key info for each table
@@ -72,7 +72,7 @@ WITH RECURSIVE
         )
       ) as fks_json
     FROM all_tables t
-    CROSS JOIN pragma_foreign_key_list(t.name) f
+    CROSS JOIN temp.pragma_foreign_key_list(t.name, 'main') f
     GROUP BY t.name
   ),
   -- Get index columns for each table/index
@@ -92,8 +92,8 @@ WITH RECURSIVE
         ELSE 0
       END as is_expression
     FROM all_tables t
-    CROSS JOIN pragma_index_list(t.name) il
-    CROSS JOIN pragma_index_xinfo(il.name) ix
+    CROSS JOIN temp.pragma_index_list(t.name, 'main') il
+    CROSS JOIN temp.pragma_index_xinfo(il.name, 'main') ix
     WHERE il.origin != 'pk'
       AND ix.key = 1
       AND (ix.name IS NOT NULL OR il.name = 'uniq_' || t.name || '_singleton')
@@ -132,14 +132,14 @@ WITH RECURSIVE
         )
       ) as indexes_json
     FROM index_defs d
-    LEFT JOIN sqlite_master sm ON sm.type='index' AND sm.name = d.index_name
+    LEFT JOIN main.sqlite_master sm ON sm.type='index' AND sm.name = d.index_name
     GROUP BY d.table_name
   ),
   -- Get migration state
   migration_state AS (
     SELECT 
       CASE 
-        WHEN EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='_pyre_migrations') THEN
+        WHEN EXISTS (SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='_pyre_migrations') THEN
           jsonb_object(
             'MigrationTable',
             jsonb_object(
@@ -151,7 +151,7 @@ WITH RECURSIVE
           )
         ELSE jsonb('{"NoMigrationTable": null}')
       END as state_json
-    FROM _pyre_migrations
+    FROM main._pyre_migrations
   )
 SELECT json_object(
   'tables',
@@ -165,7 +165,7 @@ SELECT json_object(
   ),
   'migration_state', json((SELECT state_json FROM migration_state)),
   'schema_source', COALESCE(
-    (SELECT schema FROM _pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL AND schema IS NOT NULL ORDER BY id DESC LIMIT 1),
+    (SELECT schema FROM main._pyre_migrations WHERE finished_at IS NOT NULL AND error IS NULL AND schema IS NOT NULL ORDER BY id DESC LIMIT 1),
     ''
   ),
   'links', jsonb('[]')
@@ -183,9 +183,9 @@ WITH RECURSIVE
   -- Get all tables except system tables
   all_tables AS (
     SELECT name 
-    FROM sqlite_master 
+    FROM main.sqlite_master
     WHERE type='table' 
-    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync', '_pyre_external_identities')
+    AND name NOT IN ('sqlite_sequence', '_pyre_migrations', '_pyre_sync', '_pyre_external_identities', '_pyre_database_policy')
   ),
   -- Get table info for each table
   table_info AS (
@@ -202,7 +202,7 @@ WITH RECURSIVE
         )
       ) as columns_json
     FROM all_tables t
-    CROSS JOIN pragma_table_info(t.name) c
+    CROSS JOIN temp.pragma_table_info(t.name, 'main') c
     GROUP BY t.name
   ),
   -- Get foreign key info for each table
@@ -222,7 +222,7 @@ WITH RECURSIVE
         )
       ) as fks_json
     FROM all_tables t
-    CROSS JOIN pragma_foreign_key_list(t.name) f
+    CROSS JOIN temp.pragma_foreign_key_list(t.name, 'main') f
     GROUP BY t.name
   ),
   -- Get index columns for each table/index
@@ -242,8 +242,8 @@ WITH RECURSIVE
         ELSE 0
       END as is_expression
     FROM all_tables t
-    CROSS JOIN pragma_index_list(t.name) il
-    CROSS JOIN pragma_index_xinfo(il.name) ix
+    CROSS JOIN temp.pragma_index_list(t.name, 'main') il
+    CROSS JOIN temp.pragma_index_xinfo(il.name, 'main') ix
     WHERE il.origin != 'pk'
       AND ix.key = 1
       AND (ix.name IS NOT NULL OR il.name = 'uniq_' || t.name || '_singleton')
@@ -282,7 +282,7 @@ WITH RECURSIVE
         )
       ) as indexes_json
     FROM index_defs d
-    LEFT JOIN sqlite_master sm ON sm.type='index' AND sm.name = d.index_name
+    LEFT JOIN main.sqlite_master sm ON sm.type='index' AND sm.name = d.index_name
     GROUP BY d.table_name
   )
 SELECT json_object(
@@ -372,9 +372,9 @@ pub async fn load_metadata(
     conn: &libsql::Connection,
     raw: &mut IntrospectionRaw,
 ) -> Result<(), libsql::Error> {
-    let mut tables = conn.query("select name from sqlite_master where type = 'table' and name = '_pyre_external_identities'", ()).await?;
+    let mut tables = conn.query("select name from main.sqlite_master where type = 'table' and name = '_pyre_external_identities'", ()).await?;
     if tables.next().await?.is_some() {
-        let mut rows = conn.query("select namespace, record_name, field_name, identity_kind from _pyre_external_identities order by namespace, record_name, field_name", ()).await?;
+        let mut rows = conn.query("select namespace, record_name, field_name, identity_kind from main._pyre_external_identities order by namespace, record_name, field_name", ()).await?;
         while let Some(row) = rows.next().await? {
             let kind: String = row.get(3)?;
             let kind = match kind.as_str() {
@@ -398,9 +398,9 @@ pub async fn load_namespace(
     conn: &libsql::Connection,
     raw: &mut IntrospectionRaw,
 ) -> Result<(), libsql::Error> {
-    let mut columns = conn.query("select name from pragma_table_info('_pyre_migrations') where name = 'schema_namespace'", ()).await?;
+    let mut columns = conn.query("select name from temp.pragma_table_info('_pyre_migrations', 'main') where name = 'schema_namespace'", ()).await?;
     if columns.next().await?.is_some() {
-        let mut rows = conn.query("select schema_namespace from _pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1", ()).await?;
+        let mut rows = conn.query("select schema_namespace from main._pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1", ()).await?;
         if let Some(row) = rows.next().await? {
             raw.schema_namespace = row.get(0)?;
         }

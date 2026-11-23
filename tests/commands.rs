@@ -93,6 +93,703 @@ fn docs_lists_topics() {
 }
 
 #[test]
+fn db_seed_requires_existing_database_and_runs_the_conformance_fixture() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        include_str!("fixtures/seed/schema.pyre"),
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("fixtures.json"),
+        include_str!("fixtures/seed/input.json"),
+    )
+    .unwrap();
+    let seed = || {
+        let mut cmd = ctx.run_command("db");
+        cmd.args(["seed", "$TEST_DB", "--fixtures", "fixtures.json"])
+            .env("TEST_DB", "fixture.db");
+        cmd
+    };
+    seed().assert().failure();
+    assert!(!ctx.workspace_path.join("fixture.db").exists());
+
+    ctx.run_command("migrate")
+        .args(["fixture.db", "--push"])
+        .assert()
+        .success();
+    let output = seed().assert().success();
+    let actual: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/seed/expected.json")).unwrap();
+    assert_eq!(actual, expected);
+    seed()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("posts[0]"));
+}
+
+#[tokio::test]
+async fn db_seed_keeps_fixture_file_order_for_flat_foreign_keys() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        "@syncable(false)\nrecord Zebra {\n id Id.Int @id\n @public\n}\nrecord Ant {\n id Id.Int @id\n parentId Zebra.id\n @public\n}\n",
+    )
+    .unwrap();
+    ctx.run_command("db")
+        .args(["init", "app.db", "--disposable"])
+        .assert()
+        .success();
+    let db = libsql::Builder::new_local(ctx.workspace_path.join("app.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch("drop table ants; create table ants (id integer primary key, parentId integer not null references zebras(id), updatedAt integer default 0);").await.unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("fixtures.json"),
+        r#"{"zebras":[{"id":22}],"ants":[{"id":1,"parentId":22}]}"#,
+    )
+    .unwrap();
+    ctx.run_command("db")
+        .args(["seed", "app.db", "--fixtures", "fixtures.json"])
+        .assert()
+        .success();
+    let row = conn
+        .query("select parentId from ants where id = 1", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 22);
+}
+
+#[tokio::test]
+async fn db_remote_reset_and_reseed_through_hrana() {
+    let Ok(url) = std::env::var("PYRE_TEST_SQLD_URL") else {
+        return; // CI also runs this test against an isolated, empty libSQL server.
+    };
+    let ctx = TestContext::new();
+    let schema = include_str!("fixtures/seed/schema.pyre");
+    let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
+    std::fs::write(&schema_path, schema).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("fixtures.json"),
+        include_str!("fixtures/seed/input.json"),
+    )
+    .unwrap();
+    let cycles = include_str!("fixtures/seed/reset-cycles.sql");
+    std::fs::write(ctx.workspace_path.join("cycles.sql"), cycles).unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("expected.json"),
+        include_str!("fixtures/seed/expected.json"),
+    )
+    .unwrap();
+
+    let command = |operation: &str| {
+        let mut cmd = ctx.run_command("db");
+        cmd.args([operation, &url, "--auth", ""]);
+        cmd
+    };
+    command("init").arg("--disposable").assert().success();
+    let db = libsql::Builder::new_remote(url.clone(), String::new())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let scalar = |sql: &'static str| {
+        let conn = conn.clone();
+        async move {
+            conn.query(sql, ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let epoch_sql = "select database_epoch from _pyre_sync";
+    let old_epoch: String = scalar(epoch_sql).await.get(0).unwrap();
+    conn.execute_batch(cycles).await.unwrap();
+    assert_eq!(
+        scalar("pragma foreign_keys").await.get::<i64>(0).unwrap(),
+        1
+    );
+    assert_eq!(
+        scalar("select count(*) from pragma_foreign_key_check")
+            .await
+            .get::<i64>(0)
+            .unwrap(),
+        0
+    );
+
+    std::fs::write(
+        &schema_path,
+        schema.replace(
+            "record User {",
+            "record User {\n    @tablename(\"sqlite_reserved_example\")",
+        ),
+    )
+    .unwrap();
+    command("reset")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reserved"));
+    assert_eq!(scalar(epoch_sql).await.get::<String>(0).unwrap(), old_epoch);
+    assert_eq!(
+        scalar("select count(*) from cycle_x")
+            .await
+            .get::<i64>(0)
+            .unwrap(),
+        1
+    );
+
+    std::fs::write(schema_path, schema).unwrap();
+    let seeded = command("reseed")
+        .args(["--fixtures", "fixtures.json"])
+        .assert()
+        .success();
+    let actual: serde_json::Value = serde_json::from_slice(&seeded.get_output().stdout).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/seed/expected.json")).unwrap();
+    assert_eq!(actual, expected);
+    assert_ne!(scalar(epoch_sql).await.get::<String>(0).unwrap(), old_epoch);
+    assert_eq!(scalar("select count(*) from main.sqlite_schema where name glob 'cycle_*' or name glob 'pragma_*' or name = 'self_ref'").await.get::<i64>(0).unwrap(), 0);
+    assert_eq!(
+        scalar("pragma foreign_keys").await.get::<i64>(0).unwrap(),
+        1
+    );
+
+    ensure_workspace_node_modules(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "remote-reset.ts",
+        include_str!("fixtures/seed/remote-reset.ts"),
+        "remote-reset-ok",
+        "remote TypeScript reset and reseed",
+    );
+}
+
+#[tokio::test]
+async fn db_policy_is_shared_and_independent_of_schema_changes() {
+    use pyre::db::policy::{self, Policy};
+    let ctx = TestContext::new();
+    write_clocktower_schema(&ctx, "record Note {\n id Id.Uuid @id\n @public\n}\n");
+    let other_schema = ctx.workspace_path.join("pyre/schema/Other");
+    std::fs::create_dir_all(&other_schema).unwrap();
+    std::fs::write(
+        other_schema.join("schema.pyre"),
+        "record Other {\n id Id.Uuid @id\n @public\n}\n",
+    )
+    .unwrap();
+    let command = |path: &str, namespace: &str| {
+        let mut cmd = ctx.run_command("db");
+        cmd.args(["policy", path, "--namespace", namespace]);
+        cmd
+    };
+    command("missing.db", "Clocktower").assert().failure();
+    assert!(!ctx.workspace_path.join("missing.db").exists());
+    ctx.run_command("migrate")
+        .args(["app.db", "--namespace", "Clocktower", "--push"])
+        .assert()
+        .success();
+    let open = |name| libsql::Builder::new_local(ctx.workspace_path.join(name));
+    let db = open("app.db").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "insert into notes (id) values ('00000000-0000-4000-8000-000000000001')",
+        (),
+    )
+    .await
+    .unwrap();
+
+    command("app.db", "Clocktower")
+        .assert()
+        .success()
+        .stdout("preserved\n");
+    assert!(conn
+        .query(policy::FIND, ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_none());
+    command("app.db", "Other")
+        .args(["--set", "disposable"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("found 'Clocktower'"));
+    command("app.db", "Clocktower")
+        .args(["--set", "disposable"])
+        .assert()
+        .success()
+        .stdout("disposable\n");
+    assert_eq!(
+        policy::inspect(&conn, Some("Clocktower")).await.unwrap(),
+        Policy::Disposable
+    );
+    let mut rows = conn.query("select count(*) from notes", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1
+    );
+    drop(rows);
+    let other = open("other.db").build().await.unwrap();
+    let other_conn = other.connect().unwrap();
+    other_conn
+        .execute("create table unrelated (id integer)", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        policy::inspect(&other_conn, None).await.unwrap(),
+        Policy::Preserved
+    );
+
+    ensure_workspace_node_modules(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "policy.ts",
+        r#"
+import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
+import { init } from '@pyre/server/wasm';
+import { inspectDatabasePolicy, setDatabaseDisposable } from '@pyre/server/schema';
+await init();
+const app = createClient({ url: 'file:app.db' });
+assert.equal(await inspectDatabasePolicy(app, 'Clocktower'), 'disposable');
+await assert.rejects(inspectDatabasePolicy(app, 'Other'), /found 'Clocktower'/);
+const other = createClient({ url: 'file:other.db' });
+assert.equal(await inspectDatabasePolicy(other), 'preserved');
+assert.equal(await setDatabaseDisposable(other), 'disposable');
+assert.equal((await other.execute('select name from sqlite_schema where type = \'table\' order by name')).rows.map(row => row.name).join(), '_pyre_database_policy,unrelated');
+await app.execute('delete from _pyre_database_policy');
+await assert.rejects(inspectDatabasePolicy(app), /Malformed database policy metadata/);
+console.log('database-policy-ok');
+"#,
+        "database-policy-ok",
+        "shared TypeScript database policy",
+    );
+
+    command("other.db", "Clocktower")
+        .assert()
+        .success()
+        .stdout("disposable\n");
+    command("app.db", "Clocktower")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Malformed database policy metadata",
+        ));
+    assert!(matches!(
+        policy::set_disposable(&conn, None).await,
+        Err(policy::Error::Malformed)
+    ));
+    conn.execute_batch("drop table _pyre_database_policy; create view _pyre_database_policy as select 1 as id, 'disposable' as policy;").await.unwrap();
+    assert!(matches!(
+        policy::inspect(&conn, None).await,
+        Err(policy::Error::Malformed)
+    ));
+}
+
+#[tokio::test]
+async fn db_disposable_init_and_reset_replace_lineage_atomically() {
+    use pyre::db::lifecycle;
+    let ctx = TestContext::new();
+    let source = "record Note {\n id Id.Uuid @id\n @public\n}\n";
+    let schema_path = ctx.workspace_path.join("pyre/schema.pyre");
+    std::fs::write(&schema_path, source).unwrap();
+    let command = |operation: &str, path: &str| {
+        let mut cmd = ctx.run_command("db");
+        cmd.args([operation, path]);
+        cmd
+    };
+    command("reset", "missing.db").assert().failure();
+    assert!(!ctx.workspace_path.join("missing.db").exists());
+    command("init", "app.db")
+        .arg("--disposable")
+        .assert()
+        .success();
+    command("init", "app.db")
+        .arg("--disposable")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires an empty database"));
+    let db = libsql::Builder::new_local(ctx.workspace_path.join("app.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        r#"
+        pragma foreign_keys=on;
+        insert into notes (id) values ('00000000-0000-4000-8000-000000000001');
+        update _pyre_sync set server_revision = 17;
+        create table "A""stale" (id integer primary key autoincrement);
+        create table "Z-child" (ref integer not null references "A""stale"(id) on delete restrict);
+        create index stale_idx on "Z-child" (ref);
+        create view stale_view as select * from "Z-child";
+        create trigger stale_trigger after insert on "Z-child" begin select 1; end;
+        insert into "A""stale" default values;
+        insert into "Z-child" values (1);
+    "#,
+    )
+    .await
+    .unwrap();
+    conn.execute_batch(include_str!("fixtures/seed/reset-cycles.sql"))
+        .await
+        .unwrap();
+    assert!(conn
+        .query("pragma foreign_key_check", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_none());
+    let state = |conn: libsql::Connection| async move {
+        let row = conn
+            .query("select database_epoch, server_revision from _pyre_sync", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        (row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap())
+    };
+    let old = state(conn.clone()).await;
+    let invalid = source.replace(
+        "id Id.Uuid",
+        "@tablename(\"sqlite_reserved_example\")\n id Id.Uuid",
+    );
+    assert!(matches!(
+        lifecycle::reset(&db, "_default", &invalid, &[]).await,
+        Err(lifecycle::Error::Database(_))
+    ));
+    assert_eq!(state(conn.clone()).await, old);
+    let row = conn
+        .query("select ref from stale_view", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    drop(row);
+
+    lifecycle::reset(&db, "_default", source, &[])
+        .await
+        .unwrap();
+    let fresh = state(conn.clone()).await;
+    assert_ne!(old.0, fresh.0);
+    assert_eq!(fresh.1, 0);
+    let row = conn.query("select count(*) from main.sqlite_schema where name in ('A\"stale', 'Z-child', 'stale_idx', 'stale_view', 'stale_trigger', 'self_ref') or name glob 'cycle_*' or name glob 'pragma_*'", ()).await.unwrap().next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+    drop(row);
+    for (pragma, expected) in [("foreign_keys", 1), ("defer_foreign_keys", 0)] {
+        let row = conn
+            .query(&format!("pragma {pragma}"), ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), expected);
+    }
+
+    let preserved = libsql::Builder::new_local(ctx.workspace_path.join("preserved.db"))
+        .build()
+        .await
+        .unwrap();
+    let pc = preserved.connect().unwrap();
+    pc.execute("create view keep_me as select 1", ())
+        .await
+        .unwrap();
+    command("reset", "preserved.db")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires an existing disposable database",
+        ));
+    command("init", "preserved.db")
+        .arg("--disposable")
+        .assert()
+        .failure();
+    assert!(pc
+        .query("select * from keep_me", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_some());
+
+    ensure_workspace_node_modules(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "reset.ts",
+        r#"
+import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
+import { init } from '@pyre/server/wasm';
+import { DatabaseOutcomeUnknown, initDisposableDatabase, inspectDatabasePolicy, loadSchemaFromDatabase, resetDatabase } from '@pyre/server/schema';
+import { catchup } from '@pyre/server/sync';
+await init();
+const source = await Bun.file('pyre/schema.pyre').text();
+const app = createClient({ url: 'file:app.db' });
+const stamp = async () => (await app.execute('select database_epoch, server_revision from _pyre_sync')).rows[0];
+const old = await stamp();
+await resetDatabase(app, '_default', source);
+const current = await stamp();
+assert.notEqual(old.database_epoch, current.database_epoch);
+assert.equal(current.server_revision, 0);
+assert.equal(await inspectDatabasePolicy(app), 'disposable');
+await loadSchemaFromDatabase('app', app);
+assert.deepEqual(await catchup(app, { tables: {} }, {}, 100, 'app', old.database_epoch), {
+  type: 'reset', databaseId: 'app', databaseEpoch: current.database_epoch,
+  operation: 'replace', scope: 'database', reason: 'database_epoch_changed',
+});
+const created = createClient({ url: 'file:ts-init.db' });
+await initDisposableDatabase(created, '_default', source);
+assert.equal(await inspectDatabasePolicy(created), 'disposable');
+const beforeInvalid = (await created.execute('select database_epoch from _pyre_sync')).rows[0].database_epoch;
+const invalid = source.replace('record Note {', 'record Note {\n @tablename("sqlite_reserved_example")');
+await assert.rejects(resetDatabase(created, '_default', invalid), DatabaseOutcomeUnknown);
+assert.equal((await created.execute('select database_epoch from _pyre_sync')).rows[0].database_epoch, beforeInvalid);
+assert.equal((await created.execute('pragma foreign_keys')).rows[0].foreign_keys, 1);
+console.log('disposable-reset-ok');
+"#,
+        "disposable-reset-ok",
+        "TypeScript disposable database lifecycle",
+    );
+    command("reset", "ts-init.db").assert().success();
+
+    let rows = conn
+        .query("select name from _pyre_migrations", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows.get::<String>(0).unwrap(), "disposable:working");
+}
+
+async fn reseed_state(conn: &libsql::Connection) -> (String, i64, i64, i64) {
+    let row = conn
+        .query(
+            "select database_epoch, server_revision, (select count(*) from users), (select count(*) from posts) from _pyre_sync",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        row.get(0).unwrap(),
+        row.get(1).unwrap(),
+        row.get(2).unwrap(),
+        row.get(3).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn db_reseed_cli_commits_reset_before_reading_fixtures_and_rolls_back_seed() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        include_str!("fixtures/seed/schema.pyre"),
+    )
+    .unwrap();
+    let fixtures = ctx.workspace_path.join("fixtures.json");
+    let reseed = |name: &str| {
+        let mut cmd = ctx.run_command("db");
+        cmd.args(["reseed", name, "--fixtures", "fixtures.json"]);
+        cmd
+    };
+    reseed("missing.db").assert().failure();
+    assert!(!ctx.workspace_path.join("missing.db").exists());
+    ctx.run_command("migrate")
+        .args(["app.db", "--push"])
+        .assert()
+        .success();
+
+    let db = libsql::Builder::new_local(ctx.workspace_path.join("app.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch("insert into users (name) values ('Keep until reset'); update _pyre_sync set server_revision = 9;").await.unwrap();
+    let old = reseed_state(&conn).await;
+    reseed("app.db")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "Reset requires an existing disposable database",
+        ))
+        .stderr(predicate::str::contains("Could not read fixtures").not());
+    assert_eq!(reseed_state(&conn).await, old);
+    ctx.run_command("db")
+        .args(["policy", "app.db", "--set", "disposable"])
+        .assert()
+        .success();
+
+    std::fs::write(&fixtures, "{").unwrap();
+    reseed("app.db")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("Invalid fixture JSON"))
+        .stderr(predicate::str::contains(
+            "fresh initialized schema and no fixture rows",
+        ))
+        .stderr(predicate::str::contains("rerun reseed from the beginning"));
+    let empty = reseed_state(&conn).await;
+    assert_ne!(empty.0, old.0);
+    assert_eq!((empty.1, empty.2, empty.3), (0, 0, 0));
+
+    std::fs::write(&fixtures, r#"{"users":[{"id":1},{"id":1}]}"#).unwrap();
+    reseed("app.db")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("users[1]"))
+        .stderr(predicate::str::contains(
+            "fresh initialized schema and no fixture rows",
+        ));
+    let rolled_back = reseed_state(&conn).await;
+    assert_ne!(rolled_back.0, empty.0);
+    assert_eq!((rolled_back.1, rolled_back.2, rolled_back.3), (0, 0, 0));
+
+    std::fs::write(&fixtures, include_str!("fixtures/seed/input.json")).unwrap();
+    let success = reseed("app.db").assert().success();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&success.get_output().stdout).unwrap(),
+        serde_json::from_str::<serde_json::Value>(include_str!("fixtures/seed/expected.json"))
+            .unwrap()
+    );
+    let ready = reseed_state(&conn).await;
+    assert_ne!(ready.0, rolled_back.0);
+    assert_eq!((ready.1, ready.2, ready.3), (0, 2, 2));
+}
+
+#[tokio::test]
+async fn db_reseed_native_stops_on_reset_failures_and_loads_the_fresh_schema() {
+    use pyre::db::lifecycle::{self, ReseedError};
+    use pyre::server::schema::load_schema_from_database;
+    use serde_json::{json, Value};
+
+    let ctx = TestContext::new();
+    let db = libsql::Builder::new_local(ctx.workspace_path.join("app.db"))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let schema = include_str!("fixtures/seed/schema.pyre");
+    let obsolete = "record Obsolete {\n id Id.Uuid @id\n @public\n}\n";
+    let unused = || -> Result<Value, std::convert::Infallible> {
+        panic!("fixture loader ran before reset committed")
+    };
+    assert!(matches!(
+        lifecycle::reseed_with(&db, "Fixtures", schema, &[], unused).await,
+        Err(ReseedError::ResetFailed(
+            lifecycle::Error::RequiresDisposable
+        ))
+    ));
+    lifecycle::init_disposable(&conn, "Fixtures", obsolete, &[])
+        .await
+        .unwrap();
+    let before = load_schema_from_database(&conn).await.unwrap();
+
+    // A reader holding a shared lock in rollback journal mode blocks COMMIT,
+    // after the writer has already executed reset statements.
+    conn.execute_batch("pragma journal_mode=delete;")
+        .await
+        .unwrap();
+    let reader = db.connect().unwrap();
+    let read_tx = reader.transaction().await.unwrap();
+    assert!(read_tx
+        .query("select * from obsoletes", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        lifecycle::reseed_with(&db, "Fixtures", schema, &[], unused).await,
+        Err(ReseedError::ResetOutcomeUnknown(
+            lifecycle::Error::CommitUnknown(_)
+        ))
+    ));
+    read_tx.rollback().await.unwrap();
+    // Inspect and reopen the connection after an unconfirmed outcome before retrying.
+    drop(conn);
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        load_schema_from_database(&conn)
+            .await
+            .unwrap()
+            .schema()
+            .unwrap()
+            .namespace,
+        "Fixtures"
+    );
+
+    let malformed = lifecycle::reseed_with(&db, "Fixtures", schema, &[], || {
+        serde_json::from_str::<Value>("{")
+    })
+    .await;
+    assert!(matches!(
+        malformed,
+        Err(ReseedError::FreshWithoutFixtures(_))
+    ));
+    let empty = reseed_state(&conn).await;
+    assert_eq!((empty.1, empty.2, empty.3), (0, 0, 0));
+    let late = lifecycle::reseed(
+        &db,
+        "Fixtures",
+        schema,
+        &[],
+        json!({"users": [{"id":1}, {"id": 1}]}),
+    )
+    .await;
+    assert!(
+        matches!(late, Err(ReseedError::FreshWithoutFixtures(message)) if message.contains("users[1]"))
+    );
+    assert_eq!(reseed_state(&conn).await.2, 0);
+
+    let result = lifecycle::reseed(
+        &db,
+        "Fixtures",
+        schema,
+        &[],
+        serde_json::from_str::<Value>(include_str!("fixtures/seed/input.json")).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.response,
+        serde_json::from_str::<Value>(include_str!("fixtures/seed/expected.json")).unwrap()
+    );
+    assert_ne!(reseed_state(&conn).await.0, empty.0);
+    let after = load_schema_from_database(&conn).await.unwrap();
+    assert!(before.context().unwrap().tables.contains_key("obsolete"));
+    assert!(!after.context().unwrap().tables.contains_key("obsolete"));
+    assert!(after.context().unwrap().tables.contains_key("user"));
+}
+
+#[test]
 fn docs_prints_requested_topic() {
     let ctx = TestContext::new();
 
@@ -1070,6 +1767,35 @@ fn test_generate_embeds_namespaced_database_initializers() {
     assert!(campaign.contains("pub struct SeedEncountersRow"));
     assert!(!campaign.contains("SeedUsersRow"));
     assert!(!campaign.contains("pub user:"));
+    assert!(main.contains("Some(\"Main\")"));
+    assert!(campaign.contains("Some(\"Campaign\")"));
+
+    ctx.run_command("migrate")
+        .args(["main.db", "--namespace", "Main", "--push"])
+        .assert()
+        .success();
+    ensure_workspace_node_modules(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "namespaced-seed.ts",
+        r#"
+import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
+import { init } from '@pyre/server/wasm';
+import { fixtures, type SeedInput } from './pyre/generated/typescript/seed';
+await init();
+const db = createClient({ url: 'file:main.db' });
+const input: SeedInput<'Campaign'> = {};
+const wrong = await fixtures.Campaign.seed(db, input);
+assert.equal(wrong.kind, 'error');
+assert.match(wrong.error!.message, /expected database namespace 'Campaign', found 'Main'/);
+const result = await fixtures.Main.seed(db, { users: [{}] });
+assert.equal(result.kind, 'success');
+console.log('namespaced-seed-ok');
+"#,
+        "namespaced-seed-ok",
+        "namespaced generated seed verification",
+    );
 }
 
 #[test]
@@ -1116,29 +1842,37 @@ fn test_generated_seed_artifacts_include_typed_inputs() {
         r#"
 @syncable(false)
 record User {
+    @tablename("accounts")
     id Id.Int @id
-    name String
+    name String @default("Anonymous")
     posts @link(Post.authorId)
     @public
 }
 
 record Post {
-    id Int @id
+    @tablename("written_posts")
+    id Id.Uuid @id
     authorId User.id
     title String
     summary String?
     status Status
     attrs Json<PostAttrs>
+    jsonStatus Json<Status>?
+    groupedStatus Json<Dict<List<Status?>>>?
+    color Json<Color>?
+    position Sequence.Int
     author @link(authorId, User.id)
     @public
 }
 
 type Status
-   = Draft
-   | Published { publishedAt DateTime }
+   = Draft {}
+   | Published { publishedAt DateTime, type String }
+
+type Color = Red | Blue
 
 type PostAttrs
-   = PostAttrs { tags List<String> }
+   = PostAttrs { tags List<String?> }
 
 type Attribute
    = AttributeText { value String }
@@ -1153,7 +1887,32 @@ record Entity {
     )
     .unwrap();
 
-    ctx.run_command("generate").assert().success();
+    generate_runtime(&ctx);
+    for database in ["raw.db", "rust.db", "facets.db"] {
+        ctx.run_command("migrate")
+            .args([database, "--push"])
+            .assert()
+            .success();
+    }
+    std::fs::write(
+        ctx.workspace_path.join("fixture.json"),
+        r#"{"accounts":[{"id":41,"updatedAt":1,"posts":[{
+            "id":"00000000-0000-4000-8000-000000000051","title":"First","summary":null,"updatedAt":1,
+            "status":{"_type":"Published","publishedAt":1,"type":"release"},
+            "attrs":{"_type":"PostAttrs","tags":["pdf",null]}
+        }]}]}"#,
+    )
+    .unwrap();
+    let raw = ctx
+        .run_command("db")
+        .args(["seed", "raw.db", "--fixtures", "fixture.json"])
+        .assert()
+        .success();
+    std::fs::write(
+        ctx.workspace_path.join("expected.json"),
+        &raw.get_output().stdout,
+    )
+    .unwrap();
 
     let server_ts = std::fs::read_to_string(
         ctx.workspace_path
@@ -1167,32 +1926,9 @@ record Entity {
         std::fs::read_to_string(ctx.workspace_path.join("pyre/generated/rust/seed.rs")).unwrap();
 
     assert!(server_ts.contains("export * from './seed';"));
-    assert!(!server_ts.contains("seedValidators"));
-    assert!(!server_ts.contains("SeedConstructed"));
-    assert!(seed_ts.contains("import * as Db from './core/decode';"));
-    assert!(seed_ts.contains("const seedValidators: SeedValidators ="));
-    assert!(seed_ts.contains("type SeedConstructed<T>"));
-    assert!(seed_ts.contains("export type SeedUsersRow = {"));
-    assert!(seed_ts.contains("\"posts\"?: SeedPostsRow[];"));
-    assert!(seed_ts.contains("export type SeedPostsRow = {"));
-    assert!(seed_ts.contains("\"status\"?: SeedConstructed<Db.Status>;"));
-    assert!(seed_ts.contains("\"attrs\"?: SeedConstructed<Db.PostAttrs>;"));
-    assert!(seed_ts.contains("\"users\"?: SeedUsersRow[];"));
-    assert!(seed_ts.contains("\"posts\"?: SeedPostsRow[];"));
-    assert!(
-        seed_ts.contains("export const seed = (db: Client, input: SeedInput): Promise<SeedResult>")
-    );
-    assert!(seed_ts.contains("{ _type: K }"));
-    assert!(!seed_ts.contains("type?:"));
-    assert!(!seed_ts.contains("$?:"));
-    assert!(seed_rs.contains("pub struct SeedInput"));
-    assert!(seed_rs.contains("pub struct SeedUsersRow"));
-    assert!(seed_rs.contains("pub posts: Option<Vec<SeedPostsRow>>"));
-    assert!(seed_rs.contains("pub author: Option<Box<SeedUsersRow>>"));
-    assert!(seed_rs.contains("pub enum SeedStatus"));
-    assert!(seed_rs.contains("HashMap<String, SeedAttribute>"));
-    assert!(seed_rs.contains("#[serde(tag = \"_type\")]"));
-    assert!(seed_rs.contains("pub async fn seed("));
+    assert!(!seed_ts.contains("seedValidators"));
+    assert!(!seed_ts.contains("\"position\"?:"));
+    assert!(!seed_rs.contains("pub position:"));
 
     let compile_dir = ctx.workspace_path.join("seed-compile");
     std::fs::create_dir_all(compile_dir.join("src")).unwrap();
@@ -1211,6 +1947,7 @@ libsql = "0.9.11"
 pyre = {{ path = {:?} }}
 serde = {{ version = "1.0.203", features = ["derive"] }}
 serde_json = "1.0.117"
+tokio = {{ version = "1.38.0", features = ["macros", "rt-multi-thread"] }}
 "#,
             env!("CARGO_MANIFEST_DIR")
         ),
@@ -1226,16 +1963,22 @@ serde_json = "1.0.117"
         r#"
 mod seed;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let input = seed::SeedInput {
-        users: Some(vec![seed::SeedUsersRow {
-            name: Some("Imported".to_string()),
-            posts: Some(vec![seed::SeedPostsRow {
-                status: Some(seed::SeedStatus::Published {
-                    published_at: seed::DateTime::UnixSeconds(1),
+        accounts: Some(vec![seed::SeedAccountsRow {
+            id: Some(41),
+            updated_at: Some(seed::DateTime::UnixSeconds(1)),
+            posts: Some(vec![seed::SeedWrittenPostsRow {
+                id: Some("00000000-0000-4000-8000-000000000051".into()),
+                title: Some("First".to_string()),
+                updated_at: Some(seed::DateTime::UnixSeconds(1)),
+                 status: Some(seed::SeedStatus::Published {
+                     published_at: seed::DateTime::UnixSeconds(1),
+                     r#type: "release".into(),
                 }),
                 attrs: Some(seed::SeedPostAttrs::PostAttrs {
-                    tags: vec!["pdf".to_string()],
+                    tags: vec![Some("pdf".to_string()), None],
                 }),
                 summary: seed::SeedField::Null,
                 ..Default::default()
@@ -1244,9 +1987,14 @@ fn main() {
         }]),
         ..Default::default()
     };
-    let value = serde_json::to_value(input).expect("seed input serializes");
-    assert_eq!(value["users"][0]["posts"][0]["status"]["_type"], "Published");
-    assert!(value["users"][0]["posts"][0]["summary"].is_null());
+    let read_json = |path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    assert_eq!(serde_json::to_value(&input).unwrap(), read_json("fixture.json"));
+    let db = libsql::Builder::new_local("rust.db").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let result = seed::seed(&conn, input).await.unwrap();
+    assert_eq!(result.response, read_json("expected.json"));
 }
 "#,
     )
@@ -1254,6 +2002,7 @@ fn main() {
     let output = StdCommand::new("cargo")
         .args(["run", "--offline", "--quiet", "--manifest-path"])
         .arg(compile_dir.join("Cargo.toml"))
+        .current_dir(&ctx.workspace_path)
         .output()
         .unwrap();
     assert!(
@@ -1261,6 +2010,100 @@ fn main() {
         "generated Rust seed failed to compile:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    run_bun_verification_script(
+        &ctx,
+        "verify-authored-fixture.ts",
+        r#"
+import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
+import { init } from '@pyre/server/wasm';
+import { seed, type SeedInput } from './pyre/generated/typescript/seed';
+
+await init();
+const authorId = 41;
+const foundation = { accounts: [{ id: authorId, updatedAt: 1, posts: [{
+  id: '00000000-0000-4000-8000-000000000051', title: 'First', summary: null, updatedAt: 1,
+  status: { _type: 'Published', publishedAt: 1, type: 'release' },
+  attrs: { _type: 'PostAttrs', tags: ['pdf', null] },
+}] }] } satisfies SeedInput;
+assert.deepEqual(JSON.parse(JSON.stringify(foundation)), await Bun.file('fixture.json').json());
+const db = createClient({ url: 'file:.yak/yak.db' });
+assert.deepEqual(await seed(db, foundation), {
+  kind: 'success', response: await Bun.file('expected.json').json(),
+});
+
+const facets = createClient({ url: 'file:facets.db' });
+const extension = {
+  accounts: [{ id: 42, name: 'Second' }, { id: authorId }],
+  written_posts: [{ authorId, title: 'Flat reference', status: { _type: 'Draft' },
+    attrs: { _type: 'PostAttrs', tags: [] } }],
+} satisfies SeedInput;
+const combined = { ...extension, accounts: [...foundation.accounts, ...extension.accounts] };
+const size = async (table: 'accounts' | 'written_posts') =>
+  (await facets.execute(`select count(*) as n from ${table}`)).rows[0].n;
+const combinedError = await seed(facets, combined);
+assert.equal(combinedError.kind, 'error');
+assert.match(combinedError.error!.message, /accounts\[2\]/);
+assert.equal(await size('accounts'), 0);
+assert.equal(await size('written_posts'), 0);
+
+assert.equal((await seed(facets, foundation)).kind, 'success');
+const separateError = await seed(facets, extension);
+assert.equal(separateError.kind, 'error');
+assert.match(separateError.error!.message, /accounts\[1\]/);
+assert.equal(await size('accounts'), 1);
+assert.equal(await size('written_posts'), 1);
+assert.equal((await seed(facets, { ...extension, accounts: extension.accounts.slice(0, 1) })).kind, 'success');
+assert.equal((await facets.execute('select authorId from written_posts where title = \'Flat reference\'')).rows[0].authorId, authorId);
+console.log('authored-fixture-ok');
+"#,
+        "authored-fixture-ok",
+        "generated Rust/TypeScript and raw JSON conformance",
+    );
+
+    std::fs::write(
+        ctx.workspace_path.join("check-fixture-types.ts"),
+        r#"
+import type { SeedInput } from './pyre/generated/typescript/seed';
+
+({ written_posts: [{
+  status: 'Draft',
+  jsonStatus: { _type: 'Draft' },
+  groupedStatus: { group: [null, 'Draft', { _type: 'Draft' }] },
+  color: 'Red',
+}, {
+  status: { _type: 'Draft' },
+  jsonStatus: 'Draft',
+  color: { _type: 'Red' },
+}] }) satisfies SeedInput;
+// @ts-expect-error A variant with a payload cannot use string shorthand.
+({ written_posts: [{ jsonStatus: 'Published' }] }) satisfies SeedInput;
+"#,
+    )
+    .unwrap();
+    let output = StdCommand::new("node_modules/.bin/tsc")
+        .args([
+            "--noEmit",
+            "--strict",
+            "--skipLibCheck",
+            "--module",
+            "preserve",
+            "--moduleResolution",
+            "bundler",
+            "--target",
+            "es2022",
+            "check-fixture-types.ts",
+        ])
+        .current_dir(&ctx.workspace_path)
+        .output()
+        .expect("typecheck generated fixture authoring module");
+    assert!(
+        output.status.success(),
+        "generated TypeScript seed failed to compile:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
@@ -2747,7 +3590,9 @@ async fn test_generated_typescript_runner_matches_nullable_typed_json_null() {
 import { createClient } from "@libsql/client";
 import { seed } from "./pyre/generated/typescript/seed.ts";
 import { EndLifecycle, GetLifecycles, GetNullLifecycles } from "./pyre/generated/typescript/run.ts";
+import { init } from "@pyre/server/wasm";
 
+await init();
 const db = createClient({ url: "file:.yak/yak.db" });
 const id = "7f4d3a18-8b6c-4e2f-a901-5c7d9e3b2f60";
 
@@ -2863,7 +3708,9 @@ query GetGames {
 import { createClient } from "@libsql/client";
 import { seed } from "./pyre/generated/typescript/server.ts";
 import { GetGames, GetTokens } from "./pyre/generated/typescript/run.ts";
+import { init } from "@pyre/server/wasm";
 
+await init();
 const db = createClient({ url: "file:.yak/yak.db" });
 
 const seeded = await seed(db, {

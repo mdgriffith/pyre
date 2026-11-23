@@ -1,5 +1,5 @@
 import { Client, InStatement, type Transaction } from "@libsql/client";
-import type { LinkInfo, SchemaMetadata, TableMetadata } from "@pyre/core";
+import type { SchemaMetadata } from "@pyre/core";
 import type { ZodType } from "zod";
 import { buildArgs, formatResultData, toSqlStatements, type SqlInfo } from "./runtime/sql";
 
@@ -124,33 +124,24 @@ export type SeedRow = {
 export type SeedInput = Record<string, SeedRow[]>;
 export type SeedValidators = Record<string, Record<string, Validator<unknown>>>;
 export interface SeedOptions {
+    namespace?: string;
+    /** @deprecated Seed no longer batches inserts independently. */
     batchSize?: number;
+    /** @deprecated Only a single write transaction is supported. */
     transactionMode?: "manual" | "batch" | "none";
 }
 
-export interface SeedResult {
-    kind: "success" | "error";
-    response?: Record<string, unknown[]>;
-    error?: {
-        errorType: "InvalidInput" | "DatabaseError";
+export type SeedResult = {
+    kind: "success";
+    response: Record<string, unknown[]>;
+    error?: never;
+} | {
+    kind: "error";
+    response?: never;
+    error: {
+        errorType: "InvalidInput" | "DatabaseError" | "OutcomeUnknown";
         message: string;
     };
-}
-
-type SeedContext = {
-    db: Client;
-    schema: SchemaMetadata;
-    validators?: SeedValidators;
-    batchSize: number;
-    transactionMode: "manual" | "batch" | "none";
-    statementIndex: number;
-    physicalColumns: Map<string, Set<string>>;
-};
-
-type SeedPreparedRow = {
-    path: string;
-    scalarValues: Record<string, SeedValue>;
-    nestedValues: Array<{ key: string; link: LinkInfo; value: SeedRow | SeedRow[] }>;
 };
 
 function extractAffectedRowGroups(sql: SqlInfo[], resultSets: any[]): any[] {
@@ -563,685 +554,121 @@ function combineAffectedRows(affected: any[]): any[] {
     return [...tables.values()];
 }
 
-/**
- * Insert seed data using Pyre schema links to connect nested records.
- *
- * This is intended for server-side fixture/import setup. It bypasses Pyre query
- * permissions and does not currently integrate with Pyre sync metadata.
- */
+type SeedBind = { type: "null" } | { type: "blob"; value: number[] }
+    | { type: "integer" | "real" | "text" | "json"; value: bigint | number | string };
+
+/** Insert trusted fixtures in one write transaction using the target's installed schema. */
+export function seed(db: Client, input: SeedInput, options?: SeedOptions): Promise<SeedResult>;
+/** @deprecated Pass input and options only. The target schema replaces metadata and validators. */
+export function seed(db: Client, schema: SchemaMetadata, input: SeedInput, validators?: SeedValidators, options?: SeedOptions): Promise<SeedResult>;
 export async function seed(
     db: Client,
-    schema: SchemaMetadata,
-    input: SeedInput,
-    validators?: SeedValidators,
-    options: SeedOptions = {},
+    inputOrSchema: SeedInput | SchemaMetadata,
+    optionsOrInput?: SeedOptions | SeedInput,
+    _validators?: SeedValidators,
+    legacyOptions?: SeedOptions,
 ): Promise<SeedResult> {
-    const context: SeedContext = {
-        db,
-        schema,
-        validators,
-        batchSize: options.batchSize ?? 100,
-        transactionMode: resolveSeedTransactionMode(db, options.transactionMode),
-        statementIndex: 0,
-        physicalColumns: new Map(),
-    };
-    const response: Record<string, unknown[]> = {};
-
+    const fail = (errorType: NonNullable<SeedResult["error"]>["errorType"], cause: unknown): SeedResult => ({
+        kind: "error", error: { errorType, message: seedErrorMessage(cause) },
+    });
+    let entries: [string, unknown][];
+    let options: SeedOptions;
     try {
-        validateSeedInput(schema, input);
-        if (context.transactionMode === "manual") {
-            await db.execute("begin");
+        const legacy = inputOrSchema != null && typeof inputOrSchema === "object" && "queryFieldToTable" in inputOrSchema
+            && !Array.isArray(inputOrSchema.queryFieldToTable) && "tables" in inputOrSchema;
+        const input = (legacy ? optionsOrInput : inputOrSchema) as SeedInput;
+        options = (legacy ? legacyOptions : optionsOrInput as SeedOptions | undefined) ?? {};
+        if (options.transactionMode !== undefined && options.transactionMode !== "manual") {
+            return fail("InvalidInput", "Seed requires one write transaction; batch and none modes are unsupported");
         }
+        const value = fixtureValue(input);
+        if (value === null || typeof value !== "object" || Array.isArray(value)) {
+            return fail("InvalidInput", "seed input must be an object");
+        }
+        // A JSON map in Rust sorts its keys. Send pairs to keep JS table order.
+        entries = Object.entries(value);
+    } catch (error) {
+        return fail("InvalidInput", error);
+    }
 
-        for (const [tableName, rows] of Object.entries(input)) {
-            const table = schema.tables[tableName];
-            response[tableName] = await insertSeedRows(
-                context,
-                table,
-                rows.map((row, index) => ({ row, path: `${tableName}[${index}]` })),
-            );
+    let tx: Transaction | undefined;
+    let committing = false;
+    try {
+        const [{ introspectDatabase, requireSeedIntegerMode }, wasm] = await Promise.all([
+            import("./schema"), import("./wasm/pyre_wasm.js"),
+        ]);
+        // The local libSQL adapter detaches the connection when opening a transaction.
+        if (db.protocol === "file") {
+            const databases = await db.execute("pragma database_list");
+            if (!databases.rows.some(row => row.name === "main" && typeof row.file === "string" && row.file.length > 0)) {
+                return fail("DatabaseError", "Seed requires a file-backed local database");
+            }
         }
-
-        if (context.transactionMode === "manual") {
-            await db.execute("commit");
+        const transaction = tx = await db.transaction("write");
+        await requireSeedIntegerMode(transaction);
+        const { initialized, introspection } = await introspectDatabase(transaction);
+        if (!initialized || !introspection.schema_source) {
+            throw new Error("Database does not contain an initialized Pyre schema");
         }
+        const triggerTables = (await transaction.execute(wasm.fixture_trigger_tables_sql())).rows[0]?.trigger_tables;
+        if (typeof triggerTables !== "string") throw new Error("Could not read fixture trigger tables");
+        const response = await wasm.ingest_fixture(introspection, entries, triggerTables, async ({ sql, args, path }: {
+            sql: string; args: SeedBind[]; path: string;
+        }) => {
+            try {
+                const result = await transaction.execute({
+                    sql,
+                    args: args.map(arg => arg.type === "null" ? null
+                        : arg.type === "blob" ? Uint8Array.from(arg.value) : arg.value),
+                });
+                if (result.rows.length !== 1) throw new Error("insert did not return one row");
+                return Object.fromEntries(result.columns.map(column => {
+                    const cell = result.rows[0][column];
+                    return [column, cell instanceof ArrayBuffer ? Array.from(new Uint8Array(cell)) : cell];
+                }));
+            } catch (error) {
+                throw new Error(`${path}: ${seedErrorMessage(error)}`);
+            }
+        }, options.namespace);
+        committing = true;
+        await transaction.commit();
         return { kind: "success", response };
     } catch (error) {
-        if (context.transactionMode === "manual") {
+        if (tx) {
+            if (committing) {
+                return fail("OutcomeUnknown", `Seed commit outcome unknown: ${seedErrorMessage(error)}`);
+            }
             try {
-                await db.execute("rollback");
-            } catch (_) {
-                // Ignore rollback failures; the original error is more useful.
+                if (tx.closed) throw new Error("transaction closed without confirming rollback");
+                await tx.rollback();
+            } catch (rollback) {
+                return fail("OutcomeUnknown", `${seedErrorMessage(error)}; seed rollback outcome unknown: ${seedErrorMessage(rollback)}`);
             }
         }
-
-        return {
-            kind: "error",
-            error: {
-                errorType: error instanceof SeedInputError ? "InvalidInput" : "DatabaseError",
-                message: error instanceof Error ? error.message : "Seed failed",
-            },
-        };
+        return fail(typeof error === "string" ? "InvalidInput" : "DatabaseError", error);
+    } finally {
+        try { tx?.close(); } catch { /* The commit or rollback result determines the outcome. */ }
     }
 }
 
-function resolveSeedTransactionMode(
-    db: Client,
-    requestedMode: SeedOptions["transactionMode"],
-): "manual" | "batch" | "none" {
-    if (requestedMode === "manual" || requestedMode === "none") {
-        return requestedMode;
-    }
-
-    if (requestedMode === "batch") {
-        if (typeof db.batch !== "function") {
-            throw new Error("seed batch mode requires a database client with batch support");
-        }
-
-        return "batch";
-    }
-
-    return typeof db.batch === "function" ? "batch" : "manual";
+function seedErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
 }
 
-class SeedInputError extends Error { }
-
-function validateSeedInput(schema: SchemaMetadata, input: SeedInput): void {
-    if (input == null || typeof input !== "object" || Array.isArray(input)) {
-        throw new SeedInputError("seed input must be an object keyed by table name");
+// Convert legacy JS conveniences to the canonical JSON representation. Column
+// interpretation and validation belong to the shared fixture engine.
+function fixtureValue(value: unknown): unknown {
+    if (value instanceof Date) {
+        const seconds = Math.floor(value.getTime() / 1000);
+        if (!Number.isFinite(seconds)) throw new Error("Invalid Date seed value");
+        return seconds;
     }
-
-    for (const [tableName, rows] of Object.entries(input)) {
-        if (!(tableName in schema.tables)) {
-            throw new SeedInputError(`unknown seed table '${tableName}'`);
-        }
-        if (!Array.isArray(rows)) {
-            throw new SeedInputError(`seed table '${tableName}' must be an array`);
-        }
-        rows.forEach((row, index) => {
-            if (row == null || typeof row !== "object" || Array.isArray(row)) {
-                throw new SeedInputError(`seed row '${tableName}[${index}]' must be an object`);
-            }
-        });
-    }
-}
-
-async function insertSeedRow(
-    context: SeedContext,
-    table: TableMetadata,
-    row: SeedRow,
-    path: string,
-    inheritedValues: Record<string, SeedValue> = {},
-): Promise<Record<string, unknown>> {
-    const [inserted] = await insertSeedRows(context, table, [{ row, path, inheritedValues }]);
-    return inserted;
-}
-
-async function insertSeedRows(
-    context: SeedContext,
-    table: TableMetadata,
-    rows: Array<{ row: SeedRow; path: string; inheritedValues?: Record<string, SeedValue> }>,
-): Promise<Record<string, unknown>[]> {
-    const preparedRows: SeedPreparedRow[] = [];
-
-    for (const item of rows) {
-        preparedRows.push(await prepareSeedRow(context, table, item.row, item.path, item.inheritedValues ?? {}));
-    }
-
-    const insertedRows = await insertScalarRows(context, table, preparedRows);
-
-    for (let rowIndex = 0; rowIndex < preparedRows.length; rowIndex += 1) {
-        const prepared = preparedRows[rowIndex];
-        const inserted = insertedRows[rowIndex];
-
-        for (const nested of prepared.nestedValues.filter(({ link }) => isParentToChildLink(table, link))) {
-            const linkedTable = context.schema.tables[nested.link.to.table];
-            if (!linkedTable) {
-                throw new SeedInputError(`seed link '${prepared.path}.${nested.key}' points to unknown table '${nested.link.to.table}'`);
-            }
-            const parentValue = inserted[nested.link.from];
-            if (!isSeedValue(parentValue)) {
-                throw new SeedInputError(`seed link '${prepared.path}.${nested.key}' cannot derive '${nested.link.from}' from inserted parent row`);
-            }
-
-            const childRows = Array.isArray(nested.value) ? nested.value : [nested.value];
-            const nestedResult = await insertSeedRows(
-                context,
-                linkedTable,
-                childRows.map((childRow, index) => ({
-                    row: childRow,
-                    path: `${prepared.path}.${nested.key}[${index}]`,
-                    inheritedValues: { [nested.link.to.column]: parentValue },
-                })),
-            );
-            inserted[nested.key] = Array.isArray(nested.value) ? nestedResult : nestedResult[0];
-        }
-    }
-
-    return insertedRows;
-}
-
-async function prepareSeedRow(
-    context: SeedContext,
-    table: TableMetadata,
-    row: SeedRow,
-    path: string,
-    inheritedValues: Record<string, SeedValue> = {},
-): Promise<SeedPreparedRow> {
-    const scalarValues: Record<string, SeedValue> = { ...inheritedValues };
-    const nestedValues: Array<{ key: string; link: LinkInfo; value: SeedRow | SeedRow[] }> = [];
-    const columns = new Set((table.columns ?? []).map((column) => column.name));
-
-    for (const [key, value] of Object.entries(row)) {
-        if (columns.has(key)) {
-            if (!isSeedValue(value)) {
-                throw new SeedInputError(`seed field '${path}.${key}' must be a scalar column value`);
-            }
-            assertCanonicalDiscriminators(value, `${path}.${key}`);
-            const validatedValue = validateSeedColumnValue(context, table, key, value, `${path}.${key}`);
-            if (key in scalarValues && !sameSeedValue(scalarValues[key], validatedValue)) {
-                throw new SeedInputError(`seed field '${path}.${key}' conflicts with a value derived from its parent link`);
-            }
-            scalarValues[key] = validatedValue;
-            continue;
-        }
-
-        const link = table.links[key];
-        if (!link) {
-            throw new SeedInputError(`unknown seed field '${path}.${key}'; expected a column or link on table '${table.name}'`);
-        }
-        if (!isSeedLinkValue(value)) {
-            throw new SeedInputError(`seed link '${path}.${key}' must be an object or array of objects`);
-        }
-        assertCanonicalDiscriminators(value, `${path}.${key}`);
-        nestedValues.push({ key, link, value });
-    }
-
-    for (const nested of nestedValues.filter(({ link }) => !isParentToChildLink(table, link))) {
-        const linkedTable = context.schema.tables[nested.link.to.table];
-        if (!linkedTable) {
-            throw new SeedInputError(`seed link '${path}.${nested.key}' points to unknown table '${nested.link.to.table}'`);
-        }
-        if (Array.isArray(nested.value)) {
-            throw new SeedInputError(`seed link '${path}.${nested.key}' must be a single object because '${nested.link.from}' is set on '${table.name}'`);
-        }
-        const linkedRow = await insertSeedRow(context, linkedTable, nested.value, `${path}.${nested.key}`);
-        const linkedValue = linkedRow[nested.link.to.column];
-        if (!isSeedValue(linkedValue)) {
-            throw new SeedInputError(`seed link '${path}.${nested.key}' did not return '${nested.link.to.column}'`);
-        }
-        if (nested.link.from in scalarValues && !sameSeedValue(scalarValues[nested.link.from], linkedValue)) {
-            throw new SeedInputError(`seed field '${path}.${nested.link.from}' conflicts with nested link '${nested.key}'`);
-        }
-        scalarValues[nested.link.from] = linkedValue;
-    }
-
-    return { path, scalarValues, nestedValues };
-}
-
-function validateSeedColumnValue(
-    context: SeedContext,
-    table: TableMetadata,
-    columnName: string,
-    value: SeedValue,
-    path: string,
-): SeedValue {
-    const validator = context.validators?.[table.name]?.[columnName];
-    if (!validator || value == null) {
-        return value;
-    }
-
-    const result = decodeOrError(validator, value, path);
-    if (!result.valid) {
-        throw new SeedInputError(`invalid seed field '${path}': ${result.error}`);
-    }
-    return result.value as SeedValue;
-}
-
-async function insertScalarRow(
-    context: SeedContext,
-    table: TableMetadata,
-    values: Record<string, SeedValue>,
-    path: string,
-): Promise<Record<string, unknown>> {
-    const [inserted] = await insertScalarRows(context, table, [{ path, scalarValues: values, nestedValues: [] }]);
-    return inserted;
-}
-
-async function insertScalarRows(
-    context: SeedContext,
-    table: TableMetadata,
-    rows: SeedPreparedRow[],
-): Promise<Record<string, unknown>[]> {
-    const insertedRows: Record<string, unknown>[] = [];
-
-    for (let offset = 0; offset < rows.length; offset += context.batchSize) {
-        const chunk = rows.slice(offset, offset + context.batchSize);
-        const statements = await Promise.all(chunk.map(async ({ scalarValues, path }) => {
-            const inputColumnNames = Object.keys(scalarValues);
-            const knownColumns = new Set((table.columns ?? []).map((column) => column.name));
-
-            for (const columnName of inputColumnNames) {
-                if (!knownColumns.has(columnName)) {
-                    throw new SeedInputError(`unknown seed column '${path}.${columnName}' on table '${table.name}'`);
-                }
-                if (table.columns?.some(column => column.name === columnName && column.type === "Sequence.Int")) {
-                    throw new SeedInputError(`seed field '${path}.${columnName}' is a server-managed sequence and cannot be supplied`);
-                }
-            }
-
-            const normalizedValues = await normalizeSeedValues(context, table, scalarValues);
-            const columnNames = Object.keys(normalizedValues);
-            const args: Record<string, SeedPrimitive> = {};
-            const placeholders = columnNames.map((columnName) => {
-                const argName = `seed_${context.statementIndex++}`;
-                args[argName] = normalizedValues[columnName];
-                return `$${argName}`;
-            });
-            const sql = columnNames.length === 0
-                ? `insert into ${quoteIdentifier(table.name)} default values returning *`
-                : `insert into ${quoteIdentifier(table.name)} (${columnNames.map(quoteIdentifier).join(", ")}) values (${placeholders.join(", ")}) returning *`;
-
-            return { sql, args };
-        }));
-
-        try {
-            const results = await executeSeedInsertStatements(context, statements);
-            for (const result of results) {
-                const row = result.rows?.[0];
-                if (!row) {
-                    throw new Error("insert returned no rows");
-                }
-                insertedRows.push(formatReturnedSeedRow(table, row as Record<string, unknown>));
-            }
-        } catch (error) {
-            const message = error instanceof Error ? error.message : "database insert failed";
-            throw new Error(`failed to insert seed rows starting at '${chunk[0]?.path ?? table.name}' into '${table.name}': ${message}`);
-        }
-    }
-
-    return insertedRows;
-}
-
-async function executeSeedInsertStatements(
-    context: SeedContext,
-    statements: InStatement[],
-): Promise<Array<{ rows?: unknown[] }>> {
-    if (statements.length === 0) {
-        return [];
-    }
-
-    if (context.transactionMode === "batch") {
-        if (typeof context.db.batch !== "function") {
-            throw new Error("seed batch mode requires a database client with batch support");
-        }
-
-        return await context.db.batch(statements) as Array<{ rows?: unknown[] }>;
-    }
-
-    const results: Array<{ rows?: unknown[] }> = [];
-    for (const statement of statements) {
-        results.push(await context.db.execute(statement) as { rows?: unknown[] });
-    }
-
-    return results;
-}
-
-async function normalizeSeedValues(
-    context: SeedContext,
-    table: TableMetadata,
-    values: Record<string, SeedValue>,
-): Promise<Record<string, SeedPrimitive>> {
-    const physicalColumns = await getPhysicalColumns(context, table);
-    const logicalColumns = new Map((table.columns ?? []).map((column) => [column.name, column]));
-    const normalized: Record<string, SeedPrimitive> = {};
-
-    for (const [columnName, value] of Object.entries(values)) {
-        const column = logicalColumns.get(columnName);
-        if (!column) {
-            normalized[columnName] = toSqlSeedValue(value);
-            continue;
-        }
-
-        if (column.type.startsWith("Json")) {
-            normalized[columnName] = toJsonSqlValue(value);
-            continue;
-        }
-
-        if (column.type === "DateTime") {
-            normalized[columnName] = toDateTimeSqlValue(value, `${table.name}.${columnName}`);
-            continue;
-        }
-
-        if (isConstructedValue(value) && hasNestedPhysicalColumns(physicalColumns, columnName)) {
-            flattenConstructedValue(normalized, physicalColumns, columnName, value);
-            continue;
-        }
-
-        normalized[columnName] = toSqlSeedValue(value);
-    }
-
-    return normalized;
-}
-
-async function getPhysicalColumns(context: SeedContext, table: TableMetadata): Promise<Set<string>> {
-    const cached = context.physicalColumns.get(table.name);
-    if (cached) {
-        return cached;
-    }
-
-    const result = await context.db.execute(`pragma table_info(${quoteIdentifier(table.name)})`);
-    const columns = new Set<string>();
-    for (const row of result.rows ?? []) {
-        const name = (row as Record<string, unknown>).name;
-        if (typeof name === "string") {
-            columns.add(name);
-        }
-    }
-    context.physicalColumns.set(table.name, columns);
-    return columns;
-}
-
-function flattenConstructedValue(
-    output: Record<string, SeedPrimitive>,
-    physicalColumns: Set<string>,
-    prefix: string,
-    value: SeedValue,
-): void {
-    if (!isConstructedValue(value)) {
-        output[prefix] = toSqlSeedValue(value);
-        return;
-    }
-
-    const discriminator = constructedDiscriminator(value);
-    if (discriminator !== undefined && physicalColumns.has(prefix)) {
-        output[prefix] = discriminator;
-    }
-
-    if (value == null || typeof value !== "object" || Array.isArray(value) || value instanceof Uint8Array) {
-        return;
-    }
-
-    for (const [fieldName, fieldValue] of Object.entries(value)) {
-        if (fieldName === "_type") {
-            continue;
-        }
-
-        const fieldPrefix = `${prefix}__${fieldName}`;
-        if (!hasPhysicalColumnAtOrBelow(physicalColumns, fieldPrefix)) {
-            continue;
-        }
-
-        if (isConstructedValue(fieldValue) && hasNestedPhysicalColumns(physicalColumns, fieldPrefix)) {
-            flattenConstructedValue(output, physicalColumns, fieldPrefix, fieldValue);
-        } else if (physicalColumns.has(fieldPrefix)) {
-            output[fieldPrefix] = toSqlSeedValue(fieldValue);
-        }
-    }
-}
-
-function formatReturnedSeedRow(table: TableMetadata, row: Record<string, unknown>): Record<string, unknown> {
-    const formatted: Record<string, unknown> = {};
-
-    for (const column of table.columns ?? []) {
-        if (column.type.startsWith("Json")) {
-            formatted[column.name] = parseJsonSqlValue(row[column.name]);
-        } else if (hasReturnedNestedColumns(row, column.name)) {
-            formatted[column.name] = reconstructConstructedValue(row, column.name);
-        } else {
-            formatted[column.name] = normalizeReturnedScalar(column.type, row[column.name]);
-        }
-    }
-
-    return formatted;
-}
-
-function reconstructConstructedValue(row: Record<string, unknown>, prefix: string): unknown {
-    const discriminator = row[prefix];
-    if (discriminator == null) {
-        return null;
-    }
-
-    const result: Record<string, unknown> = { _type: discriminator };
-    const childFields = directChildFields(row, prefix);
-
-    for (const field of childFields) {
-        const fieldPrefix = `${prefix}__${field}`;
-        if (hasReturnedNestedColumns(row, fieldPrefix)) {
-            result[field] = reconstructConstructedValue(row, fieldPrefix);
-        } else {
-            result[field] = parseJsonSqlValue(row[fieldPrefix]);
-        }
-    }
-
-    return result;
-}
-
-function directChildFields(row: Record<string, unknown>, prefix: string): string[] {
-    const marker = `${prefix}__`;
-    const fields = new Set<string>();
-    for (const key of Object.keys(row)) {
-        if (!key.startsWith(marker)) {
-            continue;
-        }
-        const rest = key.slice(marker.length);
-        fields.add(rest.split("__")[0]);
-    }
-    return [...fields].sort();
-}
-
-function normalizeReturnedScalar(type: string, value: unknown): unknown {
-    if (type === "Bool") {
-        return value === true || value === 1;
+    if (value instanceof Uint8Array) return Array.from(value);
+    if (Array.isArray(value)) return value.map(fixtureValue);
+    if (value != null && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value)
+            .filter(([, field]) => field !== undefined)
+            .map(([key, field]) => [key, fixtureValue(field)]));
     }
     return value;
-}
-
-function hasReturnedNestedColumns(row: Record<string, unknown>, prefix: string): boolean {
-    return Object.keys(row).some((key) => key.startsWith(`${prefix}__`));
-}
-
-function hasPhysicalColumnAtOrBelow(physicalColumns: Set<string>, prefix: string): boolean {
-    if (physicalColumns.has(prefix)) {
-        return true;
-    }
-    for (const column of physicalColumns) {
-        if (column.startsWith(`${prefix}__`)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function hasNestedPhysicalColumns(physicalColumns: Set<string>, prefix: string): boolean {
-    for (const column of physicalColumns) {
-        if (column.startsWith(`${prefix}__`)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function isSeedValue(value: unknown): value is SeedValue {
-    return value == null
-        || typeof value === "boolean"
-        || typeof value === "number"
-        || typeof value === "string"
-        || value instanceof Uint8Array
-        || Array.isArray(value)
-        || typeof value === "object";
-}
-
-function isSeedLinkValue(value: unknown): value is SeedRow | SeedRow[] {
-    if (Array.isArray(value)) {
-        return value.every((item) => item != null && typeof item === "object" && !Array.isArray(item) && !(item instanceof Uint8Array));
-    }
-    return value != null && typeof value === "object" && !(value instanceof Uint8Array);
-}
-
-function assertCanonicalDiscriminators(value: unknown, path: string): void {
-    if (value == null || typeof value !== "object" || value instanceof Uint8Array) {
-        return;
-    }
-    if (Array.isArray(value)) {
-        value.forEach((item, index) => assertCanonicalDiscriminators(item, `${path}[${index}]`));
-        return;
-    }
-
-    const record = value as Record<string, unknown>;
-    for (const legacyKey of ["type", "type_", "$" ] as const) {
-        if (legacyKey in record) {
-            throw new SeedInputError(`seed value '${path}' uses '${legacyKey}' as a discriminator; use '_type'`);
-        }
-    }
-
-    for (const [key, nested] of Object.entries(record)) {
-        assertCanonicalDiscriminators(nested, `${path}.${key}`);
-    }
-}
-
-function sameSeedValue(a: SeedValue, b: SeedValue): boolean {
-    if (a instanceof Date || b instanceof Date) {
-        return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
-    }
-    if (a instanceof Uint8Array || b instanceof Uint8Array) {
-        return a instanceof Uint8Array && b instanceof Uint8Array && a.length === b.length && a.every((value, index) => value === b[index]);
-    }
-    return a === b;
-}
-
-function isConstructedValue(value: unknown): value is SeedValue {
-    return typeof value === "string" || constructedDiscriminator(value) !== undefined;
-}
-
-function constructedDiscriminator(value: unknown): string | undefined {
-    if (typeof value === "string") {
-        return value;
-    }
-    if (value == null || typeof value !== "object" || Array.isArray(value) || value instanceof Uint8Array) {
-        return undefined;
-    }
-    const record = value as Record<string, unknown>;
-    if (typeof record._type === "string") {
-        return record._type;
-    }
-    return undefined;
-}
-
-function toSqlSeedValue(value: SeedValue): SeedPrimitive {
-    if (value instanceof Date) {
-        if (Number.isNaN(value.getTime())) {
-            throw new SeedInputError("invalid Date seed value");
-        }
-        return Math.floor(value.getTime() / 1000);
-    }
-    if (value == null || typeof value === "boolean" || typeof value === "number" || typeof value === "string" || value instanceof Uint8Array) {
-        return value;
-    }
-    return JSON.stringify(normalizeSeedDates(value));
-}
-
-function toDateTimeSqlValue(value: SeedValue, path: string): SeedPrimitive {
-    if (value == null) {
-        return value;
-    }
-
-    if (value instanceof Date) {
-        if (!Number.isNaN(value.getTime())) {
-            return Math.floor(value.getTime() / 1000);
-        }
-        throw new SeedInputError(`invalid DateTime seed field '${path}'`);
-    }
-
-    if (typeof value === "number") {
-        if (Number.isSafeInteger(value)) {
-            return value;
-        }
-        throw new SeedInputError(`invalid DateTime seed field '${path}': expected whole Unix seconds`);
-    }
-
-    if (typeof value === "string") {
-        const trimmed = value.trim();
-        if (/^[+-]?\d+$/.test(trimmed)) {
-            const asNumber = Number(trimmed);
-            if (Number.isSafeInteger(asNumber)) {
-                return asNumber;
-            }
-            throw new SeedInputError(`invalid DateTime seed field '${path}': invalid Unix seconds`);
-        }
-
-        const parsed = parseRfc3339(trimmed);
-        if (parsed) {
-            return Math.floor(parsed.getTime() / 1000);
-        }
-    }
-
-    throw new SeedInputError(`invalid DateTime seed field '${path}'`);
-}
-
-function toJsonSqlValue(value: SeedValue): SeedPrimitive {
-    if (value == null || typeof value === "string" || value instanceof Uint8Array) {
-        return value;
-    }
-    return JSON.stringify(normalizeSeedDates(value));
-}
-
-function normalizeSeedDates(value: SeedValue): unknown {
-    if (value instanceof Date) {
-        if (Number.isNaN(value.getTime())) {
-            throw new SeedInputError("invalid Date seed value");
-        }
-        return Math.floor(value.getTime() / 1000);
-    }
-    if (Array.isArray(value)) {
-        return value.map(normalizeSeedDates);
-    }
-    if (value !== null && typeof value === "object" && !(value instanceof Uint8Array)) {
-        return Object.fromEntries(
-            Object.entries(value).map(([key, nested]) => [key, normalizeSeedDates(nested as SeedValue)])
-        );
-    }
-    return value;
-}
-
-function parseRfc3339(value: string): Date | null {
-    const match = /^(\d{4})-(\d{2})-(\d{2})[Tt](?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
-    if (!match) {
-        return null;
-    }
-
-    const year = Number(match[1]);
-    const month = Number(match[2]);
-    const day = Number(match[3]);
-    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-    const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]) {
-        return null;
-    }
-
-    const parsed = new Date(value);
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-function parseJsonSqlValue(value: unknown): unknown {
-    if (typeof value !== "string") {
-        return value;
-    }
-    const trimmed = value.trim();
-    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-        return value;
-    }
-    try {
-        return JSON.parse(value);
-    } catch (_) {
-        return value;
-    }
-}
-
-function isParentToChildLink(table: TableMetadata, link: LinkInfo): boolean {
-    return (table.columns ?? []).some((column) => column.name === link.from && column.primary);
-}
-
-function quoteIdentifier(identifier: string): string {
-    return `"${identifier.replace(/"/g, '""')}"`;
 }

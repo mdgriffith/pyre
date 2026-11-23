@@ -160,7 +160,7 @@ At a high level:
 
 - a tagged union used directly in a record is flattened into columns so Pyre can typecheck, migrate, and query it like normal structured data
 - a tagged union used inside `Json<T>` stays inside one validated document value instead of expanding into multiple columns
-- raw `JSON` is the untyped escape hatch when you do not want Pyre to validate the shape
+- bare `Json` (also spelled `JSON`) is an opaque escape hatch: Pyre only guarantees valid JSON and rejects comparisons on these fields in `@where` and `@allow`. Prefer `Json<T>` for documents with a validated shape, and typed columns for values you routinely filter on.
 
 That means the same logical type can have two different persistence strategies depending on where it is used:
 

@@ -1,9 +1,10 @@
 import type { Client, InStatement, Transaction } from "@libsql/client";
 import * as wasm from "./wasm/pyre_wasm.js";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
+import { seed, type SeedInput } from "./query";
 
 const DEFAULT_SCHEMA_KEY = "__default__";
-const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities"]);
+const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities", "_pyre_database_policy"]);
 const CREATE_EXTERNAL_IDENTITIES = `create table if not exists _pyre_external_identities (
     namespace text not null,
     record_name text not null,
@@ -39,6 +40,223 @@ const INTERNAL_SETUP_SQL: InStatement[] = [
 ];
 
 export type EnsureDatabaseOutcome = "created" | "migrated" | "up-to-date";
+
+export type DatabasePolicy = "preserved" | "disposable";
+
+type PolicySql = {
+    create: string; find: string; read: string; write: string;
+    hasNamespace: string; readNamespace: string;
+};
+
+async function readPolicy(tx: Transaction, sql: PolicySql, namespace?: string): Promise<{
+    policy: DatabasePolicy;
+    marked: boolean;
+}> {
+    if (namespace !== undefined && (await tx.execute(sql.hasNamespace)).rows.length !== 0) {
+        const actual = (await tx.execute(sql.readNamespace)).rows[0]?.schema_namespace;
+        if (actual != null && actual !== namespace) {
+            throw new Error(`Expected database namespace '${namespace}', found '${actual}'`);
+        }
+    }
+    const { rows } = await tx.execute(sql.find);
+    if (rows.length === 0) return { policy: "preserved", marked: false };
+    if (rows.length === 1 && rows[0].sql === sql.create) {
+        const policy = (await tx.execute(sql.read)).rows[0]?.policy;
+        if (policy === "preserved" || policy === "disposable") return { policy, marked: true };
+    }
+    throw new Error("Malformed database policy metadata");
+}
+
+/** Read the policy without creating metadata. Initialize server WASM before use. */
+export async function inspectDatabasePolicy(db: Client, namespace?: string): Promise<DatabasePolicy> {
+    await requireFileBackedLocalDatabase(db, "Database policy operations");
+    const sql = wasm.database_policy_sql() as PolicySql;
+    const tx = await db.transaction("read");
+    try {
+        return (await readPolicy(tx, sql, namespace)).policy;
+    } finally {
+        try { await tx.rollback(); } finally { tx.close(); }
+    }
+}
+
+/** Persist explicit opt-in on the existing database. Initialize server WASM before use. */
+export async function setDatabaseDisposable(db: Client, namespace?: string): Promise<DatabasePolicy> {
+    await requireFileBackedLocalDatabase(db, "Database policy operations");
+    const sql = wasm.database_policy_sql() as PolicySql;
+    return databaseWrite<DatabasePolicy>(db, "Database policy", async tx => {
+        const { marked } = await readPolicy(tx, sql, namespace);
+        if (!marked) await tx.execute(sql.create);
+        await tx.execute({ sql: sql.write, args: ["disposable"] });
+        return "disposable";
+    });
+}
+
+export class DatabaseOutcomeUnknown extends Error {}
+
+async function databaseWrite<T>(db: Client, operation: string, work: (tx: Transaction) => Promise<T>): Promise<T> {
+    const tx = await db.transaction("write");
+    let committing = false;
+    try {
+        const result = await work(tx);
+        committing = true;
+        await tx.commit();
+        return result;
+    } catch (error) {
+        if (committing) throw new DatabaseOutcomeUnknown(`${operation} commit outcome unknown`, { cause: error });
+        try {
+            if (tx.closed) throw new Error("Transaction closed without confirming rollback");
+            await tx.rollback();
+        } catch (rollback) {
+            throw new DatabaseOutcomeUnknown(`${operation} rollback outcome unknown`, { cause: new AggregateError([error, rollback]) });
+        }
+        throw error;
+    } finally {
+        try { tx.close(); } catch { /* Commit or rollback determines the outcome. */ }
+    }
+}
+
+/** Install a working schema on an empty target and mark it disposable. */
+export function initDisposableDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[] = []): Promise<void> {
+    return runDisposableDatabase(db, "init", namespace, source, identities);
+}
+
+/** Replace the schema and lineage in place. Use a dedicated maintenance client. */
+export function resetDatabase(db: Client, namespace: string, source: string, identities: ExternalIdentity[] = []): Promise<void> {
+    return runDisposableDatabase(db, "reset", namespace, source, identities);
+}
+
+export class ReseedError extends Error {
+    constructor(
+        readonly kind: "reset-failed" | "reset-outcome-unknown" | "fresh-without-fixtures" | "seed-outcome-unknown",
+        detail: string,
+        cause: unknown,
+    ) {
+        const summary = {
+            "reset-failed": "Reseed stopped during reset",
+            "reset-outcome-unknown": "Reseed reset outcome unknown. Inspect the target before retrying",
+            "fresh-without-fixtures": "Reset committed: the database has a fresh initialized schema and no fixture rows. Fix the failure and rerun reseed from the beginning",
+            "seed-outcome-unknown": "Reset committed, but reseed fixture outcome is unknown. Inspect the target before retrying",
+        }[kind];
+        super(`${summary}: ${detail}`, { cause });
+    }
+}
+
+/**
+ * Commit a reset, then seed separately. Use a dedicated maintenance client.
+ * Pass a loader to defer reading and parsing input until after reset.
+ */
+export async function reseedDatabase(
+    db: Client,
+    namespace: string,
+    source: string,
+    fixtures: SeedInput | (() => SeedInput | Promise<SeedInput>),
+    identities: ExternalIdentity[] = [],
+): Promise<Record<string, unknown[]>> {
+    const describe = (error: unknown) => error instanceof Error ? error.message : String(error);
+    try {
+        await runDisposableDatabase(db, "reseed", namespace, source, identities);
+    } catch (error) {
+        throw new ReseedError(error instanceof DatabaseOutcomeUnknown ? "reset-outcome-unknown" : "reset-failed", describe(error), error);
+    }
+
+    let input: SeedInput;
+    try {
+        input = typeof fixtures === "function" ? await fixtures() : fixtures;
+    } catch (error) {
+        throw new ReseedError("fresh-without-fixtures", describe(error), error);
+    }
+    const result = await seed(db, input, { namespace });
+    if (result.kind === "success") return result.response;
+    const error = result.error;
+    throw new ReseedError(error.errorType === "OutcomeUnknown" ? "seed-outcome-unknown" : "fresh-without-fixtures", error.message, error);
+}
+
+async function requireFileBackedLocalDatabase(db: Client, operation: string): Promise<void> {
+    // The local adapter detaches the connection when starting an interactive transaction.
+    if (db.protocol === "file") {
+        const databases = await db.execute("pragma database_list");
+        if (!databases.rows.some(row => row.name === "main" && typeof row.file === "string" && row.file.length > 0)) {
+            throw new Error(`${operation} require a file-backed local database`);
+        }
+    }
+}
+
+/** @internal libSQL does not expose the configured integer mode on Client. */
+export async function requireSeedIntegerMode(tx: Transaction): Promise<void> {
+    const { rows } = await tx.execute("select 1 as integer_mode_probe");
+    if (typeof rows[0]?.integer_mode_probe === "string") {
+        throw new Error('Seed does not support libSQL intMode "string"; use "number" or "bigint"');
+    }
+}
+
+function planDisposable(catalog: string, reset: boolean, namespace: string, source: string, identities: ExternalIdentity[]): InStatement[] {
+    try {
+        return wasm.plan_disposable_database(catalog, reset, namespace, source, identities) as InStatement[];
+    } catch (error) {
+        throw new Error(String(error));
+    }
+}
+
+async function readCatalog(tx: Transaction): Promise<string> {
+    const catalog = (await tx.execute(wasm.database_catalog_sql())).rows[0]?.catalog;
+    if (typeof catalog !== "string") throw new Error("Could not read database object catalog");
+    return catalog;
+}
+
+async function resetDatabaseInBatch(db: Client, namespace: string, source: string, identities: ExternalIdentity[], reseed: boolean): Promise<void> {
+    // migrate() switches FK enforcement off before BEGIN and restores it after
+    // the batch. This is synchronous on SQLite and stream-scoped on Hrana.
+    // Plan from a read snapshot and verify its preconditions in the batch.
+    if (db.protocol === "file" && Number((await db.execute("pragma foreign_keys")).rows[0]?.foreign_keys) !== 1) {
+        throw new Error("Local reset requires a maintenance client with foreign-key enforcement enabled");
+    }
+    const sql = wasm.database_policy_sql() as PolicySql;
+    const tx = await db.transaction("read");
+    let catalog: string;
+    let hasNamespace: boolean;
+    try {
+        if ((await readPolicy(tx, sql, namespace)).policy !== "disposable") {
+            throw new Error("Reset requires an existing disposable database");
+        }
+        if (reseed) await requireSeedIntegerMode(tx);
+        hasNamespace = (await tx.execute(sql.hasNamespace)).rows.length !== 0;
+        catalog = await readCatalog(tx);
+    } finally {
+        try { await tx.rollback(); } finally { tx.close(); }
+    }
+
+    const statements = planDisposable(JSON.stringify({ ...JSON.parse(catalog), foreign_keys: 0 }), true, namespace, source, identities);
+    // SQLite RAISE() is only available in triggers. Invalid JSON aborts the
+    // batch's first statement if any precondition is false or NULL.
+    const guard = {
+        sql: `with current_catalog as (${wasm.database_catalog_sql()}), policy_objects as (${sql.find})
+            select case when json_extract(catalog, '$.foreign_keys') = 0
+                and json_remove(catalog, '$.foreign_keys') = json_remove(?, '$.foreign_keys')
+                and (select count(*) = 1 and min(sql) = ? from policy_objects)
+                and (select policy from (${sql.read})) = 'disposable'
+                ${hasNamespace ? `and coalesce((${sql.readNamespace}) collate binary = ?, 1)` : ""}
+                then 1 else json('Pyre reset preconditions changed') end
+            from current_catalog`,
+        args: hasNamespace ? [catalog, sql.create, namespace] : [catalog, sql.create],
+    };
+    try {
+        await db.migrate([guard, ...statements]);
+    } catch (cause) {
+        // migrate() does not expose which step failed or confirm rollback.
+        throw new DatabaseOutcomeUnknown("Database reset batch outcome unknown", { cause });
+    }
+}
+
+async function runDisposableDatabase(db: Client, operation: "init" | "reset" | "reseed", namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
+    await requireFileBackedLocalDatabase(db, "Database lifecycle operations");
+    if (operation !== "init") {
+        return resetDatabaseInBatch(db, namespace, source, identities, operation === "reseed");
+    }
+    return databaseWrite(db, "Database initialization", async tx => {
+        const statements = planDisposable(await readCatalog(tx), false, namespace, source, identities);
+        for (const statement of statements) await tx.execute(statement);
+    });
+}
 
 type MigrationPlan = {
     sql: InStatement[];
@@ -133,23 +351,23 @@ async function upsertExternalIdentities(tx: Transaction, identities: ExternalIde
 }
 
 async function loadMetadata(db: Client | Transaction, introspection: any): Promise<any> {
-    const tables = await db.execute("select name from sqlite_master where type = 'table' and name = '_pyre_external_identities'");
+    const tables = await db.execute("select name from main.sqlite_master where type = 'table' and name = '_pyre_external_identities'");
     introspection.external_identities = [];
     if (tables.rows.length > 0) {
-        const identities = await db.execute("select namespace, record_name, field_name, identity_kind from _pyre_external_identities order by namespace, record_name, field_name");
+        const identities = await db.execute("select namespace, record_name, field_name, identity_kind from main._pyre_external_identities order by namespace, record_name, field_name");
         introspection.external_identities = identities.rows.map(row => ({
             namespace: row.namespace, record: row.record_name, field: row.field_name, kind: row.identity_kind,
         }));
     }
-    const columns = await db.execute("pragma table_info('_pyre_migrations')");
+    const columns = await db.execute("pragma main.table_info('_pyre_migrations')");
     if (columns.rows.some(row => row.name === "schema_namespace")) {
-        const namespaces = await db.execute("select schema_namespace from _pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1");
+        const namespaces = await db.execute("select schema_namespace from main._pyre_migrations where finished_at is not null and error is null and schema is not null order by id desc limit 1");
         introspection.schema_namespace = namespaces.rows[0]?.schema_namespace ?? null;
     }
     return introspection;
 }
 
-async function introspectDatabase(tx: Client | Transaction): Promise<{
+export async function introspectDatabase(tx: Client | Transaction): Promise<{
     initialized: boolean;
     introspection: any;
 }> {

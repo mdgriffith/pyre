@@ -4,6 +4,8 @@ pub mod db;
 pub mod error;
 pub mod ext;
 pub mod filesystem;
+#[cfg(feature = "json")]
+pub mod fixture;
 pub mod format;
 pub mod generate;
 pub mod generated_queries;

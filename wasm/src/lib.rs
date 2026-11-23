@@ -3,12 +3,15 @@ use js_sys;
 use log::Level;
 use wasm_bindgen::prelude::*;
 mod cache;
+mod fixture;
 mod migrate;
 mod query;
 mod seed;
 mod sync;
 mod sync_deltas;
 mod sync_shape;
+
+pub use fixture::{fixture_trigger_tables_sql, ingest_fixture};
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -59,6 +62,44 @@ pub fn sql_introspect() -> String {
 #[wasm_bindgen]
 pub fn sql_introspect_uninitialized() -> String {
     pyre::db::introspect::INTROSPECT_UNINITIALIZED_SQL.to_string()
+}
+
+#[wasm_bindgen]
+pub fn database_policy_sql() -> JsValue {
+    use pyre::db::policy;
+    js_sys::JSON::parse(
+        &serde_json::json!({
+            "create": policy::CREATE,
+            "find": policy::FIND,
+            "read": policy::READ,
+            "write": policy::WRITE,
+            "hasNamespace": policy::HAS_NAMESPACE,
+            "readNamespace": policy::READ_NAMESPACE,
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+#[wasm_bindgen]
+pub fn database_catalog_sql() -> String {
+    pyre::db::lifecycle::CATALOG_SQL.into()
+}
+
+#[wasm_bindgen]
+pub fn plan_disposable_database(
+    catalog: &str,
+    reset: bool,
+    namespace: &str,
+    source: &str,
+    identities: JsValue,
+) -> Result<JsValue, JsValue> {
+    let catalog = serde_json::from_str(catalog).map_err(|e| e.to_string())?;
+    let identities: Vec<pyre::ast::ExternalIdentity> =
+        serde_wasm_bindgen::from_value(identities).map_err(|e| e.to_string())?;
+    let statements =
+        pyre::db::lifecycle::plan_disposable(catalog, reset, namespace, source, &identities)?;
+    Ok(serde_wasm_bindgen::to_value(&statements).map_err(|e| e.to_string())?)
 }
 
 #[wasm_bindgen]

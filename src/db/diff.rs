@@ -137,7 +137,7 @@ fn default_value_to_sql(default: &crate::ast::DefaultValue) -> Option<String> {
 fn add_fields(
     context: &crate::typecheck::Context,
     fields: &Vec<crate::ast::Field>,
-    columns: &mut Vec<crate::db::introspect::ColumnInfo>,
+    columns: &mut PhysicalColumns,
     field_namespace: Option<String>,
     seen_fields: &mut std::collections::HashSet<String>,
     force_nullable: bool,
@@ -168,7 +168,10 @@ fn add_fields(
 
             match col.type_.to_serialization_type() {
                 crate::ast::SerializationType::Concrete(concrete) => {
-                    columns.push(crate::db::introspect::ColumnInfo {
+                    if matches!(concrete, crate::ast::ConcreteSerializationType::JsonB) {
+                        columns.json.insert(column_name.clone());
+                    }
+                    columns.info.push(crate::db::introspect::ColumnInfo {
                         cid: 0,
                         name: column_name,
                         column_type: concrete.to_sql_type(),
@@ -188,7 +191,7 @@ fn add_fields(
                     if let Some((_, type_)) = context.types.get(&typename) {
                         match type_ {
                             crate::typecheck::Type::OneOf { variants } => {
-                                columns.push(crate::db::introspect::ColumnInfo {
+                                columns.info.push(crate::db::introspect::ColumnInfo {
                                     cid: 0,
                                     name: column_name.clone(),
                                     column_type: crate::ast::ConcreteSerializationType::Text
@@ -217,7 +220,7 @@ fn add_fields(
                                 }
                             }
                             _ => {
-                                columns.push(crate::db::introspect::ColumnInfo {
+                                columns.info.push(crate::db::introspect::ColumnInfo {
                                     cid: 0,
                                     name: column_name,
                                     column_type: typename.clone(),
@@ -287,7 +290,7 @@ mod tests {
         };
 
         let fields = vec![crate::ast::Field::Column(column)];
-        let mut columns = Vec::new();
+        let mut columns = PhysicalColumns::default();
         let mut seen_fields = std::collections::HashSet::new();
         let context = crate::typecheck::empty_context();
 
@@ -300,8 +303,8 @@ mod tests {
             false,
         );
 
-        assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0].default_value, None);
+        assert_eq!(columns.info.len(), 1);
+        assert_eq!(columns.info[0].default_value, None);
     }
 
     #[test]
@@ -442,13 +445,18 @@ record ClocktowerParticipant {
     }
 }
 
-fn create_table_from_fields(
+#[derive(Default)]
+pub(crate) struct PhysicalColumns {
+    pub info: Vec<crate::db::introspect::ColumnInfo>,
+    // SQLite declares JSONB as BLOB, so the DDL type alone cannot distinguish it.
+    pub json: std::collections::HashSet<String>,
+}
+
+pub(crate) fn physical_columns(
     context: &crate::typecheck::Context,
-    name: &str,
     fields: &Vec<crate::ast::Field>,
-    syncable: bool,
-) -> crate::db::introspect::Table {
-    let mut columns = Vec::new();
+) -> PhysicalColumns {
+    let mut columns = PhysicalColumns::default();
     add_fields(
         context,
         fields,
@@ -457,6 +465,16 @@ fn create_table_from_fields(
         &mut std::collections::HashSet::new(),
         false,
     );
+    columns
+}
+
+fn create_table_from_fields(
+    context: &crate::typecheck::Context,
+    name: &str,
+    fields: &Vec<crate::ast::Field>,
+    syncable: bool,
+) -> crate::db::introspect::Table {
+    let mut columns = physical_columns(context, fields).info;
 
     let table_name = crate::ast::get_tablename(name, fields);
 
