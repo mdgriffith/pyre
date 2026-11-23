@@ -76,7 +76,7 @@ query GetUser($id: User.id) {
 
 The server validates its authenticated session against the schema and enforces the schema permissions when selecting data to sync. `GetUser` remains a normal local query: its only explicit filter uses the ordinary `$id` input, and its only `Session` dependency is in server-side schema permissions.
 
-Synced records require one non-null UUID primary key. `ownerId` here is an ordinary integer from the external authentication system, not this record's primary key. Generated `User.create` allocates the row's UUIDv7; updates and queries use that UUID. See [Schema Identity](./schema.md#identity-and-syncability).
+Synced records require one non-null UUID primary key. `ownerId` here is an ordinary integer from the external authentication system, not this record's primary key. Generated `User.newId()` allocates a UUIDv7 for `User.create`; updates and queries use that same UUID. See [Schema Identity](./schema.md#identity-and-syncability).
 
 For explicit `Session` filters and their ordinary-input alternative, see [Local Queries And Session](./query.md#local-queries-and-session).
 
@@ -325,7 +325,7 @@ const target = database('_default', bootstrap.mainDatabaseId);
 const id = userId('01900000-0000-7000-8000-000000000001');
 const edits = batch([
   User.update(id, { name: 'Updated name' }),
-  User.create({ ownerId: bootstrap.userId, name: 'Another user' }),
+  User.create(User.newId(), { ownerId: bootstrap.userId, name: 'Another user' }),
 ]);
 
 try {
@@ -342,7 +342,7 @@ try {
 }
 ```
 
-`batch` is an optional pure ordered-composition helper; `client.submit(target, [edit])` works for one edit. Construction copies inputs and allocates UUID creates once. Only submission sends a request and installs supported optimistic intent. Use the generated ID conversion function for external IDs; IDs returned by typed CRUD results are already branded. For named namespaces use their actual name instead of `_default`.
+`batch` is an optional pure ordered-composition helper; `client.submit(target, [edit])` works for one edit. Construction copies inputs and captures each supplied create ID. Only submission sends a request and installs supported optimistic intent. Use the generated ID conversion function for external IDs; IDs returned by typed CRUD results are already branded. For named namespaces use their actual name instead of `_default`.
 
 One submission is one atomic server transaction. Generated writes reject if they do not affect exactly one row. Consume typed indexed results rather than assuming success means a row remains visible under query permissions. For input omission/null semantics and named-command composition, see [Query Guide](./query.md#generated-crud-and-composed-operations).
 

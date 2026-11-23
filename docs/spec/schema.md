@@ -120,7 +120,7 @@ externalId Id.Uuid    -- UUID identifier (branded as Uuid Table)
 
 ID types are stored in the database using their underlying representation (`INTEGER` for `Id.Int`, `TEXT` for `Id.Uuid`), but the generated client code uses branded types to prevent accidental misuse. For example, a `UserId` cannot be passed where a `PostId` is expected.
 
-Generated UUID create builders capture canonical lowercase UUIDv7 once and omit the primary key from application input. Named commands and trusted imports can accept explicit UUIDs of other versions. See [Generated CRUD And Composed Operations](../usage/query.md#generated-crud-and-composed-operations) for the distinct execution contracts.
+Generated UUID creates capture a canonical lowercase UUIDv7 once: TypeScript takes the key separately from the input record, and Elm allocates it on submission unless supplied through `withId`. Named commands and trusted imports can accept explicit UUIDs of other versions. See [Generated CRUD And Composed Operations](../usage/query.md#generated-crud-and-composed-operations) for the distinct execution contracts.
 
 **Foreign Key Field References:**
 Reference the ID field of another table to get the correct branded type:

@@ -5,7 +5,7 @@
 The examples below describe the schema-derived field expansion. Current compiled
 CRUD uses flat per-field input parameters (not a nested `$input` object), and the
 actual schema primary-key name rather than assuming `id`. Generated edit builders
-omit UUID create IDs and allocate UUIDv7 once; synced namespaces require UUID keys.
+capture a UUIDv7 once for creates; synced namespaces require UUID keys.
 See [operation builders](composed-operation-builders.md) for the current public
 TypeScript/Elm APIs, execution contract and runnable examples.
 

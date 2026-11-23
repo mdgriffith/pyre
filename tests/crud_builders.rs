@@ -181,7 +181,7 @@ fn elm_edit_builders_preserve_schema_names() {
     let mut schema = ast::Schema::default();
     parser::run(
         "schema.pyre",
-        &format!("record PreludeNames {{\n    @public\n    id Id.Uuid @id\n{fields}}}\nrecord OptimisticNote {{\n    @public\n    optimisticKey Id.Uuid @id\n    optimistic String\n}}\nrecord Internal {{\n    @public\n    id Id.Uuid @id\n    title String\n}}\n"),
+        &format!("record PreludeNames {{\n    @public\n    id Id.Uuid @id\n{fields}}}\nrecord OptimisticNote {{\n    @public\n    optimisticKey Id.Uuid @id\n    optimistic String\n    id String?\n    withId String\n    optionId String\n}}\nrecord Internal {{\n    @public\n    id Id.Uuid @id\n    title String\n}}\n"),
         &mut schema,
     )
     .unwrap();
@@ -218,6 +218,10 @@ fn elm_edit_builders_preserve_schema_names() {
     assert!(!metadata.contains("identity__"));
     let edits =
         std::fs::read_to_string(dir.path().join("client/elm/Db/Edit/OptimisticNote.elm")).unwrap();
+    assert!(edits.contains("\nwithId : Db.Id.OptimisticNote -> CreateOption"));
+    assert!(edits.contains("\nwithId_ : (String) -> Patch"));
+    assert!(edits.contains("\nwithId__ : (Maybe (String)) -> CreateOption"));
+    assert!(edits.contains("\noptionId_ : (String) -> Patch"));
     // Helper names and signatures must not rewrite quoted schema metadata.
     for helper in ["optimistic", "optimisticCreate", "optimisticDelete"] {
         let declaration = format!("{helper} : () -> Encode.Value\n{helper} _ =\n");
@@ -292,6 +296,12 @@ record Document {
     key Id.Uuid @id
     title String
 }
+record Ticket {
+    @public
+    key Id.Uuid @id
+    number Sequence.Int
+    title String
+}
 "#,
         &mut schema,
     )
@@ -302,6 +312,8 @@ record Document {
     let context = typecheck::check_schema(&database).unwrap();
     let mut queries = ast::QueryList { queries: vec![] };
     generated_queries::append_generated_crud_queries(&mut queries, &context);
+    // Exercise a generated artifact with only the create builder for a UUID record.
+    queries.queries.retain(|definition| !matches!(definition, ast::QueryDef::Query(query) if matches!(query.name.as_str(), "DocumentUpdate" | "DocumentDelete")));
     let info = typecheck::check_queries(&queries, &context).unwrap();
     let mut files = vec![];
     generate::generate_schema(&context, &mut files);
@@ -314,22 +326,24 @@ record Document {
     }
     std::fs::write(dir.path().join("verify.ts"), r#"
 import assert from 'node:assert/strict';
-import { Note, Counter, Account, Document, noteId, counterId, accountId, documentId, type NoteId } from './typescript/core/edits';
+import { Note, Counter, Account, Document, Ticket, noteId, counterId, accountId, documentId, type NoteId } from './typescript/core/edits';
 import { captureOperations, type Operation } from '@pyre/client/operations';
 import { meta as create } from './typescript/core/queries/metadata/noteCreate';
 import { meta as update } from './typescript/core/queries/metadata/noteUpdate';
 import { meta as remove } from './typescript/core/queries/metadata/noteDelete';
 import { meta as counterUpdate } from './typescript/core/queries/metadata/counterUpdate';
 import { meta as accountUpdate } from './typescript/core/queries/metadata/accountUpdate';
-import { meta as documentUpdate } from './typescript/core/queries/metadata/documentUpdate';
 const key = noteId('arbitrary-string-key');
 const edits = [Note.create({key, id: 'ordinary', title: 'First'}), Note.update(key, {id: 'other', title: 'Next'}), Note.delete(key)];
+const allocated = Document.newId();
+assert.deepEqual(captureOperations([Document.create(allocated, { title: 'UUID' })])[0].input, { key: allocated, title: 'UUID' });
+const ticket = Ticket.newId();
+assert.deepEqual(captureOperations([Ticket.create(ticket, { title: 'Automatic sequence' })])[0].input, { key: ticket, title: 'Automatic sequence' });
 for (const [i, validator] of [create, update, remove].entries()) assert(validator.InputValidator.safeParse(captureOperations([edits[i]])[0].input).success);
 assert.deepEqual(captureOperations([edits[1]])[0].input, {key: 'arbitrary-string-key', id: 'other', title: 'Next'});
 for (const [edit, validator] of [
     [Counter.update(counterId(42), {title: 'Int'}), counterUpdate],
     [Account.update(accountId(43), {title: 'Id.Int'}), accountUpdate],
-    [Document.update(documentId('01900000-0000-7000-8000-000000000001'), {title: 'UUID'}), documentUpdate],
 ] as const) assert(validator.InputValidator.safeParse(captureOperations([edit])[0].input).success);
 type ResultOf<T> = T extends Operation<any, infer R> ? R : never;
 function typedResult(result: ResultOf<ReturnType<typeof Note.create>>) {
@@ -420,6 +434,13 @@ record Note {
     id String
     title String
 }
+record Reply {
+    @allow(query) { True }
+    @allow(insert, update, delete) { Session.write == True && title != "Forbidden" }
+    replyKey Id.Uuid @id
+    noteKey Note.noteKey
+    title String @unique
+}
 "#,
         &mut schema,
     )
@@ -463,11 +484,13 @@ import Query.DocumentDelete
 port output : Encode.Value -> Cmd msg
 main =
     Platform.worker
-        { init = \() -> ( (), output (Encode.list identity [ Internal.encode create, Internal.encode (Document.update (Db.Id.uuid "01900000-0000-7000-8000-000000000000") patch), receiptCheck, Internal.encode (Note.create { id = "ordinary", title = "Custom key" } []) ]) )
+        { init = \() -> ( (), output (Encode.list identity [ Internal.encode create, Internal.encode (Document.update (Db.Id.uuid "01900000-0000-7000-8000-000000000000") patch), receiptCheck, Internal.encode (note [ explicit ]), Internal.encode (note [ explicit, explicit ]) ]) )
         , update = \() model -> ( model, Cmd.none )
         , subscriptions = \_ -> Sub.none
         }
 create = Document.create { title = "Title", owner = "Owner", tags = [] } [ Document.withSummary Nothing ]
+note = Note.create { id = "ordinary", title = "Custom key" }
+explicit = Note.withId (Db.Id.uuid "01900000-0000-7000-8000-000000000002")
 patch = [ Document.title "New title", Document.summary Nothing, Document.tags [ "tag" ] ]
 receiptCheck =
     let
@@ -525,6 +548,7 @@ receiptCheck =
         "Document.title Nothing",
         "Document.owner \"forbidden\"",
         "Document.create { title = \"missing\" } []",
+        "Document.withId wrongAccount\n\nwrongAccount : Db.Id.Account\nwrongAccount = Db.Id.uuid \"any\"",
         "Document.update (Db.Id.uuid \"01900000-0000-7000-8000-000000000000\") [ Account.name \"wrong record\" ]",
     ] {
         std::fs::write(
@@ -543,17 +567,24 @@ receiptCheck =
         );
     }
     std::fs::write(dir.path().join("verify.ts"), r#"
-import { documentCreate, documentUpdate, documentId, accountId, batch, database } from './typescript/core/edits';
+import assert from 'node:assert/strict';
+import { Document, documentCreate, documentUpdate, documentId, accountId, batch, database } from './typescript/core/edits';
 import { captureOperations } from '@pyre/client/operations';
 import type { PyreClient } from '@pyre/client';
 import { meta as createMeta } from './typescript/core/queries/metadata/documentCreate';
 import { meta as updateMeta } from './typescript/core/queries/metadata/documentUpdate';
 import { meta as deleteMeta } from './typescript/core/queries/metadata/documentDelete';
 import { Note } from './typescript/core/edits';
-const custom: any = captureOperations([Note.create({ id: 'ordinary', title: 'Custom key' })])[0];
-if (custom.optimistic.where.field !== 'noteKey' || custom.input.id !== 'ordinary' || !custom.input.noteKey) throw new Error('Custom create identity');
+const note = Note.newId();
+const custom: any = captureOperations([Note.create(note, { id: 'ordinary', title: 'Custom key' })])[0];
+if (custom.optimistic.where.field !== 'noteKey' || custom.input.id !== 'ordinary' || custom.input.noteKey !== note) throw new Error('Custom create identity');
+assert.throws(() => Note.create('01900000-0000-4000-8000-000000000000' as typeof note, { id: 'ordinary', title: 'Wrong version' }), /UUIDv7/);
 if (createMeta.optimistic.kind !== 'create' || deleteMeta.optimistic.kind !== 'delete') throw new Error('Missing CRUD prediction');
-const created = documentCreate({ title: 'Title', owner: 'Owner', tags: [], summary: null });
+const input = { title: 'Title', owner: 'Owner', tags: [], summary: null };
+const createKey = Document.newId();
+const created = documentCreate(createKey, input);
+input.title = 'Changed after capture';
+assert.deepEqual(captureOperations([created])[0].input, { id: createKey, title: 'Title', owner: 'Owner', tags: [], summary: null });
 const id = documentId('01900000-0000-7000-8000-000000000000');
 const account = accountId('01900000-0000-7000-8000-000000000001');
 documentUpdate(id, { assignee: account });
@@ -571,14 +602,20 @@ for (const [meta, input] of [[createMeta, captured[0].input], [updateMeta, { id 
   if (meta.syncEffects.sql || !meta.syncEffects.syncSql) throw new Error('Incorrect CRUD sync effects');
 }
 if (updateMeta.InputValidator.safeParse({ id: '01900000-0000-7000-8000-000000000000', owner: 'forged' }).success) throw new Error('Protected input accepted');
-// @ts-expect-error ID is allocated by the runtime
-documentCreate({ id: 'forged', title: 'Title', owner: 'Owner', tags: [] });
+if (false) {
+  // @ts-expect-error UUID create requires an explicit ID argument
+  Document.create(input);
+  // @ts-expect-error Create IDs from different records have different types
+  Document.create(note, input);
+  // @ts-expect-error ID cannot be passed as a create field
+  documentCreate(createKey, { ...input, id: 'forged' });
+}
 // @ts-expect-error Immutable fields are not patchable
 documentUpdate(id, { owner: 'Other' });
 // @ts-expect-error Non-nullable values cannot be cleared
 documentUpdate(id, { title: null });
 // @ts-expect-error Required create fields cannot be omitted
-documentCreate({ title: 'Title' });
+documentCreate(createKey, { title: 'Title' });
 // @ts-expect-error Unbranded strings are not record identities
 documentUpdate('01900000-0000-7000-8000-000000000000', {});
 async function typedSubmission(client: PyreClient) {
@@ -619,20 +656,45 @@ import { Elm } from './elm.js';
 const app = Elm.Main.init({ flags: null });
 const edits: any[] = await new Promise(resolve => app.ports.output.subscribe(resolve));
 assert.deepEqual(edits[0].input, { title: 'Title', owner: 'Owner', tags: [], summary: null });
-assert.equal(edits[0].createId, 'id');
+assert.deepEqual(edits[0].createId, { mode: 'auto', field: 'id' });
 assert.equal(edits[0].optimistic.kind, 'create');
 assert.deepEqual(edits[1].input, { id: '01900000-0000-7000-8000-000000000000', title: 'New title', summary: null, tags: ['tag'] });
 assert(!('owner' in edits[1].input));
 assert.equal(edits[2], true, 'typed receipt must reject another database and wrong operation accessor');
-assert.equal(edits[3].createId, 'noteKey');
+assert.deepEqual(edits[3].createId, { mode: 'explicit', field: 'noteKey', id: '01900000-0000-7000-8000-000000000002' });
 assert.equal(edits[3].optimistic.where.field, 'noteKey');
 assert.deepEqual(edits[3].input, { id: 'ordinary', title: 'Custom key' });
+assert.deepEqual(edits[4].createId, { mode: 'duplicate' });
 "#).unwrap();
     std::fs::write(
         dir.path().join("composed-browser.ts"),
         include_str!("fixtures/composed-browser.ts"),
     )
     .unwrap();
+    for (module, compiled, source) in [
+        (
+            "AcquireExample.elm",
+            "acquire.js",
+            include_str!("fixtures/AcquireExample.elm"),
+        ),
+        (
+            "AcquireChecks.elm",
+            "acquire-checks.js",
+            include_str!("fixtures/AcquireChecks.elm"),
+        ),
+    ] {
+        std::fs::write(dir.path().join(module), source).unwrap();
+        let output = Command::new("elm")
+            .args(["make", module, &format!("--output={compiled}")])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     std::fs::write(
         dir.path().join("composed-conformance.ts"),
         include_str!("fixtures/composed-conformance.ts"),

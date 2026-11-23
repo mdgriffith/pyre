@@ -208,7 +208,7 @@ Send the returned value with `pyreStoreOut (save databaseId requestId documentId
 
 Builders are pure and record-specific. Required create inputs are a record; optional create fields use `withField` builders. For nullable updates, omission leaves a field unchanged, `Nothing` clears it, and `Just value` sets it. `Patch` and `CreateOption` constructors are opaque; generated names may gain underscore suffixes to avoid collisions, so consult the generated module. JSON/union fields replace whole logical values.
 
-All edits in one `Db.Edit.submit` execute in order in one server transaction, targeting one typed namespace and concrete database. The bridge captures a UUIDv7 for each create once before worker dispatch; do not provide a UUID primary key in create input. There are no intra-batch generated-ID references. Use a successful create result for a later dependent submission.
+All edits in one `Db.Edit.submit` execute in order in one server transaction, targeting one typed namespace and concrete database. For ordinary creates, the bridge allocates a UUIDv7 before worker dispatch. This works with the existing ports and does not need an acquisition broker. If you already know the UUIDv7, pass `Document.withId documentId` in the options list. Duplicate `withId` options or invalid create IDs fail before worker dispatch.
 
 Subscribe to the mutation-result port and decode a completion against the database and request retained in your model:
 
@@ -227,6 +227,56 @@ Import `Json.Decode as Decode` for the port type. Wire the subscription to an ap
 Submission installs supported prediction in the existing worker; ordinary query publications update the UI. Do not apply the receipt as a second cache patch. Handle bridge dispatch errors through the configured `elm.onError` callback as well as mutation-result failures. Pending edits are memory-only, and unknown outcomes must not be automatically retried. See [Sync Outcomes And Recovery](./sync.md#shared-visible-state-and-outcomes).
 
 The repository's `tests/fixtures/ComposedExample.elm` demonstrates the complete model/effect/port path and database-scoped query storage; its generated-browser lifecycle is exercised by `cargo test --test crud_builders`.
+
+### Acquire IDs Before Submitting (Optional)
+
+If the app needs an ID beforehand, for example to link a new child to a new parent, keep one `Db.Id.Broker.Model Msg` initialized with `Broker.init` in the root model. Add the response port and route both replies and timeout messages through the broker:
+
+```elm
+import Db.Id
+import Db.Id.Acquire as Acquire
+import Db.Id.Broker as Broker
+
+port pyre_receiveAcquiredIds : (Decode.Value -> msg) -> Sub msg
+
+-- In the root Msg type, include:
+-- BrokerMsg Broker.Msg
+-- GotDocumentId (Result Acquire.Error Db.Id.Document)
+-- AcquisitionProblem Broker.Problem
+
+brokerConfig =
+    { send = pyreStoreOut
+    , toMsg = BrokerMsg
+    , onProblem = AcquisitionProblem
+    }
+
+requestDocumentId broker =
+    Broker.send brokerConfig
+        (Acquire.start identity |> Acquire.id |> Acquire.request)
+        GotDocumentId
+        broker
+
+updateBroker msg broker =
+    Broker.update brokerConfig msg broker
+
+acquisitionSubscription =
+    pyre_receiveAcquiredIds (Broker.Received >> BrokerMsg)
+```
+
+In each case, store the returned broker in the model and return its `Cmd` from the same update. Handle `GotDocumentId (Ok documentId)` by retaining the ID or building the ordered batch in that update. In this example the comment's own ID stays automatic:
+
+```elm
+pyreStoreOut
+    (Db.Edit.submit databaseId requestId
+        [ Document.create { title = "New document" } [ Document.withId documentId ]
+        , Comment.create { documentId = documentId, body = "First comment" } []
+        ]
+    )
+```
+
+To acquire multiple IDs in one round trip, start with a function of the IDs and pipe through `Acquire.id` once for each argument: `Acquire.start Tuple.pair |> Acquire.id |> Acquire.id |> Acquire.request`. Acquisition is local and has no visible-state or network effects. Treat generation failure and the five-second timeout as ordinary errors. On bridge replacement call `Broker.reset` on the existing model to retire outstanding requests. JavaScript uses `pyre_receiveAcquiredIds` by default; set `elm.idAcquisitionResultPort` if your port has a different name.
+
+See [`tests/fixtures/AcquireExample.elm`](../../tests/fixtures/AcquireExample.elm) for a runnable standard Elm example with both explicit and automatic child IDs.
 
 ## Named Mutation Compatibility
 

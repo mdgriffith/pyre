@@ -171,7 +171,7 @@ A query whose only `Session` dependency is in schema permissions, such as `@allo
 
 Pyre generates precompiled `{Record}Create`, `{Record}Update`, and `{Record}Delete` operations and typed builders for writable records. Prefer these builders for standard application CRUD:
 
-- TypeScript: `Record.create(input)`, `Record.update(id, patch)`, and `Record.delete(id)` from generated `typescript/core/edits`.
+- TypeScript: `Record.create(id, input)` for UUID-backed records, plus `Record.update(id, patch)` and `Record.delete(id)` from generated `typescript/core/edits`. After regenerating, migrate `Record.create(input)` to `Record.create(Record.newId(), input)`.
 - Elm: `Db.Edit.<Record>` constructors and field builders, submitted with `Db.Edit.submit`.
 
 Construction captures values; it does not execute SQL, send a request, or change visible state. Explicit submission sends an ordered list of compiled query IDs and inputs. The server uses its own manifest/metadata for validation, SQL, permissions, and execution in one transaction. Clients do not send SQL or permission rules.
@@ -191,11 +191,20 @@ Named commands remain available through `client.run` and generated `Query.*` mod
 
 - Generated create inputs retain `@immutable` fields when insertable; updates omit protected fields. Omitted update fields stay unchanged, explicit `null` clears a nullable field, and a supplied value replaces it. Elm builders express nullable values with `Maybe`: omit the builder, pass `Nothing`, or pass `Just value`.
 - JSON and tagged unions replace whole logical values, not nested patches or automatic merges.
-- UUID create builders allocate canonical lowercase UUIDv7 once: at TS construction or Elm bridge capture before dispatch. Do not supply the primary key. Custom primary-key field names work too. Query-only non-UUID records retain their schema-derived input behavior.
+- `Record.newId()` returns a record-branded canonical lowercase UUIDv7 synchronously. TypeScript takes it as the first argument to `create`; Elm allocates automatically on submission unless you pass the typed `Record.withId` option. Custom primary-key names work too. Query-only non-UUID keys and server-managed `Sequence.Int` fields retain their existing behavior.
 - A batch targets one namespace and one database instance. The namespace evidence is a type/runtime check, not authorization.
 - Every generated write must affect exactly one row; zero or multiple rows reject and roll back the whole batch. Named commands retain their existing semantics, including successful empty update/delete results.
 - Success returns ordered `{ index, queryId, result }` entries with each operation's result shape. Generated TS validators and Elm receipt accessors decode them. Results describe each operation at its execution point; synced readers receive final authorized rows/removals for the transaction.
-- There is no intra-batch result binding or generated-ID placeholder API. To use a newly created ID in another write, read its committed result and submit a later batch; those submissions are separate transactions.
+- To create related rows atomically, acquire the parent's ID before submission, use it in the child's foreign-key input, and submit the parent first. Acquiring an ID does not reserve a row, authorize a write, or publish optimistic state.
+
+```ts
+const parentId = Parent.newId();
+const childId = Child.newId();
+const result = await client.submit(target, [
+  Parent.create(parentId, { title: 'Parent' }),
+  Child.create(childId, { parentId, title: 'Child' }),
+]);
+```
 
 Generated CRUD enforces schema permissions, but it does not enforce business invariants that exist only in a named command. Choosing named commands in application code is not server-enforced exclusive command ownership.
 

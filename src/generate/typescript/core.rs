@@ -37,7 +37,7 @@ pub fn generate_queries(
     files: &mut Vec<filesystem::GeneratedFile<String>>,
 ) {
     let formatter = to_metadata_formatter();
-    let mut edits = String::from("// Generated browser-independent CRUD builders.\nimport { operation, createId, type Operation } from '@pyre/client/operations';\nexport { batch, database } from '@pyre/client/operations';\n\ndeclare const identity: unique symbol;\ntype Id<Namespace, Record, Value> = Value & { readonly [identity]: readonly [Namespace, Record] };\ntype BindIds<Value, Ids> = { [Key in keyof Value]: Key extends keyof Ids ? Ids[Key] | Extract<Value[Key], null | undefined> : Value[Key] };\ntype BindRows<Value, Ids> = { [Key in keyof Value]: Value[Key] extends (infer Row)[] ? BindIds<Row, Ids>[] : Value[Key] };\n\n");
+    let mut edits = String::from("// Generated browser-independent CRUD builders.\nimport { operation, createId, requireCreateId, type Operation } from '@pyre/client/operations';\nexport { batch, database } from '@pyre/client/operations';\n\ndeclare const identity: unique symbol;\ntype Id<Namespace, Record, Value> = Value & { readonly [identity]: readonly [Namespace, Record] };\ntype BindIds<Value, Ids> = { [Key in keyof Value]: Key extends keyof Ids ? Ids[Key] | Extract<Value[Key], null | undefined> : Value[Key] };\ntype BindRows<Value, Ids> = { [Key in keyof Value]: Value[Key] extends (infer Row)[] ? BindIds<Row, Ids>[] : Value[Key] };\n\n");
     let mut identity_tables: Vec<_> = context.tables.values().collect();
     identity_tables.sort_by(|a, b| a.record.name.cmp(&b.record.name));
     for table in identity_tables {
@@ -113,8 +113,8 @@ pub fn generate_queries(
                             if matches!(primary_key.type_, ast::ColumnType::IdUuid { .. }) =>
                         {
                             (
-                                format!("input: Omit<BindIds<{module}.Input, {record}Ids>, {key}>"),
-                                format!("{{ ...input, [{}]: createId() }}", key),
+                                format!("id: {record}Id, input: Omit<BindIds<{module}.Input, {record}Ids>, {key}>"),
+                                format!("{{ ...input, [{key}]: requireCreateId(id) }}"),
                             )
                         }
                         ast::QueryOperation::Insert => {
@@ -161,9 +161,36 @@ pub fn generate_queries(
     records.sort_by(|a, b| a.record.name.cmp(&b.record.name));
     for table in records {
         let name = &table.record.name;
-        let has_all = ["Create", "Update", "Delete"].iter().all(|suffix| query_list.queries.iter().any(|definition| matches!(definition, ast::QueryDef::Query(query) if query.name == format!("{name}{suffix}") && crate::generated_queries::generated_crud_table(context, query).is_some())));
-        if has_all {
-            edits.push_str(&format!("export const {name} = {{ create: {}Create, update: {}Update, delete: {}Delete }} as const;\n", string::decapitalize(name), string::decapitalize(name), string::decapitalize(name)));
+        let has = |suffix: &str| {
+            let query_name = format!("{name}{suffix}");
+            query_list.queries.iter().any(|definition| matches!(definition, ast::QueryDef::Query(query) if query.name == query_name && crate::generated_queries::generated_crud_table(context, query).is_some()))
+        };
+        let create = has("Create");
+        let update = has("Update");
+        let delete = has("Delete");
+        let uuid_create = create
+            && ast::collect_columns(&table.record.fields)
+                .iter()
+                .any(|column| {
+                    ast::is_primary_key(column)
+                        && matches!(column.type_, ast::ColumnType::IdUuid { .. })
+                });
+        if uuid_create || (create && update && delete) {
+            let prefix = string::decapitalize(name);
+            let mut members = vec![format!("create: {prefix}Create")];
+            if uuid_create {
+                members.push(format!("newId: (): {name}Id => createId() as {name}Id"));
+            }
+            if update {
+                members.push(format!("update: {prefix}Update"));
+            }
+            if delete {
+                members.push(format!("delete: {prefix}Delete"));
+            }
+            edits.push_str(&format!(
+                "export const {name} = {{ {} }} as const;\n",
+                members.join(", ")
+            ));
         }
     }
     files.push(generate_text_file(base_out_dir.join("edits.ts"), edits));

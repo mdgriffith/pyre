@@ -18,7 +18,7 @@ const outcome = await executeOperations(
   authorizedConnection,
   queries,
   database('_default', databaseId),
-  [Document.create({ title: 'Initial document', summary: null })],
+  [Document.create(Document.newId(), { title: 'Initial document', summary: null })],
   authenticatedSession,
   { mode: 'sync', sessions: connectedSessions, publish: sendToSession },
 );
@@ -30,7 +30,7 @@ The application must authorize `databaseId`, resolve it to `authorizedConnection
 
 Use `{ mode: 'normal' }` for simple request/response execution without live publication. Both modes run one ordered transaction, enforce generated-write cardinality, and return typed indexed results. Construction is browser-independent; no worker, IndexedDB, or SSE connection is required. Local TypeScript execution requires file-backed libSQL.
 
-Generated UUID creates capture UUIDv7 once and omit identity from input. Use the committed `createdId` in a later submission for dependent records; there is no intra-batch result binding. A definite execution rejection rolls back the batch. `OutcomeUnknown`, a publication exception, or a post-commit decoding exception must not trigger automatic replay. See [Operation Semantics](./query.md#generated-crud-and-composed-operations).
+Generated UUID creates capture the UUIDv7 passed as the first argument. Allocate it ahead of time with `Document.newId()` if another operation needs to reference it in the same batch. A definite execution rejection rolls back the batch. `OutcomeUnknown`, a publication exception, or a post-commit decoding exception must not trigger automatic replay. See [Operation Semantics](./query.md#generated-crud-and-composed-operations).
 
 Rust applications use manifest descriptors with `query::run_operations`, or `$batch` through `query::run` / `query::run_sync`; see [Rust Server](./rust-server.md#composed-operations).
 

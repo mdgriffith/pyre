@@ -13,7 +13,7 @@ const id = documentId('01900000-0000-7000-8000-000000000000');
 const edit = Document.update(id, { title: 'New title', summary: null });
 await client.submit(target, batch([edit]));
 
-const create = Document.create({ title: 'Title', owner: 'Owner', tags: [] });
+const create = Document.create(Document.newId(), { title: 'Title', owner: 'Owner', tags: [] });
 const receipt = await client.submit(target, [create]);
 if (receipt.ok) {
   const created = receipt.value[0].result.document[0];
@@ -22,8 +22,9 @@ if (receipt.ok) {
 ```
 
 Construction does not execute. Inputs are copied at construction and transport
-captures are isolated copies. A UUID create allocates its canonical UUIDv7 once
-at construction; callers do not supply the primary key. `batch` preserves order
+captures are isolated copies. `Document.newId()` allocates a branded UUIDv7;
+`Document.create(id, input)` validates and captures the same canonical ID under
+the actual primary-key field. `batch` preserves order
 and rejects mixed known namespaces. `@pyre/client/operations` has no worker,
 IndexedDB, or browser-executor import. Request/response adapters can obtain
 descriptors using `captureOperations` and pass only `{ queryId, input }` to the
@@ -62,15 +63,42 @@ Send these requests through the normal `pyreStoreOut` bridge port. Record-specif
 `Patch` and `CreateOption` constructors are opaque. Omitted fields stay unchanged;
 `Nothing` encodes null and `Just` sets nullable values. Required create fields are
 a record; optional fields are builders. Optional-create names use `withField`;
-collisions receive underscore suffixes. The bridge allocates create UUIDv7 IDs
-before sending the existing `$batch` mutation and its prediction list to the
-worker. Submission does not patch an application-side cache.
+collisions receive underscore suffixes. UUID records reserve `withId` for a
+record-typed explicit ID. The bridge captures each create's automatic or explicit
+UUIDv7 before sending the existing `$batch` mutation and its prediction list to
+the worker. Duplicate `withId` options and invalid explicit IDs reject locally.
+Submission does not patch an application-side cache.
 
 Use `Db.Edit.receive databaseId requestId message` on the mutation-result port to
 obtain an opaque `Receipt namespace`. It rejects a different database instance or
 request. `Document.createResult 0 receipt`, `updateResult`, and `deleteResult`
 return the corresponding generated `Result String ReturnData`, checking both the
 index and compiled query identity. Rejections remain ordinary `Err` values.
+
+### Local Elm ID acquisition protocol
+
+Ordinary Elm submission requires no acquisition setup. Applications that need
+IDs in advance can use a fixed-size `Db.Id.Acquire` plan. The plan supplies typed
+IDs in order, and captures all application data and callbacks in Elm. Zero-ID
+plans complete locally. Nonempty plans send exactly one request:
+
+| Direction | Message |
+| --- | --- |
+| Elm outgoing (`pyreStoreOut`) | `{ type: "acquire-ids", requestId, count }` |
+| JS to Elm (default `pyre_receiveAcquiredIds`) | `{ type: "ids-acquired", requestId, ids }` or `{ type: "ids-failed", requestId, error }` |
+
+Request IDs are 1–128 ASCII characters from `[A-Za-z0-9._:-]`; Elm and JS both
+limit requests to 64 UUIDs. JavaScript uses the same local cryptographic UUIDv7
+allocator as TypeScript and ordinary Elm creates. Elm validates reply identity,
+count, canonical lowercase UUIDv7 format, and distinctness before applying the
+plan. The messages never reach the worker or server.
+
+Standard Elm apps can keep a single `Db.Id.Broker` in the root model. It registers
+the decoder and callback before sending, removes them on completion or after
+five seconds, and does not retry. A malformed correlated reply fails its request;
+an unknown or malformed request ID is reported without consuming another entry.
+Reset the existing broker on bridge replacement to retire pending callbacks and
+preserve the app-lifetime correlation counter. See the [Elm guide](../usage/elm-sync.md#acquire-ids-before-submitting-optional).
 
 ## Execution
 
@@ -143,7 +171,7 @@ import { Document, database } from './generated/typescript/core/edits';
 
 const result = await executeOperations(
   authorizedConnection, queries, database('_default', databaseId),
-  [Document.create({ title: 'Seed', owner: 'Owner', tags: [], summary: null })],
+  [Document.create(Document.newId(), { title: 'Seed', owner: 'Owner', tags: [], summary: null })],
   authenticatedSession,
   { mode: 'sync', sessions: connectedSessions, publish: sendToSession },
 );
@@ -252,10 +280,11 @@ schema, server and client upgrade together. IndexedDB v4 discards legacy caches;
 the next initialization loads migrated authority.
 
 Trusted imports and named commands can supply explicit UUIDs of any version.
-Generated client creates allocate canonical lowercase UUIDv7 once, and their
+Generated client creates capture canonical lowercase UUIDv7 once, and their
 trusted manifest metadata requires UUIDv7 at execution. UUID ordering is an index
-locality optimization, not business ordering. A newly created ID cannot be used by
-another operation in the same batch without a future reference/placeholder API.
+locality optimization, not business ordering. An ID allocated ahead of submission
+can be passed as ordinary input to later items in the same batch. Allocation does
+not reserve a row or imply authorization or commit.
 
 Generated compile-positive/negative and wire checks:
 
@@ -269,6 +298,7 @@ npm exec --yes --package=elm@0.19.1-6 --package=bun@latest -- cargo test --test 
 | --- | --- |
 | Generated TS/Elm types, protected fields, custom keys, nullable inputs and receipts | `tests/crud_builders.rs`, `tests/elm_client.rs`, `tests/typescript_db.rs` |
 | Actual generated bridge, two database instances, optimistic updates and typed completion | `tests/fixtures/ComposedExample.elm` + Chromium `composed-conformance.ts` |
+| Local acquisition, broker correlation, ordered related UUID creates and failed-child rollback | `tests/fixtures/AcquireChecks.elm`, `tests/fixtures/AcquireExample.elm` + Chromium `composed-conformance.ts` |
 | Compiled seed permissions, normal/sync results, JSON replacement and operation-N rollback | `composed-conformance.ts`, `packages/server/query.test.ts` |
 | Native Rust ordered execution, UUIDv7/cardinality, atomic rollback and commit-order revisions | `tests/query_server.rs` |
 | Original/final visibility, mixed writes, hidden grants, custom-key removals and caps | `tests/sync_server.rs`, `tests/query_server.rs`, `packages/client/scripts/field-edit-proof.ts`, `packages/server/query-sync.test.ts` |
