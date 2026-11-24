@@ -325,6 +325,8 @@ setFromJson field jsonValue form =
 
 Import `Json.Decode` for this helper. Wire-format unions use an `_type` string and payload fields (for example `{ "_type": "Published", "by": "Sam" }`); date-times use epoch seconds. Use `Editor.set` with `Db.Absent` or `Db.Null` for omission, revert, or clear. The decoder builds whole editable field values; nested kinds describe their shape, not separately writable fields.
 
+Avoid JavaScript special property names such as `hasOwnProperty` and `__proto__` as keys in typed dictionaries, including dictionaries nested inside other values. Elm's JSON dictionary decoder can throw on `hasOwnProperty`, and its encoder can drop `__proto__`.
+
 Render the views from `Editor.fields form`. For example, pass each string view to the same text widget, using `field.current` for display and the field view itself for edits. This helper works for `Title`, `Owner`, and other records in the same namespace:
 
 ```elm
