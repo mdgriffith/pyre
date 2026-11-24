@@ -16,7 +16,7 @@ If your main goal is Elm port wiring, also see [Elm + Sync Runtime Setup](./elm-
 The shortest sync path looks like this:
 
 1. Define server-side schema permissions and a local query using ordinary inputs.
-2. Apply the schema to a database with `pyre migrate db/app.db --push`.
+2. Initialize a development database with `pyre db init db/app.db --disposable`.
 3. Run `pyre generate`.
 4. Start a Pyre-backed server that exposes `/sync`, `/sync/events`, and `/db`.
 5. Create a `PyreClient` in your browser app.
@@ -85,7 +85,7 @@ For explicit `Session` filters and their ordinary-input alternative, see [Local 
 For a local sync prototype, use direct push:
 
 ```bash
-pyre migrate db/app.db --push
+pyre db init db/app.db --disposable
 ```
 
 For checked-in migration files instead of direct push, see [Migration Guide](./migrations.md).

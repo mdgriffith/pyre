@@ -3,6 +3,7 @@ use js_sys;
 use log::Level;
 use wasm_bindgen::prelude::*;
 mod cache;
+mod finalized;
 mod fixture;
 mod migrate;
 mod query;
@@ -11,6 +12,10 @@ mod sync;
 mod sync_deltas;
 mod sync_shape;
 
+pub use finalized::{
+    audit_finalized_structure, finalized_migration_sql, plan_finalized_history,
+    verify_finalized_bundle,
+};
 pub use fixture::{fixture_trigger_tables_sql, ingest_fixture};
 
 #[wasm_bindgen(start)]

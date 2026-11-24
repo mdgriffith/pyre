@@ -21,7 +21,7 @@ fn database_commands_fail_on_connection_errors() {
         vec!["migrate", "$PYRE_TEST_MISSING_DATABASE"],
         vec!["migrate", "$PYRE_TEST_MISSING_DATABASE", "--push"],
         vec!["introspect", "$PYRE_TEST_MISSING_DATABASE"],
-        vec!["migration", "init", "--db", "$PYRE_TEST_MISSING_DATABASE"],
+        vec!["db", "init", "$PYRE_TEST_MISSING_DATABASE", "--disposable"],
     ] {
         let output = Command::cargo_bin("pyre")
             .unwrap()
@@ -59,10 +59,10 @@ async fn database_commands_fail_on_introspection_errors() {
     conn.execute("CREATE TABLE _pyre_migrations (wrong_column TEXT)", ())
         .await
         .unwrap();
+    pyre::db::policy::set_disposable(&conn, None).await.unwrap();
     for args in [
         vec!["migrate", "broken.db", "--push"],
         vec!["introspect", "broken.db"],
-        vec!["migration", "init", "--db", "broken.db"],
     ] {
         Command::cargo_bin("pyre")
             .unwrap()
@@ -111,24 +111,26 @@ fn format_invalid_query_fails_without_overwriting_or_success_summary() {
 #[test]
 fn migration_sql_failure_identifies_file() {
     let dir = workspace();
-    let folder = dir.path().join("pyre/migrations/202601010000_broken");
-    std::fs::create_dir_all(&folder).unwrap();
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migration", "create", "broken", "--draft"])
+        .assert()
+        .success();
+    let folder = dir.path().join("pyre/migrations/_default/broken");
     std::fs::write(folder.join("migration.sql"), "THIS IS NOT SQL;").unwrap();
     Command::cargo_bin("pyre")
         .unwrap()
         .current_dir(dir.path())
-        .args(["migrate", "test.db"])
+        .args(["migration", "check", "broken"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "202601010000_broken/migration.sql",
-        ))
-        .stderr(predicate::str::contains("syntax error"))
-        .stderr(predicate::str::contains("rolled back"));
+        .stderr(predicate::str::contains("migration.sql statement 1"))
+        .stderr(predicate::str::contains("syntax error"));
 }
 
 #[test]
-fn migration_generation_rejects_non_directory_and_pending_migrations() {
+fn migration_generation_rejects_non_directory_and_allows_parallel_drafts() {
     let dir = workspace();
     std::fs::write(dir.path().join("not-a-directory"), "").unwrap();
     Command::cargo_bin("pyre")
@@ -136,23 +138,26 @@ fn migration_generation_rejects_non_directory_and_pending_migrations() {
         .current_dir(dir.path())
         .args([
             "migration",
-            "init",
-            "--db",
-            "test.db",
+            "create",
+            "initial",
             "--migration-dir",
             "not-a-directory",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not a directory"));
-    std::fs::create_dir_all(dir.path().join("pyre/migrations/pending")).unwrap();
-    Command::cargo_bin("pyre")
-        .unwrap()
-        .current_dir(dir.path())
-        .args(["migration", "init", "--db", "test.db"])
-        .assert()
-        .failure()
-        .stdout(predicate::str::contains("migrations have not been applied"));
+        .stderr(predicate::str::contains("Not a directory"));
+    for name in ["first", "second"] {
+        Command::cargo_bin("pyre")
+            .unwrap()
+            .current_dir(dir.path())
+            .args(["migration", "create", name, "--draft"])
+            .assert()
+            .success();
+        assert!(!dir
+            .path()
+            .join(format!("pyre/migrations/_default/{name}/manifest.json"))
+            .exists());
+    }
 }
 
 #[test]
@@ -161,7 +166,7 @@ fn migration_generation_accepts_missing_migration_directory() {
     Command::cargo_bin("pyre")
         .unwrap()
         .current_dir(dir.path())
-        .args(["migration", "init", "--db", "test.db"])
+        .args(["migration", "create", "initial"])
         .assert()
         .success();
     assert_eq!(
@@ -182,7 +187,7 @@ async fn destructive_push_requires_force_and_preserves_unrelated_rows() {
     Command::cargo_bin("pyre")
         .unwrap()
         .current_dir(dir.path())
-        .args(["migrate", "test.db", "--push"])
+        .args(["db", "init", "test.db", "--disposable"])
         .assert()
         .success();
 
@@ -270,7 +275,7 @@ fn force_does_not_bypass_unsupported_column_changes() {
     Command::cargo_bin("pyre")
         .unwrap()
         .current_dir(dir.path())
-        .args(["migrate", "test.db", "--push"])
+        .args(["db", "init", "test.db", "--disposable"])
         .assert()
         .success();
     std::fs::write(
@@ -292,7 +297,7 @@ fn force_does_not_bypass_unsupported_column_changes() {
 }
 
 #[test]
-fn missing_recorded_schema_identifies_schema_and_database() {
+fn serve_refuses_an_unmarked_target_without_creating_missing_paths() {
     let dir = workspace();
     let database = dir.path().join("empty.db");
     Command::cargo_bin("pyre")
@@ -302,15 +307,20 @@ fn missing_recorded_schema_identifies_schema_and_database() {
         .args(["serve", "$PYRE_SCHEMA_DATABASE"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(format!(
-            "Schema: {}",
-            pyre::ast::DEFAULT_SCHEMANAME
-        )))
-        .stderr(predicate::str::contains(format!(
-            "Database: {}",
-            database.display()
-        )))
-        .stderr(predicate::str::contains("No recorded schema found"));
+        .stderr(predicate::str::contains(
+            database.to_string_lossy().as_ref(),
+        ));
+    assert!(!database.exists());
+    std::fs::write(&database, []).unwrap();
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["serve", database.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Serving a preserved database requires finalized provenance",
+        ));
 }
 
 #[cfg(unix)]
@@ -319,8 +329,8 @@ fn migration_generation_propagates_directory_read_errors() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = workspace();
-    let migrations = dir.path().join("pyre/migrations");
-    std::fs::create_dir(&migrations).unwrap();
+    let migrations = dir.path().join("pyre/migrations/_default");
+    std::fs::create_dir_all(&migrations).unwrap();
     std::fs::set_permissions(&migrations, std::fs::Permissions::from_mode(0o300)).unwrap();
     // Privileged users can bypass directory permissions.
     if std::fs::read_dir(&migrations).is_ok() {
@@ -330,7 +340,7 @@ fn migration_generation_propagates_directory_read_errors() {
     let output = Command::cargo_bin("pyre")
         .unwrap()
         .current_dir(dir.path())
-        .args(["migration", "init", "--db", "test.db"])
+        .args(["migration", "create", "initial"])
         .output()
         .unwrap();
     std::fs::set_permissions(&migrations, std::fs::Permissions::from_mode(0o700)).unwrap();

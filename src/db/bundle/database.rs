@@ -2,17 +2,13 @@
 
 use super::{
     author::{self, Draft},
-    execute, Bundle, Catalog, History,
+    execute, plan, Bundle, Catalog, History,
 };
 use libsql::{Connection, TransactionBehavior};
 use std::collections::BTreeMap;
 
 const BUNDLES: &str = "_pyre_migration_bundles";
 const DRAFTS: &str = "_pyre_migration_drafts";
-const CREATE_BUNDLES: &str = "create table if not exists main._pyre_migration_bundles (
-    namespace text not null, name text not null, manifest text not null, files text not null,
-    primary key (namespace, name)
-)";
 const CREATE_DRAFTS: &str = "create table if not exists main._pyre_migration_drafts (
     namespace text not null, name text not null, draft text not null,
     primary key (namespace, name)
@@ -55,7 +51,11 @@ impl<'a> DatabaseCatalog<'a> {
         let mut names = BTreeMap::new();
         let mut bundles = Vec::new();
         if exists(self.connection, BUNDLES).await? {
-            let mut rows = self.connection.query("select name, manifest, files from main._pyre_migration_bundles where namespace = ? order by name", [namespace]).await.map_err(error)?;
+            let mut rows = self
+                .connection
+                .query(plan::READ_BUNDLES, [namespace])
+                .await
+                .map_err(error)?;
             while let Some(row) = rows.next().await.map_err(error)? {
                 let name: String = row.get(0).map_err(error)?;
                 let manifest: String = row.get(1).map_err(error)?;
@@ -175,11 +175,12 @@ impl Catalog for DatabaseCatalog<'_> {
 }
 
 pub(super) async fn store(conn: &Connection, name: &str, bundle: &Bundle) -> Result<(), Error> {
-    conn.execute(CREATE_BUNDLES, ()).await.map_err(error)?;
-    conn.execute("insert into main._pyre_migration_bundles(namespace, name, manifest, files) values (?, ?, ?, ?)", libsql::params![
-        bundle.namespace(), name, String::from_utf8(bundle.manifest_json()).expect("manifest is UTF-8"),
-        serde_json::to_string(bundle.files()).map_err(error)?,
-    ]).await.map_err(error)?;
+    conn.execute(plan::CREATE_BUNDLES, ())
+        .await
+        .map_err(error)?;
+    execute::execute_statement(conn, plan::store_bundle(name, bundle))
+        .await
+        .map_err(error)?;
     Ok(())
 }
 

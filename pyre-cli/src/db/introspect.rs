@@ -1,43 +1,5 @@
 use libsql;
-use pyre::db::introspect::{
-    DbTable, Introspection, Migration, MigrationRun, MigrationState, LIST_MIGRATIONS, LIST_TABLES,
-    MIGRATION_TABLE,
-};
-
-pub async fn get_migration_state(
-    conn: &libsql::Connection,
-) -> Result<MigrationState, libsql::Error> {
-    let args: Vec<String> = vec![];
-    let table_list_result = conn.query(LIST_TABLES, args).await?;
-    let mut has_migrations_table = false;
-
-    let mut table_rows = table_list_result;
-    while let Some(row) = table_rows.next().await? {
-        let table = libsql::de::from_row::<DbTable>(&row).unwrap();
-        if table.name == MIGRATION_TABLE {
-            has_migrations_table = true;
-            break;
-        }
-    }
-
-    if !has_migrations_table {
-        return Ok(MigrationState::NoMigrationTable);
-    }
-
-    let args: Vec<String> = vec![];
-    let migration_list_result = conn.query(LIST_MIGRATIONS, args).await?;
-    let mut migrations = Vec::new();
-
-    let mut migration_rows = migration_list_result;
-    while let Some(row) = migration_rows.next().await? {
-        let migration_run = libsql::de::from_row::<MigrationRun>(&row).unwrap();
-        migrations.push(Migration {
-            name: migration_run.name,
-        });
-    }
-
-    Ok(MigrationState::MigrationTable { migrations })
-}
+use pyre::db::introspect::{Introspection, MigrationState};
 
 #[derive(serde::Deserialize)]
 struct IntrospectionRow {

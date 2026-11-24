@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use pyre::ast::{ExternalIdentity, IdentityKind};
+use pyre::db::lifecycle::init_disposable;
 use pyre::server::schema::{self, EnsureDatabaseOutcome};
 use std::path::Path;
 
@@ -21,14 +22,7 @@ fn migrate(root: &Path, mode: &str) {
         Command::cargo_bin("pyre")
             .unwrap()
             .current_dir(root)
-            .args([
-                "migration",
-                "upgrade",
-                "--db",
-                "app.db",
-                "--namespace",
-                "App",
-            ])
+            .args(["migration", "create", "upgrade", "--namespace", "App"])
             .assert()
             .success();
     }
@@ -54,7 +48,7 @@ async fn timestamp_representations_are_equivalent_across_migration_modes() {
         (implicit, ""),
     ]
     .into_iter()
-    .flat_map(|(old, new)| ["runtime", "push", "files"].map(|mode| (old, new, mode)))
+    .flat_map(|(old, new)| ["runtime", "push"].map(|mode| (old, new, mode)))
     {
         let root = tempfile::tempdir().unwrap();
         let db = libsql::Builder::new_local(root.path().join("app.db"))
@@ -63,7 +57,7 @@ async fn timestamp_representations_are_equivalent_across_migration_modes() {
             .unwrap();
         let conn = db.connect().unwrap();
         let old = format!("record Note {{\n    @public\n    id Id.Uuid @id\n{old_fields}}}\n");
-        schema::ensure_database(&conn, "App", &old).await.unwrap();
+        init_disposable(&conn, "App", &old, &[]).await.unwrap();
         // The implicit-only case has no createdAt column.
         let created_at = if old_fields == implicit {
             ""
@@ -140,7 +134,7 @@ async fn legacy_external_scalar_snapshots_upgrade_without_rebuilding_columns() {
         ),
         (IdentityKind::Int, "Int", "42"),
     ] {
-        for mode in ["runtime", "push", "files"] {
+        for mode in ["runtime", "push"] {
             let root = tempfile::tempdir().unwrap();
             let db = libsql::Builder::new_local(root.path().join("app.db"))
                 .build()
@@ -148,9 +142,7 @@ async fn legacy_external_scalar_snapshots_upgrade_without_rebuilding_columns() {
                 .unwrap();
             let conn = db.connect().unwrap();
             let legacy = format!("@syncable(false)\nrecord Note {{\n    @public\n    id Id.Uuid @id\n    ownerId {scalar}\n}}\n");
-            schema::ensure_database(&conn, "App", &legacy)
-                .await
-                .unwrap();
+            init_disposable(&conn, "App", &legacy, &[]).await.unwrap();
             conn.execute_batch(&format!("insert into notes (id, ownerId) values ('01900000-0000-7000-8000-000000000002', {value}); drop table _pyre_external_identities; alter table _pyre_migrations drop column schema_namespace;")).await.unwrap();
             let current = legacy.replace(&format!("ownerId {scalar}"), "ownerId Auth.User.id");
             let identity = ExternalIdentity {
@@ -229,13 +221,7 @@ async fn legacy_external_scalar_snapshots_upgrade_without_rebuilding_columns() {
 
 #[tokio::test]
 async fn retired_external_session_identities_do_not_block_migrations() {
-    for mode in [
-        "runtime",
-        "push",
-        "files",
-        "no-pending-files",
-        "applied-files",
-    ] {
+    for mode in ["runtime", "push"] {
         let root = tempfile::tempdir().unwrap();
         let db = libsql::Builder::new_local(root.path().join("app.db"))
             .build()
@@ -250,7 +236,7 @@ async fn retired_external_session_identities_do_not_block_migrations() {
             field: "id".into(),
             kind: IdentityKind::Uuid,
         };
-        schema::ensure_database_with_external_identities(&conn, "App", &old, &[identity])
+        init_disposable(&conn, "App", &old, &[identity])
             .await
             .unwrap();
         conn.execute(
@@ -259,15 +245,6 @@ async fn retired_external_session_identities_do_not_block_migrations() {
         )
         .await
         .unwrap();
-        if mode == "applied-files" {
-            project(
-                root.path(),
-                app,
-                "record User {\n    @public\n    id Id.Uuid @id\n}\n",
-                Some("session {\n    ownerId Auth.User.id?\n}\n"),
-            );
-            migrate(root.path(), "files");
-        }
         let session = "session {\n    isAdmin Bool\n}\n";
         let current = format!("{session}{app}");
         if mode == "runtime" {
@@ -316,13 +293,7 @@ async fn retired_external_session_identities_do_not_block_migrations() {
 
 #[tokio::test]
 async fn renamed_external_identity_fields_resolve_old_snapshots_until_refresh() {
-    for mode in [
-        "runtime",
-        "push",
-        "files",
-        "no-pending-files",
-        "applied-files",
-    ] {
+    for mode in ["runtime", "push"] {
         let root = tempfile::tempdir().unwrap();
         let db = libsql::Builder::new_local(root.path().join("app.db"))
             .build()
@@ -338,29 +309,15 @@ async fn renamed_external_identity_fields_resolve_old_snapshots_until_refresh() 
             field: "id".into(),
             kind: IdentityKind::Uuid,
         };
-        schema::ensure_database_with_external_identities(
-            &conn,
-            "App",
-            &old,
-            &[old_identity.clone()],
-        )
-        .await
-        .unwrap();
+        init_disposable(&conn, "App", &old, &[old_identity.clone()])
+            .await
+            .unwrap();
         conn.execute(
             "insert into notes (id) values ('01900000-0000-7000-8000-000000000001')",
             (),
         )
         .await
         .unwrap();
-        if mode == "applied-files" {
-            project(
-                root.path(),
-                app,
-                "record User {\n    @public\n    id Id.Uuid @id\n}\n",
-                Some(old_session),
-            );
-            migrate(root.path(), "files");
-        }
         let session = old_session.replace("Auth.User.id", "Auth.User.key");
         let current = format!("{session}{app}");
         let identity = ExternalIdentity {
@@ -421,7 +378,7 @@ async fn renamed_external_identity_fields_resolve_old_snapshots_until_refresh() 
 }
 
 #[tokio::test]
-async fn no_pending_migrations_refresh_required_identities_and_preserve_history() {
+async fn no_pending_migrations_leave_world_and_history_at_the_finalized_schema() {
     let root = tempfile::tempdir().unwrap();
     let db = libsql::Builder::new_local(root.path().join("app.db"))
         .build()
@@ -431,7 +388,18 @@ async fn no_pending_migrations_refresh_required_identities_and_preserve_history(
     let app = "record Note {\n    @public\n    id Id.Uuid @id\n    ownerId Auth.User.id\n}\n";
     let auth = "record User {\n    @public\n    id Id.Uuid @id\n}\nrecord Account {\n    @public\n    id Id.Uuid @id\n}\n";
     project(root.path(), app, auth, None);
-    migrate(root.path(), "files");
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["migration", "create", "initial", "--namespace", "App"])
+        .assert()
+        .success();
+    Command::cargo_bin("pyre")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["db", "init", "app.db", "--namespace", "App"])
+        .assert()
+        .success();
     conn.execute(
         "insert into notes (id, ownerId) values (?, ?)",
         libsql::params![
@@ -442,7 +410,7 @@ async fn no_pending_migrations_refresh_required_identities_and_preserve_history(
     .await
     .unwrap();
     let history_sql =
-        "select json_group_array(json_array(id, name, sql, finished_at)) from _pyre_migrations";
+        "select json_group_array(json_array(hash, predecessor, applied_at)) from _pyre_migration_receipts";
     let history: String = conn
         .query(history_sql, ())
         .await
@@ -465,14 +433,8 @@ async fn no_pending_migrations_refresh_required_identities_and_preserve_history(
         loaded.context().unwrap(),
         loaded.schema().unwrap(),
     );
-    assert!(source.contains("accountId Auth.Account.id?"));
-    assert_eq!(loaded.context().unwrap().external_identities.len(), 2);
-    assert!(loaded
-        .context()
-        .unwrap()
-        .external_identities
-        .iter()
-        .any(|identity| identity.record == "Account"));
+    assert!(!source.contains("accountId Auth.Account.id?"));
+    assert_eq!(loaded.context().unwrap().external_identities.len(), 1);
     let updated_history: String = conn
         .query(history_sql, ())
         .await
@@ -485,32 +447,21 @@ async fn no_pending_migrations_refresh_required_identities_and_preserve_history(
         .unwrap();
     assert_eq!(history, updated_history);
 
-    // A logical identity change still needs an explicit migration even though
-    // both columns use TEXT. Failure must roll back the attempted refresh.
+    // A metadata-only change takes effect only after publishing a bundle.
     project(
         root.path(),
-        &app.replace("ownerId Auth.User.id", "ownerId Auth.Account.id"),
+        app,
         auth,
-        Some("session {\n    isAdmin Bool\n}\n"),
+        Some("session {\n    accountId Auth.Account.id?\n}\n"),
     );
-    Command::cargo_bin("pyre")
-        .unwrap()
-        .current_dir(root.path())
-        .args(["migrate", "app.db", "--namespace", "App"])
-        .assert()
-        .failure();
+    migrate(root.path(), "files");
     let after = schema::load_schema_from_database(&conn).await.unwrap();
-    assert_eq!(
-        pyre::db::migrate::schema_to_storage_string(
-            after.context().unwrap(),
-            after.schema().unwrap()
-        ),
-        source
-    );
-    assert_eq!(
-        after.context().unwrap().external_identities,
-        loaded.context().unwrap().external_identities
-    );
+    assert!(pyre::db::migrate::schema_to_storage_string(
+        after.context().unwrap(),
+        after.schema().unwrap()
+    )
+    .contains("accountId Auth.Account.id?"));
+    assert_eq!(after.context().unwrap().external_identities.len(), 2);
     let count: i64 = conn
         .query("select count(*) from notes", ())
         .await
@@ -526,7 +477,7 @@ async fn no_pending_migrations_refresh_required_identities_and_preserve_history(
 
 #[tokio::test]
 async fn local_identity_qualification_does_not_require_a_physical_migration() {
-    for mode in ["runtime", "push", "files", "no-pending-files"] {
+    for mode in ["runtime", "push"] {
         let root = tempfile::tempdir().unwrap();
         let db = libsql::Builder::new_local(root.path().join("app.db"))
             .build()
@@ -534,7 +485,7 @@ async fn local_identity_qualification_does_not_require_a_physical_migration() {
             .unwrap();
         let conn = db.connect().unwrap();
         let old = "record User {\n    @public\n    id Id.Uuid @id\n}\nrecord Account {\n    @public\n    id Id.Uuid @id\n}\nrecord Note {\n    @public\n    id Id.Uuid @id\n    ownerId User.id\n    owners Json<List<User.id>>\n}\n";
-        schema::ensure_database(&conn, "App", old).await.unwrap();
+        init_disposable(&conn, "App", old, &[]).await.unwrap();
         conn.execute(
             "insert into notes (id, ownerId, owners) values (?, ?, jsonb(?))",
             libsql::params![

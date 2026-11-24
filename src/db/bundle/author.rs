@@ -8,12 +8,7 @@ use crate::ast;
 use crate::db::{diff, introspect};
 use crate::generate::sql::to_sql::SqlAndParams;
 use crate::schema_contract::ApiTransition;
-use fallible_iterator::FallibleIterator;
 use libsql::{Builder, Connection};
-use libsql_sqlite3_parser::{
-    ast::{Cmd, CreateTableBody, Stmt, ToTokens, TokenStream},
-    lexer::sql::{Parser, TokenType},
-};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -367,110 +362,17 @@ pub async fn audit_schema(
     conn: &Connection,
     context: &crate::typecheck::Context,
 ) -> Result<(), String> {
-    let expected = memory().await?;
-    materialize(&expected, context).await?;
-    let expected = structure(&expected).await?;
-    let actual = structure(conn).await?;
-    let mut changes = Vec::new();
-    for (name, definition) in &expected {
-        match actual.get(name) {
-            None => changes.push(format!("missing {} {}", name.0, name.1)),
-            Some(actual) if actual != definition => {
-                changes.push(format!("different definition for {} {}", name.0, name.1))
-            }
-            _ => {}
-        }
-    }
-    for name in actual.keys().filter(|name| !expected.contains_key(*name)) {
-        changes.push(format!("unexpected {} {}", name.0, name.1));
-    }
-    if changes.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "physical schema differs from the expected schema:\n{}",
-            changes.join("\n")
-        ))
-    }
-}
-
-async fn structure(conn: &Connection) -> Result<BTreeMap<(String, String), Vec<Tokens>>, String> {
-    let mut rows = conn.query("select type, name, sql from main.sqlite_schema where sql is not null and lower(substr(name,1,7)) != 'sqlite_' and lower(name) not in ('_pyre_migrations','_pyre_external_identities','_pyre_sync','_pyre_database_policy','_pyre_finalized_schema','_pyre_migration_receipts','_pyre_migration_bundles','_pyre_migration_drafts')", ()).await.map_err(string)?;
-    let mut result = BTreeMap::new();
+    let mut rows = conn
+        .query(super::structure::READ_STRUCTURE, ())
+        .await
+        .map_err(string)?;
+    let mut actual = Vec::new();
     while let Some(row) = rows.next().await.map_err(string)? {
-        let name = (row.get(0).map_err(string)?, row.get(1).map_err(string)?);
-        let source: String = row.get(2).map_err(string)?;
-        let mut parser = Box::new(Parser::new(source.as_bytes()));
-        let mut definition = Vec::new();
-        match parser
-            .next()
-            .map_err(string)?
-            .ok_or("empty catalog definition")?
-        {
-            Cmd::Stmt(Stmt::CreateTable {
-                body:
-                    CreateTableBody::ColumnsAndConstraints {
-                        columns,
-                        constraints,
-                        options,
-                    },
-                ..
-            }) => {
-                // Physical column order is irrelevant to generated named queries.
-                for column in columns {
-                    definition.push(tokens(&column));
-                }
-                for constraint in constraints.into_iter().flatten() {
-                    definition.push(tokens(&constraint));
-                }
-                definition.sort();
-                definition.push(vec![format!("table options {}", options.bits())]);
-            }
-            Cmd::Stmt(Stmt::CreateIndex {
-                unique,
-                idx_name,
-                tbl_name,
-                columns,
-                where_clause,
-                ..
-            }) => {
-                // SQLite strips IF NOT EXISTS, and ASC is implicit.
-                definition.push(tokens(&Stmt::CreateIndex {
-                    unique,
-                    idx_name,
-                    tbl_name,
-                    columns,
-                    where_clause,
-                    if_not_exists: false,
-                }));
-            }
-            other => definition.push(tokens(&other)),
-        }
-        result.insert(name, definition);
+        actual.push((
+            row.get(0).map_err(string)?,
+            row.get(1).map_err(string)?,
+            row.get(2).map_err(string)?,
+        ));
     }
-    Ok(result)
-}
-
-type Tokens = Vec<String>;
-
-fn tokens(value: &impl ToTokens) -> Tokens {
-    #[derive(Default)]
-    struct Stream(Tokens);
-    impl TokenStream for Stream {
-        type Error = std::convert::Infallible;
-        fn append(&mut self, kind: TokenType, value: Option<&str>) -> Result<(), Self::Error> {
-            let value = match (kind, value) {
-                (TokenType::TK_ID, Some(name)) => {
-                    name.trim_matches(['"', '`', '[', ']']).to_ascii_lowercase()
-                }
-                (_, Some(value)) => value.to_string(),
-                (_, None) => String::new(),
-            };
-            self.0.push(format!("{}:{value}", kind as u16));
-            Ok(())
-        }
-    }
-    let mut stream = Stream::default();
-    value.to_tokens(&mut stream).unwrap();
-    stream.0
+    super::structure::audit(context, actual)
 }

@@ -249,9 +249,11 @@ async fn init_project(options: &Options<'_>, arguments: &JsonValue) -> Result<Js
 
     if let Some(database) = database {
         let mut migrate_args = vec![
-            "migrate".to_string(),
+            "db".to_string(),
+            "init".to_string(),
             database.clone(),
-            "--push".to_string(),
+            "--migration-catalog".to_string(),
+            "database".to_string(),
         ];
         if let Some(namespace) = namespace.as_ref() {
             migrate_args.push("--namespace".to_string());
@@ -545,13 +547,7 @@ async fn db_status(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonV
         string_arg(arguments, "namespace").unwrap_or_else(|| ast::DEFAULT_SCHEMANAME.to_string());
     let migration_dir =
         string_arg(arguments, "migration_dir").unwrap_or_else(|| "pyre/migrations".to_string());
-    let namespace_migration_dir = if namespace == ast::DEFAULT_SCHEMANAME {
-        PathBuf::from(&migration_dir)
-    } else {
-        Path::new(&migration_dir).join(&namespace)
-    };
-
-    let db = match db::connect(&database, &auth).await {
+    let db = match db::connect_existing(&database, &auth).await {
         Ok(db) => db,
         Err(error) => {
             return Ok(json!({
@@ -570,7 +566,11 @@ async fn db_status(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonV
             &error,
         )
     })?;
-    let introspection = crate::db::introspect::introspect_connection(&conn)
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
+        .await
+        .map_err(|e| e.to_string())?;
+    let introspection = crate::db::introspect::introspect_connection(&tx)
         .await
         .map_err(|error| {
             db::error::operation_error(
@@ -581,28 +581,42 @@ async fn db_status(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonV
             )
         })?;
 
-    let migration_files = match db::read_migration_items(&namespace_migration_dir) {
-        Ok(files) => files,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(format!(
-                "Failed to read migrations in {}: {error}",
-                namespace_migration_dir.display()
-            ))
-        }
+    let installed = pyre::db::bundle::execute::installed(&tx).await?;
+    if installed
+        .as_ref()
+        .is_some_and(|state| state.namespace != namespace)
+    {
+        return Err("Requested namespace does not match the finalized installation".into());
+    }
+    let binding = installed.as_ref().map(|state| state.binding);
+    let (history, names) = super::finalized::load(
+        &tx,
+        Path::new(&migration_dir),
+        &namespace,
+        binding.unwrap_or(pyre::db::bundle::execute::Binding::Filesystem),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let progress =
+        pyre::db::bundle::execute::inspect_history(&tx, &history, installed.as_ref()).await?;
+    tx.rollback().await.map_err(|e| e.to_string())?;
+    let names: std::collections::BTreeMap<_, _> =
+        names.into_iter().map(|(name, hash)| (hash, name)).collect();
+    let label = |bundle: &pyre::db::bundle::Bundle| {
+        names
+            .get(bundle.hash())
+            .cloned()
+            .unwrap_or_else(|| bundle.hash().to_string())
     };
-    let applied_migrations = match &introspection.migration_state {
-        pyre::db::introspect::MigrationState::NoMigrationTable => Vec::new(),
-        pyre::db::introspect::MigrationState::MigrationTable { migrations } => migrations
-            .iter()
-            .map(|migration| migration.name.clone())
-            .collect::<Vec<_>>(),
-    };
-    let pending_migrations = migration_files
+    let applied_migrations: Vec<_> = progress
+        .applied
         .iter()
-        .filter(|name| !applied_migrations.contains(name))
-        .cloned()
-        .collect::<Vec<_>>();
+        .map(|&index| label(&history.bundles()[index]))
+        .collect();
+    let pending_migrations: Vec<_> = history.bundles()[progress.pending_from..]
+        .iter()
+        .map(label)
+        .collect();
 
     let mut schema_status = json!({ "checked": false });
     let stored_schema_error = match &introspection.schema {
@@ -661,6 +675,8 @@ async fn db_status(options: &Options<'_>, arguments: &JsonValue) -> Result<JsonV
         "accessible": true,
         "status": status,
         "namespace": namespace,
+        "migrationCatalog": binding.map(|binding| binding.as_str()),
+        "baseline": installed.and_then(|state| state.baseline.map(|hash| hash.to_string())),
         "appliedMigrations": applied_migrations,
         "pendingMigrations": pending_migrations,
         "schema": schema_status
@@ -1365,7 +1381,7 @@ fn sorted_keys<T>(map: &HashMap<String, T>) -> Vec<String> {
 
 fn tools() -> Vec<JsonValue> {
     vec![
-        tool("pyre_init", "Initialize a new Pyre schema directory from provided schema source. Fails if the target directory already exists or the schema is invalid.", json!({"type":"object","required":["schema"],"properties":{"dir":{"type":"string","description":"Directory to initialize. Defaults to pyre."},"schema":{"type":"string","description":"Initial namespace schema source to write."},"session":{"type":"string","description":"Optional shared session declaration source to write to session.pyre."},"namespace":{"type":"string","description":"Optional schema namespace. If omitted, uses the default namespace."},"database":{"type":"string","description":"Optional local database path to create and migrate, for example pyre.db."}}})),
+        tool("pyre_init", "Initialize a new Pyre schema directory from provided schema source. Fails if the target directory already exists or the schema is invalid.", json!({"type":"object","required":["schema"],"properties":{"dir":{"type":"string","description":"Directory to initialize. Defaults to pyre."},"schema":{"type":"string","description":"Initial namespace schema source to write."},"session":{"type":"string","description":"Optional shared session declaration source to write to session.pyre."},"namespace":{"type":"string","description":"Optional schema namespace. If omitted, uses the default namespace."},"database":{"type":"string","description":"Optional local path for a new preserved database with a target-local finalized catalog."}}})),
         tool("pyre_project_info", "Report basic information about the current Pyre project.", json!({"type":"object","properties":{"dir":{"type":"string"},"generated":{"type":"string"},"migration_dir":{"type":"string"}}})),
         tool("pyre_docs", "Return bundled Pyre documentation by topic. Read schema and query for identity and operation contracts, sync for TypeScript submission/recovery, elm-sync for Elm builders/receipts, and seeding or rust-server for server-owned execution. multi-database-upgrade and migrations cover upgrades; server-contexts is optional session caching.", json!({"type":"object","properties":{"topic":{"type":"string","enum":DOC_RESOURCES.iter().map(|doc| doc.topic).collect::<Vec<_>>()}}})),
         tool("pyre_schema", "Return all Pyre schema files and their contents.", json!({"type":"object","properties":{"dir":{"type":"string"}}})),

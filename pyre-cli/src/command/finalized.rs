@@ -55,7 +55,7 @@ pub fn project_schema(
     ))
 }
 
-async fn load(
+pub(super) async fn load(
     conn: &libsql::Connection,
     root: &Path,
     namespace: &str,
@@ -132,19 +132,25 @@ pub async fn apply(
     inspect: Option<&str>,
 ) -> io::Result<()> {
     let conn = connect(database, auth, false).await?;
-    let installed = execute::installed(&conn)
-        .await
-        .map_err(other)?
-        .ok_or_else(|| other("no finalized history; use pyre db init or pyre db baseline"))?;
-    if namespace.is_some_and(|namespace| namespace != installed.namespace) {
+    let installed = execute::installed(&conn).await.map_err(other)?;
+    if installed
+        .as_ref()
+        .is_some_and(|state| namespace.is_some_and(|namespace| namespace != state.namespace))
+    {
         return Err(other(
             "requested namespace does not match the installed database",
         ));
     }
-    let catalog = load(&conn, root, &installed.namespace, installed.binding).await?;
     if let Some(name) = inspect {
+        // An ambiguous first filesystem commit may have left no installation.
+        // Only inspect in that case; ordinary apply still requires a binding.
+        let (namespace, binding) = match &installed {
+            Some(state) => (state.namespace.as_str(), state.binding),
+            None => (namespace.unwrap_or(DEFAULT_SCHEMANAME), Binding::Filesystem),
+        };
+        let catalog = load(&conn, root, namespace, binding).await?;
         let bundle = named(&catalog, name)?;
-        match execute::inspect_outcome(&conn, bundle, installed.binding)
+        match execute::inspect_outcome(&conn, bundle, binding)
             .await
             .map_err(other)?
         {
@@ -155,6 +161,9 @@ pub async fn apply(
         }
         return Ok(());
     }
+    let installed = installed
+        .ok_or_else(|| other("no finalized history; use pyre db init or pyre db baseline"))?;
+    let catalog = load(&conn, root, &installed.namespace, installed.binding).await?;
     if installed.binding == Binding::Filesystem {
         note_application(root, &catalog.0)?;
     }

@@ -9,7 +9,7 @@ import { Note, Reply, Document, database, noteId } from './typescript/core/edits
 import { captureOperations } from '@pyre/client/operations';
 import { executeOperations } from '@pyre/server/operations';
 import { runWithSync } from '@pyre/server/query-sync';
-import { loadSchemaFromDatabase } from '@pyre/server/schema';
+import { initDisposableDatabase, loadSchemaFromDatabase } from '@pyre/server/schema';
 import { catchup } from '@pyre/server/sync';
 import { Elm as Checks } from './acquire-checks.js';
 
@@ -20,7 +20,7 @@ await init({ module_or_path: await Bun.file('../packages/server/wasm/pyre_wasm_b
 const stores = new Map();
 for (const instance of ['first', 'second']) {
   const db = createClient({ url: `file:${process.cwd()}/${instance}.db` });
-  await databases._default.ensureDatabase(db);
+  await initDisposableDatabase(db, '_default', databases._default.schemaSource);
   await loadSchemaFromDatabase(instance, db);
   stores.set(instance, db);
 }

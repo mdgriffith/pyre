@@ -48,9 +48,9 @@ CLI shortcut: `pyre docs serve`
 
 These commands do different things:
 
-- `pyre migrate db/app.db --push`: apply the schema directly
-- `pyre migration add_users --db db/app.db`: generate migration files
-- `pyre migrate db/app.db`: apply migration files already on disk
+- `pyre migrate db/dev.db --push`: update an explicitly disposable database from the working schema
+- `pyre migration create add_users`: author a bundle against finalized history
+- `pyre migrate db/app.db`: apply finalized bundles through the target's stored catalog binding
 
 See [Migration Guide](./migrations.md).
 

@@ -19,7 +19,7 @@ fn workspace() -> TempDir {
     assert_cmd::Command::cargo_bin("pyre")
         .unwrap()
         .current_dir(dir.path())
-        .args(["migrate", "test.db", "--push"])
+        .args(["db", "init", "test.db", "--disposable"])
         .assert()
         .success();
     dir

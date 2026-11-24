@@ -1,48 +1,12 @@
 //! Single-target finalized migration execution. Hosts own the maintenance window.
 
-use super::{sql, Bundle, BundleHash, History};
+use super::{plan::*, Bundle, BundleHash, History};
 use crate::db::{migrate, policy};
 use crate::generate::sql::to_sql::SqlAndParams;
 use libsql::{Connection, TransactionBehavior};
-use std::{fmt, str::FromStr};
+use std::fmt;
 
-const STATE: &str = "_pyre_finalized_schema";
-const CREATE_STATE: &str = "create table main._pyre_finalized_schema (
-    id integer primary key check (id = 1), namespace text not null,
-    catalog text not null check (catalog in ('filesystem', 'database')),
-    head text not null, baseline text, api_version text not null, fingerprint text not null
-)";
-const CREATE_RECEIPTS: &str = "create table main._pyre_migration_receipts (
-    hash text primary key not null, predecessor text, applied_at integer not null,
-    api_version text not null, update_by integer
-)";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Binding {
-    Filesystem,
-    Database,
-}
-
-impl Binding {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Filesystem => "filesystem",
-            Self::Database => "database",
-        }
-    }
-}
-
-impl FromStr for Binding {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "filesystem" => Ok(Self::Filesystem),
-            "database" => Ok(Self::Database),
-            _ => Err("expected filesystem or database migration catalog"),
-        }
-    }
-}
+pub use super::plan::Binding;
 
 #[derive(Debug)]
 pub struct Installed {
@@ -113,13 +77,7 @@ fn message(error: impl fmt::Display) -> String {
 }
 
 async fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
-    Ok(first(
-        conn,
-        "select 1 from main.sqlite_schema where type = 'table' and name = ?",
-        [table],
-    )
-    .await?
-    .is_some())
+    Ok(first(conn, TABLE_EXISTS, [table]).await?.is_some())
 }
 
 /// Read target-owned catalog binding and runtime installation metadata.
@@ -127,7 +85,8 @@ pub async fn installed(conn: &Connection) -> Result<Option<Installed>, String> {
     if !table_exists(conn, STATE).await? {
         return Ok(None);
     }
-    let row = first(conn, "select namespace, catalog, head, baseline, api_version, fingerprint from main._pyre_finalized_schema where id = 1", ()).await?
+    let row = first(conn, READ_STATE, ())
+        .await?
         .ok_or_else(|| "missing finalized installation metadata".to_string())?;
     let parse_hash = |s: String| s.parse::<BundleHash>().map_err(message);
     Ok(Some(Installed {
@@ -149,7 +108,7 @@ pub async fn installed(conn: &Connection) -> Result<Option<Installed>, String> {
 }
 
 async fn receipt(conn: &Connection, bundle: &Bundle) -> Result<Option<Receipt>, String> {
-    let Some(row) = first(conn, "select predecessor, applied_at, api_version, update_by from main._pyre_migration_receipts where hash = ?", [bundle.hash().to_string()]).await? else {
+    let Some(row) = first(conn, READ_RECEIPT, [bundle.hash().to_string()]).await? else {
         return Ok(None);
     };
     let predecessor: Option<String> = row.get(0).map_err(message)?;
@@ -188,6 +147,44 @@ fn validate_installation(
         return Err("installed schema metadata conflicts with its catalog artifact".into());
     }
     Ok(position)
+}
+
+pub struct HistoryProgress {
+    pub applied: Vec<usize>,
+    pub pending_from: usize,
+}
+
+/// Read-only status for a bound catalog, using the caller's read snapshot.
+pub async fn inspect_history(
+    conn: &Connection,
+    history: &History,
+    state: Option<&Installed>,
+) -> Result<HistoryProgress, String> {
+    let Some(state) = state else {
+        return Ok(HistoryProgress {
+            applied: vec![],
+            pending_from: 0,
+        });
+    };
+    let head = validate_installation(history, state.binding, state)?;
+    let baseline = state
+        .baseline
+        .as_ref()
+        .map(|hash| chain_position(history, hash))
+        .transpose()?;
+    if baseline.is_some_and(|index| index > head) {
+        return Err("baseline is ahead of the installed history".into());
+    }
+    let start = baseline.map_or(0, |index| index + 1);
+    for bundle in &history.bundles()[start..head + 1] {
+        if receipt(conn, bundle).await?.is_none() {
+            return Err(format!("missing receipt for {}", bundle.hash()));
+        }
+    }
+    Ok(HistoryProgress {
+        applied: (start..head + 1).collect(),
+        pending_from: head + 1,
+    })
 }
 
 /// Apply all bundles in a verified catalog. Each step commits independently.
@@ -236,12 +233,7 @@ pub(super) async fn run_step(
 ) -> Result<Application, Error> {
     let bundle = &history.bundles()[index];
     let previous = index.checked_sub(1).map(|i| &history.bundles()[i]);
-    let transition = bundle
-        .verify_api_transition(previous)
-        .map_err(|e| Error::NotApplied(message(e)))?;
-    let fingerprint = bundle
-        .runtime_fingerprint()
-        .map_err(|e| Error::NotApplied(message(e)))?;
+    let plan = step(bundle, previous, binding).map_err(Error::NotApplied)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await
@@ -251,18 +243,27 @@ pub(super) async fn run_step(
         validate_connection(&tx).await?;
         let state = installed(&tx).await?;
         if initialize {
-            if state.is_some() || first(&tx, "select 1 from main.sqlite_schema where lower(substr(name, 1, 7)) != 'sqlite_' limit 1", ()).await?.is_some() {
+            if state.is_some() || first(&tx, NONEMPTY, ()).await?.is_some() {
                 return Err("initialization requires an empty database".into());
             }
         } else {
-            let state = state.ok_or_else(|| "target has no finalized provenance; use db init or db baseline".to_string())?;
+            let state = state.ok_or_else(|| {
+                "target has no finalized provenance; use db init or db baseline".to_string()
+            })?;
             let position = validate_installation(history, binding, &state)?;
             if binding == Binding::Database {
-                let local = super::database::DatabaseCatalog::new(&tx).history(history.namespace()).await.map_err(message)?;
+                let local = super::database::DatabaseCatalog::new(&tx)
+                    .history(history.namespace())
+                    .await
+                    .map_err(message)?;
                 chain_position(&local, bundle.hash())?;
                 chain_position(&local, &state.head)?;
             }
-            let baseline = state.baseline.as_ref().map(|hash| chain_position(history, hash)).transpose()?;
+            let baseline = state
+                .baseline
+                .as_ref()
+                .map(|hash| chain_position(history, hash))
+                .transpose()?;
             if baseline.is_some_and(|baseline| index <= baseline && baseline <= position) {
                 return Ok(Application::CoveredByBaseline);
             }
@@ -273,11 +274,14 @@ pub(super) async fn run_step(
                 return Ok(Application::AlreadyApplied(receipt));
             }
             if bundle.predecessor() != Some(&state.head) {
-                return Err(format!("unexpected predecessor for {}; target head is {}", bundle.hash(), state.head));
+                return Err(format!(
+                    "unexpected predecessor for {}; target head is {}",
+                    bundle.hash(),
+                    state.head
+                ));
             }
         }
 
-        let plan = sql::plan(bundle).map_err(message)?;
         if !plan.statements.is_empty() {
             validate_writable_schema(&tx).await?;
         }
@@ -286,31 +290,69 @@ pub(super) async fn run_step(
             tx.execute(CREATE_STATE, ()).await.map_err(message)?;
             tx.execute(CREATE_RECEIPTS, ()).await.map_err(message)?;
             tx.execute(policy::CREATE, ()).await.map_err(message)?;
-            tx.execute(policy::WRITE, [policy::Policy::Preserved.as_str()]).await.map_err(message)?;
+            execute_statement(&tx, preserved_policy()).await?;
             if binding == Binding::Database {
                 for (index, bundle) in history.bundles().iter().enumerate() {
-                    let name = if index == 0 { "root".into() } else { bundle.hash().to_string() };
-                    super::database::store(&tx, &name, bundle).await.map_err(message)?;
+                    let name = if index == 0 {
+                        "root".into()
+                    } else {
+                        bundle.hash().to_string()
+                    };
+                    super::database::store(&tx, &name, bundle)
+                        .await
+                        .map_err(message)?;
                 }
             }
         }
         for (index, sql) in plan.statements.iter().enumerate() {
-            tx.execute(sql, ()).await.map_err(|e| format!("migration.sql statement {}: {e}", index + 1))?;
+            tx.execute(sql, ())
+                .await
+                .map_err(|e| format!("migration.sql statement {}: {e}", index + 1))?;
         }
         for (name, sql) in plan.assertions {
-            if first(&tx, sql, ()).await.map_err(|e| format!("assertion {name}: {e}"))?.is_some() {
+            if first(&tx, sql, ())
+                .await
+                .map_err(|e| format!("assertion {name}: {e}"))?
+                .is_some()
+            {
                 return Err(format!("assertion {name} returned a row"));
             }
         }
-        install_runtime(&tx, bundle, binding, &fingerprint, false, !plan.statements.is_empty()).await?;
-        let timestamp = first(&tx, "select unixepoch()", ()).await?.ok_or("could not obtain application time")?.get::<i64>(0).map_err(message)?;
-        let update_by = if transition.from.is_some_and(|from| from != transition.to) {
-            Some(i64::try_from(bundle.grace_seconds()).ok().and_then(|seconds| timestamp.checked_add(seconds)).ok_or("grace deadline overflows database timestamp")?)
-        } else { None };
-        tx.execute("insert into main._pyre_migration_receipts (hash, predecessor, applied_at, api_version, update_by) values (?, ?, ?, ?, ?)",
-            libsql::params![bundle.hash().to_string(), bundle.predecessor().map(ToString::to_string), timestamp, bundle.target_api_version(), update_by]).await.map_err(message)?;
-        Ok(Application::Applied(Receipt { applied_at: timestamp, update_by }))
-    }.await;
+        write_runtime(&tx, plan.install).await?;
+        let timestamp = first(&tx, "select unixepoch()", ())
+            .await?
+            .ok_or("could not obtain application time")?
+            .get::<i64>(0)
+            .map_err(message)?;
+        let update_by = if let Some(grace_seconds) = plan.grace_seconds {
+            Some(
+                grace_seconds
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|seconds| timestamp.checked_add(seconds))
+                    .ok_or("grace deadline overflows database timestamp")?,
+            )
+        } else {
+            None
+        };
+        tx.execute(
+            INSERT_RECEIPT,
+            libsql::params![
+                bundle.hash().to_string(),
+                bundle.predecessor().map(ToString::to_string),
+                timestamp,
+                bundle.target_api_version(),
+                update_by
+            ],
+        )
+        .await
+        .map_err(message)?;
+        Ok(Application::Applied(Receipt {
+            applied_at: timestamp,
+            update_by,
+        }))
+    }
+    .await;
 
     match result {
         Ok(outcome @ Application::Applied(_)) => {
@@ -350,7 +392,7 @@ pub async fn inspect_outcome(
     let result = async {
         validate_connection(&tx).await?;
         let Some(state) = installed(&tx).await? else {
-            if bundle.predecessor().is_none() && first(&tx, "select 1 from main.sqlite_schema where lower(substr(name, 1, 7)) != 'sqlite_' limit 1", ()).await?.is_none() {
+            if bundle.predecessor().is_none() && first(&tx, NONEMPTY, ()).await?.is_none() {
                 return Ok(Inspection::NotApplied);
             }
             return Err("no matching target history".into());
@@ -365,7 +407,8 @@ pub async fn inspect_outcome(
         } else {
             Err("target history diverged; do not retry".into())
         }
-    }.await;
+    }
+    .await;
     tx.rollback()
         .await
         .map_err(|e| Error::OutcomeUnknown(message(e)))?;
@@ -373,8 +416,11 @@ pub async fn inspect_outcome(
 }
 
 async fn validate_connection(conn: &Connection) -> Result<(), String> {
-    if first(conn, "select 1 from temp.sqlite_schema union all select 1 from temp.pragma_database_list() where name not in ('main', 'temp') limit 1", ()).await?.is_some() {
-        return Err("migration requires a dedicated connection without temp objects or attached databases".into());
+    if first(conn, UNSAFE_CONNECTION, ()).await?.is_some() {
+        return Err(
+            "migration requires a dedicated connection without temp objects or attached databases"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -382,53 +428,20 @@ async fn validate_connection(conn: &Connection) -> Result<(), String> {
 async fn validate_writable_schema(conn: &Connection) -> Result<(), String> {
     // Remote libSQL cannot install an SQLite authorizer hook. Block schema
     // objects that could otherwise cause writes outside the approved SQL AST.
-    if first(conn, "select 1 from main.sqlite_schema where type = 'trigger' union all select 1 from temp.pragma_table_list() where schema = 'main' and type in ('virtual', 'shadow') limit 1", ()).await?.is_some() {
-        return Err("v1 migration writes do not support targets with triggers or virtual tables".into());
+    if first(conn, UNSAFE_WRITES, ()).await?.is_some() {
+        return Err(
+            "v1 migration writes do not support targets with triggers or virtual tables".into(),
+        );
     }
     Ok(())
 }
 
-async fn install_runtime(
-    conn: &Connection,
-    bundle: &Bundle,
-    binding: Binding,
-    fingerprint: &str,
-    baseline: bool,
-    wrote_sql: bool,
-) -> Result<(), String> {
+async fn write_runtime(conn: &Connection, statements: Vec<SqlAndParams>) -> Result<(), String> {
     migrate::ensure_metadata_storage(conn)
         .await
         .map_err(message)?;
-    conn.execute(migrate::CREATE_SYNC_TABLE, ())
-        .await
-        .map_err(message)?;
-    conn.execute(migrate::INSERT_SYNC_STATE_ROW, ())
-        .await
-        .map_err(message)?;
-    conn.execute(
-        "delete from main._pyre_migrations where name = 'finalized:installed'",
-        (),
-    )
-    .await
-    .map_err(message)?;
-    conn.execute("insert into main._pyre_migrations (name, sql, schema, schema_namespace, finished_at) values ('finalized:installed', '', ?, ?, unixepoch())",
-        libsql::params![bundle.schema_source(), bundle.namespace()]).await.map_err(message)?;
-    for statement in migrate::external_identity_sql(bundle.external_identities()) {
+    for statement in statements {
         execute_statement(conn, statement).await?;
-    }
-    let hash = bundle.hash().to_string();
-    conn.execute("insert into main._pyre_finalized_schema (id, namespace, catalog, head, baseline, api_version, fingerprint) values (1, ?, ?, ?, ?, ?, ?) on conflict(id) do update set head = excluded.head, api_version = excluded.api_version, fingerprint = excluded.fingerprint",
-        libsql::params![bundle.namespace(), binding.as_str(), hash.clone(), baseline.then_some(hash), bundle.target_api_version(), fingerprint]).await.map_err(message)?;
-    if wrote_sql
-        && bundle
-            .load_target_schema()
-            .map_err(message)?
-            .database
-            .schemas[0]
-            .sync_mode
-            == crate::ast::SyncMode::Synced
-    {
-        conn.execute("update main._pyre_sync set database_epoch = lower(hex(randomblob(16))), server_revision = 0 where id = 1", ()).await.map_err(message)?;
     }
     Ok(())
 }
@@ -477,7 +490,11 @@ pub async fn baseline(
         }
         tx.execute(CREATE_STATE, ()).await.map_err(message)?;
         tx.execute(CREATE_RECEIPTS, ()).await.map_err(message)?;
-        install_runtime(&tx, bundle, binding, &fingerprint, true, false).await
+        write_runtime(
+            &tx,
+            install_runtime(bundle, binding, &fingerprint, true, false),
+        )
+        .await
     }
     .await;
     finish_change(tx, result).await

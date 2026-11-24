@@ -7,7 +7,7 @@ import { buildArgs, toSqlStatements } from "./runtime/sql";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureDatabase, getIntrospectionJson, initDisposableDatabase, inspectDatabasePolicy, loadSchemaFromDatabase, reseedDatabase, setDatabaseDisposable } from "./schema";
+import { getIntrospectionJson, initDisposableDatabase, inspectDatabasePolicy, loadSchemaFromDatabase, reseedDatabase, setDatabaseDisposable } from "./schema";
 import { catchup } from "./sync";
 import { initSync } from "./wasm/pyre_wasm.js";
 
@@ -24,7 +24,7 @@ function seedDatabase(intMode: "number" | "bigint" | "string" = "number") {
 test("WASM seed matches the native fixture and persists both directions of nested links", async () => {
   const { db, close } = seedDatabase();
   try {
-    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    await initDisposableDatabase(db, "Fixtures", fixtureSchema);
     const input = JSON.parse(fixtureFile("input.json"));
     expect(await seed(db, input, { namespace: "Wrong" })).toMatchObject({
       kind: "error", error: { message: expect.stringContaining("found 'Fixtures'") },
@@ -54,7 +54,7 @@ test("seed rejects an uninitialized target and rolls back late validation errors
   try {
     expect(await seed(db, {})).toMatchObject({ kind: "error", error: { message: expect.stringContaining("initialized") } });
     expect((await db.execute("select name from sqlite_schema")).rows).toHaveLength(0);
-    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    await initDisposableDatabase(db, "Fixtures", fixtureSchema);
     const result = await seed(db, { users: [{ name: "Discard", posts: [{ title: null }] }] });
     expect(result).toMatchObject({ kind: "error", error: { errorType: "InvalidInput", message: expect.stringContaining("users[0].posts[0].title") } });
     expect((await db.execute("select count(*) as n from users")).rows[0].n).toBe(0);
@@ -83,10 +83,11 @@ record Item {
   @public
 }
 `;
-    await ensureDatabase(db, "Fixtures", source);
+    await initDisposableDatabase(db, "Fixtures", source);
     await db.executeMultiple(`drop table items;
       create table items (id integer primary key, name text unique on conflict replace, updatedAt integer);
-      insert into items (id, name) values (1, 'original');`);
+      insert into items (id, name) values (1, 'original');
+      drop table _pyre_database_policy;`);
     expect(await inspectDatabasePolicy(db)).toBe("preserved");
     expect(await seed(db, { items: [{ id: 2, name: "rollback-me" }, { id: 3, name: "original" }] }))
       .toMatchObject({ kind: "error", error: { errorType: "DatabaseError", message: expect.stringContaining("items[1]") } });
@@ -110,7 +111,7 @@ test("policy calls reject an in-memory client without detaching its database", a
 test("WASM seed preserves caller table order and ignores TEMP shadows", async () => {
   const { db, close } = seedDatabase();
   try {
-    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    await initDisposableDatabase(db, "Fixtures", fixtureSchema);
     await db.execute("create temp table users (id integer primary key, decoy text)");
     await db.execute("create temp table _pyre_migrations (decoy text)");
     await db.execute(`create trigger require_author before insert on posts
@@ -128,7 +129,7 @@ test("WASM seed preserves caller table order and ignores TEMP shadows", async ()
 test("WASM seed rolls back earlier rows for a late typed JSON error", async () => {
   const { db, close } = seedDatabase();
   try {
-    await ensureDatabase(db, "Fixtures", fixtureFile("typed-json.pyre"));
+    await initDisposableDatabase(db, "Fixtures", fixtureFile("typed-json.pyre"));
     const payload = { _type: "Payload", count: 7 };
     const valid = { payload, groups: { group: [null, payload] } };
     expect(await seed(db, { entries: [valid, { payload, groups: { group: [{ ...payload, count: "wrong" }] } }] }))
@@ -177,7 +178,7 @@ test("WASM seed preserves explicit conflict handling inside a trigger", async ()
 test("WASM seed preserves exact returned integer keys and generates UUIDv7 without assigning sequences", async () => {
   const { db, close } = seedDatabase("bigint");
   try {
-    await ensureDatabase(db, "Fixtures", `${fixtureSchema}
+    await initDisposableDatabase(db, "Fixtures", `${fixtureSchema}
 record Event {
     key Id.Uuid @id
     sequence Sequence.Int
@@ -201,7 +202,7 @@ record Event {
 test("seed reports uncertain commit and rollback and rejects non-atomic transaction modes", async () => {
   const { db, close } = seedDatabase();
   try {
-    await ensureDatabase(db, "Fixtures", fixtureSchema);
+    await initDisposableDatabase(db, "Fixtures", fixtureSchema);
     const client = (failure: "commit" | "rollback") => ({
       transaction: async () => {
         const tx = await db.transaction("write");
@@ -251,7 +252,8 @@ test("reseed commits a fresh schema before loading fixtures and before admitting
   const epoch = async () => (await db.execute("select database_epoch from _pyre_sync")).rows[0].database_epoch;
   const counts = async () => ({ ...(await db.execute("select (select count(*) from users) as users, (select count(*) from posts) as posts")).rows[0] });
   try {
-    await ensureDatabase(db, namespace, "record Obsolete {\n id Id.Uuid @id\n @public\n}\n");
+    await initDisposableDatabase(db, namespace, "record Obsolete {\n id Id.Uuid @id\n @public\n}\n");
+    await db.execute("drop table _pyre_database_policy");
     await loadSchemaFromDatabase("reseed-test", db);
     const oldEpoch = await epoch();
     const loader = mock(() => JSON.parse("{"));

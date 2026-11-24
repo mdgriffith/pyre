@@ -64,3 +64,22 @@ pyre migrate app.db
 Target-local init generates and checks a root from the working schema, then installs and stores it on an empty target in the same transaction. It does not read the filesystem migration catalog. Database-catalog authoring can consume a standalone schema plus optional `--external-identities identities.json`. Finalizing publishes an artifact to the catalog; it does not apply it.
 
 See the [bundle format and compiler contracts](../spec/migration-bundles.md) for the wire format.
+
+## TypeScript hosts
+
+Initialize server WASM before calling the migration APIs. For a filesystem catalog, pass the exact contents of the sealed bundles, including the raw manifest text. Pyre verifies the hashes and orders the chain by predecessor. For a target-local catalog, ordinary apply reads from the database.
+
+```ts
+import { applyFinalizedMigrations, initPreservedDatabase } from "@pyre/server";
+
+// bundles: [{ manifest: manifestText, files: { "migration.sql": sql, "schema.pyre": schema } }]
+await initPreservedDatabase(db, "Billing", bundles);
+await applyFinalizedMigrations(db, "Billing", { bundles });
+
+// On a database already bound to its target-local catalog:
+await applyFinalizedMigrations(otherDb, "Billing", { catalog: "database" });
+```
+
+Use `baselineDatabase(db, namespace, hash, source)` to adopt an exact finalized schema, `auditDatabaseSchema(db)` to compare live structure with the installed schema, and `setDatabasePreserved(db, namespace, source)` for explicit promotion. `ensureDatabase` checks the finalized runtime fingerprint or updates an explicitly disposable, unbound schema. Use `initDisposableDatabase` for a new working-schema development database.
+
+If a `FinalizedMigrationError` reports `outcome-unknown`, keep the target out of service and use `inspectMigrationOutcome(freshClient, namespace, attemptedBundle, catalog)` before retrying. Pass the exact attempted artifact and its catalog binding. Receipts expose application and grace deadlines as Unix seconds (`bigint`).

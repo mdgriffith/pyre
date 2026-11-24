@@ -9,7 +9,9 @@ pub mod execute;
 #[cfg(feature = "filesystem")]
 pub mod filesystem;
 mod history;
+pub mod plan;
 pub mod sql;
+pub mod structure;
 
 pub use history::{History, HistoryError};
 

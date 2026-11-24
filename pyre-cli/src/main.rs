@@ -78,7 +78,7 @@ enum Commands {
         auth: Option<String>,
     },
 
-    /// Execute any migrations that are needed.
+    /// Apply pending finalized migrations through the target's catalog binding.
     Migrate {
         /// A local filename, or a url, or an environment variable if prefixed with a $.
         database: String,
@@ -90,7 +90,7 @@ enum Commands {
         #[arg(long)]
         namespace: Option<String>,
 
-        /// Push changes directly to the DB
+        /// Push working-schema changes to an existing, unbound disposable target.
         #[arg(long, default_value_t = false)]
         push: bool,
 

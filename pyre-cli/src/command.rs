@@ -4,7 +4,6 @@ mod docs;
 pub(crate) mod finalized;
 mod format;
 mod generate;
-mod generate_migration;
 mod init;
 mod introspect;
 mod lsp;

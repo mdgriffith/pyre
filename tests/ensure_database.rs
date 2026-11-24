@@ -1,4 +1,7 @@
-use pyre::server::schema::{ensure_database, EnsureDatabaseError, EnsureDatabaseOutcome};
+use pyre::{
+    db::lifecycle::init_disposable,
+    server::schema::{ensure_database, EnsureDatabaseError, EnsureDatabaseOutcome},
+};
 
 const SCHEMA: &str = r#"record World {
     id          Id.Uuid @id
@@ -41,13 +44,15 @@ async fn connection() -> Result<(tempfile::TempDir, libsql::Connection), Box<dyn
 }
 
 #[tokio::test]
-async fn ensure_database_creates_and_reuses_a_database() -> Result<(), Box<dyn std::error::Error>> {
+async fn generated_ensure_requires_explicit_creation_and_reuses_the_database(
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, conn) = connection().await?;
 
-    assert_eq!(
-        pyre_generated::campaign::ensure_database(&conn).await?,
-        EnsureDatabaseOutcome::Created
-    );
+    assert!(matches!(
+        pyre_generated::campaign::ensure_database(&conn).await,
+        Err(EnsureDatabaseError::FinalizedRequired(_))
+    ));
+    init_disposable(&conn, "Campaign", SCHEMA, &[]).await?;
     assert_eq!(
         pyre_generated::campaign::ensure_database(&conn).await?,
         EnsureDatabaseOutcome::UpToDate
@@ -79,7 +84,7 @@ async fn ensure_database_creates_and_reuses_a_database() -> Result<(), Box<dyn s
 #[tokio::test]
 async fn ensure_database_records_schema_only_changes() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, conn) = connection().await?;
-    ensure_database(&conn, "Campaign", SCHEMA).await?;
+    init_disposable(&conn, "Campaign", SCHEMA, &[]).await?;
     let changed = format!("// generated schema revision\n{SCHEMA}");
 
     assert_eq!(
@@ -110,7 +115,16 @@ async fn ensure_database_rejects_an_unmanaged_database() -> Result<(), Box<dyn s
     let error = ensure_database(&conn, "Campaign", SCHEMA)
         .await
         .expect_err("unmanaged database should be rejected");
-    assert!(matches!(error, EnsureDatabaseError::UnmanagedDatabase));
+    assert!(matches!(error, EnsureDatabaseError::FinalizedRequired(_)));
+    assert!(conn
+        .query(
+            "select name from sqlite_schema where name like '_pyre_%'",
+            ()
+        )
+        .await?
+        .next()
+        .await?
+        .is_none());
     Ok(())
 }
 
@@ -118,7 +132,7 @@ async fn ensure_database_rejects_an_unmanaged_database() -> Result<(), Box<dyn s
 async fn ensure_database_rejects_the_wrong_schema_family() -> Result<(), Box<dyn std::error::Error>>
 {
     let (_temp, conn) = connection().await?;
-    ensure_database(&conn, "Campaign", SCHEMA).await?;
+    init_disposable(&conn, "Campaign", SCHEMA, &[]).await?;
     let clocktower_schema = r#"record Player {
     id Id.Uuid @id
     name String
@@ -129,6 +143,6 @@ async fn ensure_database_rejects_the_wrong_schema_family() -> Result<(), Box<dyn
     let error = ensure_database(&conn, "Clocktower", clocktower_schema)
         .await
         .expect_err("a different schema family should be rejected");
-    assert!(matches!(error, EnsureDatabaseError::Migration(_)));
+    assert!(matches!(error, EnsureDatabaseError::FinalizedRequired(_)));
     Ok(())
 }

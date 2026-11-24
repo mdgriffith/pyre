@@ -1,6 +1,5 @@
 use libsql;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
 
 use super::shared::{check_namespace_requirements, parse_database_schemas, Options};
 use crate::db;
@@ -79,91 +78,7 @@ fn report_stored_schema_errors(
     io::Error::new(io::ErrorKind::InvalidData, "Stored schema is invalid")
 }
 
-pub async fn migrate<'a>(
-    options: &'a Options<'a>,
-    database: &str,
-    auth: &Option<String>,
-    migration_dir: &str,
-    namespace: &Option<String>,
-) -> io::Result<()> {
-    check_namespace_requirements(&namespace, &options);
-    let namespace_migration_dir = match namespace {
-        Some(ns) => Path::new(migration_dir).join(ns),
-        None => Path::new(migration_dir).to_path_buf(),
-    };
-
-    // Get schema
-    let paths = crate::filesystem::collect_filepaths(&options.in_dir)?;
-    let all_schemas = parse_database_schemas(&paths, options.enable_color)?;
-
-    let real_namespace = match namespace {
-        Some(ns) => ns,
-        None => &ast::DEFAULT_SCHEMANAME.to_string(),
-    };
-
-    // Get exactly one schema based on namespace or default
-    let schema = match all_schemas
-        .schemas
-        .iter()
-        .find(|schema| schema.namespace == *real_namespace)
-    {
-        Some(s) => s,
-        None => {
-            eprintln!("Error: No schema found for namespace '{}'", real_namespace);
-            std::process::exit(1);
-        }
-    };
-
-    // Typecheck schemas
-
-    match typecheck::check_schema(&all_schemas) {
-        Err(error_list) => {
-            error::report_and_exit(error_list, &paths, options.enable_color);
-        }
-        Ok(context) => {
-            let connection_result = db::connect(&database.to_string(), auth).await;
-            match connection_result {
-                Ok(conn) => {
-                    let migration_result = db::migrate(
-                        &conn,
-                        db::MigrateOptions {
-                            schema,
-                            context: &context,
-                            migration_folder: &namespace_migration_dir,
-                            migration_root: Path::new(migration_dir),
-                            namespace: namespace.as_deref(),
-                            db_path: database,
-                        },
-                    )
-                    .await;
-                    match migration_result {
-                        Ok(outcome) => {
-                            println!("{}", outcome.status_line());
-                        }
-                        Err(migration_error) => {
-                            return Err(io::Error::other(format!(
-                                "{}\n\n{}",
-                                db::error::context(database, real_namespace),
-                                migration_error.format_error()
-                            )));
-                        }
-                    }
-                }
-                Err(err) => {
-                    return Err(io::Error::other(err.format_error()));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/**
- * This is the new "dynamic" migration approach
- *
- *
- *
- */
+/// Update an explicitly disposable working-schema database.
 pub async fn push<'a>(
     options: &'a Options<'a>,
     database: &str,
@@ -203,7 +118,7 @@ pub async fn push<'a>(
             error::report_and_exit(error_list, &paths, options.enable_color);
         }
         Ok(current_context) => {
-            let connection_result = db::connect(&database.to_string(), auth).await;
+            let connection_result = db::connect_existing(database, auth).await;
             match connection_result {
                 Err(err) => {
                     return Err(io::Error::other(err.format_error()));

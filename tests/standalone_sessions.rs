@@ -99,14 +99,11 @@ async fn fresh_namespace_databases_load_and_seed_shared_identity_sessions(
                 .join(format!("{}-{mode}.db", namespace.namespace));
             let db = libsql::Builder::new_local(&path).build().await?;
             let conn = db.connect()?;
-            schema::ensure_database_with_external_identities(
-                &conn,
-                &namespace.namespace,
-                &source,
-                &identities,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("{} {mode}: {error:?}\n{source}", namespace.namespace));
+            pyre::db::lifecycle::init_disposable(&conn, &namespace.namespace, &source, &identities)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{} {mode}: {error:?}\n{source}", namespace.namespace)
+                });
             let loaded = schema::load_schema_from_database(&conn).await?;
             let local = loaded.context()?;
             assert_eq!(loaded.schema()?.namespace, namespace.namespace);
@@ -267,8 +264,7 @@ async fn migrations_upsert_missing_metadata_and_preserve_user_data(
     let (source, identities) = pyre::generate::to_string::standalone_schema(&context, namespace);
     let db = libsql::Builder::new_local(":memory:").build().await?;
     let conn = db.connect()?;
-    schema::ensure_database_with_external_identities(&conn, "Clocktower", &source, &identities)
-        .await?;
+    pyre::db::lifecycle::init_disposable(&conn, "Clocktower", &source, &identities).await?;
     let uuid = "01900000-0000-7000-8000-000000000001";
     seed::seed(
         &conn,
@@ -487,7 +483,7 @@ async fn metadata_upserts_preserve_rows_and_prune_removed_references(
         kind: ast::IdentityKind::Uuid,
     }];
     let source = "session {\n    ownerId Auth.User.id?\n}\nrecord Note {\n    @public\n    id Id.Uuid @id\n}\n";
-    schema::ensure_database_with_external_identities(&conn, "App", source, &identities).await?;
+    pyre::db::lifecycle::init_disposable(&conn, "App", source, &identities).await?;
     let mut rows = conn
         .query("select rowid from _pyre_external_identities", ())
         .await?;
@@ -554,8 +550,7 @@ async fn schema_loaders_respect_a_consistent_read_snapshot(
         .await?;
     let reader = db.connect()?;
     reader.execute_batch("pragma journal_mode=WAL").await?;
-    schema::ensure_database_with_external_identities(&reader, "Clocktower", &source, &identities)
-        .await?;
+    pyre::db::lifecycle::init_disposable(&reader, "Clocktower", &source, &identities).await?;
     let tx = reader
         .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
         .await?;
@@ -600,8 +595,7 @@ async fn unsupported_identity_kinds_are_not_silently_overwritten(
         pyre::generate::to_string::standalone_schema(&context, &database.schemas[2]);
     let db = libsql::Builder::new_local(":memory:").build().await?;
     let conn = db.connect()?;
-    schema::ensure_database_with_external_identities(&conn, "Clocktower", &source, &identities)
-        .await?;
+    pyre::db::lifecycle::init_disposable(&conn, "Clocktower", &source, &identities).await?;
     conn.execute_batch("pragma ignore_check_constraints=ON; update _pyre_external_identities set identity_kind = 'Id.Future' where record_name = 'Principal'; pragma ignore_check_constraints=OFF;").await?;
     let error = schema::load_schema_from_database(&conn)
         .await
