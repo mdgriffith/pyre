@@ -22,6 +22,12 @@ struct Record<'a> {
     update: Option<Vec<Field<'a>>>,
 }
 
+struct ValueType {
+    name: String,
+    kind: Kind,
+    type_: ColumnType,
+}
+
 impl<'a> Record<'a> {
     fn fields(&self) -> impl Iterator<Item = &Field<'a>> {
         self.create.iter().chain(&self.update).flatten()
@@ -103,26 +109,35 @@ pub(super) fn generate(
         let mut payloads: Vec<_> = records
             .iter()
             .flat_map(Record::fields)
-            .map(|field| field.payload.as_str())
+            .map(|field| (field.payload.as_str(), field.arg.type_.as_deref().unwrap()))
             .collect();
         // Reserve standard payload names before naming custom unions.
-        payloads.sort_unstable_by_key(|&payload| {
+        payloads.sort_unstable_by_key(|&(payload, type_)| {
             (
                 payload.starts_with("Db.")
                     && !payload.starts_with("Db.Id.")
                     && payload != "Db.Json",
                 payload,
+                type_,
             )
         });
-        payloads.dedup();
+        payloads.dedup_by_key(|(payload, _)| *payload);
         let mut used = HashSet::new();
         let constructors: BTreeMap<_, _> = payloads
             .into_iter()
-            .map(|payload| (payload, unique(&mut used, value_name(payload))))
+            .map(|(payload, type_)| {
+                let type_ = ColumnType::from_str(type_);
+                let value = ValueType {
+                    name: unique(&mut used, value_name(payload)),
+                    kind: Kind::from_type(&lookup, &type_),
+                    type_,
+                };
+                (payload, value)
+            })
             .collect();
         files.push(generate_text_file(
             base.join(format!("Db/Editor/Input/{namespace}.elm")),
-            render_input(namespace, &constructors),
+            render_input(context, &lookup, namespace, &constructors),
         ));
         for record in &records {
             files.push(generate_text_file(
@@ -161,23 +176,203 @@ fn value_name(payload: &str) -> String {
     }
 }
 
-fn render_input(namespace: &str, constructors: &BTreeMap<&str, String>) -> String {
-    if constructors.is_empty() {
-        return format!("module Db.Editor.Input.{namespace} exposing (Kind, Value, kind)\n\n\ntype alias Kind =\n    Never\n\n\ntype alias Value =\n    Never\n\n\nkind : Value -> Kind\nkind =\n    never\n");
+enum Kind {
+    Primitive(&'static str),
+    Named(&'static str, String),
+    Container(&'static str, Box<Kind>),
+    Union(String),
+}
+
+impl Kind {
+    fn from_type(lookup: &ElmLookup, type_: &ColumnType) -> Self {
+        match type_ {
+            ColumnType::String | ColumnType::Date => Self::Primitive("StringKind"),
+            ColumnType::Int | ColumnType::SequenceInt => Self::Primitive("IntKind"),
+            ColumnType::Float => Self::Primitive("FloatKind"),
+            ColumnType::Bool => Self::Primitive("BoolKind"),
+            ColumnType::DateTime => Self::Primitive("DateTimeKind"),
+            ColumnType::Json => Self::Primitive("JsonKind"),
+            ColumnType::JsonTyped(inner) => Self::from_type(lookup, inner),
+            ColumnType::List(inner) => Self::container(lookup, "ListKind", inner),
+            ColumnType::Dict(inner) => Self::container(lookup, "DictKind", inner),
+            ColumnType::Nullable(inner) => Self::container(lookup, "MaybeKind", inner),
+            ColumnType::IdInt { table } if table.is_empty() => Self::Primitive("IntKind"),
+            ColumnType::IdUuid { table } if table.is_empty() => Self::Primitive("StringKind"),
+            ColumnType::IdInt { table } => Self::Named("IntIdKind", table.clone()),
+            ColumnType::IdUuid { table } => Self::Named("UuidIdKind", table.clone()),
+            ColumnType::ForeignKey { .. } => super::resolve_foreign_key_type(lookup, type_)
+                .map(|inner| Self::from_type(lookup, &inner))
+                .unwrap_or(Self::Primitive("StringKind")),
+            ColumnType::Custom(name) => Self::Union(name.clone()),
+        }
     }
-    let kinds = constructors
-        .values()
-        .map(|name| format!("{name}Kind"))
-        .collect::<Vec<_>>();
+
+    fn container(lookup: &ElmLookup, tag: &'static str, inner: &ColumnType) -> Self {
+        Self::Container(tag, Box::new(Self::from_type(lookup, inner)))
+    }
+
+    fn elm(&self, union_prefix: &str) -> String {
+        match self {
+            Self::Primitive(tag) => format!("Editor.{tag}"),
+            Self::Named(tag, name) => format!("(Editor.{tag} {})", string::quote(name)),
+            Self::Container(tag, inner) => format!("(Editor.{tag} {})", inner.elm(union_prefix)),
+            Self::Union(name) => format!("(Editor.UnionKind {union_prefix}{name}Union)"),
+        }
+    }
+
+    fn collect_unions(
+        &self,
+        context: &typecheck::Context,
+        lookup: &ElmLookup,
+        unions: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        let name = match self {
+            Self::Container(_, inner) => return inner.collect_unions(context, lookup, unions),
+            Self::Union(name) if !unions.contains_key(name) => name,
+            _ => return,
+        };
+        let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(name) else {
+            return;
+        };
+        // Install the name before following variant fields: recursive unions refer
+        // back to this entry rather than recursively expanding their metadata.
+        unions.insert(name.clone(), Vec::new());
+        let variants = variants
+            .iter()
+            .map(|variant| {
+                let fields = variant
+                    .fields
+                    .iter()
+                    .flatten()
+                    .filter_map(|field| match field {
+                        ast::Field::Column(column) => {
+                            let mut kind = Self::from_type(lookup, &column.type_);
+                            if column.nullable {
+                                kind = Self::Container("MaybeKind", Box::new(kind));
+                            }
+                            kind.collect_unions(context, lookup, unions);
+                            Some(format!(
+                                "{{ name = {}, kind = {} }}",
+                                string::quote(&column.name),
+                                kind.elm("")
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{{ name = {}, fields = [ {fields} ] }}",
+                    string::quote(&variant.name)
+                )
+            })
+            .collect();
+        unions.insert(name.clone(), variants);
+    }
+}
+
+fn render_input(
+    context: &typecheck::Context,
+    lookup: &ElmLookup,
+    namespace: &str,
+    constructors: &BTreeMap<&str, ValueType>,
+) -> String {
+    let value_exposed = if constructors.is_empty() {
+        "Value"
+    } else {
+        "Value(..)"
+    };
+    let mut unions = BTreeMap::new();
+    for value in constructors.values() {
+        value.kind.collect_unions(context, lookup, &mut unions);
+    }
+    let (union_exposed, union_type) = if unions.is_empty() {
+        ("UnionId", "type alias UnionId =\n    Never".into())
+    } else {
+        let tags = unions
+            .keys()
+            .map(|name| format!("{name}Union"))
+            .collect::<Vec<_>>();
+        (
+            "UnionId(..)",
+            format!("type UnionId\n    = {}", tags.join("\n    | ")),
+        )
+    };
+    let mut output = format!("module Db.Editor.Input.{namespace} exposing (Kind, {union_exposed}, {value_exposed}, decoder, encode, kind, unionInfo)\n\nimport Db\nimport Db.Decode\nimport Db.Editor as Editor\nimport Db.Encode\nimport Db.Id\nimport Dict exposing (Dict)\nimport Json.Decode as Decode\nimport Json.Encode as Encode\nimport Time\n\n\n{union_type}\n\n\ntype alias Kind =\n    Editor.Kind UnionId\n");
     let values = constructors
         .iter()
-        .map(|(payload, name)| format!("{name}Value ({payload})"))
+        .map(|(payload, value)| format!("{}Value ({payload})", value.name))
         .collect::<Vec<_>>();
     let cases = constructors
         .values()
-        .map(|name| format!("        {name}Value _ ->\n            {name}Kind"))
+        .map(|value| {
+            format!(
+                "        {}Value _ ->\n            {}",
+                value.name,
+                value.kind.elm("")
+            )
+        })
         .collect::<Vec<_>>();
-    format!("module Db.Editor.Input.{namespace} exposing (Kind(..), Value(..), kind)\n\nimport Db\nimport Db.Id\nimport Dict exposing (Dict)\nimport Time\n\n\ntype Kind\n    = {}\n\n\ntype Value\n    = {}\n\n\nkind : Value -> Kind\nkind input =\n    case input of\n{}\n", kinds.join("\n    | "), values.join("\n    | "), cases.join("\n\n"))
+    if constructors.is_empty() {
+        output.push_str(
+            "\n\ntype alias Value =\n    Never\n\n\nkind : Value -> Kind\nkind =\n    never\n",
+        );
+    } else {
+        write!(output, "\n\ntype Value\n    = {}\n\n\nkind : Value -> Kind\nkind input =\n    case input of\n{}\n", values.join("\n    | "), cases.join("\n\n")).unwrap();
+    }
+
+    output.push_str("\n\n{-| Encode a value in Pyre's JSON wire format for a generic editor.\nThis encodes the payload only, not a field's outer `Db.Nullable` state.\n-}\nencode : Value -> Encode.Value\n");
+    if constructors.is_empty() {
+        output.push_str("encode =\n    never\n");
+    } else {
+        output.push_str("encode input =\n    case input of\n");
+        for value in constructors.values() {
+            let encoder = super::to_elm_encoder(lookup, &value.type_);
+            writeln!(
+                output,
+                "        {}Value payload ->\n            {encoder} payload\n",
+                value.name
+            )
+            .unwrap();
+        }
+    }
+
+    output.push_str("\n\n{-| Decode one complete editable field payload of the given kind from Pyre's\nJSON wire format. Nested kinds describe the structure of that payload, but\nonly kinds used as whole editable fields have a `Value` constructor.\n-}\ndecoder : Kind -> Decode.Decoder Value\n");
+    if constructors.is_empty() {
+        output.push_str(
+            "decoder _ =\n    Decode.fail \"No editable field values in this namespace\"\n",
+        );
+    } else {
+        output.push_str("decoder expected =\n    case expected of\n");
+        for value in constructors.values() {
+            let kind = value.kind.elm("");
+            let decoder = super::to_elm_decoder_from_column_type(lookup, &value.type_);
+            writeln!(
+                output,
+                "        {kind} ->\n            Decode.map {}Value {decoder}\n",
+                value.name
+            )
+            .unwrap();
+        }
+        output.push_str("        _ ->\n            Decode.fail \"Kind is not an editable field value in this namespace\"\n");
+    }
+
+    output.push_str("\n\n{-| Look up the exact schema name and variants of a union. Follow nested\n`Editor.UnionKind` references on demand when editing recursive unions.\n-}\nunionInfo : UnionId -> Editor.UnionInfo UnionId\n");
+    if unions.is_empty() {
+        output.push_str("unionInfo =\n    never\n");
+    } else {
+        output.push_str("unionInfo id =\n    case id of\n");
+        for (name, variants) in unions {
+            writeln!(
+                output,
+                "        {name}Union ->\n            {{ name = {}\n            , variants =\n                [ {}\n                ]\n            }}\n",
+                string::quote(&name),
+                variants.join("\n                , ")
+            )
+            .unwrap();
+        }
+    }
+    output
 }
 
 fn render_record(
@@ -185,7 +380,7 @@ fn render_record(
     lookup: &ElmLookup,
     namespace: &str,
     record: &Record,
-    constructors: &BTreeMap<&str, String>,
+    constructors: &BTreeMap<&str, ValueType>,
 ) -> String {
     let name = record.name;
     let fields: BTreeSet<_> = record.fields().map(|field| field.id.as_str()).collect();
@@ -232,7 +427,7 @@ fn render_record(
         .map(|field| field.payload.as_str())
         .collect();
     for payload in payloads {
-        let name = &constructors[payload];
+        let name = &constructors[payload].name;
         write!(body, "\n\nread{name} : Input.Value -> Maybe ({payload})\nread{name} input =\n    case input of\n        Input.{name}Value value ->\n            Just value\n").unwrap();
         if constructors.len() > 1 {
             body.push_str("\n        _ ->\n            Nothing\n");
@@ -252,7 +447,7 @@ fn render_form(
     lookup: &ElmLookup,
     body: &mut String,
     fields: &[Field],
-    constructors: &BTreeMap<&str, String>,
+    constructors: &BTreeMap<&str, ValueType>,
     create: bool,
     equality: &mut Equality,
 ) {
@@ -291,7 +486,9 @@ fn render_form(
     for (index, field) in fields.iter().enumerate() {
         let arg = field.arg;
         let id = &field.id;
-        let name = &constructors[field.payload.as_str()];
+        let value = &constructors[field.payload.as_str()];
+        let name = &value.name;
+        let kind = value.kind.elm("Input.");
         let original = if create {
             "Db.Absent".into()
         } else if arg.nullable {
@@ -313,7 +510,7 @@ fn render_form(
         };
         let nullable = elm_bool(arg.nullable);
         let mandatory = elm_bool(field.required);
-        entries.push(format!("Internal.entry {{ id = {id}, kind = Input.{name}Kind, required = {mandatory}, nullable = {nullable}, choices = [ {choices} ] }} {original} {equal}"));
+        entries.push(format!("Internal.entry {{ id = {id}, kind = {kind}, required = {mandatory}, nullable = {nullable}, choices = [ {choices} ] }} {original} {equal}"));
         let read = format!("Internal.value read{name} (get {id})");
         let value = if field.required {
             let binding = format!("required{index}");

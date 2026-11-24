@@ -311,6 +311,22 @@ The top-level `Db` provides `Nullable a = Absent | Null | Present a` for the who
 
 Use `Db.Editor` when you want to render fields from generated metadata. Each record has `Db.Edit.<Record>.Editor` with its own `FieldId`, `createForm`, and `editForm row`. Each schema namespace has `Db.Editor.Input.<Namespace>` (`Default` for unnamed schemas) with `Kind`, `Value`, and `kind`. A value constructor represents an Elm payload type: every string field in the namespace uses `Input.StringValue`. Branded IDs, unions, and typed JSON retain their Elm types. If generated Elm names collide, suffixes disambiguate them without changing schema or wire names.
 
+`Db.Editor.Kind unionId` describes the payload recursively and is shared across namespaces. With `Db.Editor` imported as `Editor`, a field of type `Json<Dict<List<Status?>>>?` has kind `Editor.DictKind (Editor.ListKind (Editor.MaybeKind (Editor.UnionKind Input.StatusUnion)))`. The outer `?` is `field.nullable`; `MaybeKind` describes the inner optional values. `Editor.UuidIdKind "Account"` and `Editor.IntIdKind "Account"` distinguish ID representations and identify the brand. `Date` uses `Editor.StringKind`, matching its Elm payload type.
+
+`Editor.UnionKind id` carries a typed `Input.UnionId`. `Input.unionInfo id` returns the exact schema name and its variants, even if the generated Elm payload type was renamed to avoid a collision. For example, a `Published { by String }` variant is described by `{ name = "Published", fields = [ { name = "by", kind = Editor.StringKind } ] }`. A generic library can accept `unionInfo` as a `unionId -> Editor.UnionInfo unionId` function and follow nested union references as needed when rendering recursive values.
+
+Generic widgets can call `Input.encode` on a present value to read its payload in Pyre's JSON wire format. When a widget has built a complete replacement, it can convert it back to a typed value without naming a generated constructor:
+
+```elm
+setFromJson field jsonValue form =
+    Json.Decode.decodeValue (Input.decoder field.kind) jsonValue
+        |> Result.map (\value -> Editor.set field.id (Db.Present value) form)
+```
+
+Import `Json.Decode` for this helper. Wire-format unions use an `_type` string and payload fields (for example `{ "_type": "Published", "by": "Sam" }`); date-times use epoch seconds. Use `Editor.set` with `Db.Absent` or `Db.Null` for omission, revert, or clear. The decoder builds whole editable field values; nested kinds describe their shape, not separately writable fields.
+
+Avoid JavaScript special property names such as `hasOwnProperty` and `__proto__` as keys in typed dictionaries, including dictionaries nested inside other values. Elm's JSON dictionary decoder can throw on `hasOwnProperty`, and its encoder can drop `__proto__`.
+
 Render the views from `Editor.fields form`. For example, pass each string view to the same text widget, using `field.current` for display and the field view itself for edits. This helper works for `Title`, `Owner`, and other records in the same namespace:
 
 ```elm
@@ -322,7 +338,7 @@ import Db.Editor.Input.Default as Input
 textChanged : Field.View fieldId Input.Kind Input.Value -> String -> Editor.Form fieldId Input.Kind Input.Value result -> Editor.Form fieldId Input.Kind Input.Value result
 textChanged field text form =
     case field.kind of
-        Input.StringKind ->
+        Editor.StringKind ->
             Editor.set field.id (Db.Present (Input.StringValue text)) form
 
         _ ->

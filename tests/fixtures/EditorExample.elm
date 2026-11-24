@@ -43,7 +43,7 @@ port pyre_receiveMutationResult : (Decode.Value -> msg) -> Sub msg
 textInput : String -> Field.View fieldId Input.Kind Input.Value -> Editor.Form fieldId Input.Kind Input.Value result -> (Editor.Form fieldId Input.Kind Input.Value result -> msg) -> Html msg
 textInput label field form toMsg =
     case field.kind of
-        Input.StringKind ->
+        Editor.StringKind ->
             let
                 text =
                     case field.current of
@@ -73,6 +73,12 @@ widget label id form toMsg =
 
         [] ->
             Html.text ""
+
+
+setFromJson : Field.View fieldId Input.Kind Input.Value -> Decode.Value -> Editor.Form fieldId Input.Kind Input.Value result -> Result Decode.Error (Editor.Form fieldId Input.Kind Input.Value result)
+setFromJson field jsonValue form =
+    Decode.decodeValue (Input.decoder field.kind) jsonValue
+        |> Result.map (\value -> Editor.set field.id (Db.Present value) form)
 
 
 type alias Model =
@@ -142,11 +148,20 @@ update msg model =
                 repaired =
                     Editor.set DocumentEditor.Title (Db.Present (Input.StringValue "Draft title")) checked
 
+                withStatus =
+                    Editor.fields model.creating
+                        |> List.filter (\field -> field.id == DocumentEditor.Status)
+                        |> List.head
+                        |> Maybe.andThen
+                            (\field ->
+                                setFromJson field (json "{\"_type\":\"Present\",\"reason\":\"Done\",\"details\":null}") model.creating
+                                    |> Result.toMaybe
+                            )
+
                 ( draft, _ ) =
-                    model.creating
+                    Maybe.withDefault model.creating withStatus
                         |> Editor.set DocumentEditor.Tags (Db.Present (Input.StringListValue [ "draft" ]))
                         |> Editor.set DocumentEditor.Summary Db.Null
-                        |> Editor.set DocumentEditor.Status (Db.Present (Input.Nullable_Value (Db.Present_ { reason = "Done", details = Nothing })))
                         |> Editor.set DocumentEditor.Groups (Db.Present (Input.Nullable_MaybeListDictValue (Dict.singleton "draft" [ Just Db.Absent_, Nothing ])))
                         |> Editor.set DocumentEditor.Labels (Db.Present (Input.StringList_Value Db.EmptyStrings))
                         |> Editor.validate
@@ -156,6 +171,15 @@ update msg model =
 
                 initialViews =
                     Editor.fields DocumentEditor.createForm
+
+                kindOf id =
+                    initialViews
+                        |> List.filter (\field -> field.id == id)
+                        |> List.head
+                        |> Maybe.map .kind
+
+                tree =
+                    Input.NodeValue (Db.Branch { children = [ Db.Leaf ] })
             in
             ( { model | draft = draft }
             , report "create"
@@ -163,6 +187,29 @@ update msg model =
                     == Nothing
                     && List.all (\field -> field.current == Db.Absent && field.original == Db.Absent) initialViews
                     && List.any (\field -> field.id == DocumentEditor.Status && field.choices == [ "Absent", "Null", "Present" ]) initialViews
+                    && kindOf DocumentEditor.Status == Just (Editor.UnionKind Input.NullableUnion)
+                    && kindOf DocumentEditor.Labels == Just (Editor.UnionKind Input.StringListUnion)
+                    && kindOf DocumentEditor.Tags == Just (Editor.ListKind Editor.StringKind)
+                    && kindOf DocumentEditor.Assignee == Just (Editor.UuidIdKind "Account")
+                    && kindOf DocumentEditor.Groups == Just (Editor.DictKind (Editor.ListKind (Editor.MaybeKind (Editor.UnionKind Input.NullableUnion))))
+                    && kindOf DocumentEditor.Tree == Just (Editor.UnionKind Input.NodeUnion)
+                    && Input.kind tree == Editor.UnionKind Input.NodeUnion
+                    && Decode.decodeValue (Input.decoder (Input.kind tree)) (Input.encode tree) == Ok tree
+                    && Input.unionInfo Input.NullableUnion
+                        == { name = "Nullable"
+                           , variants =
+                                [ { name = "Absent", fields = [] }
+                                , { name = "Null", fields = [] }
+                                , { name = "Present", fields = [ { name = "reason", kind = Editor.StringKind }, { name = "details", kind = Editor.MaybeKind Editor.JsonKind } ] }
+                                ]
+                           }
+                    && Input.unionInfo Input.NodeUnion
+                        == { name = "Node"
+                           , variants =
+                                [ { name = "Leaf", fields = [] }
+                                , { name = "Branch", fields = [ { name = "children", kind = Editor.ListKind (Editor.UnionKind Input.NodeUnion) } ] }
+                                ]
+                           }
                     && List.member ( DocumentEditor.Title, Field.Required ) (Editor.errors empty)
                     && wrong
                     == Nothing
