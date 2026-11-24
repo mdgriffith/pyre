@@ -413,7 +413,7 @@ fn elm_editors_compile_for_colliding_namespace_names() {
         };
         parser::run(
             "schema.pyre",
-            &format!("record {record} {{ @public\n id Id.Uuid @id\n title String\n }}"),
+            &format!("type {record}State = Pending{record}\nrecord {record} {{ @public\n id Id.Uuid @id\n title String\n state {record}State?\n }}"),
             &mut schema,
         )
         .unwrap();
@@ -474,6 +474,24 @@ checks =
     , Editor.set QuoteEditor.Title (Db.Present (QuoteInput.StringValue "Quote")) QuoteEditor.createForm |> Editor.validate |> Tuple.first
     )
 
+unionName : (unionId -> Editor.UnionInfo unionId) -> Editor.Kind unionId -> Maybe String
+unionName lookup kind =
+    case kind of
+        Editor.UnionKind id ->
+            Just (lookup id).name
+
+        Editor.ListKind inner ->
+            unionName lookup inner
+
+        _ ->
+            Nothing
+
+namespaceNames : List (Maybe String)
+namespaceNames =
+    [ unionName InvoiceInput.unionInfo (InvoiceInput.kind (InvoiceInput.InvoiceStateValue Db.PendingInvoice))
+    , unionName QuoteInput.unionInfo (QuoteInput.kind (QuoteInput.QuoteStateValue Db.PendingQuote))
+    ]
+
 main : Program () Pyre.Model ()
 main =
     Platform.worker { init = \() -> ( Pyre.init, Cmd.none ), update = \() model -> ( model, Cmd.none ), subscriptions = \_ -> Sub.none }
@@ -501,6 +519,7 @@ session {
 }
 type Nullable = Absent | Null | Present { reason String, details Json? }
 type StringList = EmptyStrings
+type Node = Leaf | Branch { children List<Node> }
 record Document {
     @public
     id Id.Uuid @id
@@ -515,6 +534,7 @@ record Document {
     groups Json<Dict<List<Nullable?>>>?
     payload Json?
     labels StringList?
+    tree Json<Node>?
 }
 record Account {
     @public
@@ -545,7 +565,7 @@ record Reply {
     let context = typecheck::check_schema(&database).unwrap();
     let mut queries = parser::parse_query(
         "queries.pyre",
-        "query Notes { note { @where { id == \"ordinary\" } noteKey id title } }\nquery EditorDocuments($id: Document.id) { document { @where { id == $id } id title summary tags assignee caption published status groups payload labels updatedAt } }",
+        "query Notes { note { @where { id == \"ordinary\" } noteKey id title } }\nquery EditorDocuments($id: Document.id) { document { @where { id == $id } id title summary tags assignee caption published status groups payload labels tree updatedAt } }",
     )
     .unwrap();
     generated_queries::append_generated_crud_queries(&mut queries, &context);

@@ -1,8 +1,38 @@
-module Db.Editor exposing (Form, errors, fields, formError, set, validate)
+module Db.Editor exposing (Form, Kind(..), UnionInfo, Variant, VariantField, errors, fields, formError, set, validate)
 
 import Db
 import Db.Editor.Field as Field
 import Db.Internal.Editor as Internal
+
+
+{-| The shape of an editor payload. A generated namespace supplies its own
+`UnionId` and lookup; the other constructors are shared across schemas.
+-}
+type Kind unionId
+    = StringKind
+    | IntKind
+    | FloatKind
+    | BoolKind
+    | DateTimeKind
+    | JsonKind
+    | ListKind (Kind unionId)
+    | DictKind (Kind unionId)
+    | MaybeKind (Kind unionId)
+    | IntIdKind String
+    | UuidIdKind String
+    | UnionKind unionId
+
+
+type alias UnionInfo unionId =
+    { name : String, variants : List (Variant unionId) }
+
+
+type alias Variant unionId =
+    { name : String, fields : List (VariantField unionId) }
+
+
+type alias VariantField unionId =
+    { name : String, kind : Kind unionId }
 
 
 type alias Form fieldId kind value result =
