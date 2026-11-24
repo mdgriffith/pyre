@@ -224,7 +224,23 @@ pub async fn push<'a>(
                     let tx = connected_conn
                         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                         .await
-                        .map_err(|error| failure("Could not start the migration transaction. No migration SQL was executed.", &error))?;
+                         .map_err(|error| failure("Could not start the migration transaction. No migration SQL was executed.", &error))?;
+                    let (policy, _) =
+                        pyre::db::policy::read_in_transaction(&tx, Some(real_namespace))
+                            .await
+                            .map_err(io::Error::other)?;
+                    if policy != pyre::db::policy::Policy::Disposable {
+                        return Err(io::Error::other("--push requires a disposable database; use db init --disposable or apply finalized migrations"));
+                    }
+                    if pyre::db::bundle::execute::installed(&tx)
+                        .await
+                        .map_err(io::Error::other)?
+                        .is_some()
+                    {
+                        return Err(io::Error::other(
+                            "--push cannot modify a database bound to finalized history",
+                        ));
+                    }
                     let introspection_result = crate::db::introspect::introspect_for_project(
                         &tx,
                         &current_context,

@@ -35,7 +35,7 @@ impl fmt::Display for Policy {
 }
 
 #[cfg(feature = "database")]
-pub(crate) use native::read_in_transaction;
+pub use native::read_in_transaction;
 #[cfg(feature = "database")]
 pub use native::{inspect, set_disposable, Error};
 #[cfg(feature = "database")]
@@ -131,7 +131,7 @@ mod native {
     }
 
     /// Destructive callers must read this after acquiring their write transaction.
-    pub(crate) async fn read_in_transaction(
+    pub async fn read_in_transaction(
         conn: &Connection,
         namespace: Option<&str>,
     ) -> Result<(Policy, bool), Error> {

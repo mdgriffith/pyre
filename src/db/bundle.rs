@@ -1,11 +1,19 @@
 //! Storage-independent format-1 migration artifacts and catalog reads.
 
+#[cfg(feature = "database")]
+pub mod author;
+#[cfg(feature = "database")]
+pub mod database;
+#[cfg(feature = "database")]
+pub mod execute;
 #[cfg(feature = "filesystem")]
 pub mod filesystem;
 mod history;
+pub mod sql;
 
 pub use history::{History, HistoryError};
 
+use crate::schema_contract::{self, ApiTransition, ApiVersion};
 use crate::{ast, parser, typecheck};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -58,6 +66,14 @@ pub struct BundleMetadata {
     pub predecessor: Option<BundleHash>,
     /// The exact, already validated version supplied by the compiler.
     pub target_api_version: String,
+    pub grace_seconds: Option<u64>,
+    pub external_identities: Vec<ast::ExternalIdentity>,
+}
+
+/// Authoring inputs. The compiler, rather than the caller, supplies the
+/// predecessor hash and target API version.
+pub struct DraftMetadata {
+    pub namespace: String,
     pub grace_seconds: Option<u64>,
     pub external_identities: Vec<ast::ExternalIdentity>,
 }
@@ -133,6 +149,69 @@ pub struct Bundle {
 }
 
 impl Bundle {
+    pub fn finalize(
+        metadata: DraftMetadata,
+        predecessor: Option<&Bundle>,
+        files: impl IntoIterator<Item = (String, Vec<u8>)>,
+    ) -> Result<(Self, ApiTransition), BundleError> {
+        let mut bundle = Self::seal(
+            BundleMetadata {
+                namespace: metadata.namespace,
+                predecessor: predecessor.map(|bundle| bundle.hash().clone()),
+                target_api_version: ApiVersion::default().to_string(),
+                grace_seconds: metadata.grace_seconds,
+                external_identities: metadata.external_identities,
+            },
+            files,
+        )?;
+        let transition = bundle.api_transition(predecessor)?;
+        bundle.manifest.target_api_version = transition.to.to_string();
+        bundle.hash = content_hash(&bundle.manifest, &bundle.files);
+        Ok((bundle, transition))
+    }
+
+    /// Recompute the compiler-assigned transition for this artifact.
+    pub fn api_transition(
+        &self,
+        predecessor: Option<&Bundle>,
+    ) -> Result<ApiTransition, BundleError> {
+        if self.predecessor() != predecessor.map(Bundle::hash) {
+            return Err(BundleError::WrongPredecessor);
+        }
+        let previous = predecessor
+            .map(|bundle| {
+                if bundle.namespace() != self.namespace() {
+                    return Err(BundleError::NamespaceMismatch {
+                        expected: self.namespace().into(),
+                        actual: bundle.namespace().into(),
+                    });
+                }
+                Ok((bundle.api_version(), bundle.load_target_schema()?))
+            })
+            .transpose()?;
+        schema_contract::transition(
+            previous
+                .as_ref()
+                .map(|(version, context)| (*version, context)),
+            &self.load_target_schema()?,
+        )
+        .map_err(BundleError::VersionOverflow)
+    }
+
+    pub fn verify_api_transition(
+        &self,
+        predecessor: Option<&Bundle>,
+    ) -> Result<ApiTransition, BundleError> {
+        let transition = self.api_transition(predecessor)?;
+        if transition.to != self.api_version() {
+            return Err(BundleError::WrongTargetApiVersion {
+                actual: self.api_version(),
+                expected: transition.to,
+            });
+        }
+        Ok(transition)
+    }
+
     /// Seal the exact UTF-8 payload files with compiler-supplied metadata.
     pub fn seal(
         metadata: BundleMetadata,
@@ -184,8 +263,8 @@ impl Bundle {
         if !valid_component(&manifest.namespace) {
             return Err(BundleError::InvalidNamespace(manifest.namespace));
         }
-        if manifest.target_api_version.trim().is_empty() {
-            return Err(BundleError::EmptyTargetApiVersion);
+        if manifest.target_api_version.parse::<ApiVersion>().is_err() {
+            return Err(BundleError::InvalidTargetApiVersion);
         }
         match manifest.grace_seconds {
             Some(0) => return Err(BundleError::ZeroGrace),
@@ -256,6 +335,18 @@ impl Bundle {
         &self.manifest.target_api_version
     }
 
+    pub fn api_version(&self) -> ApiVersion {
+        self.target_api_version()
+            .parse()
+            .expect("verified API version")
+    }
+
+    pub fn runtime_fingerprint(&self) -> Result<String, BundleError> {
+        Ok(schema_contract::runtime_fingerprint(
+            &self.load_target_schema()?,
+        ))
+    }
+
     pub fn grace_seconds(&self) -> u64 {
         self.manifest.grace_seconds.unwrap_or(DEFAULT_GRACE_SECONDS)
     }
@@ -292,28 +383,38 @@ impl Bundle {
 
     /// Compile the standalone schema using only this artifact's namespace and identities.
     pub fn load_target_schema(&self) -> Result<typecheck::Context, BundleError> {
-        let source = self.schema_source();
-        let mut schema = ast::Schema {
-            namespace: self.namespace().into(),
-            ..ast::Schema::default()
-        };
-        parser::run(SCHEMA_PATH, source, &mut schema)
-            .map_err(|err| BundleError::Schema(parser::render_error(source, err, false)))?;
-        let mut database = ast::Database {
-            schemas: vec![schema],
-        };
-        ast::resolve_id_brands(&mut database);
-        typecheck::check_schema_with_external_identities(&database, self.external_identities())
-            .map_err(|errors| {
-                BundleError::Schema(
-                    errors
-                        .iter()
-                        .map(|err| crate::error::format_error(source, err, false))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            })
+        load_standalone_schema(
+            self.namespace(),
+            self.schema_source(),
+            self.external_identities(),
+        )
     }
+}
+
+pub fn load_standalone_schema(
+    namespace: &str,
+    source: &str,
+    identities: &[ast::ExternalIdentity],
+) -> Result<typecheck::Context, BundleError> {
+    let mut schema = ast::Schema {
+        namespace: namespace.into(),
+        ..ast::Schema::default()
+    };
+    parser::run(SCHEMA_PATH, source, &mut schema)
+        .map_err(|err| BundleError::Schema(parser::render_error(source, err, false)))?;
+    let mut database = ast::Database {
+        schemas: vec![schema],
+    };
+    ast::resolve_id_brands(&mut database);
+    typecheck::check_schema_with_external_identities(&database, identities).map_err(|errors| {
+        BundleError::Schema(
+            errors
+                .iter()
+                .map(|err| crate::error::format_error(source, err, false))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    })
 }
 
 fn manifest_json(manifest: &Manifest) -> Vec<u8> {
@@ -383,7 +484,13 @@ pub enum BundleError {
         expected: String,
         actual: String,
     },
-    EmptyTargetApiVersion,
+    InvalidTargetApiVersion,
+    WrongPredecessor,
+    WrongTargetApiVersion {
+        actual: ApiVersion,
+        expected: ApiVersion,
+    },
+    VersionOverflow(schema_contract::VersionOverflow),
     ZeroGrace,
     DuplicateIdentity {
         namespace: String,
@@ -422,7 +529,18 @@ impl fmt::Display for BundleError {
             Self::NamespaceMismatch { expected, actual } => {
                 write!(f, "expected namespace {expected:?}, found {actual:?}")
             }
-            Self::EmptyTargetApiVersion => write!(f, "targetApiVersion must not be blank"),
+            Self::InvalidTargetApiVersion => write!(
+                f,
+                "targetApiVersion must be a canonical major.minor.patch version"
+            ),
+            Self::WrongPredecessor => {
+                write!(f, "artifact does not follow the supplied predecessor")
+            }
+            Self::WrongTargetApiVersion { actual, expected } => write!(
+                f,
+                "targetApiVersion is {actual}, expected {expected} from schema compatibility"
+            ),
+            Self::VersionOverflow(error) => error.fmt(f),
             Self::ZeroGrace => write!(f, "graceSeconds must be positive"),
             Self::DuplicateIdentity {
                 namespace,

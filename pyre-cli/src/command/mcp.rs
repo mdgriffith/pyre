@@ -413,19 +413,23 @@ fn run_generate_migration(
     arguments: &JsonValue,
 ) -> Result<JsonValue, String> {
     let name = required_string_arg(arguments, "name")?;
-    let db = required_string_arg(arguments, "database")?;
-    validate_database_ref("database", &db)?;
     let migration_dir =
         string_arg(arguments, "migration_dir").unwrap_or_else(|| "pyre/migrations".to_string());
     validate_safe_path("migration_dir", &migration_dir)?;
     let mut args = vec![
         "migration".to_string(),
+        "create".to_string(),
         name,
-        "--db".to_string(),
-        db,
         "--migration-dir".to_string(),
         migration_dir,
     ];
+    if let Some(db) = string_arg(arguments, "database") {
+        validate_database_ref("database", &db)?;
+        args.extend(["--database".into(), db]);
+    }
+    if bool_arg(arguments, "draft").unwrap_or(false) {
+        args.push("--draft".into());
+    }
     push_optional_arg(arguments, &mut args, "auth", "--auth");
     push_optional_arg(arguments, &mut args, "namespace", "--namespace");
     run_cli(
@@ -1368,7 +1372,7 @@ fn tools() -> Vec<JsonValue> {
         tool("pyre_check", "Typecheck the current Pyre schema and query files.", json!({"type":"object","properties":{"dir":{"type":"string"}}})),
         tool("pyre_format", "Format Pyre files. This may write files unless to_stdout is true.", json!({"type":"object","properties":{"dir":{"type":"string"},"files":{"type":"array","items":{"type":"string"}},"to_stdout":{"type":"boolean"}}})),
         tool("pyre_generate", "Generate Pyre artifacts.", json!({"type":"object","properties":{"dir":{"type":"string"},"out":{"type":"string"}}})),
-        tool("pyre_generate_migration", "Generate a Pyre migration against a database.", json!({"type":"object","required":["name","database"],"properties":{"dir":{"type":"string"},"name":{"type":"string"},"database":{"type":"string"},"auth":{"type":"string"},"namespace":{"type":"string"},"migration_dir":{"type":"string"}}})),
+        tool("pyre_generate_migration", "Generate a migration against finalized history. Optionally use a database-backed catalog.", json!({"type":"object","required":["name"],"properties":{"dir":{"type":"string"},"name":{"type":"string"},"database":{"type":"string"},"auth":{"type":"string"},"namespace":{"type":"string"},"migration_dir":{"type":"string"},"draft":{"type":"boolean"}}})),
         tool("pyre_migrate", "Apply Pyre migrations to a database. With push, table removals require force because MCP cannot prompt for confirmation.", json!({"type":"object","required":["database"],"properties":{"dir":{"type":"string"},"database":{"type":"string"},"auth":{"type":"string"},"namespace":{"type":"string"},"migration_dir":{"type":"string"},"push":{"type":"boolean"},"force":{"type":"boolean","description":"With push, apply destructive changes without confirmation."}}})),
         tool("pyre_introspect", "Introspect a database and generate a Pyre schema file.", json!({"type":"object","required":["database"],"properties":{"dir":{"type":"string"},"database":{"type":"string","description":"A local path, URL, or $ENV_VAR database reference."},"auth":{"type":"string","description":"Optional auth token for remote libSQL/Turso databases."},"namespace":{"type":"string","description":"Optional namespace for the generated schema."}}})),
         tool("pyre_db_status", "Check database connectivity and current schema/migration status.", json!({"type":"object","required":["database"],"properties":{"dir":{"type":"string"},"database":{"type":"string"},"auth":{"type":"string"},"namespace":{"type":"string"},"migration_dir":{"type":"string"}}})),

@@ -1,4 +1,4 @@
-use super::{valid_component, Bundle, BundleHash};
+use super::{valid_component, Bundle, BundleError, BundleHash};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -37,12 +37,23 @@ impl History {
             .map(|(hash, bundle)| (hash, bundle.predecessor()))
             .collect();
         let order: Vec<BundleHash> = chain_order(&links)?.into_iter().cloned().collect();
+        let bundles: Vec<_> = order
+            .into_iter()
+            .map(|hash| by_hash.remove(&hash).unwrap())
+            .collect();
+        let mut predecessor = None;
+        for bundle in &bundles {
+            bundle
+                .verify_api_transition(predecessor)
+                .map_err(|source| HistoryError::ApiVersion {
+                    bundle: bundle.hash().clone(),
+                    source,
+                })?;
+            predecessor = Some(bundle);
+        }
         Ok(Self {
             namespace: namespace.into(),
-            bundles: order
-                .into_iter()
-                .map(|hash| by_hash.remove(&hash).unwrap())
-                .collect(),
+            bundles,
         })
     }
 
@@ -130,6 +141,10 @@ pub enum HistoryError {
         at: BundleHash,
         disconnected: bool,
     },
+    ApiVersion {
+        bundle: BundleHash,
+        source: BundleError,
+    },
 }
 
 impl fmt::Display for HistoryError {
@@ -177,6 +192,7 @@ impl fmt::Display for HistoryError {
                 f,
                 "migration history has a cycle at {at} disconnected from the root"
             ),
+            Self::ApiVersion { bundle, source } => write!(f, "bundle {bundle}: {source}"),
         }
     }
 }

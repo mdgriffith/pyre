@@ -144,7 +144,7 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
     let addr = SocketAddr::from((host, options.port));
     let loopback = host.is_loopback();
 
-    let db = db::connect(&options.database.to_string(), options.auth)
+    let db = db::connect_existing(options.database, options.auth)
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.format_error()))?;
     let conn = db.connect().map_err(|error| {

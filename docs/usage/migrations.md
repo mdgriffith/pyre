@@ -1,172 +1,66 @@
-# Migration Guide
+# Migrations
 
-Pyre supports three related but different schema-to-database workflows:
+Preserved databases run finalized migrations. A bundle contains the SQL, the complete target schema, and any assertions. A database applies the bundle using its stored catalog binding, so the working schema is not needed at deployment.
 
-- `pyre migrate <database> --push` updates the database directly from your current schema.
-- `pyre migration <name> --db <database>` generates SQL migration files.
-- `pyre migrate <database>` applies migration files that already exist on disk.
+## Create and apply a migration
 
-## Rule Of Thumb
+```sh
+pyre migration create initial
+pyre db init app.db
 
-```text
-Local iteration, prototypes, throwaway databases:
-  pyre migrate <database> --push
-
-Checked-in SQL migrations for teams and deployments:
-  pyre migration <name> --db <database>
-  pyre migrate <database>
+# After editing the working schema:
+pyre migration create add_notes
+pyre migration check
+pyre migrate app.db
 ```
 
-Use checked-in migrations to retain data in preserved databases. Create throwaway local, demo, or CI targets with `pyre db init <database> --disposable` and rebuild them with `pyre db reset` or `pyre db reseed`. Reseed discards the old rows, starts a new sync epoch, and loads fixtures after reset commits. It is an explicit setup operation; a failed migration does not trigger it. See [database policy and reseed](./seeding.md#database-policy) for copy/restore and maintenance guidance.
+Use `--namespace Billing` when working with a named namespace and `--migration-dir` to set a non-default filesystem location. The chain is ordered by predecessor hashes; folder names are for people. Commit finalized folders with the exact file bytes intact.
 
-## Direct Push Workflow
+## Drafts and fixture checks
 
-`--push` is the fastest way to get a local database in sync with the current schema:
+`migration create NAME --draft` prepares an editable draft even when the schema is unchanged. Automatic generation compares against the latest finalized schema. Changes requiring explicit SQL, and candidates that fail replay, remain drafts. After editing `migration.sql` and optionally adding `assertions/*.sql`, run:
 
-```bash
-pyre migrate db/app.db --push
+```sh
+pyre migration check rewrite_notes --fixtures predecessor.json
+pyre migration finalize rewrite_notes --grace 2d
 ```
 
-What it does:
+Each assertion is one read-only `SELECT`; it passes only if it returns no rows. Fixture files use the same table-keyed JSON format as `db seed`. Without fixtures, replay checks the structure and executability on a fresh database; it does not prove the migration is correct for production data.
 
-- typechecks your schema
-- introspects the target database
-- computes the schema diff
-- applies the resulting SQL directly
-- stores the latest Pyre schema metadata in the database
+If the catalog head changes before a draft is finalized, regenerate against the new head, carry forward handwritten SQL and assertions, and check again. `migration unfinalize NAME` returns an unshared filesystem head to a draft when there is no known application or rollout evidence. Use a follow-up migration after sharing or applying it.
 
-Use this when you want the shortest local development loop and do not need checked-in SQL migration files.
+## Apply and recover
 
-### Schema-Only Directives
+Stop serving the target and drain in-flight work before running `pyre migrate`. Restart with compatible handlers after verifying the installed state. Each migration commits its SQL, assertions, installed schema, and receipt together. If one fails, earlier migrations stay applied. Data-changing SQL on a synced target changes its sync epoch so reconnecting clients rebuild their caches.
 
-Adding or removing `@immutable` changes Pyre's write typechecking and generated update inputs, but not the physical SQLite schema. It produces no migration SQL and installs no trigger or constraint. A direct push still stores the latest Pyre schema metadata so later dynamic queries use the current immutability rule.
+If the commit outcome is unknown, keep the database out of service. On a fresh connection, `pyre migrate app.db --inspect NAME` confirms application by receipt or identifies that the target is still at the expected predecessor. Resolve divergence or failed inspection before retrying.
 
-## Checked-In Migration Workflow
+Migration SQL supports transactional table/index DDL and `INSERT`, `UPDATE`, and `DELETE`. It rejects transaction control, `PRAGMA` (including foreign-key toggles in rebuild scripts), writes outside the main database, and references to reserved storage. V1 write migrations do not support targets with triggers or virtual tables.
 
-Use this when you want explicit SQL migration files under `pyre/migrations/`.
+## Adopt, audit, or use a disposable database
 
-### 1. Generate A Migration
-
-```bash
-pyre migration add_users --db db/app.db
+```sh
+pyre db audit app.db
+pyre db baseline app.db --at initial
+pyre db policy app.db --set preserved
 ```
 
-This creates a timestamped folder containing:
+Audit compares live structure with the installed schema. Baseline adopts an existing database only when its structure matches the named bundle; it does not execute the bundle or fabricate receipts. Promotion requires matching finalized provenance or an explicit baseline and leaves application rows untouched.
 
-- `migration.sql`
-- `schema.diff`
+For an explicitly disposable development database, use `pyre db init dev.db --disposable` followed by `pyre migrate dev.db --push`. A database already bound to a finalized chain uses finalized migrations even if its policy is disposable. Use `db reset` or `db reseed` only for deliberate replacement of a disposable database.
 
-Pyre refuses to generate a new migration if older migration folders have not been applied to the target database yet.
+## Target-local catalog
 
-### 2. Apply Existing Migrations
-
-```bash
-pyre migrate db/app.db
+```sh
+pyre db init app.db --migration-catalog database
+pyre migration create add_notes --database app.db --schema target.pyre --draft
+pyre migration show-draft add_notes --database app.db
+pyre migration edit-draft add_notes updated-draft.json --database app.db
+pyre migration check add_notes --database app.db
+pyre migration finalize add_notes --database app.db
+pyre migrate app.db
 ```
 
-This applies migration folders that already exist on disk.
+Target-local init generates and checks a root from the working schema, then installs and stores it on an empty target in the same transaction. It does not read the filesystem migration catalog. Database-catalog authoring can consume a standalone schema plus optional `--external-identities identities.json`. Finalizing publishes an artifact to the catalog; it does not apply it.
 
-## New Project Examples
-
-For a brand new local project, the simplest path is:
-
-```bash
-pyre migrate db/app.db --push
-```
-
-If you want a migration-file-first project from day one, use:
-
-```bash
-pyre migration initial --db db/app.db
-pyre migrate db/app.db
-```
-
-## MCP Equivalents
-
-### Direct push
-
-```json
-{
-  "name": "pyre_migrate",
-  "arguments": {
-    "database": "db/app.db",
-    "push": true
-  }
-}
-```
-
-### Generate migration files
-
-```json
-{
-  "name": "pyre_generate_migration",
-  "arguments": {
-    "name": "add_users",
-    "database": "db/app.db"
-  }
-}
-```
-
-### Apply migration files
-
-```json
-{
-  "name": "pyre_migrate",
-  "arguments": {
-    "database": "db/app.db"
-  }
-}
-```
-
-### Inspect database status
-
-```json
-{
-  "name": "pyre_db_status",
-  "arguments": {
-    "database": "db/app.db"
-  }
-}
-```
-
-## Namespaces
-
-For namespaced schemas, pass `--namespace` in the CLI or `namespace` in MCP arguments so Pyre operates on the intended schema partition.
-
-```bash
-pyre migration add_billing_tables --db db/app.db --namespace Billing
-pyre migrate db/app.db --namespace Billing
-pyre migrate db/app.db --namespace Billing --push
-```
-
-Run migrations with the complete project schemas available so references between
-namespaces can resolve. `migrate` refreshes the definitions needed to load each
-database independently, even when no SQL migrations are pending.
-
-If serving or loading a database reports missing type definitions, run
-`pyre migrate <database> --namespace <namespace>` from the project containing those
-schemas. Correct invalid project references first; changes to existing column
-types still require an explicit SQL migration.
-
-## Upgrading Synced Identities And Clients
-
-Synced namespaces require exactly one non-null `Id.Uuid @id` field per record. To keep integer or plain-string keys in a server-only database, declare `@syncable(false)` at namespace scope. That is a query-only execution choice, not compatibility with the UUID-based sync worker.
-
-For an existing synced database:
-
-1. Plan an explicit old-to-new UUID mapping for primary keys and migrate foreign-key values together. Update external references and stored session IDs that refer to those records.
-2. Review and apply the data migration; changing the schema type or running `--push` alone does not construct this mapping or preserve relationships automatically.
-3. Regenerate TypeScript, Elm, and server manifests with the matching compiler. Deploy schema, server/runtime packages, and generated clients together; old protocols and generated artifacts are not a supported mixed-version upgrade.
-4. Reload server schema caches. IndexedDB v4 atomically discards legacy browser caches and their cursors/revisions; the next initialization loads server authority. Pending optimistic edits are memory-only and do not survive reload.
-
-Generated create builders allocate UUIDv7 once. Existing/imported UUIDs may use other versions; do not regenerate valid identities merely to make them v7. Custom primary-key names are supported throughout the client.
-
-For application integration changes, update Elm calls to `Pyre.getResult databaseId queryId queries`, handle `QueryUpdated databaseId queryId`, and retain `databaseId` in bridge messages. Entity consumers must handle `op: 'remove'` as well as `op: 'row'`. See [Elm + Sync](./elm-sync.md) and [Sync Setup](./sync.md).
-
-## Common Mistakes
-
-- Generating a migration and then running `pyre migrate --push`.
-  `--push` skips migration files entirely.
-- Expecting `pyre migrate <database>` to create migration folders.
-  It only applies folders that already exist.
-- Forgetting `--namespace` for multi-namespace projects.
+See the [bundle format and compiler contracts](../spec/migration-bundles.md) for the wire format.

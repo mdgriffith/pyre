@@ -23,6 +23,12 @@ The payload contains only the required files and optional `assertions/<name>.sql
 
 The filesystem catalog reads `migrations/<namespace>/<folder>/`, including `migrations/_default/` for the default namespace. A folder without a manifest is outside finalized history. Finalized directories require regular files and reject extra entries. History order comes from predecessor links, not directory names. A content hash checks internal integrity; knowing whether a catalog is truncated or entirely replaced requires a separately trusted head or receipt.
 
+## Compiler contracts
+
+The first finalized schema starts at `0.0.0`. Versions are three decimal unsigned 64-bit components with no leading zeroes, prerelease labels, or build metadata. A storage-only or data-only change leaves the version unchanged. Compatible additions bump minor and reset patch; breaking changes bump major and reset minor and patch, including before `1.0.0`. Adding a variant to an existing union always bumps major. The compiler compares typechecked schemas, treating removed definitions and fields, newly required inputs, column type and nullability changes, new write constraints, and permission changes that may narrow access as breaking. It excludes table names and non-unique indexes from the API comparison. Chain validation recomputes each transition and rejects a manifest claiming a different version.
+
+The installed runtime fingerprint is separate from the bundle digest. Its v1 encoding is `v1:` followed by lowercase SHA-256 of the literal bytes `pyre-runtime-schema\0v1\0` and the compact UTF-8 JSON of the shared core's runtime projection in `src/schema_contract.rs`. The projection includes the namespace, sync mode, sorted external identities, Session fields, records, and unions. It includes effective permissions in query/insert/update/delete order, physical names and index definitions, identity brands, and schema directives that affect runtime behavior. Maps use lexical keys; index keys, link field pairs, and function arguments preserve order. Logical `And` and `Or` operands are flattened and sorted. It omits comments, source locations, file names, and draft or rollout metadata. The WASM adapter delegates to the same compiler implementation.
+
 ## Implementation order
 
 1. [MEC-192](https://linear.app/mechanical-elephant/issue/MEC-192): Define sealing, verification, history validation, and the catalog interface.

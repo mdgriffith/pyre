@@ -21,6 +21,20 @@ impl FilesystemCatalog {
 
     /// A folder without a manifest is a draft and does not enter finalized history.
     pub fn read_history(&self, namespace: &str) -> Result<History, Error> {
+        self.read_named_history(namespace)
+            .map(|(history, _)| history)
+    }
+
+    pub fn read_named_history(
+        &self,
+        namespace: &str,
+    ) -> Result<
+        (
+            History,
+            std::collections::BTreeMap<String, super::BundleHash>,
+        ),
+        Error,
+    > {
         if !valid_component(namespace) {
             return Err(Error::History(HistoryError::InvalidNamespace(
                 namespace.into(),
@@ -28,6 +42,7 @@ impl FilesystemCatalog {
         }
         let scope = self.migration_root.join(namespace);
         let mut bundles = Vec::new();
+        let mut names = std::collections::BTreeMap::new();
         if let Some(metadata) = optional_metadata(&scope)? {
             if !metadata.is_dir() {
                 return Err(invalid_entry(&scope, "expected a namespace directory"));
@@ -47,13 +62,25 @@ impl FilesystemCatalog {
                     continue;
                 }
                 if let Some(manifest) = optional_metadata(&path.join(MANIFEST_PATH))? {
-                    bundles.push(read_bundle(namespace, &path, manifest)?);
+                    let bundle = read_bundle(namespace, &path, manifest)?;
+                    let name = entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| invalid_entry(&path, "folder name must be UTF-8"))?;
+                    names.insert(name, bundle.hash().clone());
+                    bundles.push(bundle);
                 }
             }
         }
-        History::new(namespace, bundles).map_err(Error::History)
+        Ok((
+            History::new(namespace, bundles).map_err(Error::History)?,
+            names,
+        ))
     }
 }
+
+#[cfg(feature = "database")]
+pub mod authoring;
 
 impl Catalog for FilesystemCatalog {
     type Error = Error;

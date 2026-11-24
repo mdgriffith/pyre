@@ -4,7 +4,7 @@ import { requireDatabaseId, type DatabaseId } from "./database-id";
 import { seed, type SeedInput } from "./query";
 
 const DEFAULT_SCHEMA_KEY = "__default__";
-const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities", "_pyre_database_policy"]);
+const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities", "_pyre_database_policy", "_pyre_finalized_schema", "_pyre_migration_receipts", "_pyre_migration_bundles", "_pyre_migration_drafts"]);
 const CREATE_EXTERNAL_IDENTITIES = `create table if not exists _pyre_external_identities (
     namespace text not null,
     record_name text not null,
@@ -270,7 +270,7 @@ function sameIdentities(a: ExternalIdentity[], b: ExternalIdentity[]): boolean {
         && candidate.field === identity.field && candidate.kind === identity.kind));
 }
 
-/** Create or migrate a database to a generated Pyre schema. */
+/** Check an installed finalized schema, or update an explicitly disposable database. */
 export async function ensureDatabase(
     db: Client,
     schemaName: string,
@@ -280,6 +280,18 @@ export async function ensureDatabase(
     const tx = await db.transaction("write");
     try {
         const { initialized, introspection } = await introspectDatabase(tx);
+        const { policy } = await readPolicy(tx, wasm.database_policy_sql() as PolicySql, schemaName);
+        const installed = await readFinalizedState(tx);
+        if (policy !== "disposable" || installed) {
+            if (!installed) throw new Error("Finalized migration provenance required; use db init or db baseline, or initialize explicitly as disposable");
+            const fingerprint = wasm.runtime_schema_fingerprint(schemaName, schemaSource, externalIdentities);
+            const actual = wasm.runtime_schema_fingerprint(introspection.schema_namespace, introspection.schema_source, introspection.external_identities);
+            if (installed.namespace !== schemaName || actual !== installed.fingerprint || fingerprint !== installed.fingerprint) {
+                throw new Error("Apply finalized migrations matching the generated schema before serving");
+            }
+            await tx.rollback();
+            return "up-to-date";
+        }
         if (!initialized && introspection.tables.length > 0) {
             throw new Error(
                 "Refusing to initialize a non-empty database that is not managed by Pyre",
@@ -327,6 +339,14 @@ export async function ensureDatabase(
     } finally {
         tx.close();
     }
+}
+
+async function readFinalizedState(tx: Transaction) {
+    const state = await tx.execute("select 1 from main.sqlite_schema where type = 'table' and name = '_pyre_finalized_schema'");
+    if (state.rows.length === 0) return undefined;
+    const installed = (await tx.execute("select namespace, fingerprint from main._pyre_finalized_schema where id = 1")).rows[0];
+    if (!installed) throw new Error("Missing finalized installation metadata");
+    return installed;
 }
 
 async function ensureMetadataStorage(tx: Transaction): Promise<void> {
@@ -393,6 +413,10 @@ async function readIntrospectionSnapshot(db: Client): Promise<any> {
     const tx = await db.transaction("read");
     try {
         const { introspection } = await introspectDatabase(tx);
+        const installed = await readFinalizedState(tx);
+        if (installed && (installed.namespace !== introspection.schema_namespace || installed.fingerprint !== wasm.runtime_schema_fingerprint(introspection.schema_namespace, introspection.schema_source, introspection.external_identities))) {
+            throw new Error("Installed runtime schema does not match its finalized fingerprint");
+        }
         await tx.commit();
         return introspection;
     } catch (error) {
