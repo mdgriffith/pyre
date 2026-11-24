@@ -405,6 +405,92 @@ assert.throws(() => documentId('not-a-uuid'));
 }
 
 #[test]
+fn elm_editors_compile_for_colliding_namespace_names() {
+    let schemas = [("SalesEast", "Invoice"), ("Sales_East", "Quote")].map(|(namespace, record)| {
+        let mut schema = ast::Schema {
+            namespace: namespace.into(),
+            ..ast::Schema::default()
+        };
+        parser::run(
+            "schema.pyre",
+            &format!("record {record} {{ @public\n id Id.Uuid @id\n title String\n }}"),
+            &mut schema,
+        )
+        .unwrap();
+        schema
+    });
+    let context = typecheck::check_schema(&ast::Database {
+        schemas: schemas.into(),
+    })
+    .unwrap();
+    let mut queries = parser::parse_query(
+        "queries.pyre",
+        "query Invoices { invoice { id title } }\nquery Quotes { quote { id title } }",
+    )
+    .unwrap();
+    generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = vec![];
+    generate::generate_schema(&context, &mut files);
+    generate::write_queries(&context, &queries, &info, &mut files);
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = std::collections::HashSet::new();
+    for file in files
+        .into_iter()
+        .filter(|file| file.path.starts_with("client/elm"))
+    {
+        assert!(
+            paths.insert(file.path.clone()),
+            "duplicate Elm output: {:?}",
+            file.path
+        );
+        let path = dir.path().join(file.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file.contents).unwrap();
+    }
+    std::fs::write(dir.path().join("elm.json"), r#"{
+      "type": "application", "source-directories": ["client/elm", "."], "elm-version": "0.19.1",
+      "dependencies": {"direct": {"elm/core": "1.0.5", "elm/json": "1.1.3", "elm/time": "1.0.0"}, "indirect": {}},
+      "test-dependencies": {"direct": {}, "indirect": {}}
+    }"#).unwrap();
+    std::fs::write(dir.path().join("Main.elm"), r#"module Main exposing (main)
+
+import Db
+import Db.Edit.Invoice.Draft as Invoice
+import Db.Edit.Invoice.Editor as InvoiceEditor
+import Db.Edit.Quote.Draft as Quote
+import Db.Edit.Quote.Editor as QuoteEditor
+import Db.Editor as Editor
+import Db.Editor.Input.SalesEast as InvoiceInput
+import Db.Editor.Input.SalesEast_ as QuoteInput
+import Db.SalesEast.Stream
+import Db.SalesEast_.Stream
+import Platform
+import Pyre
+
+checks : ( Maybe Invoice.Draft, Maybe Quote.Draft )
+checks =
+    ( Editor.set InvoiceEditor.Title (Db.Present (InvoiceInput.StringValue "Invoice")) InvoiceEditor.createForm |> Editor.validate |> Tuple.first
+    , Editor.set QuoteEditor.Title (Db.Present (QuoteInput.StringValue "Quote")) QuoteEditor.createForm |> Editor.validate |> Tuple.first
+    )
+
+main : Program () Pyre.Model ()
+main =
+    Platform.worker { init = \() -> ( Pyre.init, Cmd.none ), update = \() model -> ( model, Cmd.none ), subscriptions = \_ -> Sub.none }
+"#).unwrap();
+    let output = Command::new("elm")
+        .args(["make", "Main.elm", "--output=/dev/null"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn generated_builders_compile() {
     let mut schema = ast::Schema::default();
     parser::run(
@@ -413,6 +499,8 @@ fn generated_builders_compile() {
 session {
     write Bool
 }
+type Nullable = Absent | Null | Present { reason String, details Json? }
+type StringList = EmptyStrings
 record Document {
     @public
     id Id.Uuid @id
@@ -421,6 +509,12 @@ record Document {
     summary String?
     tags Json<List<String>>
     assignee Account.id?
+    caption String? @default("Default caption")
+    published Bool @default(False)
+    status Nullable?
+    groups Json<Dict<List<Nullable?>>>?
+    payload Json?
+    labels StringList?
 }
 record Account {
     @public
@@ -451,7 +545,7 @@ record Reply {
     let context = typecheck::check_schema(&database).unwrap();
     let mut queries = parser::parse_query(
         "queries.pyre",
-        "query Notes { note { @where { id == \"ordinary\" } noteKey id title } }",
+        "query Notes { note { @where { id == \"ordinary\" } noteKey id title } }\nquery EditorDocuments($id: Document.id) { document { @where { id == $id } id title summary tags assignee caption published status groups payload labels updatedAt } }",
     )
     .unwrap();
     generated_queries::append_generated_crud_queries(&mut queries, &context);
@@ -467,14 +561,20 @@ record Reply {
     }
     std::fs::write(dir.path().join("elm.json"), r#"{
       "type": "application", "source-directories": ["client/elm", "."], "elm-version": "0.19.1",
-      "dependencies": {"direct": {"elm/core": "1.0.5", "elm/json": "1.1.3", "elm/time": "1.0.0"}, "indirect": {}},
+      "dependencies": {
+        "direct": {"elm/browser": "1.0.2", "elm/core": "1.0.5", "elm/html": "1.0.0", "elm/json": "1.1.3", "elm/time": "1.0.0"},
+        "indirect": {"elm/url": "1.0.0", "elm/virtual-dom": "1.0.3"}
+      },
       "test-dependencies": {"direct": {}, "indirect": {}}
     }"#).unwrap();
     std::fs::write(dir.path().join("Main.elm"), r#"port module Main exposing (main)
+import Db
 import Db.Edit
 import Db.Edit.Document as Document
+import Db.Edit.Document.Draft as DocumentDraft
 import Db.Edit.Account as Account
 import Db.Edit.Note as Note
+import Db.Edit.Note.Draft as NoteDraft
 import Db.Internal.Edit as Internal
 import Db.Id
 import Db.Database
@@ -484,14 +584,33 @@ import Query.DocumentDelete
 port output : Encode.Value -> Cmd msg
 main =
     Platform.worker
-        { init = \() -> ( (), output (Encode.list identity [ Internal.encode create, Internal.encode (Document.update (Db.Id.uuid "01900000-0000-7000-8000-000000000000") patch), receiptCheck, Internal.encode (note [ explicit ]), Internal.encode (note [ explicit, explicit ]) ]) )
+        { init = \() -> ( (), output (Encode.list identity
+            [ Internal.encode create
+            , Internal.encode (Document.update documentId patch)
+            , receiptCheck
+            , Internal.encode (note [ explicit ])
+            , Internal.encode (note [ explicit, explicit ])
+            , Internal.encode (DocumentDraft.create documentDraft)
+            , Internal.encode (DocumentDraft.create { documentDraft | caption = Db.Null, published = Just False })
+            , Internal.encode (DocumentDraft.update documentId { documentPatch | title = Just "New title", summary = Db.Null, tags = Just [ "tag" ] })
+            , Internal.encode (DocumentDraft.update documentId { documentPatch | caption = Db.Present "Updated" })
+            , Internal.encode (DocumentDraft.update documentId documentPatch)
+            , Internal.encode (NoteDraft.create { noteDraft | noteKey = Just noteId })
+            ]) )
         , update = \() model -> ( model, Cmd.none )
         , subscriptions = \_ -> Sub.none
         }
 create = Document.create { title = "Title", owner = "Owner", tags = [] } [ Document.withSummary Nothing ]
 note = Note.create { id = "ordinary", title = "Custom key" }
-explicit = Note.withId (Db.Id.uuid "01900000-0000-7000-8000-000000000002")
+documentId : Db.Id.Document
+documentId = Db.Id.uuid "01900000-0000-7000-8000-000000000000"
+noteId : Db.Id.Note
+noteId = Db.Id.uuid "01900000-0000-7000-8000-000000000002"
+explicit = Note.withId noteId
 patch = [ Document.title "New title", Document.summary Nothing, Document.tags [ "tag" ] ]
+documentDraft = DocumentDraft.draft { title = "Title", owner = "Owner", tags = [] }
+documentPatch = DocumentDraft.emptyPatch
+noteDraft = NoteDraft.draft { id = "ordinary", title = "Custom key" }
 receiptCheck =
     let
         database = Db.Database.fromString "tenant:1"
@@ -543,6 +662,32 @@ receiptCheck =
         "{}",
         String::from_utf8_lossy(&example.stderr)
     );
+    let editor_source = include_str!("fixtures/EditorExample.elm");
+    let editor_path = dir.path().join("EditorExample.elm");
+    std::fs::write(&editor_path, editor_source).unwrap();
+    let compile_editor = |destination: &str| {
+        Command::new("elm")
+            .args(["make", "EditorExample.elm", destination])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+    };
+    let editor = compile_editor("--output=editor.js");
+    assert!(
+        editor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&editor.stderr)
+    );
+    std::fs::write(&editor_path, format!("{editor_source}\nmixedFieldId = Editor.set AccountEditor.Name (Db.Present (Input.StringValue \"wrong record\")) DocumentEditor.createForm\n")).unwrap();
+    let invalid_editor = compile_editor("--output=/dev/null");
+    let diagnostic = String::from_utf8_lossy(&invalid_editor.stderr);
+    assert!(
+        !invalid_editor.status.success()
+            && diagnostic.contains("TYPE MISMATCH")
+            && diagnostic.contains("DocumentEditor.FieldId")
+            && diagnostic.contains("AccountEditor.FieldId"),
+        "{diagnostic}"
+    );
     let main = std::fs::read_to_string(dir.path().join("Main.elm")).unwrap();
     for invalid in [
         "Document.title Nothing",
@@ -550,6 +695,10 @@ receiptCheck =
         "Document.create { title = \"missing\" } []",
         "Document.withId wrongAccount\n\nwrongAccount : Db.Id.Account\nwrongAccount = Db.Id.uuid \"any\"",
         "Document.update (Db.Id.uuid \"01900000-0000-7000-8000-000000000000\") [ Account.name \"wrong record\" ]",
+        "NoteDraft.create { noteDraft | noteKey = Just documentId }",
+        "DocumentDraft.update documentId { documentPatch | owner = Just \"immutable\" }",
+        "DocumentDraft.update documentId { documentPatch | id = Just documentId }",
+        "DocumentDraft.update documentId { documentPatch | title = Db.Null }",
     ] {
         std::fs::write(
             dir.path().join("Main.elm"),
@@ -665,6 +814,12 @@ assert.deepEqual(edits[3].createId, { mode: 'explicit', field: 'noteKey', id: '0
 assert.equal(edits[3].optimistic.where.field, 'noteKey');
 assert.deepEqual(edits[3].input, { id: 'ordinary', title: 'Custom key' });
 assert.deepEqual(edits[4].createId, { mode: 'duplicate' });
+assert.deepEqual(edits[5], { ...edits[0], input: { title: 'Title', owner: 'Owner', tags: [] } });
+assert.deepEqual(edits[6], { ...edits[5], input: { ...edits[5].input, caption: null, published: false } });
+assert.deepEqual(edits[7], edits[1]);
+assert.deepEqual(edits[8], { ...edits[1], input: { id: edits[1].input.id, caption: 'Updated' } });
+assert.deepEqual(edits[9], { ...edits[1], input: { id: edits[1].input.id } });
+assert.deepEqual(edits[10], edits[3]);
 "#).unwrap();
     std::fs::write(
         dir.path().join("composed-browser.ts"),

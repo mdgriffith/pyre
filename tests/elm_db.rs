@@ -223,8 +223,8 @@ query GetEvents {
         content.contains("import Dict exposing (Dict)")
             && content.contains("type alias Input =\n    { payload : Db.Lifecycle\n    , tags : List String\n    , counts : Dict String Int")
             && content.contains("Db.Encode.lifecycle input.payload")
-            && content.contains("Encode.list Encode.string input.tags")
-            && content.contains("Dict.toList"),
+            && content.contains("(Encode.list Encode.string) input.tags")
+            && content.contains("(Encode.dict identity Encode.int) input.counts"),
         "Expected CreateEvent.elm to use rich typed Json inputs and encoders. Generated:\n{}",
         content
     );

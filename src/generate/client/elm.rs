@@ -7,6 +7,8 @@ use crate::typecheck;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+mod editor;
+
 const ELM_DELTA_MODULE: &str = include_str!("./static/elm/src/Db/Delta.elm");
 const ELM_UPDATES_MODULE: &str = include_str!("./static/elm/src/Db/Updates.elm");
 
@@ -43,35 +45,45 @@ pub fn generate(
         base_path.join("Db/Updates.elm"),
         ELM_UPDATES_MODULE,
     ));
+    let namespaces = elm_namespace_names(database);
     for schema in &database.schemas {
         let records = collect_schema_entity_stream_records(schema);
+        let namespace = &namespaces[&schema.namespace];
+        let prefix = if schema.namespace == ast::DEFAULT_SCHEMANAME {
+            "Db".into()
+        } else {
+            format!("Db.{namespace}")
+        };
+        let path = prefix.replace('.', "/");
 
         for record in &records {
             files.push(generate_text_file(
-                base_path.join(entity_stream_table_module_path(schema, record)),
-                to_entity_stream_table_module(database, schema, record),
+                base_path.join(format!("{path}/Table/{}.elm", record.table_module_segment)),
+                to_entity_stream_table_module(database, &prefix, record),
             ));
         }
 
         files.push(generate_text_file(
-            base_path.join(entity_stream_internal_module_path(schema)),
-            to_entity_stream_internal_module(schema),
+            base_path.join(format!("{path}/Stream/Internal.elm")),
+            to_entity_stream_internal_module(&prefix),
         ));
 
         files.push(generate_text_file(
-            base_path.join(entity_stream_module_path(schema)),
-            to_entity_stream_module(schema, &records),
+            base_path.join(format!("{path}/Stream.elm")),
+            to_entity_stream_module(&prefix, namespace, &records),
         ));
     }
 }
 
-fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord]) -> String {
+fn to_entity_stream_module(
+    prefix: &str,
+    namespace: &str,
+    records: &[EntityStreamRecord],
+) -> String {
     let mut result = String::new();
 
     result.push_str(&format!(
-        "module {} exposing (DatabaseId, {}, EntityChange(..), EntityChangeBatch, EntityChangeBatchSource(..), EntitySubscription, StreamId, decodeIncomingBatch, register, unregister",
-        entity_stream_module_name(schema),
-        elm_database_namespace(&schema.namespace)
+        "module {prefix}.Stream exposing (DatabaseId, {namespace}, EntityChange(..), EntityChangeBatch, EntityChangeBatchSource(..), EntitySubscription, StreamId, decodeIncomingBatch, register, unregister"
     ));
     for record in records {
         result.push_str(&format!(", {}", entity_stream_wrap_function_name(record)));
@@ -80,14 +92,12 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
     result.push_str("{-| Register and decode entity stream batches.\n\n    pyreStoreOut\n        (register databaseId\n            \"visible-posts\"\n            [ Posts.stream\n                |> Posts.idIn visiblePostIds\n                |> post\n            ]\n        )\n\n    decodeIncomingBatch value\n\n@docs DatabaseId, StreamId, EntitySubscription, EntityChange, EntityChangeBatch, EntityChangeBatchSource, register, unregister, decodeIncomingBatch\n\n-}\n\n");
     result.push_str("import Db.Database\n");
     result.push_str(&format!(
-        "import {} as StreamInternal\n",
-        entity_stream_internal_module_name(schema)
+        "import {prefix}.Stream.Internal as StreamInternal\n"
     ));
     for record in records {
         result.push_str(&format!(
-            "import {} as {}\n",
-            entity_stream_table_module_name(schema, record),
-            record.table_module_segment
+            "import {prefix}.Table.{} as {}\n",
+            record.table_module_segment, record.table_module_segment
         ));
     }
     result.push_str("import Json.Decode as Decode\n");
@@ -97,9 +107,7 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
     result
         .push_str("type alias DatabaseId namespace =\n    Db.Database.DatabaseId namespace\n\n\n");
     result.push_str(&format!(
-        "type alias {} =\n    Db.Database.{}\n\n\n",
-        elm_database_namespace(&schema.namespace),
-        elm_database_namespace(&schema.namespace)
+        "type alias {namespace} =\n    Db.Database.{namespace}\n\n\n"
     ));
     result.push_str("type alias StreamId =\n    String\n\n\n");
 
@@ -137,8 +145,7 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
     result.push_str("type alias EntityChangeBatch =\n    { streamId : StreamId\n    , databaseId : Maybe String\n    , sequence : Int\n    , source : EntityChangeBatchSource\n    , changes : List EntityChange\n    }\n\n\n");
 
     result.push_str(&format!(
-        "register : DatabaseId {} -> StreamId -> List EntitySubscription -> Encode.Value\n",
-        elm_database_namespace(&schema.namespace)
+        "register : DatabaseId {namespace} -> StreamId -> List EntitySubscription -> Encode.Value\n"
     ));
     result.push_str("register databaseId streamId subscriptions =\n");
     result.push_str("    Encode.object\n");
@@ -233,14 +240,14 @@ fn to_entity_stream_module(schema: &ast::Schema, records: &[EntityStreamRecord])
 
 fn to_entity_stream_table_module(
     database: &ast::Database,
-    schema: &ast::Schema,
+    prefix: &str,
     record: &EntityStreamRecord,
 ) -> String {
     let mut result = String::new();
 
     result.push_str(&format!(
-        "module {} exposing (Row, Stream, decodeRow, stream",
-        entity_stream_table_module_name(schema, record)
+        "module {prefix}.Table.{} exposing (Row, Stream, decodeRow, stream",
+        record.table_module_segment
     ));
     for field in entity_stream_condition_fields(database, record) {
         result.push_str(&format!(
@@ -253,8 +260,7 @@ fn to_entity_stream_table_module(
     result.push_str("import Db.Decode\n");
     result.push_str("import Db.Id\n");
     result.push_str(&format!(
-        "import {} as StreamInternal\n",
-        entity_stream_internal_module_name(schema)
+        "import {prefix}.Stream.Internal as StreamInternal\n"
     ));
     result.push_str("import Dict exposing (Dict)\n");
     result.push_str("import Json.Decode as Decode\n");
@@ -273,12 +279,11 @@ fn to_entity_stream_table_module(
     result
 }
 
-fn to_entity_stream_internal_module(schema: &ast::Schema) -> String {
+fn to_entity_stream_internal_module(prefix: &str) -> String {
     let mut result = String::new();
 
     result.push_str(&format!(
-        "module {} exposing (EntitySubscription, TableSubscription, addCondition, encodeSubscription, table, toEntitySubscription)\n\n\n",
-        entity_stream_internal_module_name(schema)
+        "module {prefix}.Stream.Internal exposing (EntitySubscription, TableSubscription, addCondition, encodeSubscription, table, toEntitySubscription)\n\n\n"
     ));
     result.push_str("import Dict exposing (Dict)\n");
     result.push_str("import Json.Encode as Encode\n\n\n");
@@ -324,44 +329,6 @@ struct EntityStreamRecord {
     fields: Vec<ast::Field>,
 }
 
-fn entity_stream_module_name(schema: &ast::Schema) -> String {
-    format!("{}.Stream", entity_stream_schema_module_prefix(schema))
-}
-
-fn entity_stream_module_path(schema: &ast::Schema) -> String {
-    format!("{}/Stream.elm", entity_stream_schema_path_prefix(schema))
-}
-
-fn entity_stream_internal_module_name(schema: &ast::Schema) -> String {
-    format!(
-        "{}.Stream.Internal",
-        entity_stream_schema_module_prefix(schema)
-    )
-}
-
-fn entity_stream_internal_module_path(schema: &ast::Schema) -> String {
-    format!(
-        "{}/Stream/Internal.elm",
-        entity_stream_schema_path_prefix(schema)
-    )
-}
-
-fn entity_stream_table_module_name(schema: &ast::Schema, record: &EntityStreamRecord) -> String {
-    format!(
-        "{}.Table.{}",
-        entity_stream_schema_module_prefix(schema),
-        record.table_module_segment
-    )
-}
-
-fn entity_stream_table_module_path(schema: &ast::Schema, record: &EntityStreamRecord) -> String {
-    format!(
-        "{}/Table/{}.elm",
-        entity_stream_schema_path_prefix(schema),
-        record.table_module_segment
-    )
-}
-
 fn entity_stream_wrap_function_name(record: &EntityStreamRecord) -> String {
     string::decapitalize(&record.record_name)
 }
@@ -371,22 +338,6 @@ fn entity_stream_condition_function_name(field_name: &str) -> String {
         "{}In",
         string::decapitalize(&elm_module_segment(field_name))
     )
-}
-
-fn entity_stream_schema_module_prefix(schema: &ast::Schema) -> String {
-    if schema.namespace == ast::DEFAULT_SCHEMANAME {
-        "Db".to_string()
-    } else {
-        format!("Db.{}", elm_database_namespace(&schema.namespace))
-    }
-}
-
-fn entity_stream_schema_path_prefix(schema: &ast::Schema) -> String {
-    if schema.namespace == ast::DEFAULT_SCHEMANAME {
-        "Db".to_string()
-    } else {
-        format!("Db/{}", elm_database_namespace(&schema.namespace))
-    }
 }
 
 fn elm_module_segment(name: &str) -> String {
@@ -596,12 +547,14 @@ fn entity_stream_elm_type(database: &ast::Database, type_: &ast::ColumnType) -> 
             }
         }
         ast::ColumnType::JsonTyped(inner) => entity_stream_elm_type(database, inner),
-        ast::ColumnType::List(inner) => format!("List {}", entity_stream_elm_type(database, inner)),
+        ast::ColumnType::List(inner) => {
+            elm_type_apply("List", entity_stream_elm_type(database, inner))
+        }
         ast::ColumnType::Dict(inner) => {
-            format!("Dict String {}", entity_stream_elm_type(database, inner))
+            elm_type_apply("Dict String", entity_stream_elm_type(database, inner))
         }
         ast::ColumnType::Nullable(inner) => {
-            format!("Maybe {}", entity_stream_elm_type(database, inner))
+            elm_type_apply("Maybe", entity_stream_elm_type(database, inner))
         }
         _ => elm_type_from_column_type(type_, true),
     }
@@ -758,19 +711,12 @@ fn entity_stream_id_type(fields: &Vec<ast::Field>) -> Option<(String, &'static s
 }
 
 fn to_database_ids(database: &ast::Database) -> String {
-    let mut namespaces: Vec<String> = database
-        .schemas
-        .iter()
-        .map(|schema| schema.namespace.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    namespaces.sort();
+    let namespaces = elm_namespace_names(database);
 
     let mut result = String::new();
     result.push_str("module Db.Database exposing (DatabaseId, fromString, toString, encode");
-    for namespace in &namespaces {
-        result.push_str(&format!(", {}", elm_database_namespace(namespace)));
+    for name in namespaces.values() {
+        result.push_str(&format!(", {name}"));
     }
     result.push_str(")\n\n");
     result.push_str("import Json.Encode as Encode\n\n\n");
@@ -778,8 +724,7 @@ fn to_database_ids(database: &ast::Database) -> String {
     result.push_str("type DatabaseId namespace\n");
     result.push_str("    = DatabaseId String\n\n\n");
 
-    for namespace in &namespaces {
-        let name = elm_database_namespace(namespace);
+    for name in namespaces.values() {
         result.push_str(&format!("type {}\n", name));
         result.push_str(&format!("    = {}\n\n\n", name));
     }
@@ -799,7 +744,7 @@ fn to_database_ids(database: &ast::Database) -> String {
     result
 }
 
-fn elm_database_namespace(namespace: &str) -> String {
+fn elm_namespace_base(namespace: &str) -> String {
     if namespace == ast::DEFAULT_SCHEMANAME {
         return "Default".to_string();
     }
@@ -829,8 +774,60 @@ fn elm_database_namespace(namespace: &str) -> String {
     }
 }
 
-fn elm_database_id_type(namespace: &str) -> String {
-    format!("(DatabaseId {})", elm_database_namespace(namespace))
+type ElmNamespaces = std::collections::BTreeMap<String, String>;
+
+fn elm_namespace_names(database: &ast::Database) -> ElmNamespaces {
+    let mut names: Vec<_> = database
+        .schemas
+        .iter()
+        .map(|schema| &schema.namespace)
+        .collect();
+    names.sort_by_key(|name| (name.as_str() != ast::DEFAULT_SCHEMANAME, name.as_str()));
+    let mut used: HashSet<_> = [
+        "DatabaseId",
+        "EntityChange",
+        "EntityChangeBatch",
+        "EntityChangeBatchSource",
+        "EntitySubscription",
+        "StreamId",
+        "Query",
+        "QueryId",
+        "Model",
+        "QueryModel",
+        "Msg",
+        "Effect",
+        "RequestId",
+        "MutationResult",
+        "Input",
+        "ReturnData",
+    ]
+    .into_iter()
+    .map(str::to_ascii_lowercase)
+    .collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut segment = elm_namespace_base(name);
+            while !used.insert(segment.to_ascii_lowercase()) {
+                segment.push('_');
+            }
+            (name.clone(), segment)
+        })
+        .collect()
+}
+
+fn elm_database_namespace<'a>(namespaces: &'a ElmNamespaces, namespace: &str) -> &'a str {
+    namespaces
+        .get(namespace)
+        .map(String::as_str)
+        .unwrap_or("Default")
+}
+
+fn elm_database_id_type(namespaces: &ElmNamespaces, namespace: &str) -> String {
+    format!(
+        "(DatabaseId {})",
+        elm_database_namespace(namespaces, namespace)
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -842,6 +839,7 @@ enum IdKind {
 #[derive(Clone, Debug, Default)]
 struct ElmLookup {
     records_by_name: std::collections::HashMap<String, ast::RecordDetails>,
+    namespaces: ElmNamespaces,
 }
 
 impl ElmLookup {
@@ -852,7 +850,10 @@ impl ElmLookup {
             records_by_name.insert(table.record.name.to_ascii_lowercase(), table.record.clone());
         }
 
-        ElmLookup { records_by_name }
+        ElmLookup {
+            records_by_name,
+            namespaces: elm_namespace_names(&context.database),
+        }
     }
 }
 
@@ -1026,6 +1027,7 @@ pub fn write_schema(database: &ast::Database) -> String {
 
     result.push_str("type alias DateTime =\n    Time.Posix\n\n\n");
     result.push_str("type alias Json =\n    Json.Encode.Value\n\n\n");
+    result.push_str("{-| Omit a write (or restore the editor baseline), explicitly clear a nullable\nfield, or supply a value.\n-}\ntype Nullable a\n    = Absent\n    | Null\n    | Present a\n\n\n");
 
     for schema in &database.schemas {
         for file in &schema.files {
@@ -1038,6 +1040,23 @@ pub fn write_schema(database: &ast::Database) -> String {
     }
 
     result
+}
+
+// Shift underscore-suffixed names too, so this Elm-only escape is injective.
+fn escape_nullable_name(name: &str, reserved: &[&str]) -> String {
+    if reserved.contains(&name.trim_end_matches('_')) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
+fn elm_union_type(name: &str) -> String {
+    escape_nullable_name(name, &["Nullable"])
+}
+
+fn elm_union_variant(name: &str) -> String {
+    escape_nullable_name(name, &["Absent", "Null", "Present"])
 }
 
 fn to_string_definition(definition: &ast::Definition) -> String {
@@ -1053,7 +1072,7 @@ fn to_string_definition(definition: &ast::Definition) -> String {
         ast::Definition::Comment { .. } => "".to_string(),
         ast::Definition::SyncMode(_) => "".to_string(),
         ast::Definition::Tagged { name, variants, .. } => {
-            let mut result = format!("type {}\n", name);
+            let mut result = format!("type {}\n", elm_union_type(name));
             let mut is_first = true;
             for variant in variants {
                 result.push_str(&to_string_variant(is_first, 4, variant));
@@ -1094,7 +1113,12 @@ fn to_string_variant(is_first: bool, indent_size: usize, variant: &ast::Variant)
     match &variant.fields {
         Some(fields) => {
             let indent = " ".repeat(indent_size + 2);
-            let mut result = format!("   {}{}\n{}{{ ", prefix, variant.name, indent);
+            let mut result = format!(
+                "   {}{}\n{}{{ ",
+                prefix,
+                elm_union_variant(&variant.name),
+                indent
+            );
 
             let mut is_first_field = true;
             for field in fields {
@@ -1106,7 +1130,7 @@ fn to_string_variant(is_first: bool, indent_size: usize, variant: &ast::Variant)
             result.push_str("      }\n");
             result
         }
-        None => format!("   {}{}\n", prefix, variant.name),
+        None => format!("   {}{}\n", prefix, elm_union_variant(&variant.name)),
     }
 }
 
@@ -1126,14 +1150,16 @@ fn to_string_field(is_first: bool, indent: usize, field: &ast::Field) -> String 
 }
 
 fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> String {
-    let maybe = if column.nullable { "Maybe " } else { "" };
-    let type_str = column_to_elm_type(column);
+    let mut type_str = column_to_elm_type(column);
+    if column.nullable {
+        type_str = elm_type_apply("Maybe", type_str);
+    }
 
     if is_first {
-        return format!("{} : {}{}\n", column.name, maybe, type_str);
+        return format!("{} : {}\n", column.name, type_str);
     } else {
         let spaces = " ".repeat(indent);
-        return format!("{}, {} : {}{}\n", spaces, column.name, maybe, type_str);
+        return format!("{}, {} : {}\n", spaces, column.name, type_str);
     }
 }
 
@@ -1141,6 +1167,14 @@ fn to_string_column(is_first: bool, indent: usize, column: &ast::Column) -> Stri
 /// For ID types with brands, generates branded types like `UserId` or `Uuid User`
 fn column_to_elm_type(column: &ast::Column) -> String {
     elm_type_from_column_type(&column.type_, false)
+}
+
+fn elm_type_apply(constructor: &str, inner: String) -> String {
+    if inner.contains(' ') {
+        format!("{constructor} ({inner})")
+    } else {
+        format!("{constructor} {inner}")
+    }
 }
 
 fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) -> String {
@@ -1160,22 +1194,14 @@ fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) ->
         }
         ast::ColumnType::JsonTyped(inner) => elm_type_from_column_type(inner, qualify_db_types),
         ast::ColumnType::List(inner) => {
-            format!(
-                "List {}",
-                elm_type_from_column_type(inner, qualify_db_types)
-            )
+            elm_type_apply("List", elm_type_from_column_type(inner, qualify_db_types))
         }
-        ast::ColumnType::Dict(inner) => {
-            format!(
-                "Dict String {}",
-                elm_type_from_column_type(inner, qualify_db_types)
-            )
-        }
+        ast::ColumnType::Dict(inner) => elm_type_apply(
+            "Dict String",
+            elm_type_from_column_type(inner, qualify_db_types),
+        ),
         ast::ColumnType::Nullable(inner) => {
-            format!(
-                "Maybe {}",
-                elm_type_from_column_type(inner, qualify_db_types)
-            )
+            elm_type_apply("Maybe", elm_type_from_column_type(inner, qualify_db_types))
         }
         ast::ColumnType::IdInt { table } => {
             if !table.is_empty() {
@@ -1200,9 +1226,9 @@ fn elm_type_from_column_type(type_: &ast::ColumnType, qualify_db_types: bool) ->
         }
         ast::ColumnType::Custom(name) => {
             if qualify_db_types {
-                format!("Db.{}", name)
+                format!("Db.{}", elm_union_type(name))
             } else {
-                name.clone()
+                elm_union_type(name)
             }
         }
     }
@@ -1310,7 +1336,7 @@ fn to_decoder_definition(
             result.push_str(&format!(
                 "{} : Decode.Decoder Db.{}\n",
                 crate::ext::string::decapitalize(name),
-                name
+                elm_union_type(name)
             ));
             result.push_str(&format!("{} =\n", crate::ext::string::decapitalize(name)));
             result.push_str("    Decode.field \"_type\" Decode.string\n");
@@ -1348,7 +1374,7 @@ fn to_decoder_variant(
                 outer_indent,
                 variant.name,
                 indent,
-                variant.name,
+                elm_union_variant(&variant.name),
                 inner_indent,
                 typename,
                 variant.name
@@ -1367,7 +1393,10 @@ fn to_decoder_variant(
         }
         None => format!(
             "{}\"{}\" ->\n{}Decode.succeed Db.{}\n",
-            outer_indent, variant.name, indent, variant.name
+            outer_indent,
+            variant.name,
+            indent,
+            elm_union_variant(&variant.name)
         ),
     }
 }
@@ -1500,7 +1529,7 @@ fn to_encoder_definition(database: &ast::Database, definition: &ast::Definition)
             result.push_str(&format!(
                 "{} : Db.{} -> Encode.Value\n",
                 string::decapitalize(name),
-                name
+                elm_union_type(name)
             ));
             result.push_str(&format!("{} input_ =\n", string::decapitalize(name)));
             result.push_str("    case input_ of\n");
@@ -1527,7 +1556,7 @@ fn to_encoder_variant(
         Some(fields) => {
             let mut result = format!(
                 "{}Db.{} inner_details__ ->\n{}Encode.object\n{}[ ( \"_type\", Encode.string \"{}\" )\n",
-                outer_indent, variant.name, indent, inner_indent, variant.name
+                outer_indent, elm_union_variant(&variant.name), indent, inner_indent, variant.name
             );
 
             for field in fields {
@@ -1539,7 +1568,10 @@ fn to_encoder_variant(
         }
         None => format!(
             "{}Db.{} ->\n{}Encode.object [ ( \"_type\", Encode.string \"{}\" ) ]\n\n",
-            outer_indent, variant.name, indent, variant.name
+            outer_indent,
+            elm_union_variant(&variant.name),
+            indent,
+            variant.name
         ),
     }
 }
@@ -1575,14 +1607,14 @@ fn to_type_encoder(database: &ast::Database, type_: &ast::ColumnType) -> String 
         ast::ColumnType::Json => "json".to_string(),
         ast::ColumnType::JsonTyped(inner) => to_type_encoder(database, inner),
         ast::ColumnType::List(inner) => {
-            format!("Encode.list {}", to_type_encoder(database, inner))
+            format!("(Encode.list {})", to_type_encoder(database, inner))
         }
         ast::ColumnType::Dict(inner) => format!(
-            "(\\dict__ -> dict__ |> Dict.toList |> List.map (\\( key__, value__ ) -> ( key__, {} value__ )) |> Encode.object)",
+            "(Encode.dict identity {})",
             to_type_encoder(database, inner)
         ),
         ast::ColumnType::Nullable(inner) => format!(
-            "(\\maybe__ -> Maybe.map ({} ) maybe__ |> Maybe.withDefault Encode.null)",
+            "(Maybe.map {} >> Maybe.withDefault Encode.null)",
             to_type_encoder(database, inner)
         ),
         ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
@@ -1612,13 +1644,12 @@ fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
         ast::ColumnType::Date => "Encode.string".to_string(),
         ast::ColumnType::Json => "Db.Encode.json".to_string(),
         ast::ColumnType::JsonTyped(inner) => to_elm_encoder(lookup, inner),
-        ast::ColumnType::List(inner) => format!("Encode.list {}", to_elm_encoder(lookup, inner)),
-        ast::ColumnType::Dict(inner) => format!(
-            "(\\dict__ -> dict__ |> Dict.toList |> List.map (\\( key__, value__ ) -> ( key__, {} value__ )) |> Encode.object)",
-            to_elm_encoder(lookup, inner)
-        ),
+        ast::ColumnType::List(inner) => format!("(Encode.list {})", to_elm_encoder(lookup, inner)),
+        ast::ColumnType::Dict(inner) => {
+            format!("(Encode.dict identity {})", to_elm_encoder(lookup, inner))
+        }
         ast::ColumnType::Nullable(inner) => format!(
-            "(\\maybe__ -> Maybe.map ({} ) maybe__ |> Maybe.withDefault Encode.null)",
+            "(Maybe.map {} >> Maybe.withDefault Encode.null)",
             to_elm_encoder(lookup, inner)
         ),
         ast::ColumnType::IdInt { .. } => "Db.Id.encodeInt".to_string(),
@@ -1675,11 +1706,19 @@ pub fn generate_queries(
     }
     let mut records: Vec<_> = edit_modules.into_iter().collect();
     records.sort_by(|a, b| a.0.cmp(&b.0));
+    editor::generate(context, base_out_dir, files, &records);
     for (record, queries) in records {
+        let (builders, draft) = to_edit_modules(context, all_query_info, &record, &queries);
         files.push(generate_text_file(
             base_out_dir.join(format!("Db/Edit/{record}.elm")),
-            to_edit_module(context, all_query_info, &record, &queries),
+            builders,
         ));
+        if let Some(draft) = draft {
+            files.push(generate_text_file(
+                base_out_dir.join(format!("Db/Edit/{record}/Draft.elm")),
+                draft,
+            ));
+        }
     }
 
     for operation in &query_list.queries {
@@ -1750,12 +1789,12 @@ const ELM_PRELUDE_VALUE_NAMES: &[&str] = &[
     "isInfinite",
 ];
 
-fn to_edit_module(
+fn to_edit_modules(
     context: &typecheck::Context,
     info: &HashMap<String, typecheck::QueryInfo>,
     record: &str,
     queries: &[&ast::Query],
-) -> String {
+) -> (String, Option<String>) {
     let lookup = ElmLookup::from_context(context);
     let mut exposing = vec!["Patch".to_string(), "CreateOption".to_string()];
     let mut used_names: HashSet<String> = [
@@ -1815,7 +1854,7 @@ fn to_edit_module(
             }
         }
     }
-    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Internal.Edit as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict\nimport Json.Encode as Encode\nimport Time\n");
+    let mut body = String::from("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Internal.Edit as Internal\nimport Db.Encode\nimport Db.Id\nimport Dict exposing (Dict)\nimport Json.Encode as Encode\nimport Time\n");
     for query in queries {
         body.push_str(&format!("import Query.{}\n", query.name));
     }
@@ -1826,11 +1865,8 @@ fn to_edit_module(
     body.push_str("\n\n");
     for query in queries {
         let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
-        let key = ast::collect_columns(&table.record.fields)
-            .into_iter()
-            .find(|c| ast::is_primary_key(c))
-            .unwrap();
-        let namespace = elm_database_namespace(&info[&query.name].primary_db);
+        let key = edit_key(table);
+        let namespace = elm_database_namespace(&lookup.namespaces, &info[&query.name].primary_db);
         let edit_type = format!("Internal.Edit Db.Database.{namespace}");
         let result_name = match query.operation {
             ast::QueryOperation::Insert => "createResult",
@@ -1984,10 +2020,114 @@ fn to_edit_module(
             _ => {}
         }
     }
-    format!(
+    let builders = format!(
         "module Db.Edit.{record} exposing ({})\n\n{body}",
         exposing.join(", ")
-    )
+    );
+    let draft = to_draft_module(context, info, record, queries, &lookup, &builder_names);
+    (builders, draft)
+}
+
+// Build on the list-based API so both interfaces share prediction and wire encoding.
+fn to_draft_module(
+    context: &typecheck::Context,
+    info: &HashMap<String, typecheck::QueryInfo>,
+    record: &str,
+    queries: &[&ast::Query],
+    lookup: &ElmLookup,
+    builder_names: &HashMap<(&str, String), String>,
+) -> Option<String> {
+    let mut exposing = Vec::new();
+    let mut body = format!("import Db\nimport Db.Database\nimport Db.Edit\nimport Db.Edit.{record} as Builders\nimport Db.Id\nimport Dict exposing (Dict)\nimport Time\n\n\n");
+    for query in queries {
+        let (alias, prefix) = match query.operation {
+            ast::QueryOperation::Insert => ("Draft", "create"),
+            ast::QueryOperation::Update => ("Patch", "patch"),
+            _ => continue,
+        };
+        let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
+        let key = edit_key(table);
+        let key_type = typecheck::query_param_type_for_column(&table.record, &key);
+        let key_type = to_elm_typename(lookup, &key_type, false);
+        let namespace = elm_database_namespace(&lookup.namespaces, &info[&query.name].primary_db);
+        let edit = format!("Db.Edit.Edit Db.Database.{namespace}");
+
+        let mut fields = Vec::new();
+        let mut defaults = Vec::new();
+        let mut required = Vec::new();
+        let mut options = Vec::new();
+        for arg in &query.args {
+            let field = &arg.name;
+            if field == &key.name {
+                if prefix == "patch" {
+                    continue;
+                }
+                if matches!(key.type_, ast::ColumnType::IdUuid { .. }) {
+                    fields.push(format!("{field} : Maybe ({key_type})"));
+                    defaults.push(format!("{field} = Nothing"));
+                    options.push(format!("Maybe.map Builders.withId values.{field}"));
+                    continue;
+                }
+            }
+            let base = to_elm_typename(lookup, arg.type_.as_deref().unwrap(), false);
+            if arg.omittable {
+                let builder = &builder_names[&(prefix, field.clone())];
+                if arg.nullable {
+                    fields.push(format!("{field} : Db.Nullable ({base})"));
+                    defaults.push(format!("{field} = Db.Absent"));
+                    options.push(format!("nullableOption Builders.{builder} values.{field}"));
+                } else {
+                    fields.push(format!("{field} : Maybe ({base})"));
+                    defaults.push(format!("{field} = Nothing"));
+                    options.push(format!("Maybe.map Builders.{builder} values.{field}"));
+                }
+            } else {
+                // Generated create arguments are always omittable when nullable.
+                fields.push(format!("{field} : {base}"));
+                defaults.push(format!("{field} = input.{field}"));
+                required.push(format!("{field} = values.{field}"));
+            }
+        }
+
+        body.push_str(&format!(
+            "type alias {alias} =\n    {{ {} }}\n\n\n",
+            fields.join("\n    , ")
+        ));
+        let options = if options.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "(List.filterMap identity\n        [ {}\n        ]\n    )",
+                options.join("\n        , ")
+            )
+        };
+        let values = if fields.is_empty() { "_" } else { "values" };
+        let defaults = defaults.join("\n    , ");
+        if prefix == "create" {
+            exposing.extend(["Draft", "draft", "create"]);
+            let input = if required.is_empty() { "_" } else { "input" };
+            let required = required.join(", ");
+            body.push_str(&format!("draft : Builders.Required -> Draft\ndraft {input} =\n    {{ {defaults} }}\n\n\ncreate : Draft -> {edit}\ncreate {values} =\n    Builders.create {{ {required} }} {options}\n\n\n"));
+        } else {
+            exposing.extend(["Patch", "emptyPatch", "update"]);
+            body.push_str(&format!("emptyPatch : Patch\nemptyPatch =\n    {{ {defaults} }}\n\n\nupdate : ({key_type}) -> Patch -> {edit}\nupdate id {values} =\n    Builders.update id {options}\n\n\n"));
+        }
+    }
+    if exposing.is_empty() {
+        return None;
+    }
+    body.push_str("nullableOption : (Maybe a -> b) -> Db.Nullable a -> Maybe b\nnullableOption build field =\n    case field of\n        Db.Absent ->\n            Nothing\n\n        Db.Null ->\n            Just (build Nothing)\n\n        Db.Present value ->\n            Just (build (Just value))\n");
+    Some(format!(
+        "module Db.Edit.{record}.Draft exposing ({})\n\n{body}",
+        exposing.join(", ")
+    ))
+}
+
+fn edit_key(table: &typecheck::Table) -> ast::Column {
+    ast::collect_columns(&table.record.fields)
+        .into_iter()
+        .find(ast::is_primary_key)
+        .expect("generated CRUD has a primary key")
 }
 
 fn to_query_file(
@@ -2062,18 +2202,12 @@ fn to_query_file(
                     }
                 };
 
-                let type_str = if is_link {
-                    if is_optional {
-                        format!("Maybe {}", base_type)
-                    } else {
-                        format!("List {}", base_type)
-                    }
+                let type_str = if is_optional {
+                    elm_type_apply("Maybe", base_type)
+                } else if is_link {
+                    elm_type_apply("List", base_type)
                 } else {
-                    if is_optional {
-                        format!("Maybe {}", base_type)
-                    } else {
-                        base_type.to_string()
-                    }
+                    base_type
                 };
                 format!("{} : {}\n", name, type_str)
             },
@@ -2146,13 +2280,15 @@ fn to_query_file(
 
     if query.operation != ast::QueryOperation::Query {
         let database_type = query_info
-            .map(|info| elm_database_id_type(&info.primary_db))
-            .unwrap_or_else(|| elm_database_id_type(ast::DEFAULT_SCHEMANAME));
+            .map(|info| elm_database_id_type(&elm_lookup.namespaces, &info.primary_db))
+            .unwrap_or_else(|| {
+                elm_database_id_type(&elm_lookup.namespaces, ast::DEFAULT_SCHEMANAME)
+            });
         result.push_str(
             "type alias DatabaseId namespace =\n    Db.Database.DatabaseId namespace\n\n\ntype alias RequestId =\n    String\n\n\ntype alias MutationResult =\n    { requestId : RequestId\n    , mutationId : String\n    , mutationName : Maybe String\n    , result : Result String ReturnData\n    }\n\n\n",
         );
         if let Some(info) = query_info {
-            let namespace = elm_database_namespace(&info.primary_db);
+            let namespace = elm_database_namespace(&elm_lookup.namespaces, &info.primary_db);
             result.push_str(&format!(
                 "type alias {} =\n    Db.Database.{}\n\n\n",
                 namespace, namespace
@@ -2198,7 +2334,8 @@ fn to_query_file(
     if query.operation != ast::QueryOperation::Query {
         exposing_items.push("DatabaseId".to_string());
         if let Some(info) = query_info {
-            exposing_items.push(elm_database_namespace(&info.primary_db));
+            exposing_items
+                .push(elm_database_namespace(&elm_lookup.namespaces, &info.primary_db).into());
         }
         exposing_items.push("RequestId".to_string());
         exposing_items.push("id".to_string());
@@ -2504,16 +2641,13 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
         ast::ColumnType::Json => "Db.Json".to_string(),
         ast::ColumnType::JsonTyped(inner) => to_elm_type_from_column_type(lookup, inner),
         ast::ColumnType::List(inner) => {
-            format!("List {}", to_elm_type_from_column_type(lookup, inner))
+            elm_type_apply("List", to_elm_type_from_column_type(lookup, inner))
         }
         ast::ColumnType::Dict(inner) => {
-            format!(
-                "Dict String {}",
-                to_elm_type_from_column_type(lookup, inner)
-            )
+            elm_type_apply("Dict String", to_elm_type_from_column_type(lookup, inner))
         }
         ast::ColumnType::Nullable(inner) => {
-            format!("Maybe {}", to_elm_type_from_column_type(lookup, inner))
+            elm_type_apply("Maybe", to_elm_type_from_column_type(lookup, inner))
         }
         ast::ColumnType::IdInt { table } => {
             if !table.is_empty() {
@@ -2536,7 +2670,7 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
 
             "String".to_string()
         }
-        ast::ColumnType::Custom(name) => format!("Db.{}", name),
+        ast::ColumnType::Custom(name) => format!("Db.{}", elm_union_type(name)),
     }
 }
 
@@ -2564,7 +2698,7 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
         }
         ast::ColumnType::Nullable(inner) => {
             format!(
-                "Decode.nullable ({})",
+                "(Decode.nullable {})",
                 to_elm_decoder_from_column_type(lookup, inner)
             )
         }
@@ -3383,12 +3517,13 @@ fn find_nested_query_field<'a>(
 // Generates the main QueryClient module that ties all queries together
 
 fn generate_pyre_module(
-    _context: &typecheck::Context,
+    context: &typecheck::Context,
     all_query_info: &HashMap<String, typecheck::QueryInfo>,
     query_list: &ast::QueryList,
     query_names: &[String],
 ) -> String {
     let mut result = String::new();
+    let namespaces = elm_namespace_names(&context.database);
 
     // Module declaration
     let mut database_namespaces: Vec<String> = query_names
@@ -3401,7 +3536,10 @@ fn generate_pyre_module(
 
     result.push_str("module Pyre exposing (DatabaseId");
     for namespace in &database_namespaces {
-        result.push_str(&format!(", {}", elm_database_namespace(namespace)));
+        result.push_str(&format!(
+            ", {}",
+            elm_database_namespace(&namespaces, namespace)
+        ));
     }
     result.push_str(", QueryId, Model, QueryModel, Query(..), Msg(..), Effect(..), init, update, decodeIncomingDelta, getResult)\n\n\n");
 
@@ -3451,7 +3589,7 @@ fn generate_pyre_module(
     result
         .push_str("type alias DatabaseId namespace =\n    Db.Database.DatabaseId namespace\n\n\n");
     for namespace in &database_namespaces {
-        let name = elm_database_namespace(namespace);
+        let name = elm_database_namespace(&namespaces, namespace);
         result.push_str(&format!(
             "type alias {} =\n    Db.Database.{}\n\n\n",
             name, name
@@ -3463,8 +3601,8 @@ fn generate_pyre_module(
         let prefix = if i == 0 { "    = " } else { "    | " };
         let database_type = all_query_info
             .get(name)
-            .map(|info| elm_database_id_type(&info.primary_db))
-            .unwrap_or_else(|| elm_database_id_type(ast::DEFAULT_SCHEMANAME));
+            .map(|info| elm_database_id_type(&namespaces, &info.primary_db))
+            .unwrap_or_else(|| elm_database_id_type(&namespaces, ast::DEFAULT_SCHEMANAME));
         result.push_str(&format!(
             "{}{} {} QueryId Query.{}.Input\n",
             prefix, name, database_type, name
@@ -3483,8 +3621,8 @@ fn generate_pyre_module(
         ));
         let database_type = all_query_info
             .get(name)
-            .map(|info| elm_database_id_type(&info.primary_db))
-            .unwrap_or_else(|| elm_database_id_type(ast::DEFAULT_SCHEMANAME));
+            .map(|info| elm_database_id_type(&namespaces, &info.primary_db))
+            .unwrap_or_else(|| elm_database_id_type(&namespaces, ast::DEFAULT_SCHEMANAME));
         result.push_str(&format!(
             "    | {}_Unregistered {} QueryId\n",
             name, database_type

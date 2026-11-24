@@ -161,7 +161,7 @@ query FindLegacyChoices($expectedChoices: Json<ChoiceStorage>?) {
     );
     assert!(
         generated.contents.contains(
-            "Maybe.map (Db.Encode.choiceStorage ) maybe__ |> Maybe.withDefault Encode.null"
+            "(Maybe.map Db.Encode.choiceStorage >> Maybe.withDefault Encode.null) input.expectedChoices"
         ),
         "Nothing should encode as JSON null. Generated:\n{}",
         generated.contents
