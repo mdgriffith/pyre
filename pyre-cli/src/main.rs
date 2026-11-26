@@ -78,7 +78,7 @@ enum Commands {
         auth: Option<String>,
     },
 
-    /// Execute any migrations that are needed.
+    /// Apply pending finalized migrations through the target's catalog binding.
     Migrate {
         /// A local filename, or a url, or an environment variable if prefixed with a $.
         database: String,
@@ -90,7 +90,7 @@ enum Commands {
         #[arg(long)]
         namespace: Option<String>,
 
-        /// Push changes directly to the DB
+        /// Push working-schema changes to an existing, unbound disposable target.
         #[arg(long, default_value_t = false)]
         push: bool,
 
@@ -101,26 +101,17 @@ enum Commands {
         /// Directory where migration files are stored.
         #[arg(long, default_value = "pyre/migrations")]
         migration_dir: String,
+        /// Resolve an earlier outcome on a fresh write transaction without applying SQL.
+        #[arg(long, conflicts_with = "push")]
+        inspect: Option<String>,
     },
 
-    /// Generate a migration
+    /// Author and verify finalized migration bundles.
     Migration {
-        /// The migration name.
-        name: String,
-
-        #[arg(long)]
-        db: String,
-
-        #[arg(long)]
-        auth: Option<String>,
-
-        /// The Pyre namespace to generate a migration for.
-        #[arg(long)]
-        namespace: Option<String>,
-
-        /// Directory where migration files are stored.
-        #[arg(long, default_value = "pyre/migrations")]
-        migration_dir: String,
+        #[command(flatten)]
+        catalog: MigrationCatalogOptions,
+        #[command(subcommand)]
+        command: MigrationCommand,
     },
 
     /// Start the built-in single-database Pyre server.
@@ -203,6 +194,31 @@ enum DatabaseCommand {
         /// Use the working schema and opt in to disposable workflows.
         #[arg(long)]
         disposable: bool,
+        /// Catalog to bind to finalized history (defaults to filesystem).
+        #[arg(long, conflicts_with = "disposable")]
+        migration_catalog: Option<MigrationBinding>,
+        #[arg(long, default_value = "pyre/migrations")]
+        migration_dir: String,
+    },
+    /// Adopt existing tables at an exact finalized target schema.
+    Baseline {
+        database: String,
+        #[arg(long)]
+        at: String,
+        #[arg(long)]
+        auth: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, default_value = "filesystem")]
+        migration_catalog: MigrationBinding,
+        #[arg(long, default_value = "pyre/migrations")]
+        migration_dir: String,
+    },
+    /// Compare live structure with installed schema without modifying the target.
+    Audit {
+        database: String,
+        #[arg(long)]
+        auth: Option<String>,
     },
     /// Replace a disposable database's schema in place and start a new lineage.
     Reset {
@@ -223,6 +239,8 @@ enum DatabaseCommand {
         namespace: Option<String>,
         #[arg(long, value_enum)]
         set: Option<DatabasePolicyArg>,
+        #[arg(long, default_value = "pyre/migrations")]
+        migration_dir: String,
     },
     /// Add fixtures to an initialized database in one transaction.
     Seed {
@@ -249,6 +267,60 @@ enum DatabaseCommand {
         /// JSON fixture file, read only after reset commits.
         #[arg(long)]
         fixtures: std::path::PathBuf,
+    },
+}
+
+type MigrationBinding = pyre::db::bundle::execute::Binding;
+
+#[derive(clap::Args)]
+struct MigrationCatalogOptions {
+    /// Author in the specified target's database-backed catalog.
+    #[arg(long, global = true)]
+    database: Option<String>,
+    #[arg(long, global = true, requires = "database")]
+    auth: Option<String>,
+    #[arg(long, global = true)]
+    namespace: Option<String>,
+    #[arg(long, global = true, default_value = "pyre/migrations")]
+    migration_dir: String,
+}
+
+#[derive(Subcommand)]
+enum MigrationCommand {
+    /// Generate a draft and finalize it if replay succeeds.
+    Create {
+        name: String,
+        #[arg(long)]
+        draft: bool,
+        #[arg(long)]
+        grace: Option<String>,
+        /// Use standalone schema text instead of the working project schema.
+        #[arg(long)]
+        schema: Option<std::path::PathBuf>,
+        /// External identity definitions for --schema, as a JSON array.
+        #[arg(long, requires = "schema")]
+        external_identities: Option<std::path::PathBuf>,
+    },
+    /// Replay and verify finalized history, and optionally a named draft.
+    Check {
+        name: Option<String>,
+        #[arg(long, requires = "name")]
+        fixtures: Option<std::path::PathBuf>,
+    },
+    /// Replay and seal a named draft against the latest finalized head.
+    Finalize {
+        name: String,
+        #[arg(long)]
+        grace: Option<String>,
+    },
+    /// Restore an unapplied and unshared filesystem head to an editable draft.
+    Unfinalize { name: String },
+    /// Export a database-catalog draft as JSON.
+    ShowDraft { name: String },
+    /// Update a database-catalog draft from JSON.
+    EditDraft {
+        name: String,
+        file: std::path::PathBuf,
     },
 }
 
@@ -285,19 +357,52 @@ async fn run() -> io::Result<()> {
                 auth,
                 namespace,
                 disposable,
+                migration_catalog,
+                migration_dir,
             } => {
                 if !disposable {
-                    return Err(io::Error::other("Preserved initialization requires finalized migration history and is not yet supported"));
+                    command::finalized::initialize(
+                        &options,
+                        database,
+                        auth,
+                        namespace.as_deref(),
+                        std::path::Path::new(migration_dir),
+                        migration_catalog.unwrap_or(MigrationBinding::Filesystem),
+                    )
+                    .await?;
+                    println!("Initialized preserved database");
+                } else {
+                    command::prepare_disposable_database(
+                        &options,
+                        database,
+                        auth,
+                        namespace,
+                        command::DisposableOperation::Init,
+                    )
+                    .await?;
+                    println!("Initialized disposable database");
                 }
-                command::prepare_disposable_database(
-                    &options,
+            }
+            DatabaseCommand::Baseline {
+                database,
+                at,
+                auth,
+                namespace,
+                migration_catalog,
+                migration_dir,
+            } => {
+                command::finalized::baseline(
                     database,
                     auth,
-                    namespace,
-                    command::DisposableOperation::Init,
+                    namespace.as_deref(),
+                    Path::new(migration_dir),
+                    *migration_catalog,
+                    at,
                 )
                 .await?;
-                println!("Initialized disposable database");
+            }
+            DatabaseCommand::Audit { database, auth } => {
+                command::finalized::audit(database, auth).await?
             }
             DatabaseCommand::Reset {
                 database,
@@ -319,8 +424,10 @@ async fn run() -> io::Result<()> {
                 auth,
                 namespace,
                 set,
+                migration_dir,
             } => {
-                command::database_policy(&options, database, auth, namespace, *set).await?;
+                command::database_policy(database, auth, namespace, *set, Path::new(migration_dir))
+                    .await?;
             }
             DatabaseCommand::Seed {
                 database,
@@ -372,30 +479,25 @@ async fn run() -> io::Result<()> {
             force,
             migration_dir,
             namespace,
+            inspect,
         } => {
             if *push {
                 command::push(&options, database, auth, namespace, *force).await?;
             } else {
-                command::migrate(&options, database, auth, migration_dir, namespace).await?;
+                command::finalized::apply(
+                    database,
+                    auth,
+                    namespace.as_deref(),
+                    Path::new(migration_dir),
+                    inspect.as_deref(),
+                )
+                .await?;
             }
         }
         Commands::Migration {
-            name,
-            db,
-            auth,
-            migration_dir,
-            namespace,
-        } => {
-            command::generate_migration(
-                &options,
-                name,
-                db,
-                auth,
-                Path::new(migration_dir),
-                namespace,
-            )
-            .await?;
-        }
+            catalog,
+            command: operation,
+        } => command::finalized::author(&options, catalog, operation).await?,
         Commands::Serve {
             database,
             auth,

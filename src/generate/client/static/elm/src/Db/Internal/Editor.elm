@@ -1,4 +1,4 @@
-module Db.Internal.Editor exposing (Form, andMap, dictEqual, entry, errors, fields, formError, init, jsonEqual, listEqual, maybeEqual, nullable, set, validate, value)
+module Db.Internal.Editor exposing (Form, andMap, baseline, dictEqual, entry, errors, fields, formError, init, jsonEqual, listEqual, maybeEqual, nullable, set, validate, value)
 
 import Db
 import Db.Editor.Field as Field
@@ -22,7 +22,7 @@ type alias Entry fieldId kind value =
     }
 
 
-entry : { id : fieldId, kind : kind, required : Bool, nullable : Bool, choices : List String } -> Db.Nullable value -> (value -> value -> Bool) -> Entry fieldId kind value
+entry : { id : fieldId, kind : kind, required : Bool, nullable : Bool, choices : List String, historical : Maybe Db.Json } -> Db.Nullable value -> (value -> value -> Bool) -> Entry fieldId kind value
 entry info original equal =
     { view =
         { id = info.id
@@ -30,12 +30,28 @@ entry info original equal =
         , required = info.required
         , nullable = info.nullable
         , choices = info.choices
+        , historical = info.historical
         , original = original
         , current = original
         , error = Nothing
         }
     , equal = equal
     }
+
+
+baseline : (read -> Maybe value) -> (read -> Db.Json) -> Maybe read -> ( Db.Nullable value, Maybe Db.Json )
+baseline convert encode original =
+    case original of
+        Nothing ->
+            ( Db.Null, Nothing )
+
+        Just old ->
+            case convert old of
+                Just value_ ->
+                    ( Db.Present value_, Nothing )
+
+                Nothing ->
+                    ( Db.Absent, Just (encode old) )
 
 
 init : (value -> kind) -> ((fieldId -> Db.Nullable value) -> Maybe result) -> List (Entry fieldId kind value) -> Form fieldId kind value result

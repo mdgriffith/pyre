@@ -19,7 +19,7 @@ pub fn generate_schema(
     files: &mut Vec<crate::filesystem::GeneratedFile<String>>,
 ) {
     let database = &context.database;
-    write_client_schema(database, files);
+    write_client_schema(context, files);
     let typescript_core_dir = Path::new("typescript/core");
     let typescript_dir = Path::new("typescript");
     generate::typescript::core::generate_schema(context, database, typescript_core_dir, files);
@@ -37,7 +37,7 @@ pub fn generate_schema(
 // CLIENT
 
 fn write_client_schema(
-    database: &ast::Database,
+    context: &typecheck::Context,
     files: &mut Vec<crate::filesystem::GeneratedFile<String>>,
 ) {
     // Target directory is
@@ -46,7 +46,7 @@ fn write_client_schema(
     let out_dir = Path::new("client/elm");
     // out_dir is
     // client/{lang} (relative path)
-    generate::client::elm::generate(out_dir, database, files)
+    generate::client::elm::generate_with_context(out_dir, context, files)
 }
 
 // WRITE QUERIES

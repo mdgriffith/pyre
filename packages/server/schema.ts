@@ -1,10 +1,10 @@
-import type { Client, InStatement, Transaction } from "@libsql/client";
+import type { Client, InStatement, Row, Transaction } from "@libsql/client";
 import * as wasm from "./wasm/pyre_wasm.js";
 import { requireDatabaseId, type DatabaseId } from "./database-id";
 import { seed, type SeedInput } from "./query";
 
 const DEFAULT_SCHEMA_KEY = "__default__";
-const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities", "_pyre_database_policy"]);
+const INTERNAL_TABLES = new Set(["_pyre_migrations", "_pyre_sync", "_pyre_external_identities", "_pyre_database_policy", "_pyre_finalized_schema", "_pyre_migration_receipts", "_pyre_migration_bundles", "_pyre_migration_drafts"]);
 const CREATE_EXTERNAL_IDENTITIES = `create table if not exists _pyre_external_identities (
     namespace text not null,
     record_name text not null,
@@ -92,6 +92,322 @@ export async function setDatabaseDisposable(db: Client, namespace?: string): Pro
 }
 
 export class DatabaseOutcomeUnknown extends Error {}
+
+export type MigrationCatalog = "filesystem" | "database";
+
+/** Exact UTF-8 contents of a finalized bundle. The manifest is not part of `files`. */
+export type FinalizedMigrationBundle = {
+    manifest: string;
+    files: Readonly<Record<string, string>>;
+};
+
+export type MigrationSource =
+    | { catalog?: "filesystem"; bundles: readonly FinalizedMigrationBundle[] }
+    | { catalog: "database" };
+
+export type MigrationReceipt = { appliedAt: bigint; updateBy: bigint | null };
+export type MigrationApplication =
+    | { hash: string; outcome: "applied" | "already-applied"; receipt: MigrationReceipt }
+    | { hash: string; outcome: "covered-by-baseline" };
+export type MigrationInspection = { outcome: "applied"; receipt: MigrationReceipt } | { outcome: "not-applied" };
+
+export class FinalizedMigrationError extends Error {
+    constructor(
+        readonly outcome: "not-applied" | "rolled-back" | "outcome-unknown",
+        cause: unknown,
+        readonly hash?: string,
+    ) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        const recovery = outcome === "outcome-unknown" ? "; reconnect and inspect before retrying" : "";
+        super(`${outcome.replaceAll("-", " ")}${hash ? ` (${hash})` : ""}: ${detail}${recovery}`, { cause });
+    }
+}
+
+type StoredBundle = { manifest: string; files: string };
+type BundleKey = { hash: string; predecessor: string | null; apiVersion: string };
+type FinalizedStep = BundleKey & {
+    schema: string; identities: ExternalIdentity[]; fingerprint: string;
+    graceSeconds: string | null; statements: string[]; assertions: [string, string][]; install: InStatement[];
+};
+type FinalizedPlan = { steps: FinalizedStep[]; store: InStatement[]; baseline: InStatement[] | null };
+type FinalizedSql = Record<
+    "createState" | "createReceipts" | "createBundles" | "createPolicy" | "readState" | "readBundles" |
+    "readReceipt" | "insertReceipt" | "tableExists" | "nonempty" | "unsafeConnection" | "unsafeWrites" |
+    "createMetadata" | "hasMetadataNamespace" | "addMetadataNamespace" | "readStructure", string
+> & { preserve: InStatement };
+
+const finalizedSql = () => wasm.finalized_migration_sql() as FinalizedSql;
+const storedBundle = (bundle: FinalizedMigrationBundle): StoredBundle => ({ manifest: bundle.manifest, files: JSON.stringify(bundle.files) });
+
+function historyPlan(namespace: string, catalog: MigrationCatalog, bundles: readonly StoredBundle[], init = false, at?: string): FinalizedPlan {
+    return wasm.plan_finalized_history(namespace, catalog, bundles, init, at) as FinalizedPlan;
+}
+
+async function hasRows(tx: Transaction, sql: string, args: string[] = []): Promise<boolean> {
+    return (await tx.execute(args.length === 0 ? sql : { sql, args })).rows.length > 0;
+}
+
+async function localArtifacts(tx: Transaction, sql: FinalizedSql, namespace: string): Promise<StoredBundle[]> {
+    if (!await hasRows(tx, sql.tableExists, ["_pyre_migration_bundles"])) return [];
+    return (await tx.execute({ sql: sql.readBundles, args: [namespace] })).rows.map(row => ({
+        manifest: requireText(row.manifest), files: requireText(row.files),
+    }));
+}
+
+function requireText(value: unknown): string {
+    if (typeof value !== "string") throw new Error("Malformed finalized migration metadata");
+    return value;
+}
+
+async function readReceipt(tx: Transaction, sql: FinalizedSql, bundle: BundleKey): Promise<MigrationReceipt | undefined> {
+    const row = (await tx.execute({ sql: sql.readReceipt, args: [bundle.hash] })).rows[0];
+    if (!row) return undefined;
+    if (row.predecessor !== bundle.predecessor || row.api_version !== bundle.apiVersion) {
+        throw new Error("Recorded receipt conflicts with the migration artifact");
+    }
+    return { appliedAt: BigInt(requireText(row.applied_at)), updateBy: row.update_by === null ? null : BigInt(requireText(row.update_by)) };
+}
+
+function position(plan: FinalizedPlan, hash: unknown): number {
+    const index = plan.steps.findIndex(step => step.hash === hash);
+    if (index < 0) throw new Error(`Target history diverges: ${hash} is absent from the bound catalog`);
+    return index;
+}
+
+function installedPosition(plan: FinalizedPlan, state: Row, namespace: string, catalog: MigrationCatalog): number {
+    if (state.namespace !== namespace || state.catalog !== catalog) throw new Error("Target namespace or catalog does not match its stored binding");
+    const index = position(plan, state.head);
+    const { apiVersion, fingerprint } = plan.steps[index];
+    if (state.api_version !== apiVersion || state.fingerprint !== fingerprint) {
+        throw new Error("Installed schema metadata conflicts with its catalog artifact");
+    }
+    return index;
+}
+
+async function validateMigrationConnection(tx: Transaction, sql: FinalizedSql): Promise<void> {
+    if (await hasRows(tx, sql.unsafeConnection)) throw new Error("Migration requires a dedicated connection without temp objects or attached databases");
+}
+
+async function migrationWrite<T>(
+    db: Client,
+    work: (tx: Transaction, started: () => void) => Promise<{ value: T; commit: boolean }>,
+    hash?: string,
+    inspecting = false,
+): Promise<T> {
+    let tx: Transaction;
+    try { tx = await db.transaction("write"); }
+    catch (cause) { throw new FinalizedMigrationError(inspecting ? "outcome-unknown" : "not-applied", cause, hash); }
+    let started = false;
+    let finishing = false;
+    try {
+        const { value, commit } = await work(tx, () => { started = true; });
+        finishing = true;
+        if (commit) await tx.commit(); else await tx.rollback();
+        return value;
+    } catch (cause) {
+        if (finishing) throw new FinalizedMigrationError("outcome-unknown", cause, hash);
+        try {
+            if (tx.closed) throw new Error("Transaction closed without confirming rollback");
+            await tx.rollback();
+        } catch (rollback) {
+            throw new FinalizedMigrationError("outcome-unknown", new AggregateError([cause, rollback], "Rollback was not confirmed"), hash);
+        }
+        throw new FinalizedMigrationError(inspecting ? "outcome-unknown" : started ? "rolled-back" : "not-applied", cause, hash);
+    } finally {
+        try { tx.close(); } catch { /* Commit or rollback determines the outcome. */ }
+    }
+}
+
+async function installFinalizedRuntime(tx: Transaction, sql: FinalizedSql, statements: InStatement[]): Promise<void> {
+    await tx.execute(sql.createMetadata);
+    if (!await hasRows(tx, sql.hasMetadataNamespace)) await tx.execute(sql.addMetadataNamespace);
+    for (const statement of statements) await tx.execute(statement);
+}
+
+async function runFinalizedHistory(db: Client, namespace: string, source: MigrationSource | {
+    catalog: MigrationCatalog; bundles: readonly FinalizedMigrationBundle[];
+}, initialize: boolean): Promise<MigrationApplication[]> {
+    const catalog = source.catalog ?? "filesystem";
+    let sql: FinalizedSql;
+    let plan: FinalizedPlan;
+    try {
+        await requireFileBackedLocalDatabase(db, "Finalized migrations");
+        sql = finalizedSql();
+        if ("bundles" in source && (initialize || catalog === "filesystem")) {
+            plan = historyPlan(namespace, catalog, source.bundles.map(storedBundle), initialize);
+        } else {
+            // This snapshot chooses the pending chain. Each write revalidates
+            // membership against the target-local catalog under its lock.
+            const tx = await db.transaction("read");
+            try {
+                const state = await readFinalizedState(tx);
+                if (state?.catalog !== catalog || state.namespace !== namespace) throw new Error("Target has no matching database catalog binding");
+                plan = historyPlan(namespace, catalog, await localArtifacts(tx, sql, namespace));
+            } finally {
+                try { await tx.rollback(); } finally { tx.close(); }
+            }
+        }
+        if (plan.steps.length === 0) throw new Error("No finalized migrations in this namespace");
+    } catch (cause) {
+        throw new FinalizedMigrationError("not-applied", cause);
+    }
+
+    const outcomes: MigrationApplication[] = [];
+    for (const [index, step] of plan.steps.entries()) {
+        const first = initialize && index === 0;
+        const { hash } = step;
+        outcomes.push(await migrationWrite<MigrationApplication>(db, async (tx, started) => {
+            await validateMigrationConnection(tx, sql);
+            const state = await readFinalizedState(tx);
+            if (first) {
+                if (state || await hasRows(tx, sql.nonempty)) throw new Error("Initialization requires an empty database");
+            } else {
+                if (!state) throw new Error("Target has no finalized provenance; initialize or baseline it first");
+                const head = installedPosition(plan, state, namespace, catalog);
+                if (catalog === "database") {
+                    const local = historyPlan(namespace, catalog, await localArtifacts(tx, sql, namespace));
+                    position(local, state.head);
+                    position(local, hash);
+                }
+                const baseline = state.baseline === null ? -1 : position(plan, state.baseline);
+                if (index <= baseline && baseline <= head) return { value: { hash, outcome: "covered-by-baseline" }, commit: false };
+                const receipt = await readReceipt(tx, sql, step);
+                if (receipt) {
+                    if (index > head) throw new Error("Migration receipt is ahead of installed history");
+                    return { value: { hash, outcome: "already-applied", receipt }, commit: false };
+                }
+                if (step.predecessor !== state.head) throw new Error(`Unexpected predecessor; target head is ${state.head}`);
+            }
+            if (step.statements.length && await hasRows(tx, sql.unsafeWrites)) {
+                throw new Error("V1 migration writes do not support targets with triggers or virtual tables");
+            }
+
+            started();
+            if (first) {
+                for (const statement of [sql.createState, sql.createReceipts, sql.createPolicy, sql.preserve]) await tx.execute(statement);
+                if (catalog === "database") {
+                    await tx.execute(sql.createBundles);
+                    for (const statement of plan.store) await tx.execute(statement);
+                }
+            }
+            for (const [i, statement] of step.statements.entries()) {
+                try { await tx.execute(statement); }
+                catch (cause) { throw new Error(`migration.sql statement ${i + 1}: ${cause}`, { cause }); }
+            }
+            for (const [name, statement] of step.assertions) {
+                let found: boolean;
+                try { found = await hasRows(tx, statement); }
+                catch (cause) { throw new Error(`assertion ${name}: ${cause}`, { cause }); }
+                if (found) throw new Error(`assertion ${name} returned a row`);
+            }
+            await installFinalizedRuntime(tx, sql, step.install);
+            const appliedAt = BigInt(requireText((await tx.execute("select cast(unixepoch() as text) as ts")).rows[0]?.ts));
+            const updateBy = step.graceSeconds === null ? null : appliedAt + BigInt(step.graceSeconds);
+            if (updateBy !== null && updateBy > 9223372036854775807n) throw new Error("Grace deadline overflows database timestamp");
+            await tx.execute({ sql: sql.insertReceipt, args: [hash, step.predecessor, appliedAt, step.apiVersion, updateBy] });
+            return { value: { hash, outcome: "applied", receipt: { appliedAt, updateBy } }, commit: true };
+        }, hash));
+    }
+    return outcomes;
+}
+
+/** Create a preserved database from finalized history. The root requires an empty target. */
+export function initPreservedDatabase(db: Client, namespace: string, bundles: readonly FinalizedMigrationBundle[], catalog: MigrationCatalog = "filesystem"): Promise<MigrationApplication[]> {
+    return runFinalizedHistory(db, namespace, { catalog, bundles }, true);
+}
+
+/** Apply finalized history from the stored binding. The host owns the maintenance window. */
+export function applyFinalizedMigrations(db: Client, namespace: string, source: MigrationSource): Promise<MigrationApplication[]> {
+    return runFinalizedHistory(db, namespace, source, false);
+}
+
+/** Inspect an ambiguous commit on a fresh, dedicated client. Does not retry. */
+export async function inspectMigrationOutcome(db: Client, namespace: string, bundle: FinalizedMigrationBundle, catalog: MigrationCatalog = "filesystem"): Promise<MigrationInspection> {
+    let key: BundleKey;
+    let sql: FinalizedSql;
+    try {
+        await requireFileBackedLocalDatabase(db, "Finalized migrations");
+        sql = finalizedSql();
+        key = wasm.verify_finalized_bundle(namespace, storedBundle(bundle)) as BundleKey;
+    } catch (cause) { throw new FinalizedMigrationError("outcome-unknown", cause); }
+    return migrationWrite<MigrationInspection>(db, async tx => {
+        await validateMigrationConnection(tx, sql);
+        const state = await readFinalizedState(tx);
+        if (!state) {
+            if (key.predecessor === null && !await hasRows(tx, sql.nonempty)) return { value: { outcome: "not-applied" }, commit: false };
+            throw new Error("No matching target history");
+        }
+        if (state.namespace !== namespace || state.catalog !== catalog) throw new Error("Target has a different namespace or catalog binding");
+        const receipt = await readReceipt(tx, sql, key);
+        if (receipt) return { value: { outcome: "applied", receipt }, commit: false };
+        if (key.predecessor === state.head) return { value: { outcome: "not-applied" }, commit: false };
+        throw new Error("Target history diverged; do not retry");
+    }, key.hash, true);
+}
+
+async function auditStructure(tx: Transaction, sql: FinalizedSql, namespace: string, source: string, identities: ExternalIdentity[]): Promise<void> {
+    const { rows } = await tx.execute(sql.readStructure);
+    wasm.audit_finalized_structure(namespace, source, identities, rows.map(row => [row.type, row.name, row.sql]));
+}
+
+/** Adopt exactly the chosen finalized schema without running migration SQL or creating receipts. */
+export async function baselineDatabase(db: Client, namespace: string, at: string, source: MigrationSource): Promise<void> {
+    await requireFileBackedLocalDatabase(db, "Database baseline");
+    const sql = finalizedSql();
+    const catalog = source.catalog ?? "filesystem";
+    return migrationWrite(db, async tx => {
+        await validateMigrationConnection(tx, sql);
+        if (await readFinalizedState(tx) || await hasRows(tx, sql.tableExists, ["_pyre_migration_receipts"])) throw new Error("Target already has finalized migration history");
+        await readPolicy(tx, wasm.database_policy_sql() as PolicySql, namespace);
+        const local = await localArtifacts(tx, sql, namespace);
+        if (catalog === "filesystem" && (local.length || await hasRows(tx, sql.tableExists, ["_pyre_migration_drafts"]))) {
+            throw new Error("Target already contains database-catalog authoring data");
+        }
+        const plan = historyPlan(namespace, catalog, "bundles" in source && catalog === "filesystem" ? source.bundles.map(storedBundle) : local, false, at);
+        const step = plan.steps[position(plan, at)];
+        await auditStructure(tx, sql, namespace, step.schema, step.identities);
+        await tx.execute(sql.createState);
+        await tx.execute(sql.createReceipts);
+        await installFinalizedRuntime(tx, sql, plan.baseline!);
+        return { value: undefined, commit: true };
+    }, at);
+}
+
+/** Promote an existing target only after verifying finalized provenance and structure. */
+export async function setDatabasePreserved(db: Client, namespace: string, source: MigrationSource): Promise<DatabasePolicy> {
+    await requireFileBackedLocalDatabase(db, "Database promotion");
+    const sql = finalizedSql();
+    const catalog = source.catalog ?? "filesystem";
+    return migrationWrite<DatabasePolicy>(db, async tx => {
+        await validateMigrationConnection(tx, sql);
+        const { policy, marked } = await readPolicy(tx, wasm.database_policy_sql() as PolicySql, namespace);
+        const state = await readFinalizedState(tx);
+        if (!state) throw new Error("Promotion requires verified finalized history or an explicit baseline");
+        const plan = historyPlan(namespace, catalog, "bundles" in source && catalog === "filesystem" ? source.bundles.map(storedBundle) : await localArtifacts(tx, sql, namespace));
+        const head = plan.steps[installedPosition(plan, state, namespace, catalog)];
+        if (state.baseline !== head.hash && !await readReceipt(tx, sql, head)) throw new Error("Installed head has neither a matching receipt nor a baseline");
+        await auditStructure(tx, sql, namespace, head.schema, head.identities);
+        verifyInstalledFingerprint((await introspectDatabase(tx)).introspection, state);
+        if (!marked) await tx.execute(sql.createPolicy);
+        if (policy !== "preserved" || !marked) await tx.execute(sql.preserve);
+        return { value: "preserved", commit: true };
+    });
+}
+
+/** Compare live structure to the installed schema without modifying either. */
+export async function auditDatabaseSchema(db: Client): Promise<void> {
+    const sql = finalizedSql();
+    const tx = await db.transaction("read");
+    try {
+        const state = await readFinalizedState(tx);
+        if (!state) throw new Error("Target has no finalized installation");
+        const { introspection } = await introspectDatabase(tx);
+        verifyInstalledFingerprint(introspection, state);
+        await auditStructure(tx, sql, introspection.schema_namespace, introspection.schema_source, introspection.external_identities);
+    } finally {
+        try { await tx.rollback(); } finally { tx.close(); }
+    }
+}
 
 async function databaseWrite<T>(db: Client, operation: string, work: (tx: Transaction) => Promise<T>): Promise<T> {
     const tx = await db.transaction("write");
@@ -270,7 +586,7 @@ function sameIdentities(a: ExternalIdentity[], b: ExternalIdentity[]): boolean {
         && candidate.field === identity.field && candidate.kind === identity.kind));
 }
 
-/** Create or migrate a database to a generated Pyre schema. */
+/** Check an installed finalized schema, or update an explicitly disposable database. */
 export async function ensureDatabase(
     db: Client,
     schemaName: string,
@@ -280,6 +596,18 @@ export async function ensureDatabase(
     const tx = await db.transaction("write");
     try {
         const { initialized, introspection } = await introspectDatabase(tx);
+        const { policy } = await readPolicy(tx, wasm.database_policy_sql() as PolicySql, schemaName);
+        const installed = await readFinalizedState(tx);
+        if (policy !== "disposable" || installed) {
+            if (!installed) throw new Error("Finalized migration provenance required; use db init or db baseline, or initialize explicitly as disposable");
+            const fingerprint = wasm.runtime_schema_fingerprint(schemaName, schemaSource, externalIdentities);
+            const actual = wasm.runtime_schema_fingerprint(introspection.schema_namespace, introspection.schema_source, introspection.external_identities);
+            if (installed.namespace !== schemaName || actual !== installed.fingerprint || fingerprint !== installed.fingerprint) {
+                throw new Error("Apply finalized migrations matching the generated schema before serving");
+            }
+            await tx.rollback();
+            return "up-to-date";
+        }
         if (!initialized && introspection.tables.length > 0) {
             throw new Error(
                 "Refusing to initialize a non-empty database that is not managed by Pyre",
@@ -326,6 +654,20 @@ export async function ensureDatabase(
         throw error;
     } finally {
         tx.close();
+    }
+}
+
+async function readFinalizedState(tx: Transaction): Promise<Row | undefined> {
+    const sql = finalizedSql();
+    if (!await hasRows(tx, sql.tableExists, ["_pyre_finalized_schema"])) return undefined;
+    const installed = (await tx.execute(sql.readState)).rows[0];
+    if (!installed) throw new Error("Missing finalized installation metadata");
+    return installed;
+}
+
+function verifyInstalledFingerprint(introspection: any, installed: Row): void {
+    if (installed.namespace !== introspection.schema_namespace || installed.fingerprint !== wasm.runtime_schema_fingerprint(introspection.schema_namespace, introspection.schema_source, introspection.external_identities)) {
+        throw new Error("Installed runtime schema does not match its finalized fingerprint");
     }
 }
 
@@ -393,6 +735,8 @@ async function readIntrospectionSnapshot(db: Client): Promise<any> {
     const tx = await db.transaction("read");
     try {
         const { introspection } = await introspectDatabase(tx);
+        const installed = await readFinalizedState(tx);
+        if (installed) verifyInstalledFingerprint(introspection, installed);
         await tx.commit();
         return introspection;
     } catch (error) {

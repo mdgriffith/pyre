@@ -315,6 +315,8 @@ Use `Db.Editor` when you want to render fields from generated metadata. Each rec
 
 `Editor.UnionKind id` carries a typed `Input.UnionId`. `Input.unionInfo id` returns the exact schema name and its variants, even if the generated Elm payload type was renamed to avoid a collision. For example, a `Published { by String }` variant is described by `{ name = "Published", fields = [ { name = "by", kind = Editor.StringKind } ] }`. A generic library can accept `unionInfo` as a `unionId -> Editor.UnionInfo unionId` function and follow nested union references as needed when rendering recursive values.
 
+When a union contains a retired variant (directly or in a nested payload), generated write inputs use `Db.Write` types. Reads still use `Db`, including historical constructors. `Db.Write.fromStatus`, for example, converts a `Db.Status` to `Maybe Db.Write.Status` and returns `Nothing` if any nested value is retired. Editor choices and `unionInfo` expose writable variants only. If an edit form opens on historical data that cannot be written back, the field's `historical` contains its read-only JSON. Leave it untouched or restore it with `Db.Absent` to omit it from the patch; supply a writable replacement or use `Db.Null` if the field is nullable.
+
 Generic widgets can call `Input.encode` on a present value to read its payload in Pyre's JSON wire format. When a widget has built a complete replacement, it can convert it back to a typed value without naming a generated constructor:
 
 ```elm

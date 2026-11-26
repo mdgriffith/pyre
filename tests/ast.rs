@@ -40,6 +40,7 @@ record TestRecord {{
             ast::ColumnDirective::Immutable => "@immutable",
             ast::ColumnDirective::CreatedAt => "@createdAt",
             ast::ColumnDirective::UpdatedAt => "@updatedAt",
+            ast::ColumnDirective::Lifecycle(state) => state.annotation(),
             ast::ColumnDirective::Default { .. } => "",
         }
     );

@@ -1,5 +1,6 @@
 use super::{
-    edit_key, elm_database_namespace, elm_union_type, elm_union_variant, to_elm_typename, ElmLookup,
+    edit_key, elm_database_namespace, elm_union_type, elm_union_variant,
+    to_elm_type_from_column_type, write, ElmLookup, InputTypes,
 };
 use crate::ast::{self, ColumnType, QueryOperation};
 use crate::ext::string;
@@ -13,6 +14,7 @@ struct Field<'a> {
     arg: &'a ast::QueryParamDefinition,
     id: String,
     payload: String,
+    type_: ColumnType,
     required: bool,
 }
 
@@ -52,6 +54,7 @@ pub(super) fn generate(
         let mut used = HashSet::new();
         let mut collect = |operation| {
             let query = queries.iter().find(|query| query.operation == operation)?;
+            let input = InputTypes::new(context, query);
             Some(
                 query
                     .args
@@ -64,10 +67,12 @@ pub(super) fn generate(
                             .clone();
                         let automatic_id =
                             arg.name == key.name && matches!(key.type_, ColumnType::IdUuid { .. });
+                        let type_ = input.get(arg);
                         Field {
                             arg,
                             id,
-                            payload: to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false),
+                            payload: to_elm_type_from_column_type(&lookup, &type_),
+                            type_,
                             required: !automatic_id && !arg.omittable,
                         }
                     })
@@ -109,7 +114,7 @@ pub(super) fn generate(
         let mut payloads: Vec<_> = records
             .iter()
             .flat_map(Record::fields)
-            .map(|field| (field.payload.as_str(), field.arg.type_.as_deref().unwrap()))
+            .map(|field| (field.payload.as_str(), &field.type_))
             .collect();
         // Reserve standard payload names before naming custom unions.
         payloads.sort_unstable_by_key(|&(payload, type_)| {
@@ -118,7 +123,7 @@ pub(super) fn generate(
                     && !payload.starts_with("Db.Id.")
                     && payload != "Db.Json",
                 payload,
-                type_,
+                type_.to_string(),
             )
         });
         payloads.dedup_by_key(|(payload, _)| *payload);
@@ -126,11 +131,10 @@ pub(super) fn generate(
         let constructors: BTreeMap<_, _> = payloads
             .into_iter()
             .map(|(payload, type_)| {
-                let type_ = ColumnType::from_str(type_);
                 let value = ValueType {
                     name: unique(&mut used, value_name(payload)),
-                    kind: Kind::from_type(&lookup, &type_),
-                    type_,
+                    kind: Kind::from_type(&lookup, type_),
+                    type_: type_.clone(),
                 };
                 (payload, value)
             })
@@ -172,7 +176,11 @@ fn value_name(payload: &str) -> String {
     }
     match payload {
         "Time.Posix" => "DateTime".into(),
-        _ => payload.strip_prefix("Db.").unwrap_or(payload).into(),
+        _ => payload
+            .strip_prefix("Db.Write.")
+            .or_else(|| payload.strip_prefix("Db."))
+            .unwrap_or(payload)
+            .into(),
     }
 }
 
@@ -203,7 +211,9 @@ impl Kind {
             ColumnType::ForeignKey { .. } => super::resolve_foreign_key_type(lookup, type_)
                 .map(|inner| Self::from_type(lookup, &inner))
                 .unwrap_or(Self::Primitive("StringKind")),
-            ColumnType::Custom(name) => Self::Union(name.clone()),
+            ColumnType::Custom(name) => {
+                Self::Union(write::original_name(name).unwrap_or(name).into())
+            }
         }
     }
 
@@ -239,6 +249,7 @@ impl Kind {
         unions.insert(name.clone(), Vec::new());
         let variants = variants
             .iter()
+            .filter(|variant| variant.lifecycle != ast::Lifecycle::Retired)
             .map(|variant| {
                 let fields = variant
                     .fields
@@ -298,7 +309,15 @@ fn render_input(
             format!("type UnionId\n    = {}", tags.join("\n    | ")),
         )
     };
-    let mut output = format!("module Db.Editor.Input.{namespace} exposing (Kind, {union_exposed}, {value_exposed}, decoder, encode, kind, unionInfo)\n\nimport Db\nimport Db.Decode\nimport Db.Editor as Editor\nimport Db.Encode\nimport Db.Id\nimport Dict exposing (Dict)\nimport Json.Decode as Decode\nimport Json.Encode as Encode\nimport Time\n\n\n{union_type}\n\n\ntype alias Kind =\n    Editor.Kind UnionId\n");
+    let write_import = if constructors
+        .keys()
+        .any(|payload| payload.contains("Db.Write."))
+    {
+        "import Db.Write\n"
+    } else {
+        ""
+    };
+    let mut output = format!("module Db.Editor.Input.{namespace} exposing (Kind, {union_exposed}, {value_exposed}, decoder, encode, kind, unionInfo)\n\nimport Db\nimport Db.Decode\nimport Db.Editor as Editor\nimport Db.Encode\nimport Db.Id\n{write_import}import Dict exposing (Dict)\nimport Json.Decode as Decode\nimport Json.Encode as Encode\nimport Time\n\n\n{union_type}\n\n\ntype alias Kind =\n    Editor.Kind UnionId\n");
     let values = constructors
         .iter()
         .map(|(payload, value)| format!("{}Value ({payload})", value.name))
@@ -396,7 +415,15 @@ fn render_record(
         )
     };
     let mut exposed = vec![expose_id];
-    let mut body = format!("import Db\nimport Db.Edit.{name}.Draft as Records\nimport Db.Editor as Editor\nimport Db.Editor.Input.{namespace} as Input\nimport Db.Id\nimport Db.Internal.Editor as Internal\nimport Dict exposing (Dict)\nimport Time\n\n\n{field_id}\n");
+    let write_imports = if record
+        .fields()
+        .any(|field| field.payload.contains("Db.Write."))
+    {
+        "import Db.Write\n"
+    } else {
+        ""
+    };
+    let mut body = format!("import Db\nimport Db.Edit.{name}.Draft as Records\nimport Db.Editor as Editor\nimport Db.Editor.Input.{namespace} as Input\nimport Db.Encode\nimport Db.Id\nimport Db.Internal.Editor as Internal\n{write_imports}import Dict exposing (Dict)\nimport Json.Encode as Encode\nimport Time\n\n\n{field_id}\n");
     let mut equality = Equality::default();
     if let Some(fields) = &record.create {
         exposed.push("createForm");
@@ -459,11 +486,12 @@ fn render_form(
         let baseline = fields
             .iter()
             .map(|field| {
-                let payload = &field.payload;
+                let original = ColumnType::from_str(field.arg.type_.as_deref().unwrap());
+                let payload = to_elm_type_from_column_type(lookup, &original);
                 let type_ = if field.arg.nullable {
                     format!("Maybe ({payload})")
                 } else {
-                    payload.clone()
+                    payload
                 };
                 format!("{} : {type_}", field.arg.name)
             })
@@ -483,34 +511,53 @@ fn render_form(
     let mut entries = Vec::new();
     let mut output = Vec::new();
     let mut required = Vec::new();
+    let mut baselines = Vec::new();
     for (index, field) in fields.iter().enumerate() {
         let arg = field.arg;
         let id = &field.id;
         let value = &constructors[field.payload.as_str()];
         let name = &value.name;
         let kind = value.kind.elm("Input.");
-        let original = if create {
-            "Db.Absent".into()
+        let type_ = ColumnType::from_str(arg.type_.as_deref().unwrap());
+        let (original, historical) = if create {
+            ("Db.Absent".into(), "Nothing".into())
+        } else if field.type_ != type_ {
+            let convert = write::conversion(context, &type_);
+            let encoder = super::to_elm_encoder(lookup, &type_);
+            let field = &arg.name;
+            let row_value = if arg.nullable {
+                format!("row.{field}")
+            } else {
+                format!("(Just row.{field})")
+            };
+            baselines.push(format!("        ( original{index}, historical{index} ) =\n            Internal.baseline ({convert} >> Maybe.map Input.{name}Value) {encoder} {row_value}"));
+            (format!("original{index}"), format!("historical{index}"))
         } else if arg.nullable {
-            format!(
+            (
+                format!(
                 "(Maybe.map (Db.Present << Input.{name}Value) row.{} |> Maybe.withDefault Db.Null)",
                 arg.name
+            ),
+                "Nothing".into(),
             )
         } else {
-            format!("(Db.Present (Input.{name}Value row.{}))", arg.name)
+            (
+                format!("(Db.Present (Input.{name}Value row.{}))", arg.name),
+                "Nothing".into(),
+            )
         };
-        let type_name = arg.type_.as_deref().unwrap();
-        let type_ = ColumnType::from_str(type_name);
         let choices = union_choices(context, lookup, &type_).join(", ");
-        let equal = if !create && contains_raw_json(context, lookup, &type_, &mut HashSet::new()) {
-            let compare = equality.compare(context, lookup, &type_);
+        let equal = if !create
+            && contains_raw_json(context, lookup, &field.type_, &mut HashSet::new())
+        {
+            let compare = equality.compare(context, lookup, &field.type_);
             format!("(\\left right -> Maybe.map2 {compare} (read{name} left) (read{name} right) |> Maybe.withDefault False)")
         } else {
             "(==)".into()
         };
         let nullable = elm_bool(arg.nullable);
         let mandatory = elm_bool(field.required);
-        entries.push(format!("Internal.entry {{ id = {id}, kind = {kind}, required = {mandatory}, nullable = {nullable}, choices = [ {choices} ] }} {original} {equal}"));
+        entries.push(format!("Internal.entry {{ id = {id}, kind = {kind}, required = {mandatory}, nullable = {nullable}, choices = [ {choices} ], historical = {historical} }} {original} {equal}"));
         let read = format!("Internal.value read{name} (get {id})");
         let value = if field.required {
             let binding = format!("required{index}");
@@ -525,6 +572,9 @@ fn render_form(
     }
     let output = output.join("\n                , ");
     let builder = if fields.is_empty() { "_" } else { "get" };
+    if !baselines.is_empty() {
+        writeln!(body, "    let\n{}\n    in", baselines.join("\n\n")).unwrap();
+    }
     writeln!(
         body,
         "    Internal.init Input.kind\n        (\\{builder} ->"
@@ -589,24 +639,41 @@ impl Equality {
                 &super::resolve_foreign_key_type(lookup, ty).unwrap(),
             ),
             ColumnType::Custom(name) => {
-                let elm_name = elm_union_type(name);
-                let equal = format!("equal{elm_name}");
+                let original = write::original_name(name);
+                let elm_name = elm_union_type(original.unwrap_or(name));
+                let module = if original.is_some() { "Db.Write" } else { "Db" };
+                let equal = if original.is_some() {
+                    format!("equal_write_{elm_name}")
+                } else {
+                    format!("equal{elm_name}")
+                };
                 if self.unions.contains_key(name) {
                     return equal;
                 }
                 self.unions.insert(name.clone(), None);
-                let Some((_, typecheck::Type::OneOf { variants })) = context.types.get(name) else {
+                let Some((_, typecheck::Type::OneOf { variants })) =
+                    context.types.get(original.unwrap_or(name))
+                else {
                     unreachable!("only unions can contain opaque JSON");
                 };
-                let mut body = format!("\n\n{equal} : Db.{elm_name} -> Db.{elm_name} -> Bool\n{equal} left right =\n    case ( left, right ) of\n");
-                for variant in variants {
+                let mut body = format!("\n\n{equal} : {module}.{elm_name} -> {module}.{elm_name} -> Bool\n{equal} left right =\n    case ( left, right ) of\n");
+                let variants: Vec<_> = variants
+                    .iter()
+                    .filter(|v| original.is_none() || v.lifecycle != ast::Lifecycle::Retired)
+                    .collect();
+                for variant in &variants {
                     let tag = elm_union_variant(&variant.name);
                     if let Some(fields) = &variant.fields {
                         let comparisons = fields
                             .iter()
                             .filter_map(|field| match field {
                                 ast::Field::Column(column) => {
-                                    let mut equal = self.compare(context, lookup, &column.type_);
+                                    let ty = if original.is_some() {
+                                        crate::schema_lifecycle::write_type(context, &column.type_)
+                                    } else {
+                                        column.type_.clone()
+                                    };
+                                    let mut equal = self.compare(context, lookup, &ty);
                                     if column.nullable {
                                         equal = format!("(Internal.maybeEqual {equal})");
                                     }
@@ -623,13 +690,13 @@ impl Equality {
                         };
                         writeln!(
                             body,
-                            "        ( Db.{tag} {a}, Db.{tag} {b} ) ->\n            {test}\n"
+                            "        ( {module}.{tag} {a}, {module}.{tag} {b} ) ->\n            {test}\n"
                         )
                         .unwrap();
                     } else {
                         writeln!(
                             body,
-                            "        ( Db.{tag}, Db.{tag} ) ->\n            True\n"
+                            "        ( {module}.{tag}, {module}.{tag} ) ->\n            True\n"
                         )
                         .unwrap();
                     }
@@ -662,6 +729,7 @@ fn union_choices(
         ColumnType::Custom(name) => match context.types.get(name) {
             Some((_, typecheck::Type::OneOf { variants })) => variants
                 .iter()
+                .filter(|variant| variant.lifecycle != ast::Lifecycle::Retired)
                 .map(|variant| string::quote(&variant.name))
                 .collect(),
             _ => Vec::new(),
@@ -688,11 +756,24 @@ fn contains_raw_json(
         | ColumnType::Nullable(inner) => contains_raw_json(context, lookup, inner, seen),
         ColumnType::ForeignKey { .. } => super::resolve_foreign_key_type(lookup, type_)
             .is_some_and(|inner| contains_raw_json(context, lookup, &inner, seen)),
-        ColumnType::Custom(name) if seen.insert(name.clone()) => match context.types.get(name) {
+        ColumnType::Custom(name) if seen.insert(name.clone()) => match context
+            .types
+            .get(write::original_name(name).unwrap_or(name))
+        {
             Some((_, typecheck::Type::OneOf { variants })) => variants.iter().any(|variant| {
+                if write::original_name(name).is_some()
+                    && variant.lifecycle == ast::Lifecycle::Retired
+                {
+                    return false;
+                }
                 variant.fields.iter().flatten().any(|field| match field {
                     ast::Field::Column(column) => {
-                        contains_raw_json(context, lookup, &column.type_, seen)
+                        let ty = if write::original_name(name).is_some() {
+                            crate::schema_lifecycle::write_type(context, &column.type_)
+                        } else {
+                            column.type_.clone()
+                        };
+                        contains_raw_json(context, lookup, &ty, seen)
                     }
                     _ => false,
                 })

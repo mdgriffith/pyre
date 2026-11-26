@@ -15,7 +15,7 @@ pyre generate
 Run migrations or push your schema to a local database:
 
 ```bash
-pyre migrate ./db/app.db --push
+pyre db init ./db/app.db --disposable
 ```
 
 Start the server:

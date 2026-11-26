@@ -12,6 +12,9 @@ pub mod generated_queries;
 pub mod hash;
 pub mod parser;
 pub mod platform;
+#[cfg(feature = "json")]
+pub mod schema_contract;
+pub mod schema_lifecycle;
 pub mod seed;
 pub mod server;
 pub mod session;

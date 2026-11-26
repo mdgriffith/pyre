@@ -22,7 +22,7 @@ pyre::server::sync
 
 ## Startup
 
-Create or migrate each physical database with its schema-bound generated helper:
+After provisioning each database, check it at startup with its schema-bound generated helper:
 
 ```rust
 mod generated_databases {
@@ -33,10 +33,7 @@ generated_databases::main::ensure_database(&main_conn).await?;
 generated_databases::campaign::ensure_database(&campaign_conn).await?;
 ```
 
-The helper returns `Created`, `Migrated`, or `UpToDate`. It performs
-introspection, migration planning, DDL, and schema recording in one immediate
-transaction and rejects non-empty databases that are not already managed by
-Pyre.
+For a preserved database, the helper requires the installed finalized schema to match and returns `UpToDate`. Provision preserved targets with `pyre db init` or `pyre::db::bundle::execute::initialize`, and apply finalized bundles before starting the server. For a development database, `pyre db init --disposable` or `pyre::db::lifecycle::init_disposable` explicitly installs the working schema. Startup can update disposable databases that are not bound to finalized history.
 
 Load the generated manifest:
 

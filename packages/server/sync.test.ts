@@ -60,6 +60,8 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   set_schema: (introspection: unknown) => setSchemaCalls.push(introspection),
   migrate_with_introspection: () => migrationResult,
   sql_introspect_uninitialized: () => "select uninitialized introspection",
+  finalized_migration_sql: () => ({ tableExists: "find finalized state" }),
+  database_policy_sql: () => ({ hasNamespace: "find namespace", find: "find policy", read: "read policy", create: "create policy" }),
 }));
 
 const { catchup: catchupImplementation, rotateDatabaseEpoch } = await import("./sync");
@@ -95,12 +97,15 @@ afterEach(() => {
   migrationResult = { Ok: { sql: [], mark_success: "record migration", external_identities: [] } };
 });
 
-function initializationDatabase(initialized: boolean, introspection: any) {
+function initializationDatabase(initialized: boolean, introspection: any, disposable = false) {
   const batches: unknown[][] = [];
   let closed = false;
   const tx = {
     execute: mock(async (sql: string) => {
       if (typeof sql !== "string") return { rows: [] };
+      if (sql === "find namespace") return { rows: [] };
+      if (sql === "find policy") return { rows: disposable ? [{ sql: "create policy" }] : [] };
+      if (sql === "read policy") return { rows: [{ policy: "disposable" }] };
       if (sql.startsWith("pragma main.table_info")) return { rows: [{ name: "schema_namespace" }] };
       if (sql.startsWith("select name from main.sqlite_master")) return { rows: [] };
       if (sql.startsWith("select schema_namespace")) return { rows: [{ schema_namespace: introspection.schema_namespace ?? null }] };
@@ -125,7 +130,7 @@ function initializationDatabase(initialized: boolean, introspection: any) {
   };
 }
 
-test("ensureDatabase creates a database in one write transaction", async () => {
+test("ensureDatabase updates an explicitly disposable target in one write transaction", async () => {
   migrationResult = {
     Ok: {
       sql: ["create table notes (id integer primary key)"],
@@ -133,16 +138,16 @@ test("ensureDatabase creates a database in one write transaction", async () => {
       external_identities: [],
     },
   };
-  const database = initializationDatabase(false, {
+  const database = initializationDatabase(true, {
     tables: [],
     migration_state: { NoMigrationTable: null },
     schema_source: "",
     links: [],
-  });
+  }, true);
 
   const outcome = await ensureDatabase(database.db as any, "Campaign", "record Note {}");
 
-  expect(outcome).toBe("created");
+  expect(outcome).toBe("migrated");
   expect(database.db.transaction).toHaveBeenCalledWith("write");
   expect(database.batches).toEqual([[
     "create table notes (id integer primary key)",
@@ -159,7 +164,7 @@ test("ensureDatabase reuses an unchanged database", async () => {
     schema_source: "record Note {}",
     schema_namespace: "Campaign",
     links: [],
-  });
+  }, true);
 
   const outcome = await ensureDatabase(database.db as any, "Campaign", "record Note {}");
 
@@ -178,7 +183,7 @@ test("ensureDatabase rejects unmanaged tables", async () => {
 
   await expect(
     ensureDatabase(database.db as any, "Campaign", "record Note {}"),
-  ).rejects.toThrow("not managed by Pyre");
+  ).rejects.toThrow("Finalized migration provenance required");
   expect(database.tx.rollback).toHaveBeenCalledTimes(1);
 });
 
@@ -192,6 +197,7 @@ test("catchup activates the schema loaded for its databaseId", async () => {
       commit: async () => {}, rollback: async () => {}, close() {}, closed: false,
     })),
     execute: mock(async (sql: string) => {
+      if (typeof sql !== "string" && sql.sql === "find finalized state") return { rows: [] };
       if (sql.startsWith("pragma main.table_info") || sql.startsWith("select name from main.sqlite_master")) return { rows: [] };
       if (sql.includes("is_initialized")) {
         return { rows: [{ is_initialized: 1 }] };
@@ -280,6 +286,7 @@ test("catchup stamps response with databaseId when provided", async () => {
       commit: async () => {}, rollback: async () => {}, close() {}, closed: false,
     })),
     execute: mock(async (sql: string) => {
+      if (typeof sql !== "string" && sql.sql === "find finalized state") return { rows: [] };
       if (sql.startsWith("pragma main.table_info") || sql.startsWith("select name from main.sqlite_master")) return { rows: [] };
       if (sql.includes("is_initialized")) {
         return { rows: [{ is_initialized: 1 }] };

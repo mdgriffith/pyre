@@ -15,6 +15,7 @@ mock.module("./wasm/pyre_wasm.js", () => ({
   sql_is_initialized: () => "select 1 as is_initialized",
   sql_introspect: () => "select introspection",
   sql_introspect_uninitialized: () => "select uninitialized introspection",
+  finalized_migration_sql: () => ({ tableExists: "find finalized state" }),
   migrate_with_introspection: (_name: string, _source: string, introspection: any) => ({
     Ok: {
       sql: introspection.schema_source ? [] : ["create table notes (id integer primary key)"],
@@ -128,6 +129,7 @@ const schemaDb = {
     commit: async () => {}, rollback: async () => {}, close() {}, closed: false,
   })),
   execute: mock(async (sql: string) => {
+    if (typeof sql !== "string" && sql.sql === "find finalized state") return { rows: [] };
     if (sql.startsWith("pragma main.table_info") || sql.startsWith("select name from main.sqlite_master")) return { rows: [] };
     if (sql.includes("is_initialized")) {
       return { rows: [{ is_initialized: 1 }] };

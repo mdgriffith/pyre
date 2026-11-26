@@ -24,3 +24,6 @@ index.html
 .artifacts
 packages/server/wasm
 playground/sync/dist
+.pyre-author.lock
+.pyre-pending-manifest
+.pyre-use/

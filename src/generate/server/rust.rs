@@ -450,7 +450,15 @@ fn input_struct(context: &typecheck::Context, query: &ast::Query) -> String {
     result.push_str("    #[derive(Clone, Debug, serde::Serialize)]\n");
     result.push_str("    pub struct Input {\n");
 
+    let write_params = crate::schema_lifecycle::write_parameters(context, query);
     for arg in &query.args {
+        let type_ = resolve_arg_type(context, arg);
+        let type_ = if write_params.contains(&arg.name) {
+            crate::schema_lifecycle::write_type(context, &type_)
+        } else {
+            type_
+        };
+        let rust_type = rust_type_for_column(&type_);
         let field_name = to_field_name(&arg.name);
         if field_name != arg.name {
             result.push_str(&format!("        #[serde(rename = {:?})]\n", arg.name));
@@ -462,29 +470,22 @@ fn input_struct(context: &typecheck::Context, query: &ast::Query) -> String {
                 );
                 result.push_str(&format!(
                     "        pub {}: OptionalField<{}>,\n",
-                    field_name,
-                    rust_type_for_column(&resolve_arg_type(context, arg))
+                    field_name, rust_type
                 ));
             } else {
                 result.push_str("        #[serde(skip_serializing_if = \"Option::is_none\")]\n");
                 result.push_str(&format!(
                     "        pub {}: Option<{}>,\n",
-                    field_name,
-                    rust_type_for_column(&resolve_arg_type(context, arg))
+                    field_name, rust_type
                 ));
             }
         } else if arg.nullable {
             result.push_str(&format!(
                 "        pub {}: Option<{}>,\n",
-                field_name,
-                rust_type_for_column(&resolve_arg_type(context, arg))
+                field_name, rust_type
             ));
         } else {
-            result.push_str(&format!(
-                "        pub {}: {},\n",
-                field_name,
-                rust_type_for_column(&resolve_arg_type(context, arg))
-            ));
+            result.push_str(&format!("        pub {}: {},\n", field_name, rust_type));
         }
     }
 
@@ -591,7 +592,17 @@ fn rust_type_for_column(type_: &ast::ColumnType) -> String {
         ast::ColumnType::Nullable(inner) => {
             format!("Option<{}>", rust_type_for_column(inner))
         }
-        ast::ColumnType::Custom(name) => to_pascal_name(name),
+        ast::ColumnType::Custom(name) => {
+            if let Some(original) = name.strip_prefix(crate::schema_lifecycle::WRITE_TYPE_PREFIX) {
+                format!(
+                    "{}{}",
+                    crate::schema_lifecycle::WRITE_TYPE_PREFIX,
+                    to_pascal_name(original)
+                )
+            } else {
+                to_pascal_name(name)
+            }
+        }
     }
 }
 
@@ -610,38 +621,57 @@ fn custom_types(context: &typecheck::Context) -> String {
 
     let mut result = String::new();
     for (name, variants) in types {
-        result.push_str("#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\n");
-        result.push_str("#[serde(tag = \"_type\")]\n");
-        result.push_str(&format!("pub enum {} {{\n", to_pascal_name(name)));
-        for variant in variants {
-            result.push_str(&format!("    #[serde(rename = {:?})]\n", variant.name));
-            let variant_name = to_pascal_name(&variant.name);
-            match &variant.fields {
-                None => result.push_str(&format!("    {},\n", variant_name)),
-                Some(fields) => {
-                    result.push_str(&format!("    {} {{\n", variant_name));
-                    for field in fields {
-                        let ast::Field::Column(column) = field else {
-                            continue;
-                        };
-                        let field_name = to_field_name(&column.name);
-                        if field_name != column.name {
-                            result.push_str(&format!(
-                                "        #[serde(rename = {:?})]\n",
-                                column.name
-                            ));
+        let read_type = ast::ColumnType::Custom(name.clone());
+        let write_type = crate::schema_lifecycle::write_type(context, &read_type);
+        for (type_, write) in std::iter::once((&read_type, false))
+            .chain((read_type != write_type).then_some((&write_type, true)))
+        {
+            result.push_str("#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\n");
+            if write {
+                result.push_str("#[allow(non_camel_case_types)]\n");
+            }
+            result.push_str("#[serde(tag = \"_type\")]\n");
+            result.push_str(&format!("pub enum {} {{\n", rust_type_for_column(type_)));
+            for variant in variants {
+                if write && variant.lifecycle == ast::Lifecycle::Retired {
+                    continue;
+                }
+                result.push_str(&format!("    #[serde(rename = {:?})]\n", variant.name));
+                let variant_name = to_pascal_name(&variant.name);
+                match &variant.fields {
+                    None => result.push_str(&format!("    {},\n", variant_name)),
+                    Some(fields) => {
+                        result.push_str(&format!("    {} {{\n", variant_name));
+                        for field in fields {
+                            let ast::Field::Column(column) = field else {
+                                continue;
+                            };
+                            let field_name = to_field_name(&column.name);
+                            if field_name != column.name {
+                                result.push_str(&format!(
+                                    "        #[serde(rename = {:?})]\n",
+                                    column.name
+                                ));
+                            }
+                            let mut field_type = if write {
+                                rust_type_for_column(&crate::schema_lifecycle::write_type(
+                                    context,
+                                    &column.type_,
+                                ))
+                            } else {
+                                rust_type_for_column(&column.type_)
+                            };
+                            if column.nullable {
+                                field_type = format!("Option<{}>", field_type);
+                            }
+                            result.push_str(&format!("        {}: {},\n", field_name, field_type));
                         }
-                        let mut field_type = rust_type_for_column(&column.type_);
-                        if column.nullable {
-                            field_type = format!("Option<{}>", field_type);
-                        }
-                        result.push_str(&format!("        {}: {},\n", field_name, field_type));
+                        result.push_str("    },\n");
                     }
-                    result.push_str("    },\n");
                 }
             }
+            result.push_str("}\n\n");
         }
-        result.push_str("}\n\n");
     }
     result
 }

@@ -166,7 +166,7 @@ fn seed_custom_types(context: &typecheck::Context) -> String {
             let columns = variant
                 .fields
                 .as_ref()
-                .map(ast::collect_columns)
+                .map(|fields| ast::collect_columns(fields))
                 .unwrap_or_default();
             for column in &columns {
                 let optional = if seed_nullable(column) { "?" } else { "" };

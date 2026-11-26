@@ -3,6 +3,7 @@ use js_sys;
 use log::Level;
 use wasm_bindgen::prelude::*;
 mod cache;
+mod finalized;
 mod fixture;
 mod migrate;
 mod query;
@@ -11,6 +12,10 @@ mod sync;
 mod sync_deltas;
 mod sync_shape;
 
+pub use finalized::{
+    audit_finalized_structure, finalized_migration_sql, plan_finalized_history,
+    verify_finalized_bundle,
+};
 pub use fixture::{fixture_trigger_tables_sql, ingest_fixture};
 
 #[wasm_bindgen(start)]
@@ -84,6 +89,19 @@ pub fn database_policy_sql() -> JsValue {
 #[wasm_bindgen]
 pub fn database_catalog_sql() -> String {
     pyre::db::lifecycle::CATALOG_SQL.into()
+}
+
+#[wasm_bindgen]
+pub fn runtime_schema_fingerprint(
+    namespace: &str,
+    source: &str,
+    identities: JsValue,
+) -> Result<String, JsValue> {
+    let identities: Vec<pyre::ast::ExternalIdentity> =
+        serde_wasm_bindgen::from_value(identities).map_err(|e| e.to_string())?;
+    let context = pyre::db::bundle::load_standalone_schema(namespace, source, &identities)
+        .map_err(|e| e.to_string())?;
+    Ok(pyre::schema_contract::runtime_fingerprint(&context))
 }
 
 #[wasm_bindgen]

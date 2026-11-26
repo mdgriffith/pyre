@@ -8,6 +8,29 @@ pub struct Database {
     pub schemas: Vec<Schema>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lifecycle {
+    #[default]
+    Active,
+    Deprecated,
+    Retired,
+}
+
+impl Lifecycle {
+    pub fn is_active(&self) -> bool {
+        *self == Self::Active
+    }
+
+    pub fn annotation(self) -> &'static str {
+        match self {
+            Self::Active => "",
+            Self::Deprecated => "@deprecated",
+            Self::Retired => "@retired",
+        }
+    }
+}
+
 impl Database {
     /// Lower record shorthand and implicit fields before validation and generation.
     /// Keep the source AST separate so formatting preserves the user's directives.
@@ -222,6 +245,7 @@ pub struct RecordDetails {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Variant {
     pub name: String,
+    pub lifecycle: Lifecycle,
     pub fields: Option<Vec<Field>>,
     pub start: Option<Location>,
     pub end: Option<Location>,
@@ -235,6 +259,7 @@ pub struct Variant {
 pub fn to_variant(name: &str) -> Variant {
     Variant {
         name: name.to_string(),
+        lifecycle: Lifecycle::Active,
         fields: None,
         start: None,
         end: None,
@@ -401,6 +426,7 @@ pub fn link_equivalent(a: &LinkDetails, b: &LinkDetails) -> bool {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldDirective {
+    Lifecycle(Lifecycle),
     Watched(WatchedDetails),
     TableName((Range, String)),
     Link(LinkDetails),
@@ -583,7 +609,7 @@ pub struct Qualified {
     pub fields: Vec<String>,
 }
 
-pub fn collect_columns(fields: &Vec<Field>) -> Vec<Column> {
+pub fn collect_columns(fields: &[Field]) -> Vec<Column> {
     let mut columns = Vec::new();
     for field in fields {
         match field {
@@ -642,6 +668,37 @@ pub(crate) fn expand_record_fields(fields: &mut Vec<Field>) {
     *fields = with_timestamps_fields(fields);
     fields.retain(|field| !matches!(field, Field::FieldDirective(FieldDirective::Timestamps)));
     ensure_updated_at_field(fields);
+    for field in fields {
+        if let Field::Column(column) = field {
+            if column_lifecycle(column) == Lifecycle::Retired {
+                column.nullable = true;
+                column
+                    .directives
+                    .retain(|d| !matches!(d, ColumnDirective::Default { .. }));
+            }
+        }
+    }
+}
+
+pub fn record_lifecycle(fields: &[Field]) -> Lifecycle {
+    fields
+        .iter()
+        .find_map(|f| match f {
+            Field::FieldDirective(FieldDirective::Lifecycle(state)) => Some(*state),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+pub fn column_lifecycle(column: &Column) -> Lifecycle {
+    column
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ColumnDirective::Lifecycle(state) => Some(*state),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn with_timestamps_fields(fields: &Vec<Field>) -> Vec<Field> {
@@ -1135,6 +1192,7 @@ pub fn empty_range() -> Range {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnDirective {
+    Lifecycle(Lifecycle),
     PrimaryKey,
     Unique,
     Index,

@@ -144,7 +144,7 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
     let addr = SocketAddr::from((host, options.port));
     let loopback = host.is_loopback();
 
-    let db = db::connect(&options.database.to_string(), options.auth)
+    let db = db::connect_existing(options.database, options.auth)
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.format_error()))?;
     let conn = db.connect().map_err(|error| {
@@ -154,9 +154,25 @@ pub async fn serve<'a>(_: &'a Options<'a>, options: ServeOptions<'a>) -> io::Res
             db::error::format_libsql_error(&error)
         ))
     })?;
-    let loaded_schema = load_schema_from_database(&conn)
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Deferred)
+        .await
+        .map_err(io::Error::other)?;
+    let (policy, _) = pyre::db::policy::read_in_transaction(&tx, None)
+        .await
+        .map_err(io::Error::other)?;
+    if policy != pyre::db::policy::Policy::Disposable
+        && pyre::db::bundle::execute::installed(&tx)
+            .await
+            .map_err(io::Error::other)?
+            .is_none()
+    {
+        return Err(io::Error::other("Serving a preserved database requires finalized provenance; use pyre db init or pyre db baseline"));
+    }
+    let loaded_schema = load_schema_from_database(&tx)
         .await
         .map_err(|error| io::Error::other(error.with_database(options.database)))?;
+    tx.rollback().await.map_err(io::Error::other)?;
     let manifest_path = PathBuf::from(options.generated).join("manifest.json");
     let manifest = Manifest::load(&manifest_path).map_err(|error| {
         io::Error::new(

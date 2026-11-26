@@ -374,6 +374,10 @@ fn build_args(
         };
 
         validate_value(name, value, schema)?;
+        query
+            .write_types
+            .validate(name, value)
+            .map_err(Error::InvalidInput)?;
         let value = if json_args.contains(name) && !value.is_null() {
             JsonValue::String(value.to_string())
         } else {

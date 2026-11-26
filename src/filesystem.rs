@@ -133,7 +133,18 @@ pub fn collect_filepaths(dir: &Path) -> io::Result<Found> {
     let mut query_files: Vec<String> = vec![];
     let mut namespaces: Vec<String> = vec![];
 
-    for entry in WalkDir::new(dir) {
+    let walker = WalkDir::new(dir).into_iter().filter_entry(|entry| {
+        if entry.depth() == 0 || !entry.file_type().is_dir() {
+            return true;
+        }
+        let path = entry.path();
+        // Standalone migration snapshots can contain a Session declaration;
+        // they never participate in discovery of the working project schema.
+        path != dir.join("migrations")
+            && !(path.join("migration.sql").is_file()
+                && (path.join("manifest.json").exists() || path.join("draft.json").exists()))
+    });
+    for entry in walker {
         let entry = match entry {
             Ok(entry) => entry,
             // Standalone formatting can run without a project directory. Only a

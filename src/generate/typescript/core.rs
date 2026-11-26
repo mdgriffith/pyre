@@ -237,6 +237,31 @@ fn generate_decode_file(context: &typecheck::Context, database: &ast::Database) 
             variants,
             recursive_types.contains(&name),
         ));
+        if let ast::ColumnType::Custom(write_name) =
+            crate::schema_lifecycle::write_type(context, &ast::ColumnType::Custom(name.clone()))
+        {
+            if write_name != name {
+                let mut writable: Vec<_> = variants
+                    .iter()
+                    .filter(|v| v.lifecycle != ast::Lifecycle::Retired)
+                    .cloned()
+                    .collect();
+                for field in writable
+                    .iter_mut()
+                    .flat_map(|v| v.fields.iter_mut().flatten())
+                {
+                    if let ast::Field::Column(column) = field {
+                        column.type_ = crate::schema_lifecycle::write_type(context, &column.type_);
+                    }
+                }
+                result.push_str(&common::generate_tagged_union_with_shape(
+                    &write_name,
+                    &writable,
+                    recursive_types.contains(&name),
+                    variants.iter().all(|v| v.fields.is_none()),
+                ));
+            }
+        }
     }
 
     // Get session definition
@@ -497,7 +522,7 @@ fn to_query_metadata_file(
 
     let input_block = to_param_type_alias(
         context,
-        &query.args,
+        query,
         crate::generated_queries::generated_crud_table(context, query).is_some(),
     )
     .trim_end()
@@ -1517,14 +1542,6 @@ fn get_linked_table<'a>(
         .get(&crate::ext::string::decapitalize(&link.foreign.table))
 }
 
-fn to_zod_type(type_: &str) -> String {
-    input_zod_type_for_column_type(&ast::ColumnType::from_str(type_))
-}
-
-fn to_input_decoder_zod_type(type_: &str) -> String {
-    input_decoder_zod_type_for_column_type(&ast::ColumnType::from_str(type_))
-}
-
 fn input_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "z.string()".to_string(),
@@ -1612,20 +1629,25 @@ fn output_zod_type_for_column_type(type_: &ast::ColumnType) -> String {
     }
 }
 
-fn to_param_type_alias(
-    context: &typecheck::Context,
-    args: &Vec<ast::QueryParamDefinition>,
-    strict: bool,
-) -> String {
-    let mut result = "const RawInputValidator = z.object({".to_string();
-    let mut is_first = true;
-    for arg in args {
-        let type_name = arg
+fn to_param_type_alias(context: &typecheck::Context, query: &ast::Query, strict: bool) -> String {
+    let write_params = crate::schema_lifecycle::write_parameters(context, query);
+    let column_type = |arg: &ast::QueryParamDefinition| {
+        let type_ = arg
             .type_
             .as_deref()
             .map(|type_| typecheck::resolve_query_param_type(context, type_))
-            .unwrap_or("unknown".to_string());
-        let mut type_string = to_zod_type(&type_name);
+            .unwrap_or_else(|| "unknown".to_string());
+        let type_ = ast::ColumnType::from_str(&type_);
+        if write_params.contains(&arg.name) {
+            crate::schema_lifecycle::write_type(context, &type_)
+        } else {
+            type_
+        }
+    };
+    let mut result = "const RawInputValidator = z.object({".to_string();
+    let mut is_first = true;
+    for arg in &query.args {
+        let mut type_string = input_zod_type_for_column_type(&column_type(arg));
         if arg.nullable {
             type_string = format!("{}.nullable()", type_string);
         }
@@ -1647,13 +1669,8 @@ fn to_param_type_alias(
 
     result.push_str("const InputValidator = z.object({");
     let mut is_first = true;
-    for arg in args {
-        let type_name = arg
-            .type_
-            .as_deref()
-            .map(|type_| typecheck::resolve_query_param_type(context, type_))
-            .unwrap_or("unknown".to_string());
-        let mut type_string = to_input_decoder_zod_type(&type_name);
+    for arg in &query.args {
+        let mut type_string = input_decoder_zod_type_for_column_type(&column_type(arg));
         if arg.nullable {
             type_string = format!("{}.nullable()", type_string);
         }

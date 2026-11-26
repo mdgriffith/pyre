@@ -344,10 +344,7 @@ async fn sequence_schema_roundtrips_and_seed_allocates_sequences(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = libsql::Builder::new_local(":memory:").build().await?;
     let conn = db.connect()?;
-    assert_eq!(
-        schema::ensure_database(&conn, ast::DEFAULT_SCHEMANAME, SCHEMA).await?,
-        schema::EnsureDatabaseOutcome::Created
-    );
+    pyre::db::lifecycle::init_disposable(&conn, ast::DEFAULT_SCHEMANAME, SCHEMA, &[]).await?;
     assert_eq!(
         schema::ensure_database(&conn, ast::DEFAULT_SCHEMANAME, SCHEMA).await?,
         schema::EnsureDatabaseOutcome::UpToDate
@@ -401,7 +398,7 @@ async fn adding_sequence_to_existing_history_requires_explicit_migration(
     let db = libsql::Builder::new_local(":memory:").build().await?;
     let conn = db.connect()?;
     let old = SCHEMA.replace("    sequence Sequence.Int\n", "");
-    schema::ensure_database(&conn, ast::DEFAULT_SCHEMANAME, &old).await?;
+    pyre::db::lifecycle::init_disposable(&conn, ast::DEFAULT_SCHEMANAME, &old, &[]).await?;
     let error = schema::ensure_database(&conn, ast::DEFAULT_SCHEMANAME, SCHEMA)
         .await
         .unwrap_err();
@@ -423,7 +420,7 @@ async fn sequence_primary_key_drift_is_not_reported_as_up_to_date(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = libsql::Builder::new_local(":memory:").build().await?;
     let conn = db.connect()?;
-    schema::ensure_database(&conn, ast::DEFAULT_SCHEMANAME, SCHEMA).await?;
+    pyre::db::lifecycle::init_disposable(&conn, ast::DEFAULT_SCHEMANAME, SCHEMA, &[]).await?;
     conn.execute_batch("drop table events; create table events (key TEXT PRIMARY KEY NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL);").await?;
     let error = schema::ensure_database(&conn, ast::DEFAULT_SCHEMANAME, SCHEMA)
         .await

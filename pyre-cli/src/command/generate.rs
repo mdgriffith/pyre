@@ -28,6 +28,9 @@ fn clear(path: &Path) -> io::Result<()> {
 
 fn execute(options: &Options, paths: filesystem::Found, out_dir: &Path) -> io::Result<()> {
     let schema = parse_database_schemas(&paths, options.enable_color)?;
+    for warning in pyre::schema_lifecycle::deprecation_diagnostics(&schema) {
+        eprintln!("Warning: {warning}");
+    }
 
     // Build a map of schema filepaths to their contents for error formatting
     let mut schema_file_contents: std::collections::HashMap<String, String> =

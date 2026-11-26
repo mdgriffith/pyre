@@ -440,7 +440,7 @@ fn docs_are_exposed_as_resources() {
     assert!(migration_docs["content"]
         .as_str()
         .unwrap()
-        .contains("produces no migration SQL"));
+        .contains("draft even when the schema is unchanged"));
 
     let serve_docs = call_mcp_tool(&ctx, "pyre_docs", json!({ "topic": "serve" }));
     assert!(serve_docs["content"]
@@ -932,6 +932,13 @@ fn init_can_create_and_migrate_local_database() {
     assert_eq!(result["database"]["path"], "pyre.db");
     assert_eq!(result["database"]["migrated"], true);
     assert!(ctx.workspace_path.join("pyre.db").exists());
+    let status = call_mcp_tool(
+        &ctx,
+        "pyre_db_status",
+        json!({ "dir": "db-pyre", "database": "pyre.db" }),
+    );
+    assert_eq!(status["migrationCatalog"], "database");
+    assert_eq!(status["appliedMigrations"], json!(["root"]));
 }
 
 #[test]
@@ -1025,9 +1032,8 @@ fn db_status_reports_up_to_date_after_push() {
     let ctx = TestContext::new();
     write_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1044,9 +1050,8 @@ fn pyre_query_executes_selection_and_mutation() {
     let ctx = TestContext::new();
     write_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1096,9 +1101,8 @@ record Game {
 "#,
     )
     .unwrap();
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1116,6 +1120,53 @@ record Game {
         result["results"][0]["response"]["game"][0]["status"],
         json!({ "_type": "Running" })
     );
+}
+
+#[test]
+fn finalized_dynamic_queries_enforce_installed_retirement_with_a_stale_working_schema() {
+    let ctx = TestContext::new();
+    let active = "@syncable(false)\nrecord Note {\n @public\n id Id.Int @id\n title String\n}\n";
+    let file = ctx.workspace_path.join("pyre/schema.pyre");
+    std::fs::write(
+        &file,
+        active.replace("title String", "title String @retired"),
+    )
+    .unwrap();
+    ctx.run_command("migration")
+        .args(["create", "retired"])
+        .assert()
+        .success();
+    ctx.run_command("db")
+        .args(["init", "notes.db"])
+        .assert()
+        .success();
+    std::fs::write(&file, active).unwrap();
+
+    for tool in ["pyre_query", "pyre_explain_query"] {
+        let response = call_mcp_tool_error(
+            &ctx,
+            tool,
+            json!({
+                "database": "notes.db",
+                "query": "update Rename { note { title = \"blocked\" } }"
+            }),
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("retired column Note.title"),
+            "{response}"
+        );
+    }
+    let read = call_mcp_tool(
+        &ctx,
+        "pyre_query",
+        json!({
+            "database": "notes.db", "query": "query Read { note { title } }"
+        }),
+    );
+    assert_eq!(read["ok"], true);
 }
 
 #[test]
@@ -1212,9 +1263,8 @@ fn pyre_explain_query_uses_real_params_and_database_plan() {
     let ctx = TestContext::new();
     write_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1250,9 +1300,8 @@ fn pyre_explain_query_does_not_execute_insert_update_or_delete() {
     let ctx = TestContext::new();
     write_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1341,9 +1390,8 @@ fn pyre_explain_query_uses_session_values_without_executing_query() {
     let ctx = TestContext::new();
     write_session_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1382,9 +1430,8 @@ fn pyre_explain_query_accepts_nullable_params() {
     let ctx = TestContext::new();
     write_nullable_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1410,9 +1457,8 @@ fn pyre_explain_query_reports_invalid_parameters_like_query() {
     let ctx = TestContext::new();
     write_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1440,9 +1486,8 @@ fn pyre_query_reports_mutation_typecheck_failure() {
     let ctx = TestContext::new();
     write_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1472,9 +1517,8 @@ fn pyre_query_reports_invalid_parameters() {
     let ctx = TestContext::new();
     write_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 

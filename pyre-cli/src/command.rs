@@ -1,9 +1,9 @@
 mod check;
 mod database;
 mod docs;
+pub(crate) mod finalized;
 mod format;
 mod generate;
-mod generate_migration;
 mod init;
 mod introspect;
 mod lsp;
@@ -18,12 +18,10 @@ pub(crate) use database::{database_policy, prepare_disposable_database, Disposab
 pub use docs::docs;
 pub use format::format;
 pub use generate::generate;
-pub use generate_migration::generate_migration;
 pub use init::init;
 pub use introspect::introspect;
 pub use lsp::lsp;
 pub use mcp::mcp;
-pub use migrate::migrate;
 pub use migrate::push;
 pub use serve::{serve, ServeOptions};
 pub use shared::Options;

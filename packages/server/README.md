@@ -45,10 +45,7 @@ await databases.Main.ensureDatabase(main);
 await databases.Campaign.ensureDatabase(campaign);
 ```
 
-The call returns `"created"`, `"migrated"`, or `"up-to-date"`. It is safe to
-call whenever a database is opened: introspection, planning, DDL, and migration
-recording happen in one write transaction. Pyre rejects non-empty databases
-that do not already contain Pyre migration metadata.
+On a preserved target, `ensureDatabase` verifies the installed finalized schema and returns `"up-to-date"`. Provision that target with `pyre db init` or `initPreservedDatabase`, and apply finalized bundles before starting the server. For a development target, create it explicitly with `pyre db init --disposable` or `initDisposableDatabase`. `ensureDatabase` can update a disposable target that is not bound to finalized history. See the [migration guide](../../docs/usage/migrations.md#typescript-hosts) for library execution and recovery.
 
 ## Seed Data
 

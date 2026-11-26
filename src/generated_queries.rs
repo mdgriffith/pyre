@@ -107,6 +107,9 @@ fn generated_crud_queries(context: &typecheck::Context) -> Vec<ast::Query> {
     let mut result = Vec::new();
 
     for table in sorted_tables(context) {
+        if ast::record_lifecycle(&table.record.fields) == ast::Lifecycle::Retired {
+            continue;
+        }
         result.push(build_create_query(table));
         result.push(build_update_query(table));
         result.push(build_delete_query(table));
@@ -369,6 +372,7 @@ fn writable_create_columns(table: &typecheck::Table) -> Vec<&ast::Column> {
         .filter(|column| !ast::is_integer_primary_key(column))
         .filter(|column| !ast::is_managed_timestamp(column))
         .filter(|column| !ast::is_sequence(column))
+        .filter(|column| ast::column_lifecycle(column) != ast::Lifecycle::Retired)
         .collect()
 }
 
@@ -379,6 +383,7 @@ fn writable_update_columns(table: &typecheck::Table) -> Vec<&ast::Column> {
         .filter(|column| !ast::is_managed_timestamp(column))
         .filter(|column| !ast::is_sequence(column))
         .filter(|column| !ast::is_immutable(column))
+        .filter(|column| ast::column_lifecycle(column) != ast::Lifecycle::Retired)
         .collect()
 }
 

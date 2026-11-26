@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import assert from 'node:assert/strict';
 import init from '../../server/wasm/pyre_wasm.js';
-import { ensureDatabase, loadSchemaFromDatabase } from '../../server/schema';
+import { initDisposableDatabase, loadSchemaFromDatabase } from '../../server/schema';
 import { runWithSync } from '../../server/query-sync';
 import { catchup } from '../../server/sync';
 
@@ -15,7 +15,7 @@ await init({ module_or_path: await Bun.file(new URL('../../server/wasm/pyre_wasm
 const directory = await mkdtemp(`${tmpdir()}/pyre-field-proof-`);
 const db = createClient({ url: `file:${directory}/proof.db` });
 // Schema namespaces are capitalized; the sync database ID below is 'proof'.
-await ensureDatabase(db, 'Proof', `
+await initDisposableDatabase(db, 'Proof', `
 session {
   admin Bool
 }

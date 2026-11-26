@@ -78,6 +78,11 @@ pub(super) fn run_check(
     overlays: Option<&HashMap<String, String>>,
 ) -> io::Result<Vec<FileError>> {
     let schema = parse_database_schemas(&paths, enable_color)?;
+    if overlays.is_none() {
+        for warning in pyre::schema_lifecycle::deprecation_diagnostics(&schema) {
+            eprintln!("Warning: {warning}");
+        }
+    }
     let mut all_file_errors = Vec::new();
 
     match typecheck::check_schema(&schema) {

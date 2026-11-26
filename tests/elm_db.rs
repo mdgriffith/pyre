@@ -299,3 +299,78 @@ query GetEntities {
         content
     );
 }
+
+#[test]
+fn elm_keeps_recursive_historical_reads_and_uses_writable_shapes_everywhere_else() {
+    let source = r#"
+@syncable(false)
+type Tree = Leaf { json Json } @deprecated | Branch { next List<Forest?> } | Stump @retired
+type Forest = Grove { trees Dict<Tree> }
+type Former = Gone @retired
+record Event {
+    @public
+    id Id.Int @id
+    tree Json<Tree>
+    forest Json<Forest>?
+    former Json<Former>?
+}
+"#;
+    let mut schema = ast::Schema::default();
+    parser::run("schema.pyre", source, &mut schema).unwrap();
+    let database = ast::Database {
+        schemas: vec![schema],
+    };
+    let context = typecheck::check_schema(&database).expect("schema typechecks");
+    let mut queries = parser::parse_query(
+        "queries.pyre",
+        r#"
+update ReplaceTree($tree: Json<Tree>) { event { tree = $tree } }
+query ReadEvents { event { id tree forest former } }
+"#,
+    )
+    .unwrap();
+    pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+    let info = typecheck::check_queries(&queries, &context).unwrap();
+    let mut files = Vec::new();
+    let root = Path::new("client/elm");
+    elm::generate(root, &database, &mut files);
+    elm::generate_queries(&context, &info, &queries, root, &mut files);
+    let source = |path| {
+        files
+            .iter()
+            .find(|f| f.path == root.join(path))
+            .unwrap()
+            .contents
+            .as_str()
+    };
+
+    let writable = source("Db/Write.elm");
+    assert!(
+        writable.contains("Branch { next : List (Maybe Forest) }"),
+        "{writable}"
+    );
+    assert!(writable.contains("Grove { trees : Dict String Tree }"));
+    assert!(writable.contains("type alias Former =\n    Basics.Never"));
+    assert!(writable.contains("Leaf { json : Db.Json }"));
+    assert!(writable.contains("(Decode.dict decodeTree)"));
+    assert!(writable.contains("(traverseDict fromTree payload.trees)"));
+    assert!(!writable.contains("Stump") && !writable.contains("Gone"));
+    assert!(source("Db/Decode.elm").contains("Decode.succeed Db.Stump"));
+    assert!(source("Query/ReadEvents.elm").contains("tree : Db.Tree"));
+    let query = source("Query/ReplaceTree.elm");
+    assert!(query.contains("{ tree : Db.Write.Tree"));
+    assert!(query.contains("Db.Write.encodeTree input.tree"));
+    assert!(source("Db/Edit/Event.elm").contains("tree : Db.Write.Tree"));
+    assert!(source("Db/Edit/Event/Draft.elm").contains("forest : Db.Nullable (Db.Write.Forest)"));
+    let input = source("Db/Editor/Input/Default.elm");
+    assert!(input.contains("TreeValue (Db.Write.Tree)"));
+    assert!(input.contains("Decode.map TreeValue Db.Write.decodeTree"));
+    assert!(input.contains("Editor.ListKind (Editor.MaybeKind (Editor.UnionKind ForestUnion))"));
+    assert!(input.contains("name = \"Leaf\""));
+    assert!(!input.contains("Stump"));
+    let editor = source("Db/Edit/Event/Editor.elm");
+    assert!(editor.contains("choices = [ \"Leaf\", \"Branch\" ]"));
+    assert!(editor.contains(
+        "Internal.baseline (Db.Write.fromTree >> Maybe.map Input.TreeValue) Db.Encode.tree"
+    ));
+}

@@ -46,7 +46,17 @@ async fn load_schema_in_transaction(conn: &libsql::Connection) -> Result<LoadedS
     };
     let raw = query_introspection(conn, sql).await?;
     let introspection = introspect::from_raw(raw);
-    context_from_introspection(&introspection)?;
+    let context = context_from_introspection(&introspection)?;
+    if let Some(installed) = crate::db::bundle::execute::installed(conn)
+        .await
+        .map_err(Error::InvalidIntrospection)?
+    {
+        if installed.fingerprint != crate::schema_contract::runtime_fingerprint(context) {
+            return Err(Error::InvalidIntrospection(
+                "installed runtime schema does not match its finalized fingerprint".into(),
+            ));
+        }
+    }
 
     Ok(LoadedSchema { introspection })
 }
@@ -62,7 +72,7 @@ pub enum EnsureDatabaseOutcome {
     UpToDate,
 }
 
-/// Create or migrate a database to the supplied generated schema.
+/// Check an installed finalized schema, or update an explicitly disposable database.
 pub async fn ensure_database(
     conn: &libsql::Connection,
     schema_name: &str,
@@ -81,6 +91,30 @@ pub async fn ensure_database_with_external_identities(
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
         .map_err(EnsureDatabaseError::Database)?;
+    let (policy, _) = crate::db::policy::read_in_transaction(&tx, Some(schema_name))
+        .await
+        .map_err(|e| EnsureDatabaseError::FinalizedRequired(e.to_string()))?;
+    let state = crate::db::bundle::execute::installed(&tx)
+        .await
+        .map_err(EnsureDatabaseError::FinalizedRequired)?;
+    if policy != crate::db::policy::Policy::Disposable || state.is_some() {
+        let state = state.ok_or_else(|| EnsureDatabaseError::FinalizedRequired("use finalized db init or db baseline; to initialize from the working schema, explicitly use init_disposable".into()))?;
+        let context =
+            crate::db::bundle::load_standalone_schema(schema_name, schema_source, identities)
+                .map_err(|e| EnsureDatabaseError::FinalizedRequired(e.to_string()))?;
+        load_schema_in_transaction(&tx)
+            .await
+            .map_err(EnsureDatabaseError::Introspection)?;
+        if state.namespace != schema_name
+            || state.fingerprint != crate::schema_contract::runtime_fingerprint(&context)
+        {
+            return Err(EnsureDatabaseError::FinalizedRequired(
+                "apply finalized migrations matching the generated schema before serving".into(),
+            ));
+        }
+        tx.rollback().await.map_err(EnsureDatabaseError::Database)?;
+        return Ok(EnsureDatabaseOutcome::UpToDate);
+    }
     let initialized = is_initialized(&tx)
         .await
         .map_err(EnsureDatabaseError::Introspection)?;
@@ -339,6 +373,7 @@ pub enum EnsureDatabaseError {
     Introspection(Error),
     Migration(Vec<crate::error::Error>),
     UnmanagedDatabase,
+    FinalizedRequired(String),
 }
 
 impl std::fmt::Display for EnsureDatabaseError {
@@ -361,6 +396,9 @@ impl std::fmt::Display for EnsureDatabaseError {
                 f,
                 "refusing to initialize a non-empty database that is not managed by Pyre"
             ),
+            Self::FinalizedRequired(reason) => {
+                write!(f, "finalized migration provenance required: {reason}")
+            }
         }
     }
 }

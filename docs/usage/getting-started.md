@@ -109,7 +109,7 @@ CLI shortcut: `pyre docs schema`
 For a new local project, the simplest workflow is a direct push:
 
 ```bash
-pyre migrate db/playground.db --push
+pyre db init db/playground.db --disposable
 ```
 
 Why start here:

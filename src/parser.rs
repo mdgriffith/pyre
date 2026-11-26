@@ -420,13 +420,25 @@ fn parse_record(input: Text) -> ParseResult<ast::Definition> {
             )],
         }));
     }
+    let (input, lifecycle) = opt(parse_lifecycle)(input)?;
+    let input = if lifecycle.is_some() {
+        cut(multispace1)(input)?.0
+    } else {
+        input
+    };
     let (input, _) = tag("record")(input)?;
     let (input, _) = cut(space1)(input)?;
     let (input, start_name_pos) = position(input)?;
     let (input, name) = cut(parse_typename)(input)?;
     let (input, end_name_pos) = position(input)?;
     let (input, _) = cut(multispace0)(input)?;
-    let (input, fields) = cut(with_braces(parse_field))(input)?;
+    let (input, mut fields) = cut(with_braces(parse_field))(input)?;
+    if let Some(lifecycle) = lifecycle {
+        fields.insert(
+            0,
+            ast::Field::FieldDirective(ast::FieldDirective::Lifecycle(lifecycle)),
+        );
+    }
     let (input, end_pos) = position(input)?;
     let (input, _) = hspace0(input)?;
     let (input, _) = alt((line_ending, eof))(input)?;
@@ -913,6 +925,7 @@ fn parse_column_directive(input: Text) -> ParseResult<ast::ColumnDirective> {
         parse_directive_named("unique", ast::ColumnDirective::Unique),
         parse_directive_named("index", ast::ColumnDirective::Index),
         parse_directive_named("immutable", ast::ColumnDirective::Immutable),
+        nom::combinator::map(parse_lifecycle_name, ast::ColumnDirective::Lifecycle),
         parse_directive_named("createdAt", ast::ColumnDirective::CreatedAt),
         parse_directive_named("updatedAt", ast::ColumnDirective::UpdatedAt),
         parse_default_directive,
@@ -927,6 +940,18 @@ fn parse_column_directive(input: Text) -> ParseResult<ast::ColumnDirective> {
     // Consume trailing spaces after directive to allow multiple directives on same line
     let (input, _) = space0(input)?;
     Ok((input, directive))
+}
+
+fn parse_lifecycle(input: Text) -> ParseResult<ast::Lifecycle> {
+    let (input, _) = tag("@")(input)?;
+    parse_lifecycle_name(input)
+}
+
+fn parse_lifecycle_name(input: Text) -> ParseResult<ast::Lifecycle> {
+    alt((
+        parse_directive_named("deprecated", ast::Lifecycle::Deprecated),
+        parse_directive_named("retired", ast::Lifecycle::Retired),
+    ))(input)
 }
 
 fn parse_default_directive(input: Text) -> ParseResult<ast::ColumnDirective> {
@@ -1048,14 +1073,18 @@ fn parse_variant(input: Text) -> ParseResult<ast::Variant> {
     // Try to parse optional inline comment after variant name
     let (input, inline_comment) = parse_optional_inline_comment(input)?;
 
-    let (input, _) = multispace0(input)?;
-    let (input, optional_fields) = opt(parse_variant_fields)(input)?;
+    let (input, optional_fields) = opt(preceded(multispace0, parse_variant_fields))(input)?;
+    let (input, _) = space0(input)?;
+    let (input, lifecycle) = opt(parse_lifecycle)(input)?;
+    let (input, _) = space0(input)?;
+    let (input, trailing_comment) = parse_optional_inline_comment(input)?;
     let (input, end_pos) = position(input)?;
 
     Ok((
         input,
         ast::Variant {
             name: name.to_string(),
+            lifecycle: lifecycle.unwrap_or_default(),
             fields: optional_fields,
             start: Some(to_location(&start_pos)),
             end: Some(to_location(&end_pos)),
@@ -1063,7 +1092,7 @@ fn parse_variant(input: Text) -> ParseResult<ast::Variant> {
             start_name: Some(to_location(&start_pos)),
             end_name: Some(to_location(&end_name_pos)),
 
-            inline_comment,
+            inline_comment: inline_comment.or(trailing_comment),
         },
     ))
 }

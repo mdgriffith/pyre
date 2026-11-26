@@ -1,3 +1,5 @@
+#[cfg(feature = "json")]
+pub mod bundle;
 #[cfg(feature = "database")]
 pub mod diagnostic;
 pub mod diff;

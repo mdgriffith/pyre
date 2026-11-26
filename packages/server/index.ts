@@ -11,6 +11,8 @@ export { databaseIdFromUrl, requireDatabaseId, withDatabaseId } from "./database
 
 export type { DatabaseId } from "./database-id";
 export type { DatabasePolicy, EnsureDatabaseOutcome } from "./schema";
+export { applyFinalizedMigrations, auditDatabaseSchema, baselineDatabase, FinalizedMigrationError, initPreservedDatabase, inspectMigrationOutcome, setDatabasePreserved } from "./schema";
+export type { FinalizedMigrationBundle, MigrationApplication, MigrationCatalog, MigrationInspection, MigrationReceipt, MigrationSource } from "./schema";
 
 // Export only the types that are part of the public API for the functions above
 export type {

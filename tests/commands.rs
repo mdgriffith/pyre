@@ -114,8 +114,8 @@ fn db_seed_requires_existing_database_and_runs_the_conformance_fixture() {
     seed().assert().failure();
     assert!(!ctx.workspace_path.join("fixture.db").exists());
 
-    ctx.run_command("migrate")
-        .args(["fixture.db", "--push"])
+    ctx.run_command("db")
+        .args(["init", "fixture.db", "--disposable"])
         .assert()
         .success();
     let output = seed().assert().success();
@@ -293,13 +293,22 @@ async fn db_policy_is_shared_and_independent_of_schema_changes() {
     };
     command("missing.db", "Clocktower").assert().failure();
     assert!(!ctx.workspace_path.join("missing.db").exists());
-    ctx.run_command("migrate")
-        .args(["app.db", "--namespace", "Clocktower", "--push"])
+    ctx.run_command("db")
+        .args([
+            "init",
+            "app.db",
+            "--namespace",
+            "Clocktower",
+            "--disposable",
+        ])
         .assert()
         .success();
     let open = |name| libsql::Builder::new_local(ctx.workspace_path.join(name));
     let db = open("app.db").build().await.unwrap();
     let conn = db.connect().unwrap();
+    conn.execute("drop table _pyre_database_policy", ())
+        .await
+        .unwrap();
     conn.execute(
         "insert into notes (id) values ('00000000-0000-4000-8000-000000000001')",
         (),
@@ -618,8 +627,8 @@ async fn db_reseed_cli_commits_reset_before_reading_fixtures_and_rolls_back_seed
     };
     reseed("missing.db").assert().failure();
     assert!(!ctx.workspace_path.join("missing.db").exists());
-    ctx.run_command("migrate")
-        .args(["app.db", "--push"])
+    ctx.run_command("db")
+        .args(["init", "app.db", "--disposable"])
         .assert()
         .success();
 
@@ -628,6 +637,9 @@ async fn db_reseed_cli_commits_reset_before_reading_fixtures_and_rolls_back_seed
         .await
         .unwrap();
     let conn = db.connect().unwrap();
+    conn.execute("drop table _pyre_database_policy", ())
+        .await
+        .unwrap();
     conn.execute_batch("insert into users (name) values ('Keep until reset'); update _pyre_sync set server_revision = 9;").await.unwrap();
     let old = reseed_state(&conn).await;
     reseed("app.db")
@@ -915,11 +927,11 @@ record Account {
 }
 
 fn first_migration_sql_path(ctx: &TestContext) -> PathBuf {
-    let migration_root = ctx.workspace_path.join("pyre/migrations");
+    let migration_root = ctx.workspace_path.join("pyre/migrations/_default");
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&migration_root)
         .unwrap()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_dir())
+        .filter(|path| path.join("manifest.json").is_file())
         .collect();
     entries.sort();
 
@@ -1470,9 +1482,8 @@ fn ensure_workspace_node_modules(ctx: &TestContext) {
 }
 
 fn generate_runtime(ctx: &TestContext) {
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -1770,8 +1781,8 @@ fn test_generate_embeds_namespaced_database_initializers() {
     assert!(main.contains("Some(\"Main\")"));
     assert!(campaign.contains("Some(\"Campaign\")"));
 
-    ctx.run_command("migrate")
-        .args(["main.db", "--namespace", "Main", "--push"])
+    ctx.run_command("db")
+        .args(["init", "main.db", "--namespace", "Main", "--disposable"])
         .assert()
         .success();
     ensure_workspace_node_modules(&ctx);
@@ -1889,8 +1900,8 @@ record Entity {
 
     generate_runtime(&ctx);
     for database in ["raw.db", "rust.db", "facets.db"] {
-        ctx.run_command("migrate")
-            .args([database, "--push"])
+        ctx.run_command("db")
+            .args(["init", database, "--disposable"])
             .assert()
             .success();
     }
@@ -2192,9 +2203,10 @@ query GetUsers {
     .unwrap();
 
     let db_path = ctx.workspace_path.join("db/app.db");
-    ctx.run_command("migrate")
+    ctx.run_command("db")
+        .arg("init")
         .arg(db_path.to_str().unwrap())
-        .arg("--push")
+        .arg("--disposable")
         .assert()
         .success();
     ctx.run_command("generate").assert().success();
@@ -2263,9 +2275,10 @@ record Note {
     )
     .unwrap();
     let db_path = ctx.workspace_path.join("db/app.db");
-    ctx.run_command("migrate")
+    ctx.run_command("db")
+        .arg("init")
         .arg(&db_path)
-        .arg("--push")
+        .arg("--disposable")
         .assert()
         .success();
     ctx.run_command("generate").assert().success();
@@ -2471,9 +2484,7 @@ fn test_migration_creates_migrations_directory_and_file() {
     write_basic_schema(&ctx);
 
     ctx.run_command("migration")
-        .arg("--db")
-        .arg(".yak/yak.db")
-        .arg("init")
+        .args(["create", "initial"])
         .assert()
         .success();
 
@@ -2555,30 +2566,28 @@ fn test_check_rejects_non_session_definitions_in_session_file() {
 }
 
 #[test]
-fn test_migrate_push_creates_local_db_when_parent_directory_missing() {
+fn test_migrate_push_requires_explicit_creation() {
     let ctx = TestContext::new();
     write_basic_schema(&ctx);
 
     let db_path = ctx.workspace_path.join(".yak/yak.db");
     assert!(!db_path.exists(), "db should not exist before push");
 
-    let output = ctx
-        .run_command("migrate")
+    ctx.run_command("migrate")
         .arg(".yak/yak.db")
         .arg("--push")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.code().is_some(),
-        "migrate --push should execute and exit normally"
-    );
-
-    assert!(db_path.exists(), "db should be created by migrate --push");
+        .assert()
+        .failure();
+    assert!(!db_path.exists());
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
+        .assert()
+        .success();
+    assert!(db_path.exists());
 }
 
 #[tokio::test]
-async fn test_migrate_push_creates_enum_columns_and_records_schema() {
+async fn test_disposable_init_creates_enum_columns_and_records_schema() {
     let ctx = TestContext::new();
 
     std::fs::write(
@@ -2598,9 +2607,8 @@ record Task {
     )
     .unwrap();
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -2623,7 +2631,7 @@ record Task {
 
     assert!(
         has_status,
-        "tasks.status should exist after migrate --push for enum-backed fields"
+        "tasks.status should exist after disposable init for enum-backed fields"
     );
 
     let mut schema_rows = conn
@@ -2655,11 +2663,14 @@ async fn test_migrate_push_reports_stored_schema_parse_errors() {
         "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
-    ctx.run_command("migrate")
-        .arg(".yak/clocktower.db")
-        .arg("--namespace")
-        .arg("Clocktower")
-        .arg("--push")
+    ctx.run_command("db")
+        .args([
+            "init",
+            ".yak/clocktower.db",
+            "--namespace",
+            "Clocktower",
+            "--disposable",
+        ])
         .assert()
         .success();
     replace_stored_schema(&ctx, "record {").await;
@@ -2687,11 +2698,14 @@ async fn test_migrate_push_reports_stored_schema_typecheck_errors() {
         "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
-    ctx.run_command("migrate")
-        .arg(".yak/clocktower.db")
-        .arg("--namespace")
-        .arg("Clocktower")
-        .arg("--push")
+    ctx.run_command("db")
+        .args([
+            "init",
+            ".yak/clocktower.db",
+            "--namespace",
+            "Clocktower",
+            "--disposable",
+        ])
         .assert()
         .success();
     replace_stored_schema(
@@ -2753,11 +2767,14 @@ fn test_migrate_push_with_valid_stored_schema_still_succeeds() {
         "@syncable(false)\nrecord Note {\n    id Int @id\n    body String\n    @public\n}\n",
     );
 
-    ctx.run_command("migrate")
-        .arg(".yak/clocktower.db")
-        .arg("--namespace")
-        .arg("Clocktower")
-        .arg("--push")
+    ctx.run_command("db")
+        .args([
+            "init",
+            ".yak/clocktower.db",
+            "--namespace",
+            "Clocktower",
+            "--disposable",
+        ])
         .assert()
         .success();
     std::fs::write(
@@ -2785,9 +2802,8 @@ async fn test_migrate_push_records_immutable_only_schema_change() {
     )
     .unwrap();
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
     std::fs::write(
@@ -2862,9 +2878,8 @@ async fn test_migrate_push_applies_physical_and_immutable_changes_together() {
         "@syncable(false)\nrecord Document {\n    id Int @id\n    ownerId Int\n    @public\n}\n",
     )
     .unwrap();
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--push")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--disposable"])
         .assert()
         .success();
 
@@ -2954,11 +2969,14 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
     )
     .unwrap();
 
-    ctx.run_command("migrate")
-        .arg(".yak/clocktower.db")
-        .arg("--namespace")
-        .arg("Clocktower")
-        .arg("--push")
+    ctx.run_command("db")
+        .args([
+            "init",
+            ".yak/clocktower.db",
+            "--namespace",
+            "Clocktower",
+            "--disposable",
+        ])
         .assert()
         .success();
 
@@ -3015,6 +3033,7 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
         .arg(".yak/clocktower.db")
         .arg("--namespace")
         .arg("Clocktower")
+        .arg("--push")
         .assert()
         .success();
     pyre::server::schema::load_schema_from_database(&conn)
@@ -3024,9 +3043,7 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
         .await
         .unwrap();
     ctx.run_command("migration")
-        .arg("metadata-check")
-        .arg("--db")
-        .arg(".yak/clocktower.db")
+        .args(["create", "metadata-check"])
         .arg("--namespace")
         .arg("Clocktower")
         .assert()
@@ -3041,6 +3058,7 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
         .arg(".yak/clocktower.db")
         .arg("--namespace")
         .arg("Clocktower")
+        .arg("--push")
         .assert()
         .success();
     pyre::server::schema::load_schema_from_database(&conn)
@@ -3062,6 +3080,7 @@ async fn test_namespaced_migrate_push_records_standalone_shared_session_types() 
         .arg(".yak/clocktower.db")
         .arg("--namespace")
         .arg("Clocktower")
+        .arg("--push")
         .assert()
         .success();
     let mut metadata = conn
@@ -3096,14 +3115,14 @@ fn test_migrate_without_migrations_shows_targeted_error() {
     let ctx = TestContext::new();
     write_basic_schema(&ctx);
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("No Migrations Found"))
         .stderr(predicate::str::contains(
-            "pyre migration --db <database> init",
-        ));
+            "preserved initialization requires finalized history",
+        ))
+        .stderr(predicate::str::contains("pyre migration create"));
 }
 
 #[test]
@@ -3112,9 +3131,12 @@ fn test_migrate_reports_up_to_date_when_no_work_is_needed() {
     write_basic_schema(&ctx);
 
     ctx.run_command("migration")
-        .arg("--db")
-        .arg(".yak/yak.db")
-        .arg("init")
+        .args(["create", "initial"])
+        .assert()
+        .success();
+
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db"])
         .assert()
         .success();
 
@@ -3122,36 +3144,28 @@ fn test_migrate_reports_up_to_date_when_no_work_is_needed() {
         .arg(".yak/yak.db")
         .assert()
         .success()
-        .stdout(predicate::str::contains("1 migration applied."));
-
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Up to date, nothing applied."));
+        .stdout(predicate::str::contains("Applied 0 finalized migration(s)"));
 }
 
 #[test]
-fn test_migrate_validates_instead_of_reconciling_missing_migration_sql() {
+fn test_preserved_init_rejects_tampered_migration_sql() {
     let ctx = TestContext::new();
     write_basic_schema(&ctx);
 
     ctx.run_command("migration")
-        .arg("--db")
-        .arg(".yak/yak.db")
-        .arg("init")
+        .args(["create", "initial"])
         .assert()
         .success();
 
     let migration_sql = first_migration_sql_path(&ctx);
     std::fs::write(migration_sql, "").unwrap();
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Migration Validation Failed"))
-        .stderr(predicate::str::contains("missing table users"));
+        .stderr(predicate::str::contains("hash"));
+    assert!(!ctx.workspace_path.join(".yak/yak.db").exists());
 }
 
 #[test]
@@ -3160,14 +3174,12 @@ fn test_migrate_refuses_automatic_destructive_reconciliation() {
     write_basic_schema(&ctx);
 
     ctx.run_command("migration")
-        .arg("--db")
-        .arg(".yak/yak.db")
-        .arg("init")
+        .args(["create", "initial"])
         .assert()
         .success();
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db"])
         .assert()
         .success();
 
@@ -3185,10 +3197,12 @@ record User {
 
     ctx.run_command("migrate")
         .arg(".yak/yak.db")
+        .args(["--push", "--force"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Migration Validation Failed"))
-        .stderr(predicate::str::contains("unexpected column users.name"));
+        .stderr(predicate::str::contains(
+            "--push requires a disposable database",
+        ));
 }
 
 #[test]
@@ -3197,14 +3211,12 @@ fn test_migrate_refuses_changed_applied_migration_sql() {
     write_basic_schema(&ctx);
 
     ctx.run_command("migration")
-        .arg("--db")
-        .arg(".yak/yak.db")
-        .arg("init")
+        .args(["create", "initial"])
         .assert()
         .success();
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db"])
         .assert()
         .success();
 
@@ -3217,8 +3229,7 @@ fn test_migrate_refuses_changed_applied_migration_sql() {
         .arg(".yak/yak.db")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Applied Migration Changed"))
-        .stderr(predicate::str::contains("Create a new migration"));
+        .stderr(predicate::str::contains("hash"));
 }
 
 #[tokio::test]
@@ -3242,10 +3253,8 @@ async fn test_migrate_fails_on_non_pyre_database_with_guidance() {
         .arg(".yak/yak.db")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "Non-Pyre or Incompatible Database",
-        ))
-        .stderr(predicate::str::contains("Guidance"));
+        .stderr(predicate::str::contains("no finalized history"))
+        .stderr(predicate::str::contains("pyre db baseline"));
 }
 
 #[test]
@@ -3254,18 +3263,12 @@ fn test_migrate_fails_when_requested_namespace_is_missing_in_db_metadata() {
     write_multi_namespace_schemas(&ctx);
 
     ctx.run_command("migration")
-        .arg("--db")
-        .arg(".yak/yak.db")
-        .arg("--namespace")
-        .arg("App")
-        .arg("init")
+        .args(["create", "initial", "--namespace", "App"])
         .assert()
         .success();
 
-    ctx.run_command("migrate")
-        .arg(".yak/yak.db")
-        .arg("--namespace")
-        .arg("App")
+    ctx.run_command("db")
+        .args(["init", ".yak/yak.db", "--namespace", "App"])
         .assert()
         .success();
 
@@ -3276,10 +3279,8 @@ fn test_migrate_fails_when_requested_namespace_is_missing_in_db_metadata() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "Namespace Missing In Database Metadata",
-        ))
-        .stderr(predicate::str::contains("Requested namespace: Auth"))
-        .stderr(predicate::str::contains("Namespaces found: App"));
+            "requested namespace does not match the installed database",
+        ));
 }
 
 #[test]
@@ -3523,6 +3524,63 @@ console.log("json-roundtrip-check-passed");
         verify_script,
         "json-roundtrip-check-passed",
         "bun json runtime verification",
+    );
+}
+
+#[tokio::test]
+async fn test_generated_typescript_rejects_retired_union_values_in_composed_writes() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+@syncable(false)
+type Status = Current | Legacy { detail String } @retired
+record Note {
+    @public
+    id Id.Int @id
+    title String
+    status Status
+    historical String @retired
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/queries.pyre"),
+        r#"
+update Rename($title: String) { note { title = $title } }
+update SetStatus($status: Status) { note { status = $status } }
+query Read { note { title status historical } }
+"#,
+    )
+    .unwrap();
+    generate_runtime(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "verify-retirement.ts",
+        r#"
+import assert from "node:assert/strict";
+import { createClient } from "@libsql/client";
+import { run } from "@pyre/server/query";
+import { queries } from "./pyre/generated/typescript/server";
+import { meta as rename } from "./pyre/generated/typescript/core/queries/metadata/rename";
+import { meta as status } from "./pyre/generated/typescript/core/queries/metadata/setStatus";
+import { Read } from "./pyre/generated/typescript/run";
+
+const db = createClient({ url: "file:.yak/yak.db" });
+await db.execute("insert into notes (title,status,status__detail,historical) values ('before','Legacy','saved','old')");
+const result = await run(db, queries, [
+  { queryId: rename.id, input: { title: "rejected" } },
+  { queryId: status.id, input: { status: { _type: "Legacy", detail: "new" } } },
+], {}, {});
+assert.equal(result.kind, "error");
+assert.deepEqual((await Read(db, {})).note, [{title: "before", status: {_type: "Legacy", detail: "saved"}, historical: "old"}]);
+assert.equal((await run(db, queries, status.id, { status: { _type: "Current" } }, {})).kind, "success");
+db.close();
+console.log("retirement-check-passed");
+"#,
+        "retirement-check-passed",
+        "generated TypeScript retirement verification",
     );
 }
 

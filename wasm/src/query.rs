@@ -54,6 +54,15 @@ pub fn query_to_sql(
                     if errors.len() > 0 {
                         return Err(errors);
                     }
+                    if !pyre::schema_lifecycle::write_parameters(context, query).is_empty() {
+                        return Err(vec![error::Error {
+                            error_type: error::ErrorType::InvalidTypeUsage {
+                                message: "Use the operation runner to bind write parameters for types with retired variants.".into(),
+                            },
+                            filepath: QUERY_FILE.into(),
+                            locations: vec![],
+                        }]);
+                    }
 
                     let mut sql = Vec::new();
                     for field in &query.fields {
