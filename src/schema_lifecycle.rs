@@ -47,12 +47,50 @@ fn variants<'a>(context: &'a Context, name: &str) -> Option<&'a [Variant]> {
     }
 }
 
-pub fn has_no_writable_variant(context: &Context, type_: &ColumnType) -> bool {
+fn constructor_type_name(type_: &ColumnType) -> Option<&str> {
     match type_ {
-        ColumnType::JsonTyped(inner) => has_no_writable_variant(context, inner),
-        ColumnType::Custom(name) => variants(context, name)
-            .is_some_and(|vs| vs.iter().all(|v| v.lifecycle == Lifecycle::Retired)),
-        _ => false,
+        ColumnType::JsonTyped(inner) | ColumnType::Nullable(inner) => constructor_type_name(inner),
+        _ => type_.get_custom_type_name(),
+    }
+}
+
+/// Least fixed point of unions with a finite writable value. A required cycle
+/// has no value until one branch can terminate; nullable fields and empty
+/// collections can terminate without constructing their element type.
+pub(crate) struct WritableUnions(HashSet<String>);
+
+impl WritableUnions {
+    pub(crate) fn new(context: &Context) -> Self {
+        let mut writable = Self(HashSet::new());
+        loop {
+            let mut changed = false;
+            for (name, (_, type_)) in &context.types {
+                if let Type::OneOf { variants } = type_ {
+                    if !writable.0.contains(name) && variants.iter().any(|variant| {
+                        variant.lifecycle != Lifecycle::Retired && !variant.fields.iter().flatten().any(|field| {
+                            matches!(field, Field::Column(column) if !column.nullable && writable.is_empty_type(context, &column.type_))
+                        })
+                    }) {
+                        changed |= writable.0.insert(name.clone());
+                    }
+                }
+            }
+            if !changed {
+                return writable;
+            }
+        }
+    }
+
+    fn is_empty_type(&self, context: &Context, type_: &ColumnType) -> bool {
+        match type_ {
+            ColumnType::JsonTyped(inner) => self.is_empty_type(context, inner),
+            ColumnType::Custom(name) => variants(context, name).is_some() && !self.0.contains(name),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn blocked_by_retirement(&self, context: &Context, type_: &ColumnType) -> bool {
+        self.is_empty_type(context, type_) && has_retired_variant(context, type_)
     }
 }
 
@@ -84,20 +122,33 @@ pub fn forbidden_assignment(
     type_: &ColumnType,
     value: &QueryValue,
 ) -> Option<String> {
+    forbidden_value(context, type_, value, false)
+}
+
+fn forbidden_value(
+    context: &Context,
+    type_: &ColumnType,
+    value: &QueryValue,
+    inside_json: bool,
+) -> Option<String> {
+    let inside_json = inside_json || type_.is_typed_json();
     match value {
         QueryValue::Variable((_, variable)) if variable.session_field.is_some() && has_retired_variant(context, type_) => {
             Some("Use a validated write parameter to assign a type with retired variants, rather than copying a Session value.".into())
         }
         QueryValue::Fn(_) if has_retired_variant(context, type_) => Some("Use a validated write parameter or constructor to assign a type with retired variants.".into()),
         QueryValue::LiteralTypeValue((_, details)) => {
-            let name = type_.get_custom_type_name()?;
+            let name = constructor_type_name(type_)?;
             let variant = variants(context, name)?.iter().find(|v| v.name == details.name)?;
             if variant.lifecycle == Lifecycle::Retired {
                 return Some(format!("Cannot construct retired variant {name}.{}.", variant.name));
             }
             let columns = collect_columns(variant.fields.as_deref().unwrap_or_default());
             details.fields.iter().flatten().find_map(|(name, value)| {
-                forbidden_assignment(context, &columns.iter().find(|c| c.name == *name)?.type_, value)
+                if inside_json && name == "_type" && has_retired_variant(context, type_) {
+                    return Some("Cannot override a typed JSON variant discriminator (_type).".into());
+                }
+                forbidden_value(context, &columns.iter().find(|c| c.name == *name)?.type_, value, inside_json)
             })
         }
         _ => None,
@@ -133,8 +184,7 @@ pub fn write_parameters(context: &Context, query: &Query) -> BTreeSet<String> {
                 names.insert(v.name.clone());
             }
             QueryValue::LiteralTypeValue((_, literal)) => {
-                let Some(v) = type_
-                    .get_custom_type_name()
+                let Some(v) = constructor_type_name(type_)
                     .and_then(|name| variants(context, name))
                     .and_then(|vs| vs.iter().find(|v| v.name == literal.name))
                 else {

@@ -128,6 +128,44 @@ fn lifecycle_annotations_round_trip_and_invalid_annotations_are_rejected() {
 }
 
 #[test]
+fn retirement_cannot_remove_required_nested_construction() {
+    let source = r#"
+@syncable(false)
+type Tree = Tip | Node { next Json<Branch> }
+type Branch = Fork { tree Json<Tree> }
+record Note {
+    @public
+    id Id.Int @id
+    tree Json<Tree>
+}
+"#;
+    let (root, _) = lifecycle_bundle(None, source).unwrap();
+    let retired = source.replace("= Tip", "= Tip @retired");
+    let error = lifecycle_bundle(Some(&root), &retired).unwrap_err();
+    let reason = format!("{error:?}");
+    assert!(
+        reason.contains("Required payload Tree.Node.next has no writable variant"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("Required column Note.tree has no writable variant"),
+        "{reason}"
+    );
+
+    for optional in [
+        retired.replace("next Json<Branch>", "next Json<Branch>?"),
+        retired.replace("next Json<Branch>", "next Json<List<Branch>>"),
+        retired.replace("next Json<Branch>", "next Json<Dict<Branch>>"),
+        retired.replace("next Json<Branch>", "next Json<Branch?>"),
+    ] {
+        assert!(
+            pyre::db::bundle::load_standalone_schema("App", &optional, &[]).is_ok(),
+            "{optional}"
+        );
+    }
+}
+
+#[test]
 fn finalized_versions_distinguish_storage_additions_and_breaking_changes() {
     let compile = |previous, schema: &str, sql: &str| {
         Bundle::finalize(
@@ -328,6 +366,7 @@ mod execution {
         let source = r#"
 @syncable(false)
 type State = Current | Legacy { detail String } @retired
+type Container = Wrapped { item State }
 record Note {
  @public
  id Id.Int @id
@@ -335,6 +374,19 @@ record Note {
  old String @retired
  state State
  history Json<List<State>>?
+ snapshot Json<State>?
+ wrapper Json<Container>?
+}
+record Parent {
+ @public
+ id Id.Int @id
+ children @link(Child.parentId)
+}
+record Child {
+ @public
+ id Id.Int @id
+ parentId Parent.id @retired
+ label String
 }
 @retired
 record Archived {
@@ -354,6 +406,22 @@ record Archived {
                 "update Bad { note { state = Legacy { detail = \"changed\" } } }",
                 "retired variant State.Legacy",
             ),
+            (
+                "update Bad { note { snapshot = Legacy { detail = \"changed\" } } }",
+                "retired variant State.Legacy",
+            ),
+            (
+                "update Bad { note { wrapper = Wrapped { item = Legacy { detail = \"changed\" } } } }",
+                "retired variant State.Legacy",
+            ),
+            (
+                "update Bad { note { snapshot = Current { _type = \"Legacy\" } } }",
+                "Cannot override a typed JSON variant discriminator",
+            ),
+            (
+                "insert Bad { parent { children { label = \"new\" } } }",
+                "retired column parentId through a relationship",
+            ),
         ] {
             let queries = pyre::parser::parse_query("test.pyre", operation).unwrap();
             let Err(errors) = pyre::typecheck::check_queries(&queries, &context) else {
@@ -361,6 +429,12 @@ record Archived {
             };
             assert!(format!("{errors:?}").contains(expected));
         }
+        let historical_link = pyre::parser::parse_query(
+            "test.pyre",
+            "query Family { parent { children { id parentId } } }",
+        )
+        .unwrap();
+        pyre::typecheck::check_queries(&historical_link, &context).unwrap();
         let mut queries = pyre::parser::parse_query(
             "test.pyre",
             r#"
@@ -432,6 +506,48 @@ record Archived {
             json!({"title":"after","old":"preserved","state":{"_type":"Legacy","detail":"historical"}})
         );
         assert_eq!(read.response["archived"][0]["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_generated_schema_from_before_metadata_only_retirement() {
+        use pyre::server::schema::{ensure_database, EnsureDatabaseOutcome};
+
+        let source = "@syncable(false)\ntype State = Current | Legacy\nrecord Note {\n @public\n id Id.Int @id\n state State\n}\n";
+        let retired = source.replace("| Legacy", "| Legacy @retired");
+        let history = root(source).await;
+        let (next, _) = lifecycle_bundle(history.head(), &retired).unwrap();
+        assert!(next.migration_sql().is_empty());
+        let full = History::new("App", history.bundles().iter().cloned().chain([next])).unwrap();
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        execute::initialize(&conn, &history, Binding::Filesystem)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ensure_database(&conn, "App", source).await.unwrap(),
+            EnsureDatabaseOutcome::UpToDate
+        ));
+        conn.execute_batch("insert into notes (state) values ('Legacy')")
+            .await
+            .unwrap();
+        execute::apply_history(&conn, &full, Binding::Filesystem)
+            .await
+            .unwrap();
+        let error = ensure_database(&conn, "App", source).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("matching the generated schema before serving"),
+            "{error}"
+        );
+        assert!(matches!(
+            ensure_database(&conn, "App", &retired).await.unwrap(),
+            EnsureDatabaseOutcome::UpToDate
+        ));
+        assert_eq!(scalar(&conn, "select state from notes").await, "Legacy");
     }
 
     async fn exercise(db: &libsql::Database) {

@@ -8,11 +8,42 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 mod editor;
+mod write;
 
 const ELM_DELTA_MODULE: &str = include_str!("./static/elm/src/Db/Delta.elm");
 const ELM_UPDATES_MODULE: &str = include_str!("./static/elm/src/Db/Updates.elm");
 
 pub fn generate(
+    base_path: &Path,
+    database: &ast::Database,
+    files: &mut Vec<GeneratedFile<String>>,
+) {
+    generate_read_schema(base_path, database, files);
+    if let Ok(context) = typecheck::check_schema(database) {
+        generate_write_schema(base_path, &context, files);
+    }
+}
+
+pub(crate) fn generate_with_context(
+    base_path: &Path,
+    context: &typecheck::Context,
+    files: &mut Vec<GeneratedFile<String>>,
+) {
+    generate_read_schema(base_path, &context.database, files);
+    generate_write_schema(base_path, context, files);
+}
+
+fn generate_write_schema(
+    base_path: &Path,
+    context: &typecheck::Context,
+    files: &mut Vec<GeneratedFile<String>>,
+) {
+    if let Some(source) = write::module(context) {
+        files.push(generate_text_file(base_path.join("Db/Write.elm"), source));
+    }
+}
+
+fn generate_read_schema(
     base_path: &Path,
     database: &ast::Database,
     files: &mut Vec<GeneratedFile<String>>,
@@ -1630,10 +1661,6 @@ fn to_type_encoder(database: &ast::Database, type_: &ast::ColumnType) -> String 
     }
 }
 
-fn to_type_encoder_str(lookup: &ElmLookup, type_: &str) -> String {
-    to_elm_encoder(lookup, &ast::ColumnType::from_str(type_))
-}
-
 fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
     match type_ {
         ast::ColumnType::String => "Encode.string".to_string(),
@@ -1661,7 +1688,10 @@ fn to_elm_encoder(lookup: &ElmLookup, type_: &ast::ColumnType) -> String {
 
             "Encode.string".to_string()
         }
-        ast::ColumnType::Custom(name) => format!("Db.Encode.{}", string::decapitalize(name)),
+        ast::ColumnType::Custom(name) => match write::original_name(name) {
+            Some(name) => format!("Db.Write.encode{name}"),
+            None => format!("Db.Encode.{}", string::decapitalize(name)),
+        },
     }
 }
 
@@ -1858,12 +1888,19 @@ fn to_edit_modules(
     for query in queries {
         body.push_str(&format!("import Query.{}\n", query.name));
     }
+    if queries
+        .iter()
+        .any(|query| !crate::schema_lifecycle::write_parameters(context, query).is_empty())
+    {
+        body.push_str("import Db.Write\n");
+    }
     body.push_str("\n\ntype Patch\n    = Patch ( String, Encode.Value )\n\n\ntype CreateOption\n    = CreateOption ( String, Encode.Value )\n");
     if uuid_create {
         body.push_str("    | ExplicitId Encode.Value\n\n\noptionPair : CreateOption -> Maybe ( String, Encode.Value )\noptionPair option =\n    case option of\n        CreateOption pair -> Just pair\n        ExplicitId _ -> Nothing\n\n\noptionId : CreateOption -> Maybe Encode.Value\noptionId option =\n    case option of\n        CreateOption _ -> Nothing\n        ExplicitId id -> Just id\n");
     }
     body.push_str("\n\n");
     for query in queries {
+        let input = InputTypes::new(context, query);
         let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
         let key = edit_key(table);
         let namespace = elm_database_namespace(&lookup.namespaces, &info[&query.name].primary_db);
@@ -1904,17 +1941,14 @@ fn to_edit_modules(
                     for arg in query.args.iter().filter(|arg| arg.omittable) {
                         let name = builder_names[&("patch", arg.name.clone())].clone();
                         exposing.push(name.clone());
-                        let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                        let arg_type = input.get(arg);
+                        let base = to_elm_type_from_column_type(&lookup, &arg_type);
                         let type_ = if arg.nullable {
                             format!("Maybe ({base})")
                         } else {
                             base
                         };
-                        let encoder = to_param_encoder_str(
-                            &lookup,
-                            arg.type_.as_deref().unwrap(),
-                            arg.nullable,
-                        );
+                        let encoder = to_param_encoder(&lookup, &arg_type, arg.nullable);
                         body.push_str(&format!("{name} : ({type_}) -> Patch\n{name} value =\n    Patch ( {}, {} value )\n\n\n", string::quote(&arg.name), encoder));
                     }
                 } else {
@@ -1945,7 +1979,7 @@ fn to_edit_modules(
                 let fields: Vec<_> = required
                     .iter()
                     .map(|arg| {
-                        let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                        let base = to_elm_type_from_column_type(&lookup, &input.get(arg));
                         format!(
                             "{} : {}",
                             arg.name,
@@ -1967,11 +2001,7 @@ fn to_edit_modules(
                         format!(
                             "( {}, {} input.{} )",
                             string::quote(&arg.name),
-                            to_param_encoder_str(
-                                &lookup,
-                                arg.type_.as_deref().unwrap(),
-                                arg.nullable
-                            ),
+                            to_param_encoder(&lookup, &input.get(arg), arg.nullable),
                             arg.name
                         )
                     })
@@ -2006,14 +2036,14 @@ fn to_edit_modules(
                 for arg in args.iter().filter(|arg| arg.omittable) {
                     let name = builder_names[&("create", arg.name.clone())].clone();
                     exposing.push(name.clone());
-                    let base = to_elm_typename(&lookup, arg.type_.as_deref().unwrap(), false);
+                    let arg_type = input.get(arg);
+                    let base = to_elm_type_from_column_type(&lookup, &arg_type);
                     let type_ = if arg.nullable {
                         format!("Maybe ({base})")
                     } else {
                         base
                     };
-                    let encoder =
-                        to_param_encoder_str(&lookup, arg.type_.as_deref().unwrap(), arg.nullable);
+                    let encoder = to_param_encoder(&lookup, &arg_type, arg.nullable);
                     body.push_str(&format!("{name} : ({type_}) -> CreateOption\n{name} value =\n    CreateOption ( {}, {} value )\n\n\n", string::quote(&arg.name), encoder));
                 }
             }
@@ -2045,6 +2075,10 @@ fn to_draft_module(
             ast::QueryOperation::Update => ("Patch", "patch"),
             _ => continue,
         };
+        let input = InputTypes::new(context, query);
+        if !input.names.is_empty() && !body.contains("import Db.Write\n") {
+            body.insert_str(0, "import Db.Write\n");
+        }
         let table = crate::generated_queries::generated_crud_table(context, query).unwrap();
         let key = edit_key(table);
         let key_type = typecheck::query_param_type_for_column(&table.record, &key);
@@ -2069,7 +2103,7 @@ fn to_draft_module(
                     continue;
                 }
             }
-            let base = to_elm_typename(lookup, arg.type_.as_deref().unwrap(), false);
+            let base = to_elm_type_from_column_type(lookup, &input.get(arg));
             if arg.omittable {
                 let builder = &builder_names[&(prefix, field.clone())];
                 if arg.nullable {
@@ -2141,6 +2175,7 @@ fn to_query_file(
 
     let type_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let elm_lookup = ElmLookup::from_context(context);
+    let input = InputTypes::new(context, query);
 
     // Always include Input
     type_names.borrow_mut().push("Input".to_string());
@@ -2153,6 +2188,9 @@ fn to_query_file(
     result.push_str("import Db.Delta\n");
     result.push_str("import Db.Encode\n");
     result.push_str("import Db.Id\n");
+    if !input.names.is_empty() {
+        result.push_str("import Db.Write\n");
+    }
     result.push_str("import Dict exposing (Dict)\n");
     if query.operation == ast::QueryOperation::Update {
         result.push_str("import Db.Updates\n");
@@ -2173,11 +2211,7 @@ fn to_query_file(
         ));
     }
 
-    result.push_str(&to_param_type_alias(
-        &elm_lookup,
-        &query.operation,
-        &query.args,
-    ));
+    result.push_str(&to_param_type_alias(&elm_lookup, &input, query));
 
     let type_names_clone = type_names.clone();
     let elm_lookup_for_types = elm_lookup.clone();
@@ -2268,11 +2302,7 @@ fn to_query_file(
         to_field_separator: Box::new(|_| "        ".to_string()),
     };
 
-    result.push_str(&to_param_type_encoder(
-        &elm_lookup,
-        &query.operation,
-        &query.args,
-    ));
+    result.push_str(&to_param_type_encoder(&elm_lookup, &input, query));
 
     // Top level query decoder
 
@@ -2513,17 +2543,36 @@ fn generate_empty_return_data(query: &ast::Query) -> String {
     }
 }
 
-fn to_param_type_alias(
-    lookup: &ElmLookup,
-    operation: &ast::QueryOperation,
-    args: &Vec<ast::QueryParamDefinition>,
-) -> String {
+struct InputTypes<'a> {
+    context: &'a typecheck::Context,
+    names: std::collections::BTreeSet<String>,
+}
+
+impl<'a> InputTypes<'a> {
+    fn new(context: &'a typecheck::Context, query: &ast::Query) -> Self {
+        Self {
+            context,
+            names: crate::schema_lifecycle::write_parameters(context, query),
+        }
+    }
+
+    fn get(&self, arg: &ast::QueryParamDefinition) -> ast::ColumnType {
+        let type_ = ast::ColumnType::from_str(arg.type_.as_deref().unwrap_or("unknown"));
+        if self.names.contains(&arg.name) {
+            crate::schema_lifecycle::write_type(self.context, &type_)
+        } else {
+            type_
+        }
+    }
+}
+
+fn to_param_type_alias(lookup: &ElmLookup, input: &InputTypes, query: &ast::Query) -> String {
+    let operation = &query.operation;
     let mut result = "type alias Input =\n".to_string();
     result.push_str("    {");
     let mut is_first = true;
-    for arg in args {
-        let type_string = &arg.type_.clone().unwrap_or("unknown".to_string());
-        let base_type = to_elm_typename(lookup, type_string, false);
+    for arg in &query.args {
+        let base_type = to_elm_type_from_column_type(lookup, &input.get(arg));
         let param_type =
             if arg.nullable && !(*operation == ast::QueryOperation::Update && arg.omittable) {
                 if base_type.contains(' ') {
@@ -2554,11 +2603,9 @@ fn to_param_type_alias(
     result
 }
 
-fn to_param_type_encoder(
-    lookup: &ElmLookup,
-    operation: &ast::QueryOperation,
-    args: &Vec<ast::QueryParamDefinition>,
-) -> String {
+fn to_param_type_encoder(lookup: &ElmLookup, input: &InputTypes, query: &ast::Query) -> String {
+    let operation = &query.operation;
+    let args = &query.args;
     let mut result = "encode : Input -> Encode.Value\n".to_string();
     result.push_str("encode input =\n");
     if *operation == ast::QueryOperation::Update {
@@ -2575,14 +2622,14 @@ fn to_param_type_encoder(
     }
     let mut is_first = true;
     for arg in args {
-        let type_string = &arg.type_.clone().unwrap_or("unknown".to_string());
+        let type_ = input.get(arg);
         let encoded_value = if *operation == ast::QueryOperation::Update && arg.omittable {
-            to_update_arg_encoder_str(lookup, type_string, &arg.name)
+            to_update_arg_encoder(lookup, &type_, &arg.name)
         } else if *operation == ast::QueryOperation::Update {
-            let encoder = to_param_encoder_str(lookup, type_string, arg.nullable);
+            let encoder = to_param_encoder(lookup, &type_, arg.nullable);
             format!("Db.Updates.set ({} input.{})", encoder, &arg.name)
         } else {
-            let encoder = to_param_encoder_str(lookup, type_string, arg.nullable);
+            let encoder = to_param_encoder(lookup, &type_, arg.nullable);
             format!("{} input.{}", encoder, &arg.name)
         };
         if is_first {
@@ -2606,15 +2653,19 @@ fn to_param_type_encoder(
 
 fn to_param_encoder_str(lookup: &ElmLookup, type_: &str, nullable: bool) -> String {
     let type_ = ast::ColumnType::from_str(type_);
+    to_param_encoder(lookup, &type_, nullable)
+}
+
+fn to_param_encoder(lookup: &ElmLookup, type_: &ast::ColumnType, nullable: bool) -> String {
     if nullable {
-        to_elm_encoder(lookup, &ast::ColumnType::Nullable(Box::new(type_)))
+        to_elm_encoder(lookup, &ast::ColumnType::Nullable(Box::new(type_.clone())))
     } else {
-        to_elm_encoder(lookup, &type_)
+        to_elm_encoder(lookup, type_)
     }
 }
 
-fn to_update_arg_encoder_str(lookup: &ElmLookup, type_: &str, field_name: &str) -> String {
-    let encoder = to_type_encoder_str(lookup, type_);
+fn to_update_arg_encoder(lookup: &ElmLookup, type_: &ast::ColumnType, field_name: &str) -> String {
+    let encoder = to_elm_encoder(lookup, type_);
     format!(
         "case input.{field_name} of\n            Db.Updates.Set value ->\n                Db.Updates.Set ({encoder} value)\n\n            Db.Updates.Unchanged ->\n                Db.Updates.Unchanged\n\n            Db.Updates.SetToNull ->\n                Db.Updates.SetToNull",
         field_name = field_name,
@@ -2670,7 +2721,10 @@ fn to_elm_type_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) -> 
 
             "String".to_string()
         }
-        ast::ColumnType::Custom(name) => format!("Db.{}", elm_union_type(name)),
+        ast::ColumnType::Custom(name) => match write::original_name(name) {
+            Some(name) => format!("Db.Write.{}", elm_union_type(name)),
+            None => format!("Db.{}", elm_union_type(name)),
+        },
     }
 }
 
@@ -2711,9 +2765,10 @@ fn to_elm_decoder_from_column_type(lookup: &ElmLookup, type_: &ast::ColumnType) 
 
             "Decode.string".to_string()
         }
-        ast::ColumnType::Custom(name) => {
-            format!("Db.Decode.{}", crate::ext::string::decapitalize(name))
-        }
+        ast::ColumnType::Custom(name) => match write::original_name(name) {
+            Some(name) => format!("Db.Write.decode{name}"),
+            None => format!("Db.Decode.{}", string::decapitalize(name)),
+        },
     }
 }
 

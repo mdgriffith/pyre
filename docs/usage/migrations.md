@@ -37,7 +37,7 @@ Retirement bumps the major version and cannot be reversed. Keep the retired decl
 
 ## Apply and recover
 
-Stop serving the target and drain in-flight work before running `pyre migrate`. Restart with compatible handlers after verifying the installed state. Each migration commits its SQL, assertions, installed schema, and receipt together. If one fails, earlier migrations stay applied. Data-changing SQL on a synced target changes its sync epoch so reconnecting clients rebuild their caches.
+Stop serving the target and drain in-flight work before running `pyre migrate`. Restart with compatible handlers after verifying the installed state. In library hosts, run the generated schema's `ensure_database` / `ensureDatabase` during startup; these checks reject a stale generated schema on a finalized target, even after metadata-only retirement. The host still owns the maintenance window. Each migration commits its SQL, assertions, installed schema, and receipt together. If one fails, earlier migrations stay applied. Data-changing SQL on a synced target changes its sync epoch so reconnecting clients rebuild their caches.
 
 If the commit outcome is unknown, keep the database out of service. On a fresh connection, `pyre migrate app.db --inspect NAME` confirms application by receipt or identifies that the target is still at the expected predecessor. Resolve divergence or failed inspection before retrying.
 

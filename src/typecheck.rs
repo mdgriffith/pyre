@@ -2066,6 +2066,7 @@ fn resolve_foreign_key_serialization_types(context: &mut Context) {
 
 // Check for duplicate variants
 fn check_schema_definitions(context: &Context, database: &ast::Database, errors: &mut Vec<Error>) {
+    let writable_unions = crate::schema_lifecycle::WritableUnions::new(context);
     let vars = context.variants.clone();
     for (_variant_name, (maybe_type_range, mut instances)) in vars {
         if instances.len() > 1 {
@@ -2223,10 +2224,7 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                                 && ast::column_lifecycle(&column) != ast::Lifecycle::Retired
                                 && !column.nullable
                                 && !ast::has_default_value(&column)
-                                && crate::schema_lifecycle::has_no_writable_variant(
-                                    context,
-                                    &column.type_,
-                                )
+                                && writable_unions.blocked_by_retirement(context, &column.type_)
                             {
                                 errors.push(invalid_type_usage_error(
                                     &file.path,
@@ -2360,7 +2358,7 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                         }
                     }
                     ast::Definition::Tagged {
-                        name: _name,
+                        name,
                         variants,
                         start,
                         end,
@@ -2392,6 +2390,13 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                                             .any(|c| c.name == field.name && c.type_ != field.type_)
                                     {
                                         errors.push(invalid_type_usage_error(&file.path, format!("Active variant {} has incompatible shared storage for retired payload field {}.", variant.name, field.name), vec![], to_range(&field.start, &field.end)));
+                                    }
+                                    if variant.lifecycle != ast::Lifecycle::Retired
+                                        && !field.nullable
+                                        && writable_unions
+                                            .blocked_by_retirement(context, &field.type_)
+                                    {
+                                        errors.push(invalid_type_usage_error(&file.path, format!("Required payload {}.{}.{} has no writable variant.", name, variant.name, field.name), vec![], to_range(&field.start, &field.end)));
                                     }
                                     let mut contexts: Vec<Range> = vec![];
 
