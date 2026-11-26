@@ -54,23 +54,12 @@ pub struct ApiTransition {
     pub change: ApiChange,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VersionOverflow;
-
-impl fmt::Display for VersionOverflow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("schema API version overflow")
-    }
-}
-
-impl std::error::Error for VersionOverflow {}
-
 /// The first finalized schema establishes 0.0.0; subsequent versions compare
 /// two typechecked standalone schemas, with no dependence on SQL or rollout metadata.
 pub fn transition(
     predecessor: Option<(ApiVersion, &Context)>,
     target: &Context,
-) -> Result<ApiTransition, VersionOverflow> {
+) -> Result<ApiTransition, TransitionError> {
     let Some((from, previous)) = predecessor else {
         return Ok(ApiTransition {
             from: None,
@@ -78,17 +67,143 @@ pub fn transition(
             change: ApiChange::Unchanged,
         });
     };
-    let change = classify(&Projection::new(previous), &Projection::new(target));
+    let previous = Projection::new(previous);
+    let target = Projection::new(target);
+    check_tombstones(&previous, &target)?;
+    let change = classify(&previous, &target);
     let to = match change {
         ApiChange::Unchanged => from,
-        ApiChange::Minor => ApiVersion(from.0, from.1.checked_add(1).ok_or(VersionOverflow)?, 0),
-        ApiChange::Major => ApiVersion(from.0.checked_add(1).ok_or(VersionOverflow)?, 0, 0),
+        ApiChange::Minor => ApiVersion(
+            from.0,
+            from.1
+                .checked_add(1)
+                .ok_or(TransitionError::VersionOverflow)?,
+            0,
+        ),
+        ApiChange::Major => ApiVersion(
+            from.0
+                .checked_add(1)
+                .ok_or(TransitionError::VersionOverflow)?,
+            0,
+            0,
+        ),
     };
     Ok(ApiTransition {
         from: Some(from),
         to,
         change,
     })
+}
+
+#[derive(Debug)]
+pub enum TransitionError {
+    VersionOverflow,
+    Tombstone(String),
+}
+
+impl fmt::Display for TransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VersionOverflow => f.write_str("schema API version overflow"),
+            Self::Tombstone(name) => write!(
+                f,
+                "cannot remove, reactivate, or repurpose the retired declaration {name}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TransitionError {}
+
+fn lifecycle_change(old: Lifecycle, new: Lifecycle) -> ApiChange {
+    if old == new {
+        ApiChange::Unchanged
+    } else if new == Lifecycle::Retired {
+        ApiChange::Major
+    } else {
+        ApiChange::Minor
+    }
+}
+
+fn check_tombstones(old: &Projection, new: &Projection) -> Result<(), TransitionError> {
+    let keep = |name: String, before: Lifecycle, after: Option<Lifecycle>, compatible: bool| {
+        if (before == Lifecycle::Retired && after != Some(Lifecycle::Retired))
+            || (after == Some(Lifecycle::Retired) && !compatible)
+        {
+            Err(TransitionError::Tombstone(name))
+        } else {
+            Ok(())
+        }
+    };
+    for (name, record) in &old.records {
+        let next = new.records.get(name);
+        keep(
+            name.clone(),
+            record.lifecycle,
+            next.map(|r| r.lifecycle),
+            next.is_some_and(|r| {
+                r.table == record.table
+                    && record.columns.iter().all(|(name, column)| {
+                        r.columns.get(name).is_some_and(|c| {
+                            c.type_ == column.type_
+                                && c.primary == column.primary
+                                && (c.nullable == column.nullable
+                                    || c.lifecycle == Lifecycle::Retired)
+                        })
+                    })
+            }),
+        )?;
+        for (field, column) in &record.columns {
+            let target = next.and_then(|r| r.columns.get(field));
+            keep(
+                format!("{name}.{field}"),
+                column.lifecycle,
+                target.map(|c| c.lifecycle),
+                target.is_some_and(|c| {
+                    c.type_ == column.type_ && !column.primary && column.managed.is_none()
+                }),
+            )?;
+        }
+    }
+    for (name, variants) in &old.unions {
+        for (variant, before) in variants {
+            let after = new
+                .unions
+                .get(name)
+                .and_then(|variants| variants.get(variant));
+            let shape = |fields: &Fields| {
+                fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.type_.clone(), v.nullable))
+                    .collect::<Vec<_>>()
+            };
+            keep(
+                format!("{name}.{variant}"),
+                before.lifecycle,
+                after.map(|v| v.lifecycle),
+                after.is_some_and(|v| shape(&v.fields) == shape(&before.fields)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn published_names(context: &Context) -> std::collections::BTreeSet<Vec<String>> {
+    let projection = Projection::new(context);
+    let mut names = std::collections::BTreeSet::new();
+    for (record, shape) in projection.records {
+        names.insert(vec![record.clone()]);
+        for column in shape.columns.into_keys() {
+            names.insert(vec![record.clone(), column]);
+        }
+    }
+    for (union, variants) in projection.unions {
+        names.insert(vec![union.clone()]);
+        for variant in variants.into_keys() {
+            names.insert(vec![union.clone(), variant]);
+        }
+    }
+    names
 }
 
 /// Fingerprint of a typechecked standalone schema. Independent of artifact hash,
@@ -109,13 +224,31 @@ struct Projection {
     identities: Vec<ExternalIdentity>,
     session: Fields,
     records: BTreeMap<String, Record>,
-    unions: BTreeMap<String, BTreeMap<String, Fields>>,
+    unions: BTreeMap<String, BTreeMap<String, VariantShape>>,
 }
 
 type Fields = BTreeMap<String, ColumnShape>;
 
+struct VariantShape {
+    lifecycle: Lifecycle,
+    fields: Fields,
+}
+
+impl Serialize for VariantShape {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Preserve the v1 projection for schemas that have no lifecycle annotations.
+        if self.lifecycle.is_active() {
+            self.fields.serialize(serializer)
+        } else {
+            (&self.lifecycle, &self.fields).serialize(serializer)
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Record {
+    #[serde(skip_serializing_if = "Lifecycle::is_active")]
+    lifecycle: Lifecycle,
     columns: Fields,
     links: BTreeMap<String, Value>,
     permissions: Vec<Value>,
@@ -127,6 +260,8 @@ struct Record {
 
 #[derive(Serialize)]
 struct ColumnShape {
+    #[serde(skip_serializing_if = "Lifecycle::is_active")]
+    lifecycle: Lifecycle,
     type_: Value,
     nullable: bool,
     primary: bool,
@@ -159,7 +294,7 @@ impl ColumnShape {
         {
             Minor
         } else {
-            Unchanged
+            lifecycle_change(self.lifecycle, new.lifecycle)
         }
     }
 }
@@ -189,10 +324,13 @@ impl Projection {
                             .map(|variant| {
                                 (
                                     variant.name.clone(),
-                                    columns(
-                                        variant.fields.as_deref().unwrap_or_default(),
-                                        namespace,
-                                    ),
+                                    VariantShape {
+                                        lifecycle: variant.lifecycle,
+                                        fields: columns(
+                                            variant.fields.as_deref().unwrap_or_default(),
+                                            namespace,
+                                        ),
+                                    },
                                 )
                             })
                             .collect(),
@@ -279,6 +417,7 @@ impl Record {
                 Field::FieldDirective(
                     FieldDirective::TableName(_)
                     | FieldDirective::Permissions(_)
+                    | FieldDirective::Lifecycle(_)
                     | FieldDirective::Timestamps,
                 )
                 | Field::Column(_)
@@ -301,6 +440,7 @@ impl Record {
         })
         .collect();
         Self {
+            lifecycle: record_lifecycle(&record.fields),
             columns: columns(&record.fields, namespace),
             links,
             permissions,
@@ -324,6 +464,7 @@ fn columns(fields: &[Field], namespace: &str) -> Fields {
                 return None;
             };
             let mut shape = ColumnShape {
+                lifecycle: column_lifecycle(c),
                 type_: column_type(&c.type_, namespace),
                 nullable: c.nullable,
                 primary: false,
@@ -335,6 +476,7 @@ fn columns(fields: &[Field], namespace: &str) -> Fields {
             };
             for directive in &c.directives {
                 match directive {
+                    ColumnDirective::Lifecycle(_) => {}
                     ColumnDirective::PrimaryKey => shape.primary = true,
                     ColumnDirective::Immutable => shape.immutable = true,
                     ColumnDirective::CreatedAt => shape.managed = Some("createdAt"),
@@ -507,7 +649,17 @@ fn classify(old: &Projection, new: &Projection) -> ApiChange {
         &old.unions,
         &new.unions,
         |_| Minor,
-        |a, b| compare_map(a, b, |_| Major, compare_fields),
+        |a, b| {
+            compare_map(
+                a,
+                b,
+                |_| Major,
+                |a, b| {
+                    lifecycle_change(a.lifecycle, b.lifecycle)
+                        .max(compare_fields(&a.fields, &b.fields))
+                },
+            )
+        },
     ));
     change = change.max(compare_map(
         &old.records,
@@ -526,7 +678,8 @@ fn classify(old: &Projection, new: &Projection) -> ApiChange {
             {
                 return Major;
             }
-            let mut change = compare_fields(&a.columns, &b.columns);
+            let mut change = lifecycle_change(a.lifecycle, b.lifecycle)
+                .max(compare_fields(&a.columns, &b.columns));
             change = change.max(compare_map(
                 &a.links,
                 &b.links,

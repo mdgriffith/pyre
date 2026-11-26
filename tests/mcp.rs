@@ -1123,6 +1123,53 @@ record Game {
 }
 
 #[test]
+fn finalized_dynamic_queries_enforce_installed_retirement_with_a_stale_working_schema() {
+    let ctx = TestContext::new();
+    let active = "@syncable(false)\nrecord Note {\n @public\n id Id.Int @id\n title String\n}\n";
+    let file = ctx.workspace_path.join("pyre/schema.pyre");
+    std::fs::write(
+        &file,
+        active.replace("title String", "title String @retired"),
+    )
+    .unwrap();
+    ctx.run_command("migration")
+        .args(["create", "retired"])
+        .assert()
+        .success();
+    ctx.run_command("db")
+        .args(["init", "notes.db"])
+        .assert()
+        .success();
+    std::fs::write(&file, active).unwrap();
+
+    for tool in ["pyre_query", "pyre_explain_query"] {
+        let response = call_mcp_tool_error(
+            &ctx,
+            tool,
+            json!({
+                "database": "notes.db",
+                "query": "update Rename { note { title = \"blocked\" } }"
+            }),
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("retired column Note.title"),
+            "{response}"
+        );
+    }
+    let read = call_mcp_tool(
+        &ctx,
+        "pyre_query",
+        json!({
+            "database": "notes.db", "query": "query Read { note { title } }"
+        }),
+    );
+    assert_eq!(read["ok"], true);
+}
+
+#[test]
 fn dynamic_query_tools_surface_cli_parse_diagnostics() {
     let ctx = TestContext::new();
     write_schema(&ctx);

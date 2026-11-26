@@ -19,9 +19,9 @@ const frame = (text: string) => {
     size.writeBigUInt64BE(BigInt(bytes.length));
     return Buffer.concat([size, bytes]);
 };
-function bundle(predecessor: string | null, sql: string, assertions: Record<string, string> = {}) {
-    const manifest = { format: 1, namespace, predecessor, targetApiVersion: "0.0.0" };
-    const files = { "migration.sql": sql, "schema.pyre": schema, ...assertions };
+function bundle(predecessor: string | null, sql: string, assertions: Record<string, string> = {}, targetSchema = schema, targetApiVersion = "0.0.0") {
+    const manifest = { format: 1, namespace, predecessor, targetApiVersion };
+    const files = { "migration.sql": sql, "schema.pyre": targetSchema, ...assertions };
     const paths = Object.keys(files).sort() as (keyof typeof files)[];
     const count = Buffer.alloc(8);
     count.writeBigUInt64BE(BigInt(paths.length));
@@ -112,3 +112,34 @@ test("database catalog binding is established with the root and has no filesyste
             .toEqual(["already-applied", "already-applied"]);
     } finally { close(); }
 });
+
+const remoteUrl = process.env.PYRE_TEST_MIGRATION_SQLD_URL;
+for (const remote of [false, true]) {
+    test.skipIf(remote && !remoteUrl)(`retirement preserves values and history on ${remote ? "remote libSQL" : "local TypeScript"}`, async () => {
+        const local = target();
+        const db = remote ? createClient({ url: remoteUrl! }) : local.db;
+        const deprecatedSchema = schema.replace("title String", "title String @deprecated");
+        const retiredSchema = schema.replace("title String", "title String @retired");
+        const deprecated = bundle(root.hash, "", {}, deprecatedSchema, "0.1.0");
+        const retired = bundle(deprecated.hash, `
+            alter table notes add column preserved_title text;
+            update notes set preserved_title = title;
+            alter table notes drop column title;
+            alter table notes rename column preserved_title to title;
+        `, {}, retiredSchema, "1.0.0");
+        const reactivated = bundle(retired.hash, "", {}, schema, "2.0.0");
+        try {
+            await initPreservedDatabase(db, namespace, [root]);
+            await db.execute("insert into notes (id, title) values ('01900000-0000-7000-8000-000000000001', 'historical')");
+            await expect(applyFinalizedMigrations(db, namespace, { bundles: [root, deprecated, retired, reactivated] })).rejects.toThrow("retired declaration Note.title");
+            expect(await ensureDatabase(db, namespace, schema)).toBe("up-to-date");
+            await applyFinalizedMigrations(db, namespace, { bundles: [root, deprecated, retired] });
+            await db.execute("insert into notes (id) values ('01900000-0000-7000-8000-000000000002')");
+            await auditDatabaseSchema(db);
+            expect((await db.execute("select title from notes order by id")).rows.map(row => row.title)).toEqual(["historical", null]);
+        } finally {
+            if (remote) db.close();
+            local.close();
+        }
+    });
+}

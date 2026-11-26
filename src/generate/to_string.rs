@@ -285,7 +285,13 @@ fn to_string_definition(namespace: &str, definition: &ast::Definition) -> String
         ast::Definition::Record { name, fields, .. } => {
             let indent_collection: Indentation = collect_indentation(&fields, 4);
 
-            let mut result = format!("record {} {{\n", name);
+            let lifecycle = ast::record_lifecycle(fields);
+            let mut result = String::new();
+            if !lifecycle.is_active() {
+                result.push_str(lifecycle.annotation());
+                result.push('\n');
+            }
+            result.push_str(&format!("record {} {{\n", name));
             for (index, field) in fields.iter().enumerate() {
                 result.push_str(&to_string_field(
                     namespace,
@@ -373,12 +379,23 @@ fn field_name(field: &ast::Field) -> Option<&str> {
 
 fn to_string_variant(namespace: &str, is_first: bool, variant: &ast::Variant) -> String {
     let prefix = if is_first { " = " } else { " | " };
+    let annotation = if variant.lifecycle.is_active() {
+        String::new()
+    } else {
+        format!(" {}", variant.lifecycle.annotation())
+    };
 
     match &variant.fields {
         Some(fields) => {
             // Check if variant should be formatted inline
             if should_format_variant_inline(fields, &variant.name, prefix) {
-                format_variant_inline(prefix, &variant.name, fields, &variant.inline_comment)
+                format_variant_inline(
+                    prefix,
+                    &variant.name,
+                    fields,
+                    &annotation,
+                    &variant.inline_comment,
+                )
             } else {
                 // Format as multiline
                 let mut result = format!("  {}{} {{\n", prefix, variant.name);
@@ -391,7 +408,7 @@ fn to_string_variant(namespace: &str, is_first: bool, variant: &ast::Variant) ->
                         field,
                     ));
                 }
-                result.push_str("     }\n");
+                result.push_str(&format!("     }}{annotation}\n"));
                 result
             }
         }
@@ -400,7 +417,10 @@ fn to_string_variant(namespace: &str, is_first: bool, variant: &ast::Variant) ->
                 Some(comment) => format!(" //{}", comment),
                 None => String::new(),
             };
-            format!("  {}{}{}\n", prefix, variant.name, inline_comment)
+            format!(
+                "  {}{}{}{}\n",
+                prefix, variant.name, annotation, inline_comment
+            )
         }
     }
 }
@@ -439,7 +459,7 @@ fn should_format_variant_inline(
     }
 
     // Calculate the length if formatted inline
-    let inline_str = format_variant_inline(prefix, variant_name, fields, &None);
+    let inline_str = format_variant_inline(prefix, variant_name, fields, "", &None);
     // Check length of the variant line (should be <= 80)
     let variant_line = inline_str.trim_end();
 
@@ -450,6 +470,7 @@ fn format_variant_inline(
     prefix: &str,
     variant_name: &str,
     fields: &Vec<ast::Field>,
+    annotation: &str,
     inline_comment: &Option<String>,
 ) -> String {
     let mut result = format!("  {}{} {{ ", prefix, variant_name);
@@ -471,6 +492,7 @@ fn format_variant_inline(
     }
 
     result.push_str(" }");
+    result.push_str(annotation);
 
     if let Some(comment) = inline_comment {
         result.push_str(" //");
@@ -574,6 +596,7 @@ fn to_string_field_directive(
             to_string_permissions_details(namespace, indent, info)
         }
         ast::FieldDirective::Singleton => format!("{}@singleton\n", spaces),
+        ast::FieldDirective::Lifecycle(_) => String::new(),
         ast::FieldDirective::Timestamps => format!("{}@timestamps\n", spaces),
     }
 }
@@ -756,6 +779,7 @@ pub fn to_string_directive(directive: &ast::ColumnDirective) -> String {
         ast::ColumnDirective::PrimaryKey => "@id".to_string(),
         ast::ColumnDirective::Unique => "@unique".to_string(),
         ast::ColumnDirective::Index => "@index".to_string(),
+        ast::ColumnDirective::Lifecycle(state) => state.annotation().to_string(),
         ast::ColumnDirective::Immutable => "@immutable".to_string(),
         ast::ColumnDirective::CreatedAt => "@createdAt".to_string(),
         ast::ColumnDirective::UpdatedAt => "@updatedAt".to_string(),

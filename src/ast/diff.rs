@@ -419,7 +419,9 @@ fn diff_column(old: &crate::ast::Column, new: &crate::ast::Column) -> Option<Col
             crate::ast::ColumnDirective::CreatedAt => Some("_createdAt"),
             crate::ast::ColumnDirective::UpdatedAt => Some("_updatedAt"),
             crate::ast::ColumnDirective::Default { .. } => Some("_default"),
-            crate::ast::ColumnDirective::Immutable => None,
+            crate::ast::ColumnDirective::Immutable | crate::ast::ColumnDirective::Lifecycle(_) => {
+                None
+            }
         }
     };
 

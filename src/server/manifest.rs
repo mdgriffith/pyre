@@ -31,6 +31,8 @@ pub struct QueryManifest {
     #[serde(default)]
     pub attached_dbs: Vec<String>,
     pub input_schema: HashMap<String, FieldSchema>,
+    #[serde(default)]
+    pub write_types: crate::schema_lifecycle::WriteTypes,
     pub session_args: Vec<String>,
     pub optional_input_args: Vec<String>,
     pub json_input_args: Vec<String>,

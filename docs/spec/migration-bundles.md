@@ -29,6 +29,8 @@ The first finalized schema starts at `0.0.0`. Versions are three decimal unsigne
 
 The installed runtime fingerprint is separate from the bundle digest. Its v1 encoding is `v1:` followed by lowercase SHA-256 of the literal bytes `pyre-runtime-schema\0v1\0` and the compact UTF-8 JSON of the shared core's runtime projection in `src/schema_contract.rs`. The projection includes the namespace, sync mode, sorted external identities, Session fields, records, and unions. It includes effective permissions in query/insert/update/delete order, physical names and index definitions, identity brands, and schema directives that affect runtime behavior. Maps use lexical keys; index keys, link field pairs, and function arguments preserve order. Logical `And` and `Or` operands are flattened and sorted. It omits comments, source locations, file names, and draft or rollout metadata. The WASM adapter delegates to the same compiler implementation.
 
+Lifecycle annotations participate in the runtime fingerprint and version classification. Active declarations keep the existing v1 projection. Adding or removing a deprecation bumps minor; entering retirement bumps major. History verification rejects removing or reactivating a retired declaration and reintroducing a previously removed published name. See [MEC-199](https://linear.app/mechanical-elephant/issue/MEC-199) for the lifecycle contract.
+
 ## Implementation order
 
 1. [MEC-192](https://linear.app/mechanical-elephant/issue/MEC-192): Define sealing, verification, history validation, and the catalog interface.

@@ -112,7 +112,7 @@ pub fn to_sql(diff: &Diff) -> Vec<SqlAndParams> {
     sql_statements
 }
 
-fn column_definition(column: &crate::db::introspect::ColumnInfo) -> String {
+pub(crate) fn column_definition(column: &crate::db::introspect::ColumnInfo) -> String {
     let mut def = format!("`{}` {}", column.name, column.column_type);
 
     if column.pk {
@@ -134,7 +134,10 @@ fn column_definition(column: &crate::db::introspect::ColumnInfo) -> String {
     def
 }
 
-fn render_index_sql(table_name: &str, index: &crate::db::introspect::IndexInfo) -> String {
+pub(crate) fn render_index_sql(
+    table_name: &str,
+    index: &crate::db::introspect::IndexInfo,
+) -> String {
     let columns = index
         .columns
         .iter()

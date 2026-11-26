@@ -1,5 +1,5 @@
 use super::{valid_component, Bundle, BundleError, BundleHash};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// A verified namespace chain, in execution order from root to head.
@@ -7,6 +7,10 @@ use std::fmt;
 pub struct History {
     namespace: String,
     bundles: Vec<Bundle>,
+    #[cfg(feature = "database")]
+    reserved: BTreeSet<Vec<String>>,
+    #[cfg(feature = "database")]
+    current: BTreeSet<Vec<String>>,
 }
 
 impl History {
@@ -42,6 +46,8 @@ impl History {
             .map(|hash| by_hash.remove(&hash).unwrap())
             .collect();
         let mut predecessor = None;
+        let mut reserved = BTreeSet::new();
+        let mut previous_names = BTreeSet::new();
         for bundle in &bundles {
             bundle
                 .verify_api_transition(predecessor)
@@ -49,11 +55,34 @@ impl History {
                     bundle: bundle.hash().clone(),
                     source,
                 })?;
+            let context =
+                bundle
+                    .load_target_schema()
+                    .map_err(|source| HistoryError::ApiVersion {
+                        bundle: bundle.hash().clone(),
+                        source,
+                    })?;
+            let names = crate::schema_contract::published_names(&context);
+            if let Some(name) = names
+                .difference(&previous_names)
+                .find(|name| reserved.contains(*name))
+            {
+                return Err(HistoryError::ReservedName {
+                    bundle: bundle.hash().clone(),
+                    name: name.join("."),
+                });
+            }
+            reserved.extend(previous_names.difference(&names).cloned());
+            previous_names = names;
             predecessor = Some(bundle);
         }
         Ok(Self {
             namespace: namespace.into(),
             bundles,
+            #[cfg(feature = "database")]
+            reserved,
+            #[cfg(feature = "database")]
+            current: previous_names,
         })
     }
 
@@ -67,6 +96,27 @@ impl History {
 
     pub fn head(&self) -> Option<&Bundle> {
         self.bundles.last()
+    }
+
+    #[cfg(feature = "database")]
+    pub(super) fn check_new_names(&self, bundle: &Bundle) -> Result<(), HistoryError> {
+        let context = bundle
+            .load_target_schema()
+            .map_err(|source| HistoryError::ApiVersion {
+                bundle: bundle.hash().clone(),
+                source,
+            })?;
+        let names = crate::schema_contract::published_names(&context);
+        if let Some(name) = names
+            .difference(&self.current)
+            .find(|name| self.reserved.contains(*name))
+        {
+            return Err(HistoryError::ReservedName {
+                bundle: bundle.hash().clone(),
+                name: name.join("."),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -117,6 +167,10 @@ fn chain_order<'a>(
 
 #[derive(Debug)]
 pub enum HistoryError {
+    ReservedName {
+        bundle: BundleHash,
+        name: String,
+    },
     InvalidNamespace(String),
     NamespaceMismatch {
         hash: BundleHash,
@@ -150,6 +204,10 @@ pub enum HistoryError {
 impl fmt::Display for HistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ReservedName { bundle, name } => write!(
+                f,
+                "bundle {bundle}: published name {name} is permanently reserved"
+            ),
             Self::InvalidNamespace(namespace) => {
                 write!(f, "invalid migration namespace {namespace:?}")
             }

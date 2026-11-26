@@ -36,6 +36,97 @@ fn manifest(bundle: &Bundle) -> Value {
     serde_json::from_slice(&bundle.manifest_json()).unwrap()
 }
 
+fn lifecycle_bundle(
+    previous: Option<&Bundle>,
+    schema: &str,
+) -> Result<(Bundle, pyre::schema_contract::ApiTransition), BundleError> {
+    Bundle::finalize(
+        DraftMetadata {
+            namespace: "App".into(),
+            grace_seconds: None,
+            external_identities: vec![],
+        },
+        previous,
+        [file(SCHEMA_PATH, schema), file(MIGRATION_PATH, "")],
+    )
+}
+
+#[test]
+fn lifecycle_versions_and_tombstones_survive_a_finalized_chain() {
+    let active = format!("{SCHEMA}\ntype Status = Current | Legacy {{ detail String }}\n")
+        .replace("    id", "    label String\n    id");
+    let deprecated = active
+        .replace("record Note", "@deprecated\nrecord Note")
+        .replace("label String", "label String @deprecated")
+        .replace("detail String }", "detail String } @deprecated");
+    let retired = deprecated.replace("@deprecated", "@retired");
+    let (root, _) = lifecycle_bundle(None, &active).unwrap();
+    let (deprecation, minor) = lifecycle_bundle(Some(&root), &deprecated).unwrap();
+    assert_eq!(minor.to.to_string(), "0.1.0");
+    assert_ne!(
+        root.runtime_fingerprint().unwrap(),
+        deprecation.runtime_fingerprint().unwrap()
+    );
+    let (reactivated, minor) = lifecycle_bundle(Some(&deprecation), &active).unwrap();
+    assert_eq!(minor.to.to_string(), "0.2.0");
+    let (retirement, major) = lifecycle_bundle(Some(&reactivated), &retired).unwrap();
+    assert_eq!(major.to.to_string(), "1.0.0");
+    for invalid in [
+        active.clone(),
+        retired.replace("    label String @retired\n", ""),
+        retired.replace("detail String", "detail Int"),
+        retired.replace("label String", "label Int"),
+        retired.replace(" | Legacy { detail String } @retired", ""),
+    ] {
+        assert!(
+            matches!(
+                lifecycle_bundle(Some(&retirement), &invalid),
+                Err(BundleError::Transition(_))
+            ),
+            "{invalid}"
+        );
+    }
+    let (_, unchanged) = lifecycle_bundle(
+        Some(&retirement),
+        &retired.replace("label String", "label String?"),
+    )
+    .unwrap();
+    assert_eq!(unchanged.change, ApiChange::Unchanged);
+    assert!(History::new("App", [retirement, deprecation, root, reactivated]).is_ok());
+}
+
+#[test]
+fn removed_published_names_cannot_be_reused_after_an_intervening_bundle() {
+    let (root, _) = lifecycle_bundle(None, SCHEMA).unwrap();
+    let (removed, _) = lifecycle_bundle(Some(&root), "@syncable(false)\n").unwrap();
+    let (reused, _) = lifecycle_bundle(Some(&removed), SCHEMA).unwrap();
+    assert!(
+        matches!(History::new("App", [root, removed, reused]), Err(HistoryError::ReservedName { name, .. }) if name == "Note")
+    );
+}
+
+#[test]
+fn lifecycle_annotations_round_trip_and_invalid_annotations_are_rejected() {
+    let source = "@syncable(false)\ntype Status = Open | Closed { label String } @retired\n\n@deprecated\nrecord Note {\n @public\n id Id.Int @id\n label String @retired\n status Status\n}\n";
+    let compile = |s: &str| pyre::db::bundle::load_standalone_schema("App", s, &[]);
+    let context = compile(source).unwrap();
+    let formatted =
+        pyre::generate::to_string::schema_to_string("App", &context.database.schemas[0]);
+    assert_eq!(
+        pyre::schema_contract::runtime_fingerprint(&context),
+        pyre::schema_contract::runtime_fingerprint(&compile(&formatted).unwrap())
+    );
+    for invalid in [
+        source.replace("label String @retired", "label String @retired @deprecated"),
+        source.replace("@id", "@id @retired"),
+        source.replace("@deprecated\nrecord", "@deprecated(1)\nrecord"),
+        source.replace("= Open", "= Open @retired"),
+        source.replace("= Open", "= Open { label Int }"),
+    ] {
+        assert!(compile(&invalid).is_err(), "{invalid}");
+    }
+}
+
 #[test]
 fn finalized_versions_distinguish_storage_additions_and_breaking_changes() {
     let compile = |previous, schema: &str, sql: &str| {
@@ -180,6 +271,167 @@ mod execution {
         let (bundle, _) = generated.draft.candidate(&empty).unwrap();
         author::check(&empty, Some(&bundle), None).await.unwrap();
         History::new("App", [bundle]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retired_columns_keep_values_and_become_nullable_without_resetting_rowids() {
+        let source = SCHEMA.replace(
+            "    id",
+            "    label String @default(\"old default\") @index\n    code Int? @default(17)\n    id",
+        );
+        let history = root(&source).await;
+        let retired = source
+            .replace("label String", "label String @retired")
+            .replace("code Int?", "code Int? @retired");
+        let generated = author::create_draft(&history, retired, vec![], None)
+            .await
+            .unwrap();
+        assert!(
+            !generated.requires_manual_sql,
+            "{:?}",
+            generated.diagnostics
+        );
+        let (bundle, transition) = generated.draft.candidate(&history).unwrap();
+        assert_eq!(transition.change, ApiChange::Major);
+        author::check(&history, Some(&bundle), None).await.unwrap();
+
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        execute::initialize(&conn, &history, Binding::Filesystem)
+            .await
+            .unwrap();
+        conn.execute_batch("insert into notes (id, label, code) values (2, 'historical', 5), (100, 'deleted', 8); delete from notes where id = 100; insert into notes(id) values (3);").await.unwrap();
+        let history = History::new(
+            "App",
+            history.bundles().iter().cloned().chain([bundle.clone()]),
+        )
+        .unwrap();
+        execute::apply_history(&conn, &history, Binding::Filesystem)
+            .await
+            .unwrap();
+        conn.execute("insert into notes default values", ())
+            .await
+            .unwrap();
+        assert_eq!(scalar(&conn, "select json_group_array(json_array(id, label, code)) from (select * from notes order by id)").await, r#"[[2,"historical",5],[3,"old default",17],[101,null,null]]"#);
+        author::audit_bundle(&conn, &bundle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_operations_preserve_retired_data_and_reject_the_entire_batch() {
+        use pyre::server::{
+            manifest::{Manifest, PyreSession},
+            query,
+        };
+        let source = r#"
+@syncable(false)
+type State = Current | Legacy { detail String } @retired
+record Note {
+ @public
+ id Id.Int @id
+ title String
+ old String @retired
+ state State
+ history Json<List<State>>?
+}
+@retired
+record Archived {
+ @public
+ id Id.Int @id
+}
+"#;
+        let history = root(source).await;
+        let context = history.head().unwrap().load_target_schema().unwrap();
+        for (operation, expected) in [
+            ("delete Bad { archived { id } }", "retired record Archived"),
+            (
+                "update Bad { note { old = \"changed\" } }",
+                "retired column Note.old",
+            ),
+            (
+                "update Bad { note { state = Legacy { detail = \"changed\" } } }",
+                "retired variant State.Legacy",
+            ),
+        ] {
+            let queries = pyre::parser::parse_query("test.pyre", operation).unwrap();
+            let Err(errors) = pyre::typecheck::check_queries(&queries, &context) else {
+                panic!("accepted {operation}")
+            };
+            assert!(format!("{errors:?}").contains(expected));
+        }
+        let mut queries = pyre::parser::parse_query(
+            "test.pyre",
+            r#"
+            query Read { note { title old state } archived { id } }
+            update SaveHistory($values: Json<List<State>>) { note { history = $values } }
+        "#,
+        )
+        .unwrap();
+        pyre::generated_queries::append_generated_crud_queries(&mut queries, &context);
+        let info = pyre::typecheck::check_queries(&queries, &context).unwrap();
+        let mut files = Vec::new();
+        pyre::generate::manifest::generate_queries(&context, &queries, &info, &mut files);
+        let manifest: Manifest = serde_json::from_str(&files[0].contents).unwrap();
+        let id = |name: &str| {
+            queries
+                .queries
+                .iter()
+                .find_map(|definition| match definition {
+                    pyre::ast::QueryDef::Query(q) if q.name == name => {
+                        Some(q.interface_hash.as_str())
+                    }
+                    _ => None,
+                })
+        };
+        assert!(id("ArchivedDelete").is_none());
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        execute::initialize(&conn, &history, Binding::Filesystem)
+            .await
+            .unwrap();
+        conn.execute_batch("insert into notes (id,title,old,state,state__detail) values (1,'before','preserved','Legacy','historical'); insert into archiveds (id) values (1);").await.unwrap();
+        let session = PyreSession::new(json!({}), &manifest.session_schema).unwrap();
+        let update = id("NoteUpdate").unwrap();
+        assert!(query::run(
+            &conn,
+            &manifest,
+            update,
+            json!({"id":1,"old":"invalid"}),
+            &session
+        )
+        .await
+        .is_err());
+        let failed = query::run(&conn, &manifest, "$batch", json!([
+            {"queryId":update,"input":{"id":1,"title":"rolled back"}},
+            {"queryId":id("SaveHistory"),"input":{"values":[{"_type":"Legacy","detail":"invalid"}]}}
+        ]), &session).await.unwrap_err();
+        assert!(
+            failed.to_string().contains("retired variant State.Legacy"),
+            "{failed}"
+        );
+        assert_eq!(scalar(&conn, "select title from notes").await, "before");
+        query::run(
+            &conn,
+            &manifest,
+            update,
+            json!({"id":1,"title":"after"}),
+            &session,
+        )
+        .await
+        .unwrap();
+        let read = query::run(&conn, &manifest, id("Read").unwrap(), json!({}), &session)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.response["note"][0],
+            json!({"title":"after","old":"preserved","state":{"_type":"Legacy","detail":"historical"}})
+        );
+        assert_eq!(read.response["archived"][0]["id"], 1);
     }
 
     async fn exercise(db: &libsql::Database) {

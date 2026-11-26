@@ -3528,6 +3528,63 @@ console.log("json-roundtrip-check-passed");
 }
 
 #[tokio::test]
+async fn test_generated_typescript_rejects_retired_union_values_in_composed_writes() {
+    let ctx = TestContext::new();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/schema.pyre"),
+        r#"
+@syncable(false)
+type Status = Current | Legacy { detail String } @retired
+record Note {
+    @public
+    id Id.Int @id
+    title String
+    status Status
+    historical String @retired
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ctx.workspace_path.join("pyre/queries.pyre"),
+        r#"
+update Rename($title: String) { note { title = $title } }
+update SetStatus($status: Status) { note { status = $status } }
+query Read { note { title status historical } }
+"#,
+    )
+    .unwrap();
+    generate_runtime(&ctx);
+    run_bun_verification_script(
+        &ctx,
+        "verify-retirement.ts",
+        r#"
+import assert from "node:assert/strict";
+import { createClient } from "@libsql/client";
+import { run } from "@pyre/server/query";
+import { queries } from "./pyre/generated/typescript/server";
+import { meta as rename } from "./pyre/generated/typescript/core/queries/metadata/rename";
+import { meta as status } from "./pyre/generated/typescript/core/queries/metadata/setStatus";
+import { Read } from "./pyre/generated/typescript/run";
+
+const db = createClient({ url: "file:.yak/yak.db" });
+await db.execute("insert into notes (title,status,status__detail,historical) values ('before','Legacy','saved','old')");
+const result = await run(db, queries, [
+  { queryId: rename.id, input: { title: "rejected" } },
+  { queryId: status.id, input: { status: { _type: "Legacy", detail: "new" } } },
+], {}, {});
+assert.equal(result.kind, "error");
+assert.deepEqual((await Read(db, {})).note, [{title: "before", status: {_type: "Legacy", detail: "saved"}, historical: "old"}]);
+assert.equal((await run(db, queries, status.id, { status: { _type: "Current" } }, {})).kind, "success");
+db.close();
+console.log("retirement-check-passed");
+"#,
+        "retirement-check-passed",
+        "generated TypeScript retirement verification",
+    );
+}
+
+#[tokio::test]
 async fn test_generated_typescript_runner_roundtrips_typed_json_values() {
     let ctx = TestContext::new();
     write_typed_json_schema_and_query(&ctx);

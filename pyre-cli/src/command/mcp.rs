@@ -696,11 +696,7 @@ async fn dynamic_query(options: &Options<'_>, arguments: &JsonValue) -> Result<J
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let (query_list, manifest) = dynamic_query_plan(options, arguments)?;
-    if db::is_remote(&database).map_err(|error| error.format_error())? {
-        pyre::server::query::validate_remote_manifest(&manifest)
-            .map_err(|error| error.to_string())?;
-    }
+    let (source, queries) = parse_dynamic_query(arguments)?;
     let db = db::connect(&database, &auth)
         .await
         .map_err(|error| error.format_error())?;
@@ -711,6 +707,12 @@ async fn dynamic_query(options: &Options<'_>, arguments: &JsonValue) -> Result<J
             db::error::format_libsql_error(&error)
         )
     })?;
+    let (query_list, manifest) =
+        dynamic_query_plan_for_database(options, arguments, &conn, &source, queries).await?;
+    if db::is_remote(&database).map_err(|error| error.format_error())? {
+        pyre::server::query::validate_remote_manifest(&manifest)
+            .map_err(|error| error.to_string())?;
+    }
     let session = PyreSession::new(session_value, &manifest.session_schema)
         .map_err(|error| error.to_string())?;
 
@@ -807,11 +809,7 @@ async fn explain_dynamic_query(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let (query_list, manifest) = dynamic_query_plan(options, arguments)?;
-    if db::is_remote(&database).map_err(|error| error.format_error())? {
-        pyre::server::query::validate_remote_manifest(&manifest)
-            .map_err(|error| error.to_string())?;
-    }
+    let (source, queries) = parse_dynamic_query(arguments)?;
     let db = db::connect(&database, &auth)
         .await
         .map_err(|error| error.format_error())?;
@@ -822,6 +820,12 @@ async fn explain_dynamic_query(
             db::error::format_libsql_error(&error)
         )
     })?;
+    let (query_list, manifest) =
+        dynamic_query_plan_for_database(options, arguments, &conn, &source, queries).await?;
+    if db::is_remote(&database).map_err(|error| error.format_error())? {
+        pyre::server::query::validate_remote_manifest(&manifest)
+            .map_err(|error| error.to_string())?;
+    }
     let session = PyreSession::new(session_value, &manifest.session_schema)
         .map_err(|error| error.to_string())?;
 
@@ -869,26 +873,63 @@ fn dynamic_query_plan(
     options: &Options<'_>,
     arguments: &JsonValue,
 ) -> Result<(ast::QueryList, Manifest), String> {
-    let query_source = required_string_arg(arguments, "query")?;
+    let (source, queries) = parse_dynamic_query(arguments)?;
     let (_database_schema, mut context, paths) = current_schema_context(options, arguments)?;
     context.current_filepath = "mcp.pyre".to_string();
-    let query_list = pyre::parser::parse_query("mcp.pyre", &query_source)
-        .map_err(|error| parser::render_error(&query_source, error, false))?;
-    let query_infos = pyre::typecheck::check_queries(&query_list, &context).map_err(|errors| {
+    compile_dynamic_query(&source, queries, &context, Some(&paths))
+}
+
+fn parse_dynamic_query(arguments: &JsonValue) -> Result<(String, ast::QueryList), String> {
+    let source = required_string_arg(arguments, "query")?;
+    let queries = pyre::parser::parse_query("mcp.pyre", &source)
+        .map_err(|error| parser::render_error(&source, error, false))?;
+    Ok((source, queries))
+}
+
+async fn dynamic_query_plan_for_database(
+    options: &Options<'_>,
+    arguments: &JsonValue,
+    conn: &libsql::Connection,
+    source: &str,
+    queries: ast::QueryList,
+) -> Result<(ast::QueryList, Manifest), String> {
+    if pyre::db::bundle::execute::installed(conn).await?.is_some() {
+        let installed = pyre::server::schema::load_schema_from_database(conn)
+            .await
+            .map_err(|error| error.to_string())?;
+        let context = installed.context().map_err(|error| error.to_string())?;
+        return compile_dynamic_query(source, queries, context, None);
+    }
+    let (_database_schema, mut context, paths) = current_schema_context(options, arguments)?;
+    context.current_filepath = "mcp.pyre".to_string();
+    compile_dynamic_query(source, queries, &context, Some(&paths))
+}
+
+fn compile_dynamic_query(
+    query_source: &str,
+    query_list: ast::QueryList,
+    context: &pyre::typecheck::Context,
+    paths: Option<&pyre::filesystem::Found>,
+) -> Result<(ast::QueryList, Manifest), String> {
+    let query_infos = pyre::typecheck::check_queries(&query_list, context).map_err(|errors| {
         errors
             .iter()
             .map(|error| {
-                let source = if error.filepath == "mcp.pyre" {
-                    query_source.as_str()
+                let source = if paths.is_none() || error.filepath == "mcp.pyre" {
+                    query_source
                 } else {
-                    pyre::filesystem::get_schema_source(&error.filepath, &paths).unwrap_or("")
+                    paths
+                        .and_then(|paths| {
+                            pyre::filesystem::get_schema_source(&error.filepath, paths)
+                        })
+                        .unwrap_or("")
                 };
                 pyre::error::format_error(source, error, false)
             })
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    let manifest = dynamic_manifest(&context, &query_list, &query_infos)?;
+    let manifest = dynamic_manifest(context, &query_list, &query_infos)?;
     Ok((query_list, manifest))
 }
 
@@ -983,6 +1024,7 @@ fn dynamic_query_manifest(
         primary_db: query_info.primary_db.clone(),
         attached_dbs,
         input_schema: input_schema(context, query_info),
+        write_types: pyre::schema_lifecycle::WriteTypes::for_query(context, query),
         session_args: session_args(query_info),
         optional_input_args: query
             .args

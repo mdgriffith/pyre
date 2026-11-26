@@ -303,9 +303,24 @@ export const CoercedBool = z.union([z.boolean(), z.literal(0), z.literal(1)]).tr
 
 /// Generate a tagged union decoder using Zod
 pub fn generate_tagged_union(name: &str, variants: &[ast::Variant], recursive: bool) -> String {
-    let mut result = String::new();
+    generate_tagged_union_with_shape(
+        name,
+        variants,
+        recursive,
+        variants.iter().all(|v| v.fields.is_none()),
+    )
+}
 
-    let is_enum = variants.iter().all(|variant| variant.fields.is_none());
+pub fn generate_tagged_union_with_shape(
+    name: &str,
+    variants: &[ast::Variant],
+    recursive: bool,
+    is_enum: bool,
+) -> String {
+    let mut result = String::new();
+    if variants.is_empty() {
+        return format!("export const {name} = z.never();\nexport type {name} = never;\n\n");
+    }
 
     if is_enum {
         let variants_as_literals = variants
@@ -507,6 +522,7 @@ mod tests {
     #[test]
     fn tagged_union_foreign_key_field_uses_primitive_decoder() {
         let variants = vec![ast::Variant {
+            lifecycle: ast::Lifecycle::Active,
             name: "InviteUser".to_string(),
             fields: Some(vec![column(
                 "userId",
@@ -534,6 +550,7 @@ mod tests {
     #[test]
     fn tagged_union_custom_field_uses_lazy_decoder_for_recursive_types() {
         let variants = vec![ast::Variant {
+            lifecycle: ast::Lifecycle::Active,
             name: "AttributeCustom".to_string(),
             fields: Some(vec![column(
                 "fields",

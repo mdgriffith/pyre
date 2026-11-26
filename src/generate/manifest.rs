@@ -20,6 +20,8 @@ struct QueryManifest {
     primary_db: String,
     attached_dbs: Vec<String>,
     input_schema: BTreeMap<String, FieldSchema>,
+    #[serde(skip_serializing_if = "crate::schema_lifecycle::WriteTypes::is_empty")]
+    write_types: crate::schema_lifecycle::WriteTypes,
     session_args: Vec<String>,
     optional_input_args: Vec<String>,
     json_input_args: Vec<String>,
@@ -117,6 +119,7 @@ fn query_manifest(
         primary_db: query_info.primary_db.clone(),
         attached_dbs: sorted_strings(&query_info.attached_dbs),
         input_schema: input_schema(context, query),
+        write_types: crate::schema_lifecycle::WriteTypes::for_query(context, query),
         session_args: session_args(&query_info.variables),
         optional_input_args: query
             .args

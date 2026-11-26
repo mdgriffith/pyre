@@ -29,6 +29,12 @@ Each assertion is one read-only `SELECT`; it passes only if it returns no rows. 
 
 If the catalog head changes before a draft is finalized, regenerate against the new head, carry forward handwritten SQL and assertions, and check again. `migration unfinalize NAME` returns an unshared filesystem head to a draft when there is no known application or rollout evidence. Use a follow-up migration after sharing or applying it.
 
+## Deprecate or retire a declaration
+
+Place `@deprecated` or `@retired` before a record, after a record column's type, or after a union variant and its payload. Use at most one annotation per declaration. Deprecation leaves reads and writes intact, emits a compiler warning, and bumps the finalized API version's minor number. You can remove a deprecation in a later migration.
+
+Retirement bumps the major version and cannot be reversed. Keep the retired declaration in every later schema. A retired record stays readable but rejects inserts, updates, and deletes. A retired column still returns historical values, rejects assignments, and returns `null` on new rows. A retired union variant remains readable and decodable, but writes cannot construct it. Migration SQL can still transform historical data explicitly.
+
 ## Apply and recover
 
 Stop serving the target and drain in-flight work before running `pyre migrate`. Restart with compatible handlers after verifying the installed state. Each migration commits its SQL, assertions, installed schema, and receipt together. If one fails, earlier migrations stay applied. Data-changing SQL on a synced target changes its sync epoch so reconnecting clients rebuild their caches.

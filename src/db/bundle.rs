@@ -197,7 +197,7 @@ impl Bundle {
                 .map(|(version, context)| (*version, context)),
             &self.load_target_schema()?,
         )
-        .map_err(BundleError::VersionOverflow)
+        .map_err(BundleError::Transition)
     }
 
     pub fn verify_api_transition(
@@ -492,7 +492,7 @@ pub enum BundleError {
         actual: ApiVersion,
         expected: ApiVersion,
     },
-    VersionOverflow(schema_contract::VersionOverflow),
+    Transition(schema_contract::TransitionError),
     ZeroGrace,
     DuplicateIdentity {
         namespace: String,
@@ -542,7 +542,7 @@ impl fmt::Display for BundleError {
                 f,
                 "targetApiVersion is {actual}, expected {expected} from schema compatibility"
             ),
-            Self::VersionOverflow(error) => error.fmt(f),
+            Self::Transition(error) => error.fmt(f),
             Self::ZeroGrace => write!(f, "graceSeconds must be positive"),
             Self::DuplicateIdentity {
                 namespace,

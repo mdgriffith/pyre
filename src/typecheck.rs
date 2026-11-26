@@ -2127,6 +2127,9 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                         }
 
                         for column in ast::collect_columns(&session.fields) {
+                            if !ast::column_lifecycle(&column).is_active() {
+                                errors.push(invalid_type_usage_error(&file.path, "Lifecycle annotations are for records, record columns, and union variants.".into(), vec![], to_range(&column.start, &column.end)));
+                            }
                             if column.type_.contains_sequence() {
                                 errors.push(invalid_type_usage_error(&file.path,
                                     "Sequence.Int cannot be used in session fields. Use Int instead.".to_string(),
@@ -2200,6 +2203,41 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                             }
                         }
                         for column in ast::collect_columns(&fields) {
+                            let annotations = column
+                                .directives
+                                .iter()
+                                .filter(|d| matches!(d, ast::ColumnDirective::Lifecycle(_)))
+                                .count();
+                            if annotations > 1
+                                || (ast::column_lifecycle(&column) == ast::Lifecycle::Retired
+                                    && (ast::is_primary_key(&column)
+                                        || ast::is_managed_timestamp(&column)
+                                        || ast::is_sequence(&column)
+                                        || column.name == "updatedAt"))
+                            {
+                                errors.push(invalid_type_usage_error(&file.path,
+                                    if annotations > 1 { "Only one lifecycle annotation is allowed." } else { "Identity and system columns cannot be retired independently." }.into(),
+                                    to_range(start, end), to_range(&column.start, &column.end)));
+                            }
+                            if ast::record_lifecycle(fields) != ast::Lifecycle::Retired
+                                && ast::column_lifecycle(&column) != ast::Lifecycle::Retired
+                                && !column.nullable
+                                && !ast::has_default_value(&column)
+                                && crate::schema_lifecycle::has_no_writable_variant(
+                                    context,
+                                    &column.type_,
+                                )
+                            {
+                                errors.push(invalid_type_usage_error(
+                                    &file.path,
+                                    format!(
+                                        "Required column {}.{} has no writable variant.",
+                                        name, column.name
+                                    ),
+                                    to_range(start, end),
+                                    to_range(&column.start, &column.end),
+                                ));
+                            }
                             validate_type_expr(
                                 context,
                                 &file.path,
@@ -2327,9 +2365,34 @@ fn check_schema_definitions(context: &Context, database: &ast::Database, errors:
                         start,
                         end,
                     } => {
+                        let retired_fields = variants
+                            .iter()
+                            .filter(|v| v.lifecycle == ast::Lifecycle::Retired)
+                            .flat_map(|v| v.fields.iter().flatten())
+                            .filter_map(|f| match f {
+                                ast::Field::Column(c) => Some(c),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
                         for variant in variants {
                             if let Some(fields) = &variant.fields {
                                 for field in ast::collect_columns(&fields) {
+                                    if !ast::column_lifecycle(&field).is_active() {
+                                        errors.push(invalid_type_usage_error(
+                                            &file.path,
+                                            "Annotate the union variant, not its payload fields."
+                                                .into(),
+                                            vec![],
+                                            to_range(&field.start, &field.end),
+                                        ));
+                                    }
+                                    if variant.lifecycle != ast::Lifecycle::Retired
+                                        && retired_fields
+                                            .iter()
+                                            .any(|c| c.name == field.name && c.type_ != field.type_)
+                                    {
+                                        errors.push(invalid_type_usage_error(&file.path, format!("Active variant {} has incompatible shared storage for retired payload field {}.", variant.name, field.name), vec![], to_range(&field.start, &field.end)));
+                                    }
                                     let mut contexts: Vec<Range> = vec![];
 
                                     if let Some(new_range) = to_single_range(&start, &end) {
@@ -4429,6 +4492,17 @@ fn check_table_query(
     params: &mut HashMap<String, ParamInfo>,
     used_namespaces: &mut UsedNamespaces,
 ) {
+    if *operation != ast::QueryOperation::Query
+        && ast::record_lifecycle(&table.record.fields) == ast::Lifecycle::Retired
+    {
+        errors.push(invalid_type_usage_error(
+            &context.current_filepath,
+            format!("Cannot write to retired record {}.", table.record.name),
+            vec![],
+            to_range(&query.start, &query.end),
+        ));
+        return;
+    }
     // Mark session variables in permissions as used
     if let Some(perms) = ast::get_permissions(&table.record, operation) {
         mark_session_vars_in_where_as_used(query_context, context, &perms, params);
@@ -4737,10 +4811,14 @@ fn check_table_query(
                 for field in &link.foreign.fields {
                     if ast::collect_columns(&table.record.fields)
                         .iter()
-                        .any(|column| column.name == *field && ast::is_sequence(column))
+                        .any(|column| {
+                            column.name == *field
+                                && (ast::is_sequence(column)
+                                    || ast::column_lifecycle(column) == ast::Lifecycle::Retired)
+                        })
                     {
                         errors.push(invalid_type_usage_error(&context.current_filepath,
-                            format!("Nested inserts cannot supply server-managed sequence {} through a relationship. Link through the UUID identity instead.", field),
+                            format!("Nested inserts cannot supply server-managed sequence or retired column {} through a relationship. Link through an active identity instead.", field),
                             vec![], to_range(&query.start, &query.end)));
                         return;
                     }
@@ -4761,7 +4839,8 @@ fn check_table_query(
             }
 
             for col in ast::collect_columns(&table.record.fields) {
-                if ast::is_integer_primary_key(&col)
+                if ast::column_lifecycle(&col) == ast::Lifecycle::Retired
+                    || ast::is_integer_primary_key(&col)
                     || ast::is_sequence(&col)
                     || ast::has_default_value(&col)
                     || ast::is_managed_timestamp(&col)
@@ -4825,6 +4904,29 @@ fn check_field(
     let column_type_str = query_param_type_for_column(table, column);
     match &field.set {
         Some(set) => {
+            if matches!(
+                operation,
+                ast::QueryOperation::Insert | ast::QueryOperation::Update
+            ) {
+                let reason = if ast::column_lifecycle(column) == ast::Lifecycle::Retired {
+                    Some(format!(
+                        "Cannot assign retired column {}.{}.",
+                        table.name, column.name
+                    ))
+                } else {
+                    crate::schema_lifecycle::forbidden_assignment(context, &column.type_, set)
+                };
+                if let Some(reason) = reason {
+                    mark_as_used(query_context, set, params);
+                    errors.push(invalid_type_usage_error(
+                        &context.current_filepath,
+                        reason,
+                        vec![],
+                        to_range(&field.start, &field.end),
+                    ));
+                    return;
+                }
+            }
             if matches!(operation, ast::QueryOperation::Update) && ast::is_immutable(column) {
                 mark_as_used(query_context, set, params);
                 errors.push(Error {
@@ -5014,6 +5116,9 @@ fn check_field(
                                                 {
                                                     // Check the nested field's set value to mark variables as used
                                                     if let Some(nested_set) = &nested_field.set {
+                                                        if let Some(reason) = crate::schema_lifecycle::forbidden_assignment(context, &variant_col.type_, nested_set) {
+                                                            errors.push(invalid_type_usage_error(&context.current_filepath, reason, vec![], to_range(&nested_field.start, &nested_field.end)));
+                                                        }
                                                         let variant_col_type_str =
                                                             variant_col.type_.to_string();
                                                         check_value(

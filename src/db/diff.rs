@@ -468,7 +468,7 @@ pub(crate) fn physical_columns(
     columns
 }
 
-fn create_table_from_fields(
+pub(crate) fn create_table_from_fields(
     context: &crate::typecheck::Context,
     name: &str,
     fields: &Vec<crate::ast::Field>,
